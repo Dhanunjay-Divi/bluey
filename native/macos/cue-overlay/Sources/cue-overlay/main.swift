@@ -1514,35 +1514,56 @@ private let remoteControlAppNeedles = [
 
 private struct CardUpdateSequenceTracker {
     private var lastSequenceByCard: [String: UInt64] = [:]
+    private var interactionIdByCard: [String: String] = [:]
 
     mutating func reset(cardId: String) {
         lastSequenceByCard.removeValue(forKey: cardId)
+        interactionIdByCard.removeValue(forKey: cardId)
     }
 
     mutating func resetAll() {
         lastSequenceByCard.removeAll(keepingCapacity: true)
+        interactionIdByCard.removeAll(keepingCapacity: true)
     }
 
     mutating func shouldAccept(
         cardId: String,
+        interactionId: String? = nil,
         sequence: ParsedUpdateSequence,
         snapshot: Bool
     ) -> Bool {
         guard !cardId.isEmpty else { return false }
-        switch sequence {
+        let canonicalInteractionId = interactionId.flatMap { raw in
+            UUID(uuidString: raw)?.uuidString.lowercased()
+        }
+        if let canonicalInteractionId,
+           let current = interactionIdByCard[cardId],
+           current != canonicalInteractionId
+        {
+            return false
+        }
+        let accepted: Bool = switch sequence {
         case .absent:
             // Legacy daemons did not send a sequence. Preserve rolling-upgrade
             // compatibility by rendering every such frame without changing
             // the dedupe barrier for explicitly sequenced frames.
-            return true
+            true
         case .invalid:
-            return false
+            false
         case .value(let sequence):
-            return shouldAcceptSequenced(
+            shouldAcceptSequenced(
                 cardId: cardId,
                 sequence: sequence,
                 snapshot: snapshot)
         }
+        if accepted, let canonicalInteractionId {
+            interactionIdByCard[cardId] = canonicalInteractionId
+        }
+        return accepted
+    }
+
+    func latestSequence(cardId: String) -> UInt64? {
+        lastSequenceByCard[cardId]
     }
 
     private mutating func shouldAcceptSequenced(
@@ -1570,6 +1591,106 @@ private enum ParsedUpdateSequence: Equatable {
     case absent
     case value(UInt64)
     case invalid
+
+    var explicitValue: UInt64? {
+        guard case .value(let value) = self else { return nil }
+        return value
+    }
+}
+
+private enum AnswerRenderAckPhase: String, Equatable, Hashable {
+    case firstText = "first_text"
+    case final
+}
+
+private enum ParsedRenderAck: Equatable {
+    case absent
+    case value(AnswerRenderAckPhase)
+    case invalid
+
+    var phase: AnswerRenderAckPhase? {
+        guard case .value(let phase) = self else { return nil }
+        return phase
+    }
+}
+
+private struct PendingAnswerRenderAck: Equatable {
+    let cardId: String
+    let interactionId: String
+    let phase: AnswerRenderAckPhase
+    let sequence: UInt64
+}
+
+private struct AnswerRenderAckTracker {
+    private struct CardState {
+        let interactionId: String
+        var highestSequence: UInt64
+        var reservations: Set<String>
+    }
+
+    private var states: [String: CardState] = [:]
+
+    mutating func reset(cardId: String) {
+        states.removeValue(forKey: cardId)
+    }
+
+    mutating func resetAll() {
+        states.removeAll(keepingCapacity: true)
+    }
+
+    mutating func reserve(
+        cardId: String,
+        interactionId: String?,
+        phase: ParsedRenderAck,
+        sequence: ParsedUpdateSequence,
+        highestAcceptedSequence: UInt64?
+    ) -> PendingAnswerRenderAck? {
+        guard !cardId.isEmpty,
+              let interactionId,
+              UUID(uuidString: interactionId) != nil,
+              let phase = phase.phase,
+              let sequence = sequence.explicitValue,
+              sequence == highestAcceptedSequence
+        else {
+            return nil
+        }
+        let canonicalInteractionId = interactionId.lowercased()
+        let reservation = "\(sequence):\(phase.rawValue)"
+        if var state = states[cardId] {
+            // A card is permanently bound to the interaction that created it.
+            // A delayed frame from another answer generation must never earn a
+            // paint acknowledgement, even if its numeric sequence is larger.
+            guard state.interactionId == canonicalInteractionId,
+                  sequence >= state.highestSequence,
+                  !state.reservations.contains(reservation)
+            else {
+                return nil
+            }
+            state.highestSequence = max(state.highestSequence, sequence)
+            state.reservations.insert(reservation)
+            states[cardId] = state
+        } else {
+            states[cardId] = CardState(
+                interactionId: canonicalInteractionId,
+                highestSequence: sequence,
+                reservations: [reservation])
+        }
+        return PendingAnswerRenderAck(
+            cardId: cardId,
+            interactionId: canonicalInteractionId,
+            phase: phase,
+            sequence: sequence)
+    }
+
+    mutating func cancel(_ ack: PendingAnswerRenderAck) {
+        guard var state = states[ack.cardId],
+              state.interactionId == ack.interactionId
+        else {
+            return
+        }
+        state.reservations.remove("\(ack.sequence):\(ack.phase.rawValue)")
+        states[ack.cardId] = state
+    }
 }
 
 /// Inbound commands from the daemon.
@@ -1599,12 +1720,14 @@ private enum OverlayCommand {
     case pushCard(CueCard)
     case updateCard(
         id: String,
+        interactionId: String?,
         body: String,
         done: Bool,
         costLabel: String?,
         artifact: OverlayArtifact?,
         sequence: ParsedUpdateSequence,
-        snapshot: Bool)
+        snapshot: Bool,
+        renderAck: ParsedRenderAck)
     case shutdown
     case unknown(String)
 }
@@ -1624,6 +1747,25 @@ private func parseUpdateSequence(_ raw: Any?, present: Bool) -> ParsedUpdateSequ
         return .value(UInt64(value))
     }
     return .invalid
+}
+
+private func parseInteractionId(_ raw: Any?) -> String? {
+    guard let raw = raw as? String,
+          let value = UUID(uuidString: raw)
+    else {
+        return nil
+    }
+    return value.uuidString.lowercased()
+}
+
+private func parseRenderAck(_ raw: Any?, present: Bool) -> ParsedRenderAck {
+    guard present else { return .absent }
+    guard let raw = raw as? String,
+          let phase = AnswerRenderAckPhase(rawValue: raw)
+    else {
+        return .invalid
+    }
+    return .value(phase)
 }
 
 private func parseCommand(_ line: String) -> OverlayCommand {
@@ -1736,6 +1878,7 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         return .pushCard(card)
     case "update_card":
         let id = obj["id"] as? String ?? ""
+        let interactionId = parseInteractionId(obj["interaction_id"])
         let body = obj["body"] as? String ?? ""
         let done = obj["done"] as? Bool ?? false
         let costLabel = obj["cost_label"] as? String
@@ -1743,6 +1886,9 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             obj["sequence"],
             present: obj.keys.contains("sequence"))
         let snapshot = obj["snapshot"] as? Bool ?? false
+        let renderAck = parseRenderAck(
+            obj["render_ack"],
+            present: obj.keys.contains("render_ack"))
         var artifact: OverlayArtifact?
         if let artifactObj = obj["artifact"] as? [String: Any],
            let artifactData = try? JSONSerialization.data(withJSONObject: artifactObj) {
@@ -1750,12 +1896,14 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         }
         return .updateCard(
             id: id,
+            interactionId: interactionId,
             body: body,
             done: done,
             costLabel: costLabel,
             artifact: artifact,
             sequence: sequence,
-            snapshot: snapshot)
+            snapshot: snapshot,
+            renderAck: renderAck)
     default:
         return .unknown(line)
     }
@@ -1785,17 +1933,442 @@ private func envFlag(_ name: String) -> Bool {
     return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
 }
 
-private let sessionToken: String = ProcessInfo.processInfo
-    .environment["BLUEY_OVERLAY_SESSION_TOKEN"]
-    ?? argumentValue("--bluey-overlay-session-token")
-    ?? ""
+private let sessionToken: String = {
+    let token = ProcessInfo.processInfo
+        .environment["BLUEY_OVERLAY_SESSION_TOKEN"]
+        ?? argumentValue("--bluey-overlay-session-token")
+        ?? ""
+    // Match the native Windows boundary. An oversized credential fails closed
+    // instead of becoming an unbounded retained field on every queued record.
+    return token.utf8.count <= 128 ? token : ""
+}()
 private let overlaySocketPath: String? = argumentValue("--bluey-overlay-socket")
     ?? ProcessInfo.processInfo
         .environment["BLUEY_OVERLAY_SOCKET"]
 
-private let ipcLock = NSLock()
 private var ipcInputHandle: FileHandle?
 private var ipcOutputHandle: FileHandle = FileHandle.standardOutput
+
+private enum IpcEventPriority: Equatable {
+    case telemetry
+    case control
+    case critical
+}
+
+private struct PendingIpcEvent {
+    let payload: [String: Any]
+    let priority: IpcEventPriority
+    /// Conservative upper bound for the final authenticated NDJSON record.
+    let retainedBytes: Int
+    /// Exact serialized output must remain within this limit as a second gate.
+    let serializedByteLimit: Int
+}
+
+private let ipcMetadataEventMaxBytes = 16 * 1024
+private let ipcAskEventMaxBytes = 32 * 1024
+private let ipcBulkEventMaxBytes = 256 * 1024
+private let ipcPayloadMaxDepth = 16
+private let ipcPayloadMaxNodes = 8_192
+
+private enum IpcEventRecordClass {
+    case metadata
+    case ask
+    case bulk
+
+    var maxBytes: Int {
+        switch self {
+        case .metadata:
+            ipcMetadataEventMaxBytes
+        case .ask:
+            ipcAskEventMaxBytes
+        case .bulk:
+            ipcBulkEventMaxBytes
+        }
+    }
+}
+
+private func ipcEventRecordClass(
+    for payload: [String: Any],
+    priority: IpcEventPriority
+) -> IpcEventRecordClass {
+    guard priority == .control,
+          let type = payload["type"] as? String
+    else {
+        return .metadata
+    }
+    switch type {
+    case "ask_requested", "analyze_screen_requested":
+        return .ask
+    case "attach_files_requested", "instructions_updated", "paste_text_requested":
+        return .bulk
+    default:
+        return .metadata
+    }
+}
+
+/// Computes a conservative JSON byte upper bound without allocating or
+/// serializing an entire record on the AppKit thread. The depth and node gates
+/// also bound container overhead for records with many tiny elements.
+private struct IpcJsonByteMeter {
+    private(set) var bytes = 0
+    private var nodes = 0
+    private let maxBytes: Int
+
+    init(maxBytes: Int) {
+        self.maxBytes = maxBytes
+    }
+
+    mutating func measure(_ value: Any, depth: Int = 0) -> Bool {
+        guard depth <= ipcPayloadMaxDepth,
+              nodes < ipcPayloadMaxNodes
+        else {
+            return false
+        }
+        nodes += 1
+
+        if let string = value as? String {
+            return measureString(string)
+        }
+        if let bool = value as? Bool {
+            return add(bool ? 4 : 5)
+        }
+        if value is NSNull {
+            return add(4)
+        }
+        if value is NSNumber {
+            // 64 bytes safely covers every JSON number Foundation can emit.
+            return add(64)
+        }
+        if let array = value as? [Any] {
+            guard add(1) else { return false }
+            for (index, element) in array.enumerated() {
+                if index > 0, !add(1) { return false }
+                if !measure(element, depth: depth + 1) { return false }
+            }
+            return add(1)
+        }
+        if let object = value as? [String: Any] {
+            guard add(1) else { return false }
+            for (index, entry) in object.enumerated() {
+                if index > 0, !add(1) { return false }
+                guard measureString(entry.key),
+                      add(1),
+                      measure(entry.value, depth: depth + 1)
+                else {
+                    return false
+                }
+            }
+            return add(1)
+        }
+        return false
+    }
+
+    private mutating func measureString(_ value: String) -> Bool {
+        guard add(2) else { return false }
+        for scalar in value.unicodeScalars {
+            let scalarBytes: Int
+            switch scalar.value {
+            case 0x22, 0x2F, 0x5C:
+                scalarBytes = 2
+            case 0x00 ... 0x1F:
+                scalarBytes = 6
+            case 0x20 ... 0x7F:
+                scalarBytes = 1
+            case 0x80 ... 0x7FF:
+                scalarBytes = 2
+            case 0x800 ... 0xFFFF:
+                scalarBytes = 6
+            default:
+                scalarBytes = 12
+            }
+            if !add(scalarBytes) { return false }
+        }
+        return true
+    }
+
+    private mutating func add(_ amount: Int) -> Bool {
+        guard amount >= 0,
+              bytes <= maxBytes,
+              amount <= maxBytes - bytes
+        else {
+            return false
+        }
+        bytes += amount
+        return true
+    }
+}
+
+private func makePendingIpcEvent(
+    payload: [String: Any],
+    priority: IpcEventPriority,
+    token: String
+) -> PendingIpcEvent? {
+    var authenticatedPayload = payload
+    if !token.isEmpty {
+        authenticatedPayload["token"] = token
+    }
+    let byteLimit = ipcEventRecordClass(
+        for: authenticatedPayload,
+        priority: priority).maxBytes
+    var meter = IpcJsonByteMeter(maxBytes: byteLimit - 1)
+    guard meter.measure(authenticatedPayload),
+          meter.bytes < byteLimit
+    else {
+        return nil
+    }
+    return PendingIpcEvent(
+        payload: authenticatedPayload,
+        priority: priority,
+        retainedBytes: meter.bytes + 1,
+        serializedByteLimit: byteLimit)
+}
+
+/// A small, bounded producer buffer for the native-to-daemon event stream.
+///
+/// AppKit callbacks never serialize JSON or write a pipe/socket. Low-priority
+/// lifecycle observations cannot consume the control or critical reserves. A
+/// control or critical event may evict the oldest telemetry item when needed,
+/// while neither class silently evicts another accepted user action. Count and
+/// byte budgets are enforced together so a bounded event count cannot retain
+/// unbounded strings or arrays. Admission fails closed without pipe I/O or JSON
+/// serialization on the UI thread.
+private struct BoundedIpcEventBuffer {
+    private let capacity: Int
+    private let controlReserve: Int
+    private let criticalReserve: Int
+    private let byteCapacity: Int
+    private let controlByteReserve: Int
+    private let criticalByteReserve: Int
+    private var events: [PendingIpcEvent] = []
+    private(set) var queuedBytes = 0
+
+    init(
+        capacity: Int,
+        controlReserve: Int,
+        criticalReserve: Int,
+        byteCapacity: Int,
+        controlByteReserve: Int,
+        criticalByteReserve: Int
+    ) {
+        precondition(capacity > 0)
+        precondition(controlReserve >= 0)
+        precondition(criticalReserve >= 0)
+        precondition(controlReserve + criticalReserve < capacity)
+        precondition(byteCapacity > 0)
+        precondition(controlByteReserve >= 0)
+        precondition(criticalByteReserve >= 0)
+        precondition(controlByteReserve + criticalByteReserve < byteCapacity)
+        self.capacity = capacity
+        self.controlReserve = controlReserve
+        self.criticalReserve = criticalReserve
+        self.byteCapacity = byteCapacity
+        self.controlByteReserve = controlByteReserve
+        self.criticalByteReserve = criticalByteReserve
+        events.reserveCapacity(capacity)
+    }
+
+    var isEmpty: Bool { events.isEmpty }
+    var count: Int { events.count }
+
+    mutating func append(_ event: PendingIpcEvent) -> Bool {
+        let countLimit: Int
+        let byteLimit: Int
+        let mayEvictTelemetry: Bool
+        switch event.priority {
+        case .telemetry:
+            countLimit = capacity - controlReserve - criticalReserve
+            byteLimit = byteCapacity - controlByteReserve - criticalByteReserve
+            mayEvictTelemetry = false
+        case .control:
+            countLimit = capacity - criticalReserve
+            byteLimit = byteCapacity - criticalByteReserve
+            mayEvictTelemetry = true
+        case .critical:
+            countLimit = capacity
+            byteLimit = byteCapacity
+            mayEvictTelemetry = true
+        }
+
+        guard event.retainedBytes > 0,
+              event.retainedBytes <= byteLimit
+        else {
+            return false
+        }
+
+        guard let evictions = telemetryEvictionsNeeded(
+            eventBytes: event.retainedBytes,
+            countLimit: countLimit,
+            byteLimit: byteLimit,
+            mayEvictTelemetry: mayEvictTelemetry)
+        else {
+            return false
+        }
+        for index in evictions.reversed() {
+            remove(at: index)
+        }
+        events.append(event)
+        queuedBytes += event.retainedBytes
+        return true
+    }
+
+    mutating func popFirst() -> PendingIpcEvent? {
+        guard !events.isEmpty else { return nil }
+        let event = events.removeFirst()
+        queuedBytes = max(0, queuedBytes - event.retainedBytes)
+        return event
+    }
+
+    private func telemetryEvictionsNeeded(
+        eventBytes: Int,
+        countLimit: Int,
+        byteLimit: Int,
+        mayEvictTelemetry: Bool
+    ) -> [Int]? {
+        var candidateCount = events.count
+        var candidateBytes = queuedBytes
+        var evictions: [Int] = []
+        if !wouldExceed(
+            count: candidateCount,
+            bytes: candidateBytes,
+            eventBytes: eventBytes,
+            countLimit: countLimit,
+            byteLimit: byteLimit)
+        {
+            return evictions
+        }
+        guard mayEvictTelemetry else { return nil }
+        for (index, queued) in events.enumerated() where queued.priority == .telemetry {
+            evictions.append(index)
+            candidateCount -= 1
+            candidateBytes = max(0, candidateBytes - queued.retainedBytes)
+            if !wouldExceed(
+                count: candidateCount,
+                bytes: candidateBytes,
+                eventBytes: eventBytes,
+                countLimit: countLimit,
+                byteLimit: byteLimit)
+            {
+                return evictions
+            }
+        }
+        return nil
+    }
+
+    private func wouldExceed(
+        count: Int,
+        bytes: Int,
+        eventBytes: Int,
+        countLimit: Int,
+        byteLimit: Int
+    ) -> Bool {
+        count >= countLimit || bytes > byteLimit - eventBytes
+    }
+
+    private mutating func remove(at index: Int) {
+        let event = events.remove(at: index)
+        queuedBytes = max(0, queuedBytes - event.retainedBytes)
+    }
+}
+
+private final class IpcEventWriter {
+    private let condition = NSCondition()
+    private let outputHandle: FileHandle
+    private let token: String
+    private let stopped = DispatchSemaphore(value: 0)
+    private var buffer = BoundedIpcEventBuffer(
+        capacity: 256,
+        controlReserve: 32,
+        criticalReserve: 8,
+        byteCapacity: 4 * 1024 * 1024,
+        controlByteReserve: 1024 * 1024,
+        criticalByteReserve: 128 * 1024)
+    private var accepting = true
+    private var worker: Thread?
+
+    init(outputHandle: FileHandle, token: String) {
+        self.outputHandle = outputHandle
+        self.token = token
+        let worker = Thread { [weak self] in
+            self?.run()
+        }
+        worker.name = "bluey-overlay-ipc-writer"
+        worker.qualityOfService = .userInitiated
+        self.worker = worker
+        worker.start()
+    }
+
+    @discardableResult
+    func enqueue(_ payload: [String: Any], priority: IpcEventPriority) -> Bool {
+        guard let event = makePendingIpcEvent(
+            payload: payload,
+            priority: priority,
+            token: token)
+        else {
+            return false
+        }
+        condition.lock()
+        defer { condition.unlock() }
+        guard accepting else { return false }
+        let accepted = buffer.append(event)
+        if accepted {
+            condition.signal()
+        }
+        return accepted
+    }
+
+    func shutdownAndDrain(timeout: TimeInterval) {
+        condition.lock()
+        accepting = false
+        condition.broadcast()
+        condition.unlock()
+        _ = stopped.wait(timeout: .now() + timeout)
+    }
+
+    private func nextEvent() -> PendingIpcEvent? {
+        condition.lock()
+        defer { condition.unlock() }
+        while buffer.isEmpty && accepting {
+            condition.wait()
+        }
+        return buffer.popFirst()
+    }
+
+    private func stopAccepting() {
+        condition.lock()
+        accepting = false
+        while buffer.popFirst() != nil {}
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    private func run() {
+        defer { stopped.signal() }
+        while let event = nextEvent() {
+            autoreleasepool {
+                guard JSONSerialization.isValidJSONObject(event.payload),
+                      let data = try? JSONSerialization.data(withJSONObject: event.payload),
+                      data.count < event.serializedByteLimit
+                else {
+                    fputs("bluey-overlay: IPC writer rejected invalid event\n", stderr)
+                    stopAccepting()
+                    return
+                }
+                var line = data
+                line.append(0x0A)
+                do {
+                    try outputHandle.write(contentsOf: line)
+                } catch {
+                    // Metadata only: never print the payload, error body, token,
+                    // or user content. Future producers fail closed.
+                    fputs("bluey-overlay: IPC writer stopped\n", stderr)
+                    stopAccepting()
+                }
+            }
+        }
+    }
+}
+
+private var ipcEventWriter: IpcEventWriter?
 
 private let captureVisibleForDebug: Bool = {
 #if DEBUG
@@ -1878,18 +2451,17 @@ private func connectIpcIfNeeded() {
     ipcOutputHandle = FileHandle(fileDescriptor: outputFd, closeOnDealloc: true)
 }
 
-private func emitEvent(_ payload: [String: Any]) {
-    var withToken = payload
-    if !sessionToken.isEmpty {
-        withToken["token"] = sessionToken
-    }
-    guard let data = try? JSONSerialization.data(withJSONObject: withToken),
-          let json = String(data: data, encoding: .utf8)
-    else { return }
-    guard let line = (json + "\n").data(using: .utf8) else { return }
-    ipcLock.lock()
-    ipcOutputHandle.write(line)
-    ipcLock.unlock()
+private func startIpcEventWriter() {
+    guard ipcEventWriter == nil else { return }
+    ipcEventWriter = IpcEventWriter(outputHandle: ipcOutputHandle, token: sessionToken)
+}
+
+@discardableResult
+private func emitEvent(
+    _ payload: [String: Any],
+    priority: IpcEventPriority = .control
+) -> Bool {
+    ipcEventWriter?.enqueue(payload, priority: priority) ?? false
 }
 
 private func emitReady() {
@@ -1897,7 +2469,7 @@ private func emitReady() {
         "type": "ready",
         "platform": "macos",
         "capture_excluded": !captureVisibleForDebug,
-    ])
+    ], priority: .critical)
 }
 
 private func emitSimple(_ type: String) {
@@ -1913,9 +2485,10 @@ private func emitLifecycle(_ stage: String, status: String = "ok", detail: Strin
     if let detail, !detail.isEmpty {
         payload["detail"] = detail
     }
-    emitEvent(payload)
+    emitEvent(payload, priority: .telemetry)
 }
 
+@discardableResult
 private func emitAsk(
     question: String,
     provider: String?,
@@ -1923,8 +2496,15 @@ private func emitAsk(
     mode: String?,
     visibleContextIds: [String] = [],
     answerCurrentTranscript: Bool = false
-) {
-    var p: [String: Any] = ["type": "ask_requested", "question": question]
+) -> Bool {
+    let initiatedAtUnixMs = Int64((Date().timeIntervalSince1970 * 1_000).rounded(.down))
+    let interactionId = UUID().uuidString.lowercased()
+    var p: [String: Any] = [
+        "type": "ask_requested",
+        "question": question,
+        "interaction_id": interactionId,
+        "initiated_at_unix_ms": initiatedAtUnixMs,
+    ]
     if let provider = provider { p["provider"] = provider }
     if let model = model       { p["model"]    = model }
     if let mode = mode         { p["mode"]     = mode }
@@ -1934,7 +2514,7 @@ private func emitAsk(
     if answerCurrentTranscript {
         p["answer_current_transcript"] = true
     }
-    emitEvent(p)
+    return emitEvent(p)
 }
 
 private func emitAnalyzeScreen(question: String?) {
@@ -10553,7 +11133,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             autoSendTranscriptLinesBySource.removeAll()
             return
         }
-        consumeTranscriptBufferForAnswer()
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
         let sentContextIds = Array(pendingContextItemIds)
@@ -10571,7 +11150,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "autosend_answer_sent",
             detail: "mode=\(mode.rawValue) question_chars=\(q.count) generic_live_prompt=\(isLiveTranscriptAnswerPrompt(q)) context_ids=\(sentContextIds.count)"
         )
-        emitAsk(
+        let accepted = emitAsk(
             question: q,
             provider: route.provider,
             model: route.model,
@@ -10579,6 +11158,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             visibleContextIds: sentContextIds,
             answerCurrentTranscript: true
         )
+        guard accepted else {
+            lastSubmittedAskFingerprint = nil
+            lastSubmittedAskAt = 0
+            showSystemToast(
+                title: "Couldn't send",
+                body: "Bluey couldn't reach its local service. Please retry.",
+                duration: 2.8)
+            window?.makeFirstResponder(composer)
+            return
+        }
+        consumeTranscriptBufferForAnswer()
         consumeSentPendingContextAttachments()
         screenContextReadyForAnswer = false
         window?.makeFirstResponder(composer)
@@ -10729,15 +11319,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             window?.makeFirstResponder(composer)
             return
         }
-        composer.clearText()
-        consumeTranscriptBufferForAnswer()
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
         emitLifecycle(
             "ask_answer_sent",
             detail: "origin=\(origin) typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) preview_transcript_context=\(hadPreviewTranscriptContext) generic_live_prompt=\(isLiveTranscriptAnswerPrompt(q)) context_ids=\(sentContextIds.count)"
         )
-        emitAsk(
+        let accepted = emitAsk(
             question: q,
             provider: route.provider,
             model: route.model,
@@ -10745,6 +11333,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             visibleContextIds: sentContextIds,
             answerCurrentTranscript: hadTranscriptContext || hadPreviewTranscriptContext
         )
+        guard accepted else {
+            lastSubmittedAskFingerprint = nil
+            lastSubmittedAskAt = 0
+            showSystemToast(
+                title: "Couldn't send",
+                body: "Bluey couldn't reach its local service. Your question is still here.",
+                duration: 2.8)
+            window?.makeFirstResponder(composer)
+            return
+        }
+        composer.clearText()
+        consumeTranscriptBufferForAnswer()
         consumeSentPendingContextAttachments()
         screenContextReadyForAnswer = false
         window?.makeFirstResponder(composer)
@@ -12086,21 +12686,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeCanvasIfNeeded(card)
     }
 
+    @discardableResult
     func updateCard(
         id: String,
+        interactionId: String?,
         body: String,
         done: Bool,
         costLabel: String?,
         artifact: OverlayArtifact?,
         sequence: ParsedUpdateSequence,
         snapshot: Bool
-    ) {
+    ) -> Bool {
         guard cardUpdateSequences.shouldAccept(
             cardId: id,
+            interactionId: interactionId,
             sequence: sequence,
             snapshot: snapshot)
         else {
-            return
+            return false
         }
         let card: RenderedCard
         if let updated = feed.update(
@@ -12128,7 +12731,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             feed.push(recovered)
             card = recovered
         } else {
-            return
+            return false
         }
         trackAnswerStreamUpdate(card)
         if let artifact {
@@ -12166,6 +12769,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
         }
         routeCanvasIfNeeded(card)
+        return true
+    }
+
+    func latestAcceptedCardSequence(id: String) -> UInt64? {
+        cardUpdateSequences.latestSequence(cardId: id)
     }
 
     private func trackAnswerStreamPush(_ card: RenderedCard) {
@@ -12626,12 +13234,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "answer_recovery_requested",
             detail: "action=\(continuesPartial ? "continue" : "retry") card=\(cardId)"
         )
-        emitAsk(
+        let accepted = emitAsk(
             question: prompt,
             provider: route.provider,
             model: route.model,
             mode: route.mode
         )
+        if !accepted {
+            showSystemToast(
+                title: "Couldn't retry",
+                body: "Bluey couldn't reach its local service. Please try again.",
+                duration: 2.8)
+        }
     }
 
     private func showPreviousCanvas() {
@@ -15960,6 +16574,7 @@ private final class OverlayApp {
     private var accountUIState: OverlayAccountUIState = .unknown
     private var meetingDetectionEnabled = meetingDetectionEnabledAtLaunch
     private let meetingBanner = MeetingBannerController()
+    private var answerRenderAckTracker = AnswerRenderAckTracker()
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
@@ -16925,6 +17540,67 @@ private final class OverlayApp {
         }
     }
 
+    private func scheduleAnswerRenderAck(
+        cardId: String,
+        interactionId: String?,
+        phase: ParsedRenderAck,
+        sequence: ParsedUpdateSequence,
+        highestAcceptedSequence: UInt64?
+    ) {
+        guard let expandedWindow,
+              expandedWindow.isVisible,
+              let expandedView,
+              let ack = answerRenderAckTracker.reserve(
+                  cardId: cardId,
+                  interactionId: interactionId,
+                  phase: phase,
+                  sequence: sequence,
+                  highestAcceptedSequence: highestAcceptedSequence)
+        else {
+            return
+        }
+
+        // Run after command handling returns to AppKit, force the answer
+        // surface through layout/display, flush pending layer work, and then
+        // enqueue the acknowledgement on one further main-loop turn. Receipt
+        // of update_card alone is never treated as visible paint.
+        DispatchQueue.main.async { [weak self, weak expandedView, weak expandedWindow] in
+            guard let self,
+                  let expandedView,
+                  let expandedWindow,
+                  expandedWindow.isVisible
+            else {
+                self?.answerRenderAckTracker.cancel(ack)
+                return
+            }
+            expandedView.needsLayout = true
+            expandedView.layoutSubtreeIfNeeded()
+            expandedWindow.contentView?.needsDisplay = true
+            expandedWindow.contentView?.displayIfNeeded()
+            CATransaction.flush()
+
+            DispatchQueue.main.async { [weak self, weak expandedWindow] in
+                guard let self,
+                      let expandedWindow,
+                      expandedWindow.isVisible
+                else {
+                    self?.answerRenderAckTracker.cancel(ack)
+                    return
+                }
+                let accepted = emitEvent([
+                    "type": "answer_render_acknowledged",
+                    "id": ack.cardId,
+                    "interaction_id": ack.interactionId,
+                    "phase": ack.phase.rawValue,
+                    "sequence": ack.sequence,
+                ], priority: .critical)
+                if !accepted {
+                    self.answerRenderAckTracker.cancel(ack)
+                }
+            }
+        }
+    }
+
     func handleCommand(_ cmd: OverlayCommand) {
         switch cmd {
         case .ping:
@@ -16941,6 +17617,7 @@ private final class OverlayApp {
         case .toggle:
             if expandedWindow?.isVisible == true { collapse() } else { expand() }
         case .clear:
+            answerRenderAckTracker.resetAll()
             expandedView?.resetSessionSurface()
         case .boot(let title, let lines):
             pushBootCard(title: title, lines: lines)
@@ -17053,6 +17730,7 @@ private final class OverlayApp {
                 clearRemoteInputPassthrough()
             }
         case .pushCard(let card):
+            answerRenderAckTracker.reset(cardId: card.id)
             ensureExpandedWindow()
             expandedView?.pushCard(RenderedCard(
                 id: card.id, kind: card.kind, title: card.title,
@@ -17060,21 +17738,33 @@ private final class OverlayApp {
                 artifact: card.artifact, attachments: card.attachments ?? []))
         case .updateCard(
             let id,
+            let interactionId,
             let body,
             let done,
             let costLabel,
             let artifact,
             let sequence,
-            let snapshot):
+            let snapshot,
+            let renderAck):
             ensureExpandedWindow()
-            expandedView?.updateCard(
+            let rendered = expandedView?.updateCard(
                 id: id,
+                interactionId: interactionId,
                 body: body,
                 done: done,
                 costLabel: costLabel,
                 artifact: artifact,
                 sequence: sequence,
-                snapshot: snapshot)
+                snapshot: snapshot) ?? false
+            if rendered {
+                scheduleAnswerRenderAck(
+                    cardId: id,
+                    interactionId: interactionId,
+                    phase: renderAck,
+                    sequence: sequence,
+                    highestAcceptedSequence: expandedView?
+                        .latestAcceptedCardSequence(id: id))
+            }
         case .shutdown:
             meetingBanner.hide()
             emitLifecycle("shutdown")
@@ -17470,39 +18160,58 @@ runContextStagingTests()
 #elseif BLUEY_OVERLAY_SEQUENCE_PROTOCOL_TESTS
 private func runOverlaySequenceProtocolTests() {
     let parsed = parseCommand(
-        #"{"type":"update_card","id":"answer-1","body":"hello","done":false,"sequence":7,"snapshot":true}"#)
+        #"{"type":"update_card","id":"answer-1","interaction_id":"550e8400-e29b-41d4-a716-446655440000","body":"hello","done":false,"sequence":7,"snapshot":true,"render_ack":"first_text"}"#)
     guard case .updateCard(
         let parsedId,
+        let parsedInteractionId,
         let parsedBody,
         let parsedDone,
         _,
         _,
         let parsedSequence,
-        let parsedSnapshot) = parsed
+        let parsedSnapshot,
+        let parsedRenderAck) = parsed
     else {
         preconditionFailure("update_card must parse")
     }
     precondition(parsedId == "answer-1")
+    precondition(parsedInteractionId == "550e8400-e29b-41d4-a716-446655440000")
     precondition(parsedBody == "hello")
     precondition(!parsedDone)
     precondition(parsedSequence == .value(7))
     precondition(parsedSnapshot)
+    precondition(parsedRenderAck == .value(.firstText))
 
     let defaulted = parseCommand(
         #"{"type":"update_card","id":"answer-2","body":"legacy","done":true}"#)
-    guard case .updateCard(_, _, let defaultDone, _, _, let defaultSequence, let defaultSnapshot)
+    guard case .updateCard(
+        _,
+        let defaultInteractionId,
+        _,
+        let defaultDone,
+        _,
+        _,
+        let defaultSequence,
+        let defaultSnapshot,
+        let defaultRenderAck)
         = defaulted
     else {
         preconditionFailure("legacy update_card must parse")
     }
     precondition(defaultDone)
+    precondition(defaultInteractionId == nil)
     precondition(defaultSequence == .absent)
     precondition(!defaultSnapshot)
+    precondition(defaultRenderAck == .absent)
     precondition(parseUpdateSequence(nil, present: false) == .absent)
     precondition(parseUpdateSequence(nil, present: true) == .invalid)
     precondition(parseUpdateSequence(true, present: true) == .invalid)
     precondition(parseUpdateSequence(-1, present: true) == .invalid)
     precondition(parseUpdateSequence(1.5, present: true) == .invalid)
+    precondition(parseInteractionId("not-a-uuid") == nil)
+    precondition(parseRenderAck(nil, present: false) == .absent)
+    precondition(parseRenderAck("unknown", present: true) == .invalid)
+    precondition(parseRenderAck("final", present: true) == .value(.final))
 
     var tracker = CardUpdateSequenceTracker()
     precondition(tracker.shouldAccept(
@@ -17582,6 +18291,217 @@ private func runOverlaySequenceProtocolTests() {
         sequence: .value(0),
         snapshot: false))
 
+    var generationTracker = CardUpdateSequenceTracker()
+    precondition(generationTracker.shouldAccept(
+        cardId: "answer-generation",
+        interactionId: "550e8400-e29b-41d4-a716-446655440000",
+        sequence: .value(1),
+        snapshot: false))
+    precondition(!generationTracker.shouldAccept(
+        cardId: "answer-generation",
+        interactionId: "daec7e15-5ec0-45e8-a4ab-19b90bb30d2c",
+        sequence: .value(2),
+        snapshot: false))
+    precondition(generationTracker.latestSequence(cardId: "answer-generation") == 1)
+
+    var ackTracker = AnswerRenderAckTracker()
+    let interactionId = "550e8400-e29b-41d4-a716-446655440000"
+    let firstAck = ackTracker.reserve(
+        cardId: "answer-1",
+        interactionId: interactionId,
+        phase: .value(.firstText),
+        sequence: .value(7),
+        highestAcceptedSequence: 7)
+    precondition(firstAck?.phase == .firstText)
+    precondition(firstAck?.sequence == 7)
+    precondition(ackTracker.reserve(
+        cardId: "answer-1",
+        interactionId: interactionId,
+        phase: .value(.firstText),
+        sequence: .value(7),
+        highestAcceptedSequence: 7) == nil)
+    precondition(ackTracker.reserve(
+        cardId: "answer-1",
+        interactionId: interactionId,
+        phase: .value(.final),
+        sequence: .value(6),
+        highestAcceptedSequence: 7) == nil)
+    precondition(ackTracker.reserve(
+        cardId: "answer-1",
+        interactionId: "daec7e15-5ec0-45e8-a4ab-19b90bb30d2c",
+        phase: .value(.final),
+        sequence: .value(8),
+        highestAcceptedSequence: 8) == nil)
+    let finalAck = ackTracker.reserve(
+        cardId: "answer-1",
+        interactionId: interactionId,
+        phase: .value(.final),
+        sequence: .value(8),
+        highestAcceptedSequence: 8)
+    precondition(finalAck?.phase == .final)
+    if let finalAck {
+        ackTracker.cancel(finalAck)
+    }
+    precondition(ackTracker.reserve(
+        cardId: "answer-1",
+        interactionId: interactionId,
+        phase: .value(.final),
+        sequence: .value(8),
+        highestAcceptedSequence: 8) != nil)
+
+    func pendingTestEvent(
+        _ type: String,
+        priority: IpcEventPriority,
+        retainedBytes: Int
+    ) -> PendingIpcEvent {
+        PendingIpcEvent(
+            payload: ["type": type],
+            priority: priority,
+            retainedBytes: retainedBytes,
+            serializedByteLimit: ipcMetadataEventMaxBytes)
+    }
+
+    let escapedPayload: [String: Any] = [
+        "type": "lifecycle",
+        "detail": "quotes=\" slash=/ newline=\n emoji=🪺",
+        "count": 42,
+    ]
+    guard let escapedEvent = makePendingIpcEvent(
+        payload: escapedPayload,
+        priority: .telemetry,
+        token: "test-token"),
+          let escapedData = try? JSONSerialization.data(
+              withJSONObject: escapedEvent.payload)
+    else {
+        preconditionFailure("valid bounded metadata event must be accepted")
+    }
+    precondition(escapedData.count + 1 <= escapedEvent.retainedBytes)
+    precondition(escapedEvent.retainedBytes <= ipcMetadataEventMaxBytes)
+
+    precondition(makePendingIpcEvent(
+        payload: ["type": "lifecycle", "detail": String(repeating: "m", count: 17_000)],
+        priority: .telemetry,
+        token: "") == nil)
+    precondition(makePendingIpcEvent(
+        payload: ["type": "ask_requested", "question": String(repeating: "q", count: 24_000)],
+        priority: .control,
+        token: "test-token") != nil)
+    precondition(makePendingIpcEvent(
+        payload: ["type": "ask_requested", "question": String(repeating: "q", count: 40_000)],
+        priority: .control,
+        token: "test-token") == nil)
+    precondition(makePendingIpcEvent(
+        payload: ["type": "attach_files_requested", "paths": [String(repeating: "p", count: 200_000)]],
+        priority: .control,
+        token: "test-token") != nil)
+    precondition(makePendingIpcEvent(
+        payload: ["type": "attach_files_requested", "paths": [String(repeating: "p", count: 270_000)]],
+        priority: .control,
+        token: "test-token") == nil)
+    precondition(makePendingIpcEvent(
+        payload: ["type": "attach_files_requested", "paths": [String(repeating: "p", count: 20_000)]],
+        priority: .critical,
+        token: "test-token") == nil)
+
+    var deeplyNested: Any = "leaf"
+    for _ in 0 ... ipcPayloadMaxDepth {
+        deeplyNested = ["next": deeplyNested]
+    }
+    precondition(makePendingIpcEvent(
+        payload: ["type": "instructions_updated", "value": deeplyNested],
+        priority: .control,
+        token: "") == nil)
+
+    var countBuffer = BoundedIpcEventBuffer(
+        capacity: 4,
+        controlReserve: 1,
+        criticalReserve: 1,
+        byteCapacity: 4_000,
+        controlByteReserve: 1_000,
+        criticalByteReserve: 500)
+    precondition(countBuffer.append(pendingTestEvent(
+        "telemetry-1", priority: .telemetry, retainedBytes: 100)))
+    precondition(countBuffer.append(pendingTestEvent(
+        "telemetry-2", priority: .telemetry, retainedBytes: 100)))
+    precondition(!countBuffer.append(pendingTestEvent(
+        "telemetry-3", priority: .telemetry, retainedBytes: 100)))
+    precondition(countBuffer.append(pendingTestEvent(
+        "control-1", priority: .control, retainedBytes: 100)))
+    precondition(countBuffer.append(pendingTestEvent(
+        "control-2", priority: .control, retainedBytes: 100)))
+    precondition(countBuffer.append(pendingTestEvent(
+        "critical-1", priority: .critical, retainedBytes: 100)))
+    let countBeforeRejectedControl = countBuffer.count
+    let bytesBeforeRejectedControl = countBuffer.queuedBytes
+    precondition(!countBuffer.append(pendingTestEvent(
+        "control-3", priority: .control, retainedBytes: 100)))
+    precondition(countBuffer.count == countBeforeRejectedControl)
+    precondition(countBuffer.queuedBytes == bytesBeforeRejectedControl)
+    precondition(countBuffer.popFirst()?.payload["type"] as? String == "telemetry-2")
+    precondition(countBuffer.popFirst()?.payload["type"] as? String == "control-1")
+    precondition(countBuffer.popFirst()?.payload["type"] as? String == "control-2")
+    precondition(countBuffer.popFirst()?.payload["type"] as? String == "critical-1")
+    precondition(countBuffer.queuedBytes == 0)
+
+    var byteBuffer = BoundedIpcEventBuffer(
+        capacity: 10,
+        controlReserve: 2,
+        criticalReserve: 1,
+        byteCapacity: 100,
+        controlByteReserve: 20,
+        criticalByteReserve: 10)
+    precondition(byteBuffer.append(pendingTestEvent(
+        "telemetry-1", priority: .telemetry, retainedBytes: 35)))
+    precondition(byteBuffer.append(pendingTestEvent(
+        "telemetry-2", priority: .telemetry, retainedBytes: 35)))
+    precondition(!byteBuffer.append(pendingTestEvent(
+        "telemetry-3", priority: .telemetry, retainedBytes: 1)))
+    precondition(byteBuffer.append(pendingTestEvent(
+        "control-1", priority: .control, retainedBytes: 20)))
+    precondition(byteBuffer.queuedBytes == 90)
+    precondition(byteBuffer.append(pendingTestEvent(
+        "control-2", priority: .control, retainedBytes: 1)))
+    precondition(byteBuffer.queuedBytes == 56)
+    precondition(byteBuffer.append(pendingTestEvent(
+        "critical-1", priority: .critical, retainedBytes: 44)))
+    precondition(byteBuffer.queuedBytes == 100)
+    precondition(byteBuffer.append(pendingTestEvent(
+        "critical-2", priority: .critical, retainedBytes: 1)))
+    precondition(byteBuffer.queuedBytes == 66)
+    let byteCountBeforeRejectedCritical = byteBuffer.count
+    precondition(!byteBuffer.append(pendingTestEvent(
+        "critical-3", priority: .critical, retainedBytes: 35)))
+    precondition(byteBuffer.count == byteCountBeforeRejectedCritical)
+    precondition(byteBuffer.queuedBytes == 66)
+
+    let askPipe = Pipe()
+    ipcEventWriter = IpcEventWriter(
+        outputHandle: askPipe.fileHandleForWriting,
+        token: "test-session-token")
+    let askStartedAtUnixMs = Int64((Date().timeIntervalSince1970 * 1_000).rounded(.down))
+    precondition(emitAsk(
+        question: "test question",
+        provider: "managed",
+        model: nil,
+        mode: "instant"))
+    let askCompletedAtUnixMs = Int64((Date().timeIntervalSince1970 * 1_000).rounded(.down))
+    ipcEventWriter?.shutdownAndDrain(timeout: 1.0)
+    try? askPipe.fileHandleForWriting.close()
+    let askData = askPipe.fileHandleForReading.readDataToEndOfFile()
+    let askLines = askData.split(separator: 0x0A)
+    precondition(askLines.count == 1)
+    let askObject = try? JSONSerialization.jsonObject(with: Data(askLines[0]))
+        as? [String: Any]
+    precondition(askObject?["type"] as? String == "ask_requested")
+    precondition(askObject?["token"] as? String == "test-session-token")
+    precondition(askObject?["question"] as? String == "test question")
+    precondition(UUID(uuidString: askObject?["interaction_id"] as? String ?? "") != nil)
+    let initiatedAtUnixMs = (askObject?["initiated_at_unix_ms"] as? NSNumber)?.int64Value
+    precondition(initiatedAtUnixMs != nil)
+    precondition(initiatedAtUnixMs ?? 0 >= askStartedAtUnixMs)
+    precondition(initiatedAtUnixMs ?? Int64.max <= askCompletedAtUnixMs)
+    ipcEventWriter = nil
+
     print("Overlay sequence protocol tests passed")
 }
 
@@ -17592,6 +18512,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let meetingEvidenceDetector = MacMeetingEvidenceDetector()
     func applicationDidFinishLaunching(_ notification: Notification) {
         connectIpcIfNeeded()
+        startIpcEventWriter()
         coord.onMeetingDetectionEnabledChanged = { [weak self] enabled in
             self?.meetingEvidenceDetector.setEnabled(enabled)
         }
@@ -17600,6 +18521,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         meetingEvidenceDetector.setEnabled(false)
+        ipcEventWriter?.shutdownAndDrain(timeout: 0.75)
     }
 }
 

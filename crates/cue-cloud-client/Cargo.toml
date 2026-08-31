@@ -16,6 +16,8 @@ cue-core = { path = "../cue-core" }
 keyring = "2"
 url.workspace = true
 chrono = "0.4"
+bytes = "1"
+uuid.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

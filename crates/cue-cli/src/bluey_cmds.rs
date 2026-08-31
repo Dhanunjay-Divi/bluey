@@ -5,7 +5,7 @@
 //! customer-facing summaries to stdout matching the format documented
 //! in `docs/PRICING-MODEL.md` Section 4.3.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use cue_cloud_client::{AccountMe, CloudClient, UsageWindow};
 
 /// Print the user's current balance + auto-top-up status + tier
@@ -153,11 +153,16 @@ async fn fetch_pricing_tiers(client: &CloudClient) -> Option<cue_cloud_client::P
 
 /// Codex Stage 16: bluey logout — clear local account tokens.
 pub async fn logout(client: &CloudClient) -> Result<()> {
-    if client.current_tokens().is_none() {
+    let Some(credentials) = client.credential_snapshot() else {
         println!("Already logged out.");
         return Ok(());
+    };
+    if !client.clear_credential_snapshot_if_current(&credentials)? {
+        bail!(
+            "The signed-in account changed while sign-out was starting. \
+             The newer account was kept."
+        );
     }
-    client.clear_tokens()?;
     println!("Bluey account logged out.");
     Ok(())
 }
@@ -198,6 +203,11 @@ pub async fn export_data(client: &CloudClient) -> Result<()> {
 
 /// Codex Stage 16: bluey delete-account. REQUIRES interactive confirmation.
 pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
+    // Capture before the confirmation prompt and every network await. A late
+    // delete acknowledgement for A/A1 must never clear replacement B/A2.
+    let credentials = client
+        .credential_snapshot()
+        .context("Sign in before deleting your Bluey account")?;
     if !force {
         println!();
         println!("⚠  This will PERMANENTLY DELETE your Bluey account.");
@@ -214,26 +224,39 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
             return Ok(());
         }
     }
-    #[derive(serde::Deserialize)]
-    struct DeleteAck {
-        deleted: bool,
-        deleted_at: String,
-    }
-    let ack: DeleteAck = client
-        .auth_post(
-            "/account/delete",
-            &serde_json::json!({
-                "confirm_text": "DELETE",
-                "accept_data_loss": true,
-                "accept_credit_loss": true
-            }),
-        )
-        .await
-        .context("/account/delete")?;
+    let capability = cue_cloud_client::types::AccountDeletionCapability::new();
+    let ack = match client.delete_account(&capability).await {
+        Ok(ack) => ack,
+        Err(delete_error) => match client.account_deletion_status(&capability).await {
+            Ok(status) if status.deleted => cue_cloud_client::types::AccountDeletionAck {
+                deleted: true,
+                deleted_at: status.deleted_at,
+                deletion_pending: false,
+                retry_after_ms: None,
+                object_count_deleted: 0,
+                note: None,
+            },
+            Ok(status) if status.deletion_pending => {
+                println!("Account deletion is safely in progress.");
+                println!("Run this command again shortly to finish deletion.");
+                return Ok(());
+            }
+            Ok(_) | Err(_) => return Err(delete_error).context("/account/delete"),
+        },
+    };
     if ack.deleted {
-        let _ = client.clear_tokens();
         println!("Account deleted at {}.", ack.deleted_at);
-        println!("Local account tokens cleared.");
+        if client.clear_credential_snapshot_if_current(&credentials)? {
+            println!("Local account tokens cleared.");
+        } else {
+            println!(
+                "A newer sign-in or token refresh completed while deletion was pending; \
+                 those newer local credentials were kept."
+            );
+        }
+    } else {
+        println!("Account deletion is safely waiting for an in-flight upload.");
+        println!("Run this command again shortly to finish deletion.");
     }
     Ok(())
 }
@@ -241,6 +264,70 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cue_cloud_client::{client::ClientConfig, tokens::MemoryStore, TokenStore, Tokens};
+    use std::{sync::Arc, time::Duration};
+
+    fn tokens(access: &str, owner: &str) -> Tokens {
+        Tokens {
+            access: access.to_string(),
+            refresh: format!("refresh-{access}"),
+            email: owner.to_string(),
+        }
+    }
+
+    fn client_with(store: Arc<MemoryStore>) -> CloudClient {
+        CloudClient::new(
+            ClientConfig {
+                base_url: "https://bluey.test".to_string(),
+                user_agent: "bluey-cli-test".to_string(),
+                timeout: Duration::from_secs(1),
+                trace_id: None,
+            },
+            store,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn delayed_cli_clear_preserves_replacement_account() {
+        let store = Arc::new(MemoryStore::new());
+        TokenStore::save(store.as_ref(), &tokens("a1", "a@example.com")).unwrap();
+        let client = client_with(store.clone());
+        let captured = client.credential_snapshot().unwrap();
+
+        let replacement = tokens("b1", "b@example.com");
+        TokenStore::save(store.as_ref(), &replacement).unwrap();
+
+        assert!(!client
+            .clear_credential_snapshot_if_current(&captured)
+            .unwrap());
+        assert_eq!(TokenStore::load(store.as_ref()).unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn delayed_cli_clear_preserves_same_owner_refresh_but_exact_clear_succeeds() {
+        let store = Arc::new(MemoryStore::new());
+        TokenStore::save(store.as_ref(), &tokens("a1", "a@example.com")).unwrap();
+        let client = client_with(store.clone());
+        let captured_a1 = client.credential_snapshot().unwrap();
+
+        let refreshed = tokens("a2", "a@example.com");
+        TokenStore::save(store.as_ref(), &refreshed).unwrap();
+        assert!(!client
+            .clear_credential_snapshot_if_current(&captured_a1)
+            .unwrap());
+        assert_eq!(
+            TokenStore::load(store.as_ref()).unwrap(),
+            Some(refreshed.clone())
+        );
+
+        let current = client_with(store.clone());
+        let captured_a2 = current.credential_snapshot().unwrap();
+        assert!(current
+            .clear_credential_snapshot_if_current(&captured_a2)
+            .unwrap());
+        assert_eq!(TokenStore::load(store.as_ref()).unwrap(), None);
+    }
 
     fn account_me(auto_topup_enabled: bool) -> AccountMe {
         AccountMe {

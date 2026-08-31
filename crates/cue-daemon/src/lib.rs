@@ -2,6 +2,7 @@ pub mod app;
 pub mod audio;
 pub mod cloud;
 pub mod db;
+pub(crate) mod diagnostics;
 pub(crate) mod doc_conversion;
 pub mod export;
 pub mod llm;

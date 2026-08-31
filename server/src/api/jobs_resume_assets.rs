@@ -17,7 +17,11 @@ use zip::ZipArchive;
 use crate::{
     api::AppState,
     auth::AuthedAccount,
-    db::jobs::{self, CareerProfile, ResumeSourceAsset},
+    db::{
+        jobs::{self, CareerProfile, ResumeSourceAsset},
+        object_uploads::{self, NewObjectUpload, ObjectKind, StorageScope, UploadControlError},
+        DbPool,
+    },
     jobs_resume_template,
     object_storage::{sha256_hex, ObjectStorage},
 };
@@ -135,23 +139,66 @@ pub async fn upload_resume_source(
         updated_at_ms: now,
     };
 
-    storage
+    let reservation = object_uploads::reserve_account_object_put(
+        &state.pool,
+        &NewObjectUpload {
+            account_id: account.id.clone(),
+            object_kind: ObjectKind::Artifact,
+            logical_id: format!("jobs/resume-source/{}", asset.id),
+            session_id: None,
+            storage_scope: StorageScope::Artifact,
+            object_key: storage_key.clone(),
+            size_bytes: asset.size_bytes,
+            sha256: asset.sha256.clone(),
+            content_type: asset.media_type.clone(),
+            expires_at_ms: i64::MAX,
+            metadata_json: serde_json::json!({"source": "jobs_resume_source"}),
+            now_ms: now,
+            limits: storage.upload_limits(),
+        },
+    )
+    .map_err(account_object_upload_error)?;
+
+    if storage
         .put(&storage_key, Bytes::from(bytes), &asset.media_type)
         .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "source resume upload failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Bluey could not store this resume right now. Try again shortly.".to_string(),
-            )
-        })?;
+        .is_err()
+    {
+        let _ = object_uploads::record_put_failure(
+            &state.pool,
+            &reservation.upload.id,
+            "resume object PUT failed",
+            jobs::now_ms(),
+        );
+        cleanup_account_object(&storage, &state.pool, &account.id, &storage_key).await;
+        tracing::warn!(
+            error_category = "resume_object_put",
+            "source resume upload failed"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey could not store this resume right now. Try again shortly.".to_string(),
+        ));
+    }
+    if let Err(error) = object_uploads::finalize_account_object_put(
+        &state.pool,
+        &reservation.upload.id,
+        jobs::now_ms(),
+    ) {
+        cleanup_account_object(&storage, &state.pool, &account.id, &storage_key).await;
+        return Err(account_object_upload_error(error));
+    }
 
-    let mut profile = match input.profile {
-        Some(profile) => {
-            super::jobs::validate_profile(&profile)?;
-            profile
+    let profile_result = match input.profile {
+        Some(profile) => super::jobs::validate_profile(&profile).map(|_| profile),
+        None => jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal),
+    };
+    let mut profile = match profile_result {
+        Ok(profile) => profile,
+        Err(error) => {
+            cleanup_account_object(&storage, &state.pool, &account.id, &storage_key).await;
+            return Err(error);
         }
-        None => jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?,
     };
     profile.source_resume_name = asset.file_name.clone();
     profile.source_resume_asset_id = asset.id.clone();
@@ -159,26 +206,18 @@ pub async fn upload_resume_source(
     profile.source_resume_media_type = asset.media_type.clone();
     profile.source_resume_template_status = asset.template_status.clone();
 
-    let (previous, saved_profile) = match jobs::save_resume_source_asset(
-        &state.pool,
-        &account.id,
-        &asset,
-        &profile,
-    ) {
-        Ok(saved) => saved,
-        Err(error) => {
-            if let Err(cleanup_error) = storage.delete(&storage_key).await {
-                tracing::warn!(error = %cleanup_error, "failed to clean up source resume upload");
+    let (previous, saved_profile) =
+        match jobs::save_resume_source_asset(&state.pool, &account.id, &asset, &profile) {
+            Ok(saved) => saved,
+            Err(error) => {
+                cleanup_account_object(&storage, &state.pool, &account.id, &storage_key).await;
+                return Err(internal(error));
             }
-            return Err(internal(error));
-        }
-    };
+        };
 
     if let Some(previous) = previous.filter(|previous| previous.storage_key != storage_key) {
         if storage.key_belongs_to_account(&previous.storage_key, &account.id) {
-            if let Err(error) = storage.delete(&previous.storage_key).await {
-                tracing::warn!(error = %error, "failed to remove replaced source resume");
-            }
+            cleanup_account_object(&storage, &state.pool, &account.id, &previous.storage_key).await;
         }
     }
 
@@ -186,6 +225,49 @@ pub async fn upload_resume_source(
         asset: ResumeSourceMetadata::from(&asset),
         profile: saved_profile,
     }))
+}
+
+fn account_object_upload_error(error: anyhow::Error) -> ApiError {
+    if error.downcast_ref::<UploadControlError>() == Some(&UploadControlError::UploadGone) {
+        return (
+            StatusCode::GONE,
+            "This account is being deleted, so Bluey did not retain the upload.".to_string(),
+        );
+    }
+    tracing::warn!(
+        error_category = "account_object_reservation",
+        "resume object lifecycle request failed"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Resume storage is temporarily unavailable. Try again shortly.".to_string(),
+    )
+}
+
+async fn cleanup_account_object(
+    storage: &ObjectStorage,
+    pool: &DbPool,
+    account_id: &str,
+    object_key: &str,
+) {
+    let now_ms = jobs::now_ms();
+    if storage.delete(object_key).await.is_ok() {
+        if object_uploads::confirm_account_object_deleted(pool, account_id, object_key, now_ms)
+            .is_err()
+        {
+            tracing::warn!(
+                error_category = "resume_cleanup_commit",
+                "failed to commit resume object cleanup"
+            );
+        }
+    } else if object_uploads::schedule_account_object_cleanup(pool, account_id, object_key, now_ms)
+        .is_err()
+    {
+        tracing::warn!(
+            error_category = "resume_cleanup_schedule",
+            "failed to schedule resume object cleanup"
+        );
+    }
 }
 
 pub async fn download_template_docx(

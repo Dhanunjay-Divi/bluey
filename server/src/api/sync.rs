@@ -13,17 +13,24 @@ use axum::{
     response::Response,
     Extension, Json,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
-use super::AppState;
+use super::{support_diagnostic_schema, AppState};
 use crate::auth::AuthedAccount;
 use crate::db::object_uploads::{
     self, NewObjectUpload, ObjectKind, ObjectUpload, StorageScope, UploadControlError,
 };
+use crate::db::support_diagnostics::{
+    self, SupportDiagnosticConsentReceipt, SUPPORT_DIAGNOSTIC_CONTENT_POLICY,
+    SUPPORT_DIAGNOSTIC_POLICY_VERSION,
+};
 use crate::db::sync::{
     self, CloudDeletedSession, CloudSessionBundle, CloudSessionSummary, RagMatch,
-    SyncContextArtifactRecord, SyncCounts, SyncCueResponseRecord, SyncRagChunkRecord,
-    SyncSessionRecord, SyncTranscriptSegment,
+    SessionPageCursor, SyncContextArtifactRecord, SyncCounts, SyncCueResponseRecord,
+    SyncRagChunkRecord, SyncSessionRecord, SyncTranscriptSegment,
 };
 use crate::object_storage::{sha256_hex, ObjectStorage};
 
@@ -51,12 +58,45 @@ pub struct SyncBatchResponse {
 pub struct SessionListQuery {
     #[serde(default)]
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SessionListResponse {
     pub sessions: Vec<CloudSessionSummary>,
     pub deleted_sessions: Vec<CloudDeletedSession>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+type SessionListCursorMac = Hmac<Sha256>;
+
+const SESSION_LIST_CURSOR_VERSION: u8 = 1;
+const SESSION_LIST_CURSOR_DOMAIN: &[u8] = b"bluey-sync-session-list-cursor-v1";
+const MAX_SESSION_LIST_CURSOR_LEN: usize = 4_096;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct SessionListCursorState {
+    version: u8,
+    #[serde(default)]
+    sessions_after: Option<SessionPageCursor>,
+    sessions_done: bool,
+    #[serde(default)]
+    deleted_sessions_after: Option<SessionPageCursor>,
+    deleted_sessions_done: bool,
+}
+
+impl SessionListCursorState {
+    fn first_page() -> Self {
+        Self {
+            version: SESSION_LIST_CURSOR_VERSION,
+            sessions_after: None,
+            sessions_done: false,
+            deleted_sessions_after: None,
+            deleted_sessions_done: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +135,30 @@ pub struct SessionAuditBundleResponse {
     pub expires_at_ms: i64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupportDiagnosticConsentRequest {
+    pub enabled: bool,
+    pub policy_version: String,
+    pub content_policy: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SupportDiagnosticConsentStatus {
+    pub enabled: bool,
+    pub policy_version: &'static str,
+    pub content_policy: &'static str,
+    pub current_receipt: Option<SupportDiagnosticConsentReceipt>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SupportDiagnosticDeleteResponse {
+    pub scope: &'static str,
+    pub session_id: Option<String>,
+    pub scheduled_objects: usize,
+    pub server_time_ms: i64,
+}
+
 pub async fn batch(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -124,12 +188,63 @@ pub async fn list_sessions(
     Query(query): Query<SessionListQuery>,
 ) -> Result<Json<SessionListResponse>, (StatusCode, String)> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let sessions = sync::list_sessions(&state.pool, &account.id, limit).map_err(internal)?;
-    let deleted_sessions =
-        sync::list_deleted_sessions(&state.pool, &account.id, limit).map_err(internal)?;
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|cursor| decode_session_list_cursor(cursor, &state.config.jwt_secret, &account.id))
+        .transpose()?
+        .unwrap_or_else(SessionListCursorState::first_page);
+
+    let (sessions, sessions_after, sessions_done) = if cursor.sessions_done {
+        (Vec::new(), None, true)
+    } else {
+        let page = sync::list_sessions_page(
+            &state.pool,
+            &account.id,
+            limit,
+            cursor.sessions_after.as_ref(),
+        )
+        .map_err(internal)?;
+        let done = page.next_cursor.is_none();
+        (page.sessions, page.next_cursor, done)
+    };
+    let (deleted_sessions, deleted_sessions_after, deleted_sessions_done) =
+        if cursor.deleted_sessions_done {
+            (Vec::new(), None, true)
+        } else {
+            let page = sync::list_deleted_sessions_page(
+                &state.pool,
+                &account.id,
+                limit,
+                cursor.deleted_sessions_after.as_ref(),
+            )
+            .map_err(internal)?;
+            let done = page.next_cursor.is_none();
+            (page.sessions, page.next_cursor, done)
+        };
+
+    let next_cursor = if sessions_done && deleted_sessions_done {
+        None
+    } else {
+        Some(
+            encode_session_list_cursor(
+                &SessionListCursorState {
+                    version: SESSION_LIST_CURSOR_VERSION,
+                    sessions_after,
+                    sessions_done,
+                    deleted_sessions_after,
+                    deleted_sessions_done,
+                },
+                &state.config.jwt_secret,
+                &account.id,
+            )
+            .map_err(internal)?,
+        )
+    };
     Ok(Json(SessionListResponse {
         sessions,
         deleted_sessions,
+        next_cursor,
     }))
 }
 
@@ -319,6 +434,10 @@ pub async fn upload_session_audit_bundle(
     ensure_upload_allowed(&account, "session_audit_upload")?;
     validate_session_id(&session_id)?;
     validate_audit_bundle_id(&bundle_id)?;
+    if !sync::live_session_exists(&state.pool, &account.id, &session_id).map_err(internal)? {
+        return Err((StatusCode::NOT_FOUND, "session not found".to_string()));
+    }
+    let consent_receipt = require_active_support_diagnostic_consent(&state, &account.id)?;
     let storage_config = state
         .config
         .log_storage
@@ -339,13 +458,11 @@ pub async fn upload_session_audit_bundle(
             "audit bundle is too large".to_string(),
         ));
     }
+    support_diagnostic_schema::validate_headers(&headers)?;
+    let validated_bundle =
+        support_diagnostic_schema::validate_bundle(&body, &session_id, &bundle_id)?;
 
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("application/json")
-        .to_string();
+    let content_type = "application/json".to_string();
     let hash = sha256_hex(&body);
     let storage = ObjectStorage::new(storage_config);
     let created_at_ms = now_ms();
@@ -368,13 +485,12 @@ pub async fn upload_session_audit_bundle(
                 .saturating_add(storage.retention_days().saturating_mul(86_400_000)),
             metadata_json: serde_json::json!({
                 "bundle_id": bundle_id,
-                "content_type": headers
-                    .get(header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("application/json"),
-                "schema_version": headers
-                    .get("x-bluey-audit-schema-version")
-                    .and_then(|value| value.to_str().ok()),
+                "content_type": "application/json",
+                "schema_version": validated_bundle.schema_version,
+                "event_count": validated_bundle.event_count,
+                "content_policy": SUPPORT_DIAGNOSTIC_CONTENT_POLICY,
+                "consent_receipt_id": consent_receipt.receipt_id,
+                "consent_revision": consent_receipt.revision,
             }),
             now_ms: created_at_ms,
             limits: storage.upload_limits(),
@@ -391,6 +507,87 @@ pub async fn upload_session_audit_bundle(
         sha256: upload.sha256,
         content_type: upload.content_type,
         expires_at_ms: upload.expires_at_ms,
+    }))
+}
+
+pub async fn get_support_diagnostic_consent(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<SupportDiagnosticConsentStatus>, (StatusCode, String)> {
+    let receipt =
+        support_diagnostics::current_consent(&state.pool, &account.id).map_err(internal)?;
+    Ok(Json(SupportDiagnosticConsentStatus {
+        enabled: receipt.as_ref().is_some_and(|receipt| {
+            receipt.enabled
+                && receipt.policy_version == SUPPORT_DIAGNOSTIC_POLICY_VERSION
+                && receipt.content_policy == SUPPORT_DIAGNOSTIC_CONTENT_POLICY
+        }),
+        policy_version: SUPPORT_DIAGNOSTIC_POLICY_VERSION,
+        content_policy: SUPPORT_DIAGNOSTIC_CONTENT_POLICY,
+        current_receipt: receipt,
+    }))
+}
+
+pub async fn put_support_diagnostic_consent(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<SupportDiagnosticConsentRequest>,
+) -> Result<Json<SupportDiagnosticConsentReceipt>, (StatusCode, String)> {
+    validate_support_diagnostic_policy(&req.policy_version, &req.content_policy)?;
+    let receipt = support_diagnostics::record_consent(
+        &state.pool,
+        &account.id,
+        req.enabled,
+        &req.policy_version,
+        &req.content_policy,
+        now_ms(),
+    )
+    .map_err(support_diagnostic_consent_error)?;
+    if !receipt.enabled {
+        drain_support_diagnostic_cleanup(&state, &account.id).await;
+    }
+    Ok(Json(receipt))
+}
+
+pub async fn delete_all_support_diagnostics(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<SupportDiagnosticDeleteResponse>, (StatusCode, String)> {
+    let scheduled = object_uploads::schedule_support_diagnostic_cleanup(
+        &state.pool,
+        &account.id,
+        None,
+        now_ms(),
+    )
+    .map_err(internal)?;
+    drain_support_diagnostic_cleanup(&state, &account.id).await;
+    Ok(Json(SupportDiagnosticDeleteResponse {
+        scope: "all",
+        session_id: None,
+        scheduled_objects: scheduled,
+        server_time_ms: now_ms(),
+    }))
+}
+
+pub async fn delete_session_support_diagnostics(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(session_id): Path<String>,
+) -> Result<Json<SupportDiagnosticDeleteResponse>, (StatusCode, String)> {
+    validate_session_id(&session_id)?;
+    let scheduled = object_uploads::schedule_support_diagnostic_cleanup(
+        &state.pool,
+        &account.id,
+        Some(&session_id),
+        now_ms(),
+    )
+    .map_err(internal)?;
+    drain_support_diagnostic_cleanup(&state, &account.id).await;
+    Ok(Json(SupportDiagnosticDeleteResponse {
+        scope: "session",
+        session_id: Some(session_id),
+        scheduled_objects: scheduled,
+        server_time_ms: now_ms(),
     }))
 }
 
@@ -459,8 +656,12 @@ pub async fn download_artifact_object(
     if expires_at_ms.is_some_and(|expires_at_ms| expires_at_ms <= now_ms()) {
         if durable_index {
             drain_cleanup_jobs(&state, &account.id, StorageScope::Artifact, &storage).await;
-        } else if let Err(error) = storage.delete(&key).await {
-            tracing::warn!(error = %error, artifact_id = %artifact_id, "legacy lazy object delete failed");
+        } else if storage.delete(&key).await.is_err() {
+            tracing::warn!(
+                artifact_id_hash = %sha256_hex(artifact_id.as_bytes()),
+                error_category = "object_storage_delete",
+                "legacy lazy object delete failed"
+            );
         }
         return Err((StatusCode::GONE, "artifact object expired".into()));
     }
@@ -477,6 +678,141 @@ pub async fn download_artifact_object(
         HeaderValue::from_static("private, max-age=60"),
     );
     Ok(response)
+}
+
+fn require_active_support_diagnostic_consent(
+    state: &AppState,
+    account_id: &str,
+) -> Result<SupportDiagnosticConsentReceipt, (StatusCode, String)> {
+    let receipt =
+        support_diagnostics::current_consent(&state.pool, account_id).map_err(internal)?;
+    receipt
+        .filter(|receipt| {
+            receipt.enabled
+                && receipt.policy_version == SUPPORT_DIAGNOSTIC_POLICY_VERSION
+                && receipt.content_policy == SUPPORT_DIAGNOSTIC_CONTENT_POLICY
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Support diagnostics sharing requires active explicit consent.".to_string(),
+            )
+        })
+}
+
+fn validate_support_diagnostic_policy(
+    policy_version: &str,
+    content_policy: &str,
+) -> Result<(), (StatusCode, String)> {
+    if policy_version != SUPPORT_DIAGNOSTIC_POLICY_VERSION
+        || content_policy != SUPPORT_DIAGNOSTIC_CONTENT_POLICY
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Unsupported support diagnostics consent policy.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn support_diagnostic_consent_error(error: anyhow::Error) -> (StatusCode, String) {
+    if error
+        .downcast_ref::<support_diagnostics::SupportDiagnosticConsentError>()
+        .is_some()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Support diagnostics consent could not be recorded.".to_string(),
+        );
+    }
+    internal(error)
+}
+
+async fn drain_support_diagnostic_cleanup(state: &AppState, account_id: &str) {
+    let Some(config) = state
+        .config
+        .log_storage
+        .clone()
+        .or_else(|| state.config.object_storage.clone())
+    else {
+        // The durable delete outbox remains authoritative and the global
+        // cleanup worker will resume when audit storage is configured.
+        return;
+    };
+    drain_cleanup_jobs(
+        state,
+        account_id,
+        StorageScope::Audit,
+        &ObjectStorage::new(config),
+    )
+    .await;
+}
+
+fn encode_session_list_cursor(
+    cursor: &SessionListCursorState,
+    secret: &str,
+    account_id: &str,
+) -> anyhow::Result<String> {
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor)?);
+    let mut mac = session_list_cursor_mac(secret, account_id);
+    mac.update(payload.as_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    Ok(format!("{payload}.{signature}"))
+}
+
+fn decode_session_list_cursor(
+    cursor: &str,
+    secret: &str,
+    account_id: &str,
+) -> Result<SessionListCursorState, (StatusCode, String)> {
+    let invalid = || {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid session list cursor".to_string(),
+        )
+    };
+    if cursor.is_empty() || cursor.len() > MAX_SESSION_LIST_CURSOR_LEN {
+        return Err(invalid());
+    }
+    let (payload, signature) = cursor.split_once('.').ok_or_else(invalid)?;
+    if payload.is_empty() || signature.is_empty() || signature.contains('.') {
+        return Err(invalid());
+    }
+    let signature = URL_SAFE_NO_PAD.decode(signature).map_err(|_| invalid())?;
+    let mut mac = session_list_cursor_mac(secret, account_id);
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature).map_err(|_| invalid())?;
+    let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| invalid())?;
+    let state: SessionListCursorState = serde_json::from_slice(&payload).map_err(|_| invalid())?;
+    if state.version != SESSION_LIST_CURSOR_VERSION
+        || (state.sessions_done && state.sessions_after.is_some())
+        || (!state.sessions_done && state.sessions_after.is_none())
+        || (state.deleted_sessions_done && state.deleted_sessions_after.is_some())
+        || (!state.deleted_sessions_done && state.deleted_sessions_after.is_none())
+        || (state.sessions_done && state.deleted_sessions_done)
+    {
+        return Err(invalid());
+    }
+    for position in [
+        state.sessions_after.as_ref(),
+        state.deleted_sessions_after.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_session_id(&position.session_id).map_err(|_| invalid())?;
+    }
+    Ok(state)
+}
+
+fn session_list_cursor_mac(secret: &str, account_id: &str) -> SessionListCursorMac {
+    let mut mac = SessionListCursorMac::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts arbitrary-length keys");
+    mac.update(SESSION_LIST_CURSOR_DOMAIN);
+    mac.update(&[0]);
+    mac.update(account_id.as_bytes());
+    mac.update(&[0]);
+    mac
 }
 
 fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
@@ -705,18 +1041,26 @@ fn optional_header(
 }
 
 fn internal(e: anyhow::Error) -> (StatusCode, String) {
-    let error_chain = e
-        .chain()
-        .map(|cause| cause.to_string())
-        .collect::<Vec<_>>()
-        .join(" | ");
-    tracing::warn!(error = %e, error_chain = %error_chain, "sync endpoint failed");
+    tracing::warn!(
+        error_category = "internal",
+        error_chain_depth = e.chain().count(),
+        "sync endpoint failed"
+    );
     (StatusCode::INTERNAL_SERVER_ERROR, "sync failed".to_string())
 }
 
 fn sync_write_error(e: anyhow::Error) -> (StatusCode, String) {
     if let Some(conflict) = e.downcast_ref::<sync::SyncWriteError>() {
-        tracing::warn!(error = %conflict, "sync write rejected");
+        let category = match conflict {
+            sync::SyncWriteError::CrossAccountIdentity { .. } => "cross_account_identity",
+            sync::SyncWriteError::ParentMismatch { .. } => "parent_mismatch",
+            sync::SyncWriteError::MissingParent { .. } => "missing_parent",
+            sync::SyncWriteError::AttachmentMismatch { .. } => "attachment_mismatch",
+            sync::SyncWriteError::InvalidAttachmentMetadata { .. } => "invalid_attachment_metadata",
+            sync::SyncWriteError::DuplicateIdentity { .. } => "duplicate_identity",
+            sync::SyncWriteError::UnsupportedSessionTombstone => "unsupported_session_tombstone",
+        };
+        tracing::warn!(error_category = category, "sync write rejected");
         return (StatusCode::CONFLICT, conflict.to_string());
     }
     internal(e)
@@ -733,28 +1077,31 @@ async fn reserve_put_and_finalize(
         return Ok(reservation.upload);
     }
 
-    if let Err(error) = storage
+    if storage
         .put(
             &reservation.upload.object_key,
             body,
             &reservation.upload.content_type,
         )
         .await
+        .is_err()
     {
-        if let Err(index_error) = object_uploads::record_put_failure(
+        if object_uploads::record_put_failure(
             &state.pool,
             &reservation.upload.id,
-            &error.to_string(),
+            "object_storage_put_failed",
             now_ms(),
-        ) {
+        )
+        .is_err()
+        {
             tracing::error!(
-                error = %index_error,
+                error_category = "upload_retry_state_write",
                 upload_id_hash = %sha256_hex(reservation.upload.id.as_bytes()),
                 "failed to persist object PUT retry state"
             );
         }
         tracing::warn!(
-            error = %error,
+            error_category = "object_storage_put",
             upload_id_hash = %sha256_hex(reservation.upload.id.as_bytes()),
             "object PUT failed with durable metadata retained for retry"
         );
@@ -785,15 +1132,15 @@ async fn reserve_put_and_finalize(
                             now_ms(),
                         );
                     }
-                    Err(cleanup_error) => {
+                    Err(_) => {
                         let _ = object_uploads::mark_cleanup_failed(
                             &state.pool,
                             &reservation.upload.id,
-                            &cleanup_error.to_string(),
+                            "object_storage_delete_failed",
                             now_ms(),
                         );
                         tracing::error!(
-                            error = %cleanup_error,
+                            error_category = "object_storage_delete",
                             upload_id_hash = %sha256_hex(reservation.upload.id.as_bytes()),
                             "object PUT completed after lifecycle deletion; cleanup will retry"
                         );
@@ -822,8 +1169,11 @@ async fn drain_cleanup_jobs(
         5,
     ) {
         Ok(jobs) => jobs,
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to claim object cleanup jobs");
+        Err(_) => {
+            tracing::warn!(
+                error_category = "cleanup_claim",
+                "failed to claim object cleanup jobs"
+            );
             return;
         }
     };
@@ -838,22 +1188,33 @@ async fn drain_cleanup_jobs(
         };
         match result {
             Ok(()) => {
-                if let Err(error) =
-                    object_uploads::mark_cleanup_succeeded(&state.pool, &job.upload_id, now_ms())
+                if object_uploads::mark_cleanup_succeeded(&state.pool, &job.upload_id, now_ms())
+                    .is_err()
                 {
-                    tracing::error!(error = %error, "failed to complete object cleanup metadata");
+                    tracing::error!(
+                        error_category = "cleanup_state_write",
+                        "failed to complete object cleanup metadata"
+                    );
                 }
             }
-            Err(error) => {
-                if let Err(index_error) = object_uploads::mark_cleanup_failed(
+            Err(_) => {
+                if object_uploads::mark_cleanup_failed(
                     &state.pool,
                     &job.upload_id,
-                    &error.to_string(),
+                    "object_storage_delete_failed",
                     now_ms(),
-                ) {
-                    tracing::error!(error = %index_error, "failed to persist object cleanup retry");
+                )
+                .is_err()
+                {
+                    tracing::error!(
+                        error_category = "cleanup_retry_state_write",
+                        "failed to persist object cleanup retry"
+                    );
                 }
-                tracing::warn!(error = %error, "object cleanup will be retried");
+                tracing::warn!(
+                    error_category = "object_storage_delete",
+                    "object cleanup will be retried"
+                );
             }
         }
     }
@@ -891,6 +1252,10 @@ fn upload_error(error: anyhow::Error) -> (StatusCode, String) {
         UploadControlError::UploadGone => (
             StatusCode::GONE,
             "object upload has been deleted".to_string(),
+        ),
+        UploadControlError::SupportDiagnosticConsentRequired => (
+            StatusCode::FORBIDDEN,
+            "Support diagnostics sharing requires active explicit consent.".to_string(),
         ),
         UploadControlError::SessionNotOwned | UploadControlError::UploadNotFound => (
             StatusCode::NOT_FOUND,
@@ -981,6 +1346,63 @@ mod tests {
             billing_restriction_reason: billing_restricted.then(|| "refund.created".to_string()),
             billing_restricted_at: billing_restricted.then(|| "2026-06-26T00:00:00Z".to_string()),
         }
+    }
+
+    #[test]
+    fn session_list_cursor_round_trips_and_is_account_bound() {
+        let state = SessionListCursorState {
+            version: SESSION_LIST_CURSOR_VERSION,
+            sessions_after: Some(SessionPageCursor {
+                updated_at_ms: 42,
+                session_id: "session-live".to_string(),
+            }),
+            sessions_done: false,
+            deleted_sessions_after: None,
+            deleted_sessions_done: true,
+        };
+        let token = encode_session_list_cursor(&state, "test-secret", "account-a").unwrap();
+        assert!(!token.contains("session-live"));
+        assert_eq!(
+            decode_session_list_cursor(&token, "test-secret", "account-a").unwrap(),
+            state
+        );
+
+        let error = decode_session_list_cursor(&token, "test-secret", "account-b").unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.1, "invalid session list cursor");
+    }
+
+    #[test]
+    fn session_list_cursor_rejects_tampering_and_invalid_state() {
+        let state = SessionListCursorState {
+            version: SESSION_LIST_CURSOR_VERSION,
+            sessions_after: Some(SessionPageCursor {
+                updated_at_ms: 42,
+                session_id: "session-live".to_string(),
+            }),
+            sessions_done: false,
+            deleted_sessions_after: None,
+            deleted_sessions_done: true,
+        };
+        let token = encode_session_list_cursor(&state, "test-secret", "account-a").unwrap();
+        let (payload, signature) = token.split_once('.').unwrap();
+        let replacement = if signature.starts_with('A') { 'B' } else { 'A' };
+        let tampered = format!(
+            "{payload}{separator}{replacement}{tail}",
+            separator = ".",
+            tail = &signature[1..],
+        );
+        assert!(decode_session_list_cursor(&tampered, "test-secret", "account-a").is_err());
+
+        let complete = SessionListCursorState {
+            version: SESSION_LIST_CURSOR_VERSION,
+            sessions_after: None,
+            sessions_done: true,
+            deleted_sessions_after: None,
+            deleted_sessions_done: true,
+        };
+        let token = encode_session_list_cursor(&complete, "test-secret", "account-a").unwrap();
+        assert!(decode_session_list_cursor(&token, "test-secret", "account-a").is_err());
     }
 
     #[test]

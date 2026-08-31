@@ -25,8 +25,10 @@ can reach paying users, treat model freshness as a required release gate:
    funded keys before promoting the deploy:
 
    ```bash
-   cargo test --manifest-path server/Cargo.toml routing::dispatcher -- --nocapture
-   cargo test --manifest-path server/Cargo.toml pricing -- --nocapture
+   bash scripts/run-bluey-tests.sh -- cargo test --manifest-path server/Cargo.toml \
+     routing::dispatcher -- --nocapture
+   bash scripts/run-bluey-tests.sh -- cargo test --manifest-path server/Cargo.toml \
+     pricing -- --nocapture
    # Operator smoke: instant, balanced, deep, vision, embed, STT against deployed env.
    ```
 

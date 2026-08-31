@@ -24,7 +24,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-use super::deepgram::{map_ws_error, mask_api_key, reconnect_delay, MAX_RECONNECT_ATTEMPTS};
+use super::deepgram::{
+    map_ws_error, reconnect_delay, stt_trace_error_category, MAX_RECONNECT_ATTEMPTS,
+};
 use crate::audio::capture::{latest_channel, LatestReceiver, LatestSendResult, LatestSender};
 
 const AUDIO_QUEUE_CAPACITY: usize = 50;
@@ -39,13 +41,24 @@ enum StreamControl {
 }
 
 /// Configuration for the OpenAI Realtime provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiRealtimeConfig {
     pub api_key: String,
     /// Transcription model. Defaults to "gpt-4o-mini-transcribe".
     pub model: String,
     /// Override base URL for tests.
     pub base_url: Option<String>,
+}
+
+impl std::fmt::Debug for OpenAiRealtimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiRealtimeConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("base_url", &self.base_url.as_ref().map(|_| "[configured]"))
+            .finish()
+    }
 }
 
 impl Default for OpenAiRealtimeConfig {
@@ -83,7 +96,7 @@ pub fn resample_16k_to_24k(samples: &[i16]) -> Vec<i16> {
 
 // ========== JSON frame parsing ==========
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OaiEvent {
     #[serde(rename = "type", default)]
     ty: Option<String>,
@@ -95,32 +108,29 @@ struct OaiEvent {
     error: Option<OaiError>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct OaiError {
     #[serde(default)]
     code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
 }
 
 /// Parse an OpenAI Realtime transcription event JSON into transcript events.
 pub fn parse_event(payload: &str, source: AudioSource) -> Result<Vec<TranscriptEvent>, SttError> {
     let ev: OaiEvent = serde_json::from_str(payload)
-        .map_err(|e| SttError::Protocol(format!("invalid OpenAI JSON: {e}")))?;
+        .map_err(|_| SttError::Protocol("invalid provider JSON".into()))?;
 
     let ty = ev.ty.as_deref().unwrap_or("");
 
     if ty == "error" {
         if let Some(err) = &ev.error {
             let code = err.code.as_deref().unwrap_or("");
-            let msg = err.message.as_deref().unwrap_or("unknown");
             return Err(match code {
                 "invalid_api_key" | "authentication_error" => SttError::Auth,
-                "rate_limit_exceeded" => SttError::Quota(msg.to_string()),
-                _ => SttError::Provider(msg.to_string()),
+                "rate_limit_exceeded" => SttError::Quota("provider rate limit".into()),
+                _ => SttError::Provider("remote provider error".into()),
             });
         }
-        return Err(SttError::Provider(payload.to_string()));
+        return Err(SttError::Provider("remote provider error".into()));
     }
 
     match ty {
@@ -391,8 +401,7 @@ async fn run_supervisor(
                 if !e.is_retryable() {
                     tracing::error!(
                         provider = "openai_realtime",
-                        api_key = %mask_api_key(&cfg.api_key),
-                        error = ?e,
+                        error_category = stt_trace_error_category(&e),
                         "fatal stream error"
                     );
                     let _ = send_provider_event(&events_tx, Err(e), &state.dropped_partial_events);
@@ -432,8 +441,8 @@ async fn run_connection(
         "{base}/v1/realtime?model={}&intent=transcription",
         cfg.model
     );
-    let url: url::Url =
-        url::Url::parse(&url_str).map_err(|e| SttError::Protocol(format!("bad url: {e}")))?;
+    let url: url::Url = url::Url::parse(&url_str)
+        .map_err(|_| SttError::Protocol("invalid provider endpoint".into()))?;
 
     let mut request = url.as_str().into_client_request().map_err(map_ws_error)?;
     let headers = request.headers_mut();
@@ -651,10 +660,59 @@ mod tests {
 
     #[test]
     fn parse_event_error_rate_limit() {
-        let payload =
-            r#"{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow down"}}"#;
-        let err = parse_event(payload, AudioSource::Microphone).unwrap_err();
-        assert!(matches!(err, SttError::Quota(_)));
+        const SENTINEL: &str = "PRIVATE_TRANSCRIPT token=quota-secret";
+        let payload = serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "rate_limit_exceeded",
+                "message": SENTINEL,
+            },
+        })
+        .to_string();
+        let err = parse_event(&payload, AudioSource::Microphone).unwrap_err();
+        let SttError::Quota(detail) = &err else {
+            panic!("expected quota error");
+        };
+        assert!(!detail.contains(SENTINEL));
+        assert_eq!(err.diagnostic_category(), "quota");
+        assert!(!err.to_string().contains(SENTINEL));
+        assert!(!format!("{err:?}").contains(SENTINEL));
+    }
+
+    #[test]
+    fn provider_error_payload_is_not_retained_or_formatted() {
+        const SENTINEL: &str = "PRIVATE_TRANSCRIPT token=oai-secret https://secret.invalid";
+        let payload = serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "provider_failure",
+                "message": SENTINEL,
+            },
+            "transcript": SENTINEL,
+        })
+        .to_string();
+
+        let err = parse_event(&payload, AudioSource::Microphone).unwrap_err();
+        assert_eq!(err.diagnostic_category(), "provider");
+        let SttError::Provider(detail) = &err else {
+            panic!("expected provider error");
+        };
+        assert!(!detail.contains(SENTINEL));
+        assert!(!err.to_string().contains(SENTINEL));
+        assert!(!format!("{err:?}").contains(SENTINEL));
+    }
+
+    #[test]
+    fn realtime_config_debug_redacts_key_and_endpoint() {
+        let cfg = OpenAiRealtimeConfig {
+            api_key: "oai-secret-sentinel".into(),
+            model: "gpt-4o-mini-transcribe".into(),
+            base_url: Some("wss://user:token@secret.invalid/path".into()),
+        };
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("oai-secret-sentinel"));
+        assert!(!debug.contains("secret.invalid"));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

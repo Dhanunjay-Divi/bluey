@@ -71,8 +71,7 @@ Run the relevant subset while iterating, and the full gate before handoff:
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo build --all-targets --release
-cargo test --all-targets
-(cd server && cargo test)
+bash scripts/run-bluey-tests.sh all
 (cd crates/cue-dashboard/ui && npm run build)
 swift build -c release --package-path native/macos/cue-overlay
 swift build -c release --package-path native/macos/cue-whisper

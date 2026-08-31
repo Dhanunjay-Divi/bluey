@@ -152,6 +152,9 @@ pub struct CloudSessionSummary {
     pub transcript_count: i64,
     pub response_count: i64,
     pub context_count: i64,
+    pub rag_count: i64,
+    pub child_tombstone_count: i64,
+    pub child_tombstone_updated_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,12 +164,46 @@ pub struct CloudDeletedSession {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SessionPageCursor {
+    pub updated_at_ms: i64,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloudSessionSummaryPage {
+    pub sessions: Vec<CloudSessionSummary>,
+    pub next_cursor: Option<SessionPageCursor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloudDeletedSessionPage {
+    pub sessions: Vec<CloudDeletedSession>,
+    pub next_cursor: Option<SessionPageCursor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudChildTombstone {
+    pub child_kind: String,
+    pub child_id: String,
+    pub session_id: String,
+    pub deleted_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_index: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CloudSessionBundle {
     pub session: SyncSessionRecord,
     pub transcript_segments: Vec<SyncTranscriptSegment>,
     pub cue_responses: Vec<SyncCueResponseRecord>,
     pub context_artifacts: Vec<SyncContextArtifactRecord>,
+    pub rag_chunks: Vec<SyncRagChunkRecord>,
+    pub child_tombstones: Vec<CloudChildTombstone>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,10 +246,18 @@ pub enum SyncWriteError {
 #[derive(Debug, Clone, Copy)]
 struct ChildIdentity<'a> {
     entity: &'static str,
+    child_kind: &'static str,
     table: &'static str,
     id_column: &'static str,
     id: &'a str,
     session_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ChildTombstoneSource<'a> {
+    source_kind: Option<&'a str>,
+    source_id: Option<&'a str>,
+    chunk_index: Option<i64>,
 }
 
 fn child_identities<'a>(
@@ -229,6 +274,7 @@ fn child_identities<'a>(
     );
     identities.extend(transcript_segments.iter().map(|record| ChildIdentity {
         entity: "transcript segment",
+        child_kind: "transcript",
         table: "cloud_transcript_segments",
         id_column: "segment_id",
         id: &record.segment_id,
@@ -236,6 +282,7 @@ fn child_identities<'a>(
     }));
     identities.extend(cue_responses.iter().map(|record| ChildIdentity {
         entity: "response",
+        child_kind: "response",
         table: "cloud_cue_responses",
         id_column: "response_id",
         id: &record.response_id,
@@ -243,6 +290,7 @@ fn child_identities<'a>(
     }));
     identities.extend(context_artifacts.iter().map(|record| ChildIdentity {
         entity: "context artifact",
+        child_kind: "context",
         table: "cloud_context_artifacts",
         id_column: "artifact_id",
         id: &record.artifact_id,
@@ -250,6 +298,7 @@ fn child_identities<'a>(
     }));
     identities.extend(rag_chunks.iter().map(|record| ChildIdentity {
         entity: "RAG chunk",
+        child_kind: "rag",
         table: "cloud_rag_chunks",
         id_column: "chunk_id",
         id: &record.chunk_id,
@@ -479,6 +528,25 @@ fn validate_child_identity_sqlite_tx(
         }
         matched = true;
     }
+    let tombstone_parent = tx
+        .query_row(
+            "SELECT session_id
+             FROM cloud_child_tombstones
+             WHERE account_id = ?1 AND child_kind = ?2 AND child_id = ?3",
+            params![account_id, identity.child_kind, identity.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(existing_session_id) =
+        tombstone_parent.filter(|parent| expected_parent.as_ref() != Some(parent))
+    {
+        return Err(SyncWriteError::ParentMismatch {
+            entity: identity.entity,
+            id: identity.id.to_string(),
+            existing_session_id,
+        }
+        .into());
+    }
     Ok(matched)
 }
 
@@ -543,6 +611,7 @@ fn validate_batch_ownership_sqlite_tx(
                 account_id,
                 ChildIdentity {
                     entity: "attachment",
+                    child_kind: "context",
                     table: "cloud_context_artifacts",
                     id_column: "artifact_id",
                     id: artifact_id,
@@ -641,6 +710,24 @@ fn validate_child_identity_postgres_tx(
         }
         matched = true;
     }
+    let tombstone_parent = tx
+        .query_opt(
+            "SELECT session_id
+             FROM cloud_child_tombstones
+             WHERE account_id = $1 AND child_kind = $2 AND child_id = $3",
+            &[&account_id, &identity.child_kind, &identity.id],
+        )?
+        .map(|row| row.get::<_, String>(0));
+    if let Some(existing_session_id) =
+        tombstone_parent.filter(|parent| expected_parent.as_ref() != Some(parent))
+    {
+        return Err(SyncWriteError::ParentMismatch {
+            entity: identity.entity,
+            id: identity.id.to_string(),
+            existing_session_id,
+        }
+        .into());
+    }
     Ok(matched)
 }
 
@@ -713,6 +800,7 @@ fn validate_batch_ownership_postgres_tx(
                 account_id,
                 ChildIdentity {
                     entity: "attachment",
+                    child_kind: "context",
                     table: "cloud_context_artifacts",
                     id_column: "artifact_id",
                     id: artifact_id,
@@ -837,6 +925,7 @@ fn upsert_batch_sqlite(
                 &record.segment_id,
                 &record.session_id,
                 deleted_at_ms,
+                ChildTombstoneSource::default(),
             )? {
                 applied_transcript_segments += 1;
             }
@@ -896,6 +985,7 @@ fn upsert_batch_sqlite(
                 &record.response_id,
                 &record.session_id,
                 deleted_at_ms,
+                ChildTombstoneSource::default(),
             )? {
                 applied_cue_responses += 1;
             }
@@ -971,6 +1061,7 @@ fn upsert_batch_sqlite(
                 &record.artifact_id,
                 &record.session_id,
                 deleted_at_ms,
+                ChildTombstoneSource::default(),
             )? {
                 applied_context_artifacts += 1;
             }
@@ -1047,6 +1138,11 @@ fn upsert_batch_sqlite(
                 &record.chunk_id,
                 session_id,
                 deleted_at_ms,
+                ChildTombstoneSource {
+                    source_kind: Some(&record.source_kind),
+                    source_id: Some(&record.source_id),
+                    chunk_index: Some(record.chunk_index),
+                },
             )? {
                 applied_rag_chunks += 1;
             }
@@ -1227,6 +1323,7 @@ fn upsert_batch_postgres(
                 &record.segment_id,
                 &record.session_id,
                 deleted_at_ms,
+                ChildTombstoneSource::default(),
             )? {
                 applied_transcript_segments += 1;
             }
@@ -1297,6 +1394,7 @@ fn upsert_batch_postgres(
                 &record.response_id,
                 &record.session_id,
                 deleted_at_ms,
+                ChildTombstoneSource::default(),
             )? {
                 applied_cue_responses += 1;
             }
@@ -1389,6 +1487,7 @@ fn upsert_batch_postgres(
                 &record.artifact_id,
                 &record.session_id,
                 deleted_at_ms,
+                ChildTombstoneSource::default(),
             )? {
                 applied_context_artifacts += 1;
             }
@@ -1478,6 +1577,11 @@ fn upsert_batch_postgres(
                 &record.chunk_id,
                 session_id,
                 deleted_at_ms,
+                ChildTombstoneSource {
+                    source_kind: Some(&record.source_kind),
+                    source_id: Some(&record.source_id),
+                    chunk_index: Some(record.chunk_index),
+                },
             )? {
                 applied_rag_chunks += 1;
             }
@@ -1592,8 +1696,42 @@ pub fn list_sessions(
     limit: i64,
 ) -> Result<Vec<CloudSessionSummary>> {
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => list_sessions_sqlite(pool, account_id, limit),
-        DbPool::Postgres(_) => list_sessions_postgres(pool, account_id, limit),
+        DbPool::Sqlite(_) => list_sessions_sqlite(pool, account_id, limit, None),
+        DbPool::Postgres(_) => list_sessions_postgres(pool, account_id, limit, None),
+    })
+}
+
+pub fn list_sessions_page(
+    pool: &DbPool,
+    account_id: &str,
+    limit: i64,
+    cursor: Option<&SessionPageCursor>,
+) -> Result<CloudSessionSummaryPage> {
+    let limit = limit.max(1);
+    let mut sessions = crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            list_sessions_sqlite(pool, account_id, limit.saturating_add(1), cursor)
+        }
+        DbPool::Postgres(_) => {
+            list_sessions_postgres(pool, account_id, limit.saturating_add(1), cursor)
+        }
+    })?;
+    let has_more = sessions.len() > limit as usize;
+    if has_more {
+        sessions.truncate(limit as usize);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = sessions
+            .last()
+            .expect("a page with an extra row has a returned row");
+        SessionPageCursor {
+            updated_at_ms: last.updated_at_ms,
+            session_id: last.session_id.clone(),
+        }
+    });
+    Ok(CloudSessionSummaryPage {
+        sessions,
+        next_cursor,
     })
 }
 
@@ -1603,8 +1741,42 @@ pub fn list_deleted_sessions(
     limit: i64,
 ) -> Result<Vec<CloudDeletedSession>> {
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => list_deleted_sessions_sqlite(pool, account_id, limit),
-        DbPool::Postgres(_) => list_deleted_sessions_postgres(pool, account_id, limit),
+        DbPool::Sqlite(_) => list_deleted_sessions_sqlite(pool, account_id, limit, None),
+        DbPool::Postgres(_) => list_deleted_sessions_postgres(pool, account_id, limit, None),
+    })
+}
+
+pub fn list_deleted_sessions_page(
+    pool: &DbPool,
+    account_id: &str,
+    limit: i64,
+    cursor: Option<&SessionPageCursor>,
+) -> Result<CloudDeletedSessionPage> {
+    let limit = limit.max(1);
+    let mut sessions = crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            list_deleted_sessions_sqlite(pool, account_id, limit.saturating_add(1), cursor)
+        }
+        DbPool::Postgres(_) => {
+            list_deleted_sessions_postgres(pool, account_id, limit.saturating_add(1), cursor)
+        }
+    })?;
+    let has_more = sessions.len() > limit as usize;
+    if has_more {
+        sessions.truncate(limit as usize);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = sessions
+            .last()
+            .expect("a page with an extra row has a returned row");
+        SessionPageCursor {
+            updated_at_ms: last.deleted_at_ms,
+            session_id: last.session_id.clone(),
+        }
+    });
+    Ok(CloudDeletedSessionPage {
+        sessions,
+        next_cursor,
     })
 }
 
@@ -1615,16 +1787,51 @@ fn apply_child_tombstone_sqlite_tx(
     child_id: &str,
     session_id: &str,
     deleted_at_ms: i64,
+    source: ChildTombstoneSource<'_>,
 ) -> Result<bool> {
+    validate_child_tombstone_source(child_kind, source)?;
     let changed = tx.execute(
         "INSERT INTO cloud_child_tombstones (
-            account_id, child_kind, child_id, session_id, deleted_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5)
+            account_id, child_kind, child_id, session_id, deleted_at_ms,
+            source_kind, source_id, chunk_index
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(account_id, child_kind, child_id) DO UPDATE SET
             session_id=excluded.session_id,
-            deleted_at_ms=excluded.deleted_at_ms
-         WHERE excluded.deleted_at_ms > cloud_child_tombstones.deleted_at_ms",
-        params![account_id, child_kind, child_id, session_id, deleted_at_ms],
+            deleted_at_ms=MAX(
+                cloud_child_tombstones.deleted_at_ms,
+                excluded.deleted_at_ms
+            ),
+            source_kind=COALESCE(
+                cloud_child_tombstones.source_kind,
+                excluded.source_kind
+            ),
+            source_id=COALESCE(cloud_child_tombstones.source_id, excluded.source_id),
+            chunk_index=COALESCE(
+                cloud_child_tombstones.chunk_index,
+                excluded.chunk_index
+            )
+         WHERE excluded.deleted_at_ms > cloud_child_tombstones.deleted_at_ms
+            OR (
+                excluded.deleted_at_ms = cloud_child_tombstones.deleted_at_ms
+                AND (
+                    (cloud_child_tombstones.source_kind IS NULL
+                        AND excluded.source_kind IS NOT NULL)
+                    OR (cloud_child_tombstones.source_id IS NULL
+                        AND excluded.source_id IS NOT NULL)
+                    OR (cloud_child_tombstones.chunk_index IS NULL
+                        AND excluded.chunk_index IS NOT NULL)
+                )
+            )",
+        params![
+            account_id,
+            child_kind,
+            child_id,
+            session_id,
+            deleted_at_ms,
+            source.source_kind,
+            source.source_id,
+            source.chunk_index,
+        ],
     )?;
     let deleted = match child_kind {
         "transcript" => tx.execute(
@@ -1763,21 +1970,52 @@ fn apply_child_tombstone_postgres_tx(
     child_id: &str,
     session_id: &str,
     deleted_at_ms: i64,
+    source: ChildTombstoneSource<'_>,
 ) -> Result<bool> {
+    validate_child_tombstone_source(child_kind, source)?;
+    let source_kind = source.source_kind.map(db_text);
+    let source_id = source.source_id.map(db_text);
     let changed = tx.execute(
         "INSERT INTO cloud_child_tombstones (
-            account_id, child_kind, child_id, session_id, deleted_at_ms
-         ) VALUES ($1, $2, $3, $4, $5)
+            account_id, child_kind, child_id, session_id, deleted_at_ms,
+            source_kind, source_id, chunk_index
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT(account_id, child_kind, child_id) DO UPDATE SET
             session_id=excluded.session_id,
-            deleted_at_ms=excluded.deleted_at_ms
-         WHERE excluded.deleted_at_ms > cloud_child_tombstones.deleted_at_ms",
+            deleted_at_ms=GREATEST(
+                cloud_child_tombstones.deleted_at_ms,
+                excluded.deleted_at_ms
+            ),
+            source_kind=COALESCE(
+                cloud_child_tombstones.source_kind,
+                excluded.source_kind
+            ),
+            source_id=COALESCE(cloud_child_tombstones.source_id, excluded.source_id),
+            chunk_index=COALESCE(
+                cloud_child_tombstones.chunk_index,
+                excluded.chunk_index
+            )
+         WHERE excluded.deleted_at_ms > cloud_child_tombstones.deleted_at_ms
+            OR (
+                excluded.deleted_at_ms = cloud_child_tombstones.deleted_at_ms
+                AND (
+                    (cloud_child_tombstones.source_kind IS NULL
+                        AND excluded.source_kind IS NOT NULL)
+                    OR (cloud_child_tombstones.source_id IS NULL
+                        AND excluded.source_id IS NOT NULL)
+                    OR (cloud_child_tombstones.chunk_index IS NULL
+                        AND excluded.chunk_index IS NOT NULL)
+                )
+            )",
         &[
             &account_id,
             &child_kind,
             &child_id,
             &session_id,
             &deleted_at_ms,
+            &source_kind,
+            &source_id,
+            &source.chunk_index,
         ],
     )?;
     let deleted = match child_kind {
@@ -1835,6 +2073,28 @@ fn apply_child_tombstone_postgres_tx(
         _ => anyhow::bail!("unsupported cloud child tombstone kind"),
     };
     Ok(changed > 0 || deleted > 0)
+}
+
+fn validate_child_tombstone_source(
+    child_kind: &str,
+    source: ChildTombstoneSource<'_>,
+) -> Result<()> {
+    if child_kind == "rag" {
+        if source
+            .source_kind
+            .is_none_or(|value| value.trim().is_empty())
+            || source.source_id.is_none_or(|value| value.trim().is_empty())
+            || source.chunk_index.is_none()
+        {
+            anyhow::bail!("RAG child tombstone is missing source provenance");
+        }
+    } else if source.source_kind.is_some()
+        || source.source_id.is_some()
+        || source.chunk_index.is_some()
+    {
+        anyhow::bail!("non-RAG child tombstone has unexpected source provenance");
+    }
+    Ok(())
 }
 
 fn child_write_allowed_postgres_tx(
@@ -1914,22 +2174,37 @@ fn list_deleted_sessions_sqlite(
     pool: &DbPool,
     account_id: &str,
     limit: i64,
+    cursor: Option<&SessionPageCursor>,
 ) -> Result<Vec<CloudDeletedSession>> {
     let conn = pool.get().context("get db conn")?;
+    let cursor_updated_at_ms = cursor.map(|cursor| cursor.updated_at_ms);
+    let cursor_session_id = cursor.map(|cursor| cursor.session_id.as_str());
     let mut stmt = conn.prepare(
-        "SELECT session_id, COALESCE(deleted_at_ms, updated_at_ms), updated_at_ms
-         FROM cloud_sessions
-         WHERE account_id = ?1 AND deleted_at_ms IS NOT NULL
-         ORDER BY COALESCE(deleted_at_ms, updated_at_ms) DESC
-         LIMIT ?2",
+        "WITH deleted_sessions AS (
+            SELECT session_id,
+                   COALESCE(deleted_at_ms, updated_at_ms) AS deletion_updated_at_ms,
+                   updated_at_ms
+            FROM cloud_sessions
+            WHERE account_id = ?1 AND deleted_at_ms IS NOT NULL
+         )
+         SELECT session_id, deletion_updated_at_ms, updated_at_ms
+         FROM deleted_sessions
+         WHERE ?2 IS NULL
+            OR deletion_updated_at_ms < ?2
+            OR (deletion_updated_at_ms = ?2 AND session_id < ?3)
+         ORDER BY deletion_updated_at_ms DESC, session_id DESC
+         LIMIT ?4",
     )?;
-    let rows = stmt.query_map(params![account_id, limit], |row| {
-        Ok(CloudDeletedSession {
-            session_id: row.get(0)?,
-            deleted_at_ms: row.get(1)?,
-            updated_at_ms: row.get(2)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![account_id, cursor_updated_at_ms, cursor_session_id, limit],
+        |row| {
+            Ok(CloudDeletedSession {
+                session_id: row.get(0)?,
+                deleted_at_ms: row.get(1)?,
+                updated_at_ms: row.get(2)?,
+            })
+        },
+    )?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -1938,15 +2213,32 @@ fn list_deleted_sessions_postgres(
     pool: &DbPool,
     account_id: &str,
     limit: i64,
+    cursor: Option<&SessionPageCursor>,
 ) -> Result<Vec<CloudDeletedSession>> {
     let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let cursor_updated_at_ms = cursor.map(|cursor| cursor.updated_at_ms);
+    let cursor_session_id = cursor.map(|cursor| cursor.session_id.as_str());
     let rows = conn.query(
-        "SELECT session_id, COALESCE(deleted_at_ms, updated_at_ms), updated_at_ms
-         FROM cloud_sessions
-         WHERE account_id = $1 AND deleted_at_ms IS NOT NULL
-         ORDER BY COALESCE(deleted_at_ms, updated_at_ms) DESC
-         LIMIT $2",
-        &[&account_id, &limit],
+        "WITH deleted_sessions AS (
+            SELECT session_id,
+                   COALESCE(deleted_at_ms, updated_at_ms) AS deletion_updated_at_ms,
+                   updated_at_ms
+            FROM cloud_sessions
+            WHERE account_id = $1 AND deleted_at_ms IS NOT NULL
+         )
+         SELECT session_id, deletion_updated_at_ms, updated_at_ms
+         FROM deleted_sessions
+         WHERE $2::bigint IS NULL
+            OR deletion_updated_at_ms < $2
+            OR (deletion_updated_at_ms = $2 AND session_id < $3::text)
+         ORDER BY deletion_updated_at_ms DESC, session_id DESC
+         LIMIT $4",
+        &[
+            &account_id,
+            &cursor_updated_at_ms,
+            &cursor_session_id,
+            &limit,
+        ],
     )?;
     rows.into_iter()
         .map(|row| {
@@ -2113,10 +2405,14 @@ fn list_sessions_sqlite(
     pool: &DbPool,
     account_id: &str,
     limit: i64,
+    cursor: Option<&SessionPageCursor>,
 ) -> Result<Vec<CloudSessionSummary>> {
     let conn = pool.get().context("get db conn")?;
+    let cursor_updated_at_ms = cursor.map(|cursor| cursor.updated_at_ms);
+    let cursor_session_id = cursor.map(|cursor| cursor.session_id.as_str());
     let mut stmt = conn.prepare(
-        "SELECT s.session_id, s.title, s.status,
+        "WITH session_summaries AS (
+            SELECT s.session_id, s.title, s.status,
                 MAX(
                     s.updated_at_ms,
                     COALESCE((SELECT MAX(t.ts_ms) FROM cloud_transcript_segments t
@@ -2126,16 +2422,30 @@ fn list_sessions_sqlite(
                     COALESCE((SELECT MAX(c.updated_at_ms) FROM cloud_context_artifacts c
                         WHERE c.account_id = s.account_id AND c.session_id = s.session_id), 0),
                     COALESCE((SELECT MAX(g.updated_at_ms) FROM cloud_rag_chunks g
-                        WHERE g.account_id = s.account_id AND g.session_id = s.session_id), 0)
+                        WHERE g.account_id = s.account_id AND g.session_id = s.session_id), 0),
+                    COALESCE((SELECT MAX(d.deleted_at_ms) FROM cloud_child_tombstones d
+                        WHERE d.account_id = s.account_id AND d.session_id = s.session_id), 0)
                 ) AS content_updated_at_ms,
                 s.last_active_at_ms,
                 s.answer_style,
                 (SELECT COUNT(*) FROM cloud_transcript_segments t
-                    WHERE t.account_id = s.account_id AND t.session_id = s.session_id),
+                    WHERE t.account_id = s.account_id AND t.session_id = s.session_id)
+                    AS transcript_count,
                 (SELECT COUNT(*) FROM cloud_cue_responses r
-                    WHERE r.account_id = s.account_id AND r.session_id = s.session_id),
+                    WHERE r.account_id = s.account_id AND r.session_id = s.session_id)
+                    AS response_count,
                 (SELECT COUNT(*) FROM cloud_context_artifacts c
                     WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
+                    AS context_count,
+                (SELECT COUNT(*) FROM cloud_rag_chunks g
+                    WHERE g.account_id = s.account_id AND g.session_id = s.session_id)
+                    AS rag_count,
+                (SELECT COUNT(*) FROM cloud_child_tombstones d
+                    WHERE d.account_id = s.account_id AND d.session_id = s.session_id)
+                    AS child_tombstone_count,
+                (SELECT MAX(d.deleted_at_ms) FROM cloud_child_tombstones d
+                    WHERE d.account_id = s.account_id AND d.session_id = s.session_id)
+                    AS child_tombstone_updated_at_ms
          FROM cloud_sessions s
          WHERE s.account_id = ?1 AND s.deleted_at_ms IS NULL
            AND (
@@ -2148,23 +2458,39 @@ fn list_sessions_sqlite(
                 OR EXISTS (SELECT 1 FROM cloud_rag_chunks g
                     WHERE g.account_id = s.account_id AND g.session_id = s.session_id
                       AND TRIM(g.text) <> '')
+                OR EXISTS (SELECT 1 FROM cloud_child_tombstones d
+                    WHERE d.account_id = s.account_id AND d.session_id = s.session_id)
            )
-         ORDER BY content_updated_at_ms DESC
-         LIMIT ?2",
+         )
+         SELECT session_id, title, status, content_updated_at_ms,
+                last_active_at_ms, answer_style, transcript_count, response_count, context_count,
+                rag_count, child_tombstone_count, child_tombstone_updated_at_ms
+         FROM session_summaries
+         WHERE ?2 IS NULL
+            OR content_updated_at_ms < ?2
+            OR (content_updated_at_ms = ?2 AND session_id < ?3)
+         ORDER BY content_updated_at_ms DESC, session_id DESC
+         LIMIT ?4",
     )?;
-    let rows = stmt.query_map(params![account_id, limit], |row| {
-        Ok(CloudSessionSummary {
-            session_id: row.get(0)?,
-            title: row.get(1)?,
-            status: row.get(2)?,
-            updated_at_ms: row.get(3)?,
-            last_active_at_ms: row.get(4)?,
-            answer_style: row.get(5)?,
-            transcript_count: row.get(6)?,
-            response_count: row.get(7)?,
-            context_count: row.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![account_id, cursor_updated_at_ms, cursor_session_id, limit],
+        |row| {
+            Ok(CloudSessionSummary {
+                session_id: row.get(0)?,
+                title: row.get(1)?,
+                status: row.get(2)?,
+                updated_at_ms: row.get(3)?,
+                last_active_at_ms: row.get(4)?,
+                answer_style: row.get(5)?,
+                transcript_count: row.get(6)?,
+                response_count: row.get(7)?,
+                context_count: row.get(8)?,
+                rag_count: row.get(9)?,
+                child_tombstone_count: row.get(10)?,
+                child_tombstone_updated_at_ms: row.get(11)?,
+            })
+        },
+    )?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -2173,10 +2499,14 @@ fn list_sessions_postgres(
     pool: &DbPool,
     account_id: &str,
     limit: i64,
+    cursor: Option<&SessionPageCursor>,
 ) -> Result<Vec<CloudSessionSummary>> {
     let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let cursor_updated_at_ms = cursor.map(|cursor| cursor.updated_at_ms);
+    let cursor_session_id = cursor.map(|cursor| cursor.session_id.as_str());
     let rows = conn.query(
-        "SELECT s.session_id, s.title, s.status,
+        "WITH session_summaries AS (
+            SELECT s.session_id, s.title, s.status,
                 GREATEST(
                     s.updated_at_ms,
                     COALESCE((SELECT MAX(t.ts_ms) FROM cloud_transcript_segments t
@@ -2186,16 +2516,30 @@ fn list_sessions_postgres(
                     COALESCE((SELECT MAX(c.updated_at_ms) FROM cloud_context_artifacts c
                         WHERE c.account_id = s.account_id AND c.session_id = s.session_id), 0),
                     COALESCE((SELECT MAX(g.updated_at_ms) FROM cloud_rag_chunks g
-                        WHERE g.account_id = s.account_id AND g.session_id = s.session_id), 0)
+                        WHERE g.account_id = s.account_id AND g.session_id = s.session_id), 0),
+                    COALESCE((SELECT MAX(d.deleted_at_ms) FROM cloud_child_tombstones d
+                        WHERE d.account_id = s.account_id AND d.session_id = s.session_id), 0)
                 ) AS content_updated_at_ms,
                 s.last_active_at_ms,
                 s.answer_style,
                 (SELECT COUNT(*)::bigint FROM cloud_transcript_segments t
-                    WHERE t.account_id = s.account_id AND t.session_id = s.session_id),
+                    WHERE t.account_id = s.account_id AND t.session_id = s.session_id)
+                    AS transcript_count,
                 (SELECT COUNT(*)::bigint FROM cloud_cue_responses r
-                    WHERE r.account_id = s.account_id AND r.session_id = s.session_id),
+                    WHERE r.account_id = s.account_id AND r.session_id = s.session_id)
+                    AS response_count,
                 (SELECT COUNT(*)::bigint FROM cloud_context_artifacts c
                     WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
+                    AS context_count,
+                (SELECT COUNT(*)::bigint FROM cloud_rag_chunks g
+                    WHERE g.account_id = s.account_id AND g.session_id = s.session_id)
+                    AS rag_count,
+                (SELECT COUNT(*)::bigint FROM cloud_child_tombstones d
+                    WHERE d.account_id = s.account_id AND d.session_id = s.session_id)
+                    AS child_tombstone_count,
+                (SELECT MAX(d.deleted_at_ms) FROM cloud_child_tombstones d
+                    WHERE d.account_id = s.account_id AND d.session_id = s.session_id)
+                    AS child_tombstone_updated_at_ms
          FROM cloud_sessions s
          WHERE s.account_id = $1 AND s.deleted_at_ms IS NULL
            AND (
@@ -2208,10 +2552,25 @@ fn list_sessions_postgres(
                 OR EXISTS (SELECT 1 FROM cloud_rag_chunks g
                     WHERE g.account_id = s.account_id AND g.session_id = s.session_id
                       AND BTRIM(g.text) <> '')
+                OR EXISTS (SELECT 1 FROM cloud_child_tombstones d
+                    WHERE d.account_id = s.account_id AND d.session_id = s.session_id)
            )
-         ORDER BY content_updated_at_ms DESC
-         LIMIT $2",
-        &[&account_id, &limit],
+         )
+         SELECT session_id, title, status, content_updated_at_ms,
+                last_active_at_ms, answer_style, transcript_count, response_count, context_count,
+                rag_count, child_tombstone_count, child_tombstone_updated_at_ms
+         FROM session_summaries
+         WHERE $2::bigint IS NULL
+            OR content_updated_at_ms < $2
+            OR (content_updated_at_ms = $2 AND session_id < $3::text)
+         ORDER BY content_updated_at_ms DESC, session_id DESC
+         LIMIT $4",
+        &[
+            &account_id,
+            &cursor_updated_at_ms,
+            &cursor_session_id,
+            &limit,
+        ],
     )?;
     rows.into_iter()
         .map(cloud_session_summary_from_pg)
@@ -2226,6 +2585,37 @@ pub fn load_session(
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => load_session_sqlite(pool, account_id, session_id),
         DbPool::Postgres(_) => load_session_postgres(pool, account_id, session_id),
+    })
+}
+
+/// Return whether an undeleted cloud session belongs to this account without
+/// loading its private transcript, answer, context, or RAG children. This is a
+/// cheap route-level indistinguishability check; write paths must still repeat
+/// ownership checks inside their atomic transaction.
+pub fn live_session_exists(pool: &DbPool, account_id: &str, session_id: &str) -> Result<bool> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get().context("get db conn")?;
+            Ok(conn
+                .query_row(
+                    "SELECT 1 FROM cloud_sessions
+                      WHERE account_id = ?1 AND session_id = ?2 AND deleted_at_ms IS NULL",
+                    params![account_id, session_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some())
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg().context("get postgres db conn")?;
+            Ok(conn
+                .query_opt(
+                    "SELECT 1 FROM cloud_sessions
+                      WHERE account_id = $1 AND session_id = $2 AND deleted_at_ms IS NULL",
+                    &[&account_id, &session_id],
+                )?
+                .is_some())
+        }
     })
 }
 
@@ -2278,6 +2668,8 @@ fn load_session_sqlite(
         transcript_segments: load_transcripts(&conn, account_id, session_id)?,
         cue_responses: load_responses(&conn, account_id, session_id)?,
         context_artifacts: load_context(&conn, account_id, session_id)?,
+        rag_chunks: load_rag_chunks(&conn, account_id, session_id)?,
+        child_tombstones: load_child_tombstones(&conn, account_id, session_id)?,
         session,
     }))
 }
@@ -2307,6 +2699,8 @@ fn load_session_postgres(
         transcript_segments: load_transcripts_pg(&mut conn, account_id, session_id)?,
         cue_responses: load_responses_pg(&mut conn, account_id, session_id)?,
         context_artifacts: load_context_pg(&mut conn, account_id, session_id)?,
+        rag_chunks: load_rag_chunks_pg(&mut conn, account_id, session_id)?,
+        child_tombstones: load_child_tombstones_pg(&mut conn, account_id, session_id)?,
         session,
     }))
 }
@@ -2641,6 +3035,96 @@ fn load_context(
         .map_err(Into::into)
 }
 
+fn load_rag_chunks(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Vec<SyncRagChunkRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id, session_id, source_kind, source_id, chunk_index, text,
+                token_count, content_hash, updated_at_ms, metadata_json
+         FROM cloud_rag_chunks
+         WHERE account_id = ?1 AND session_id = ?2
+         ORDER BY updated_at_ms ASC, chunk_id ASC",
+    )?;
+    let rows = stmt.query_map(params![account_id, session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, String>(9)?,
+        ))
+    })?;
+    let mut records = Vec::new();
+    for row in rows {
+        let (
+            chunk_id,
+            session_id,
+            source_kind,
+            source_id,
+            chunk_index,
+            text,
+            token_count,
+            content_hash,
+            updated_at_ms,
+            metadata,
+        ) = row?;
+        records.push(SyncRagChunkRecord {
+            chunk_id,
+            session_id,
+            source_kind,
+            source_id,
+            chunk_index,
+            text,
+            // Embeddings are provider-derived server material. The desktop
+            // reconstructs its own local index from the user-owned text.
+            embedding: None,
+            embedding_model: None,
+            token_count,
+            content_hash,
+            updated_at_ms,
+            deleted_at_ms: None,
+            metadata: parse_json(&metadata),
+        });
+    }
+    Ok(records)
+}
+
+fn load_child_tombstones(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Vec<CloudChildTombstone>> {
+    let mut stmt = conn.prepare(
+        "SELECT child_kind, child_id, session_id, deleted_at_ms,
+                source_kind, source_id, chunk_index
+         FROM cloud_child_tombstones
+         WHERE account_id = ?1 AND session_id = ?2
+         ORDER BY deleted_at_ms ASC, child_kind ASC, child_id ASC",
+    )?;
+    let rows = stmt.query_map(params![account_id, session_id], |row| {
+        Ok(CloudChildTombstone {
+            child_kind: row.get(0)?,
+            child_id: row.get(1)?,
+            session_id: row.get(2)?,
+            deleted_at_ms: row.get(3)?,
+            source_kind: row.get(4)?,
+            source_id: row.get(5)?,
+            chunk_index: row.get(6)?,
+        })
+    })?;
+    let records = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)?;
+    validate_loaded_child_tombstones(records, session_id)
+}
+
 fn cloud_session_summary_from_pg(row: PgRow) -> Result<CloudSessionSummary> {
     Ok(CloudSessionSummary {
         session_id: row.try_get(0)?,
@@ -2652,6 +3136,9 @@ fn cloud_session_summary_from_pg(row: PgRow) -> Result<CloudSessionSummary> {
         transcript_count: row.try_get(6)?,
         response_count: row.try_get(7)?,
         context_count: row.try_get(8)?,
+        rag_count: row.try_get(9)?,
+        child_tombstone_count: row.try_get(10)?,
+        child_tombstone_updated_at_ms: row.try_get(11)?,
     })
 }
 
@@ -2780,6 +3267,120 @@ fn load_context_pg(
         .collect()
 }
 
+fn load_rag_chunks_pg(
+    conn: &mut Client,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Vec<SyncRagChunkRecord>> {
+    let rows = conn.query(
+        "SELECT chunk_id, session_id, source_kind, source_id, chunk_index, text,
+                token_count, content_hash, updated_at_ms, metadata_json
+         FROM cloud_rag_chunks
+         WHERE account_id = $1 AND session_id = $2
+         ORDER BY updated_at_ms ASC, chunk_id ASC",
+        &[&account_id, &session_id],
+    )?;
+    rows.into_iter()
+        .map(|row| {
+            let chunk_id: String = row.try_get(0)?;
+            let chunk_index: i32 = row.try_get(4)?;
+            let token_count: Option<i64> = row.try_get(6)?;
+            let metadata: String = row.try_get(9)?;
+            Ok(SyncRagChunkRecord {
+                chunk_id,
+                session_id: row.try_get(1)?,
+                source_kind: row.try_get(2)?,
+                source_id: row.try_get(3)?,
+                chunk_index: i64::from(chunk_index),
+                text: row.try_get(5)?,
+                // Embeddings are provider-derived server material. The desktop
+                // reconstructs its own local index from the user-owned text.
+                embedding: None,
+                embedding_model: None,
+                token_count,
+                content_hash: row.try_get(7)?,
+                updated_at_ms: row.try_get(8)?,
+                deleted_at_ms: None,
+                metadata: parse_json(&metadata),
+            })
+        })
+        .collect()
+}
+
+fn load_child_tombstones_pg(
+    conn: &mut Client,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Vec<CloudChildTombstone>> {
+    let rows = conn.query(
+        "SELECT child_kind, child_id, session_id, deleted_at_ms,
+                source_kind, source_id, chunk_index
+         FROM cloud_child_tombstones
+         WHERE account_id = $1 AND session_id = $2
+         ORDER BY deleted_at_ms ASC, child_kind ASC, child_id ASC",
+        &[&account_id, &session_id],
+    )?;
+    let records = rows
+        .into_iter()
+        .map(|row| {
+            Ok(CloudChildTombstone {
+                child_kind: row.try_get(0)?,
+                child_id: row.try_get(1)?,
+                session_id: row.try_get(2)?,
+                deleted_at_ms: row.try_get(3)?,
+                source_kind: row.try_get(4)?,
+                source_id: row.try_get(5)?,
+                chunk_index: row.try_get(6)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_loaded_child_tombstones(records, session_id)
+}
+
+fn validate_loaded_child_tombstones(
+    records: Vec<CloudChildTombstone>,
+    session_id: &str,
+) -> Result<Vec<CloudChildTombstone>> {
+    for record in &records {
+        if record.session_id != session_id {
+            anyhow::bail!("cloud child tombstone parent mismatch");
+        }
+        if !matches!(
+            record.child_kind.as_str(),
+            "transcript" | "response" | "context" | "rag"
+        ) {
+            anyhow::bail!("unsupported cloud child tombstone kind");
+        }
+        let provenance_count = [
+            record.source_kind.is_some(),
+            record.source_id.is_some(),
+            record.chunk_index.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        if record.child_kind == "rag" {
+            if provenance_count != 0 && provenance_count != 3 {
+                anyhow::bail!("RAG child tombstone has incomplete source provenance");
+            }
+            if record
+                .source_kind
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+                || record
+                    .source_id
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+            {
+                anyhow::bail!("RAG child tombstone has empty source provenance");
+            }
+        } else if provenance_count != 0 {
+            anyhow::bail!("non-RAG child tombstone has source provenance");
+        }
+    }
+    Ok(records)
+}
+
 fn vector_literal_1536(values: &[f32]) -> Option<String> {
     if values.len() != 1536 {
         return None;
@@ -2890,6 +3491,29 @@ mod tests {
         }
     }
 
+    fn test_response(session_id: &str, updated_at_ms: i64) -> SyncCueResponseRecord {
+        SyncCueResponseRecord {
+            response_id: format!("response-{session_id}"),
+            session_id: session_id.to_string(),
+            kind: "answer".to_string(),
+            text: "answer".to_string(),
+            source_text: None,
+            ts_ms: updated_at_ms,
+            provider: None,
+            model: None,
+            lane: None,
+            task_type: None,
+            cost_cents: None,
+            balance_cents_after: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+            deleted_at_ms: None,
+            metadata: serde_json::json!({}),
+        }
+    }
+
     #[test]
     fn db_text_removes_nul_bytes_before_postgres_bind() {
         assert_eq!(db_text("Resume\0.pdf"), "Resume.pdf");
@@ -2992,10 +3616,457 @@ mod tests {
             bundle.cue_responses[0].artifact_type.as_deref(),
             Some("system_design")
         );
+        assert_eq!(bundle.rag_chunks.len(), 1);
+        assert_eq!(bundle.rag_chunks[0].chunk_id, "c1");
+        assert!(bundle.rag_chunks[0].embedding.is_none());
+        assert!(bundle.rag_chunks[0].embedding_model.is_none());
+        assert!(bundle.child_tombstones.is_empty());
 
         let matches = query_rag(&pool, account_id, "cache", Some(&[1.0, 0.0]), 5).unwrap();
         assert_eq!(matches[0].chunk_id, "c1");
         assert!(matches[0].score > 0.8);
+    }
+
+    #[test]
+    fn live_session_existence_is_account_scoped_and_excludes_tombstones() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        insert_test_account(&pool, "acct_live_owner", "live-owner@example.test");
+        insert_test_account(&pool, "acct_live_other", "live-other@example.test");
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO cloud_sessions (
+                    account_id, session_id, title, status, created_at_ms, updated_at_ms,
+                    metadata_json
+                 ) VALUES (?1, ?2, 'Live', 'active', 1, 1, '{}')",
+                rusqlite::params!["acct_live_owner", "live-session"],
+            )
+            .unwrap();
+
+        assert!(live_session_exists(&pool, "acct_live_owner", "live-session").unwrap());
+        assert!(!live_session_exists(&pool, "acct_live_other", "live-session").unwrap());
+        assert!(!live_session_exists(&pool, "acct_live_owner", "missing-session").unwrap());
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE cloud_sessions SET deleted_at_ms = 2
+                  WHERE account_id = ?1 AND session_id = ?2",
+                rusqlite::params!["acct_live_owner", "live-session"],
+            )
+            .unwrap();
+        assert!(!live_session_exists(&pool, "acct_live_owner", "live-session").unwrap());
+    }
+
+    #[test]
+    fn session_bundle_returns_account_scoped_rag_and_child_tombstones() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_bundle_a";
+        let other_account_id = "acct_bundle_b";
+        insert_test_account(&pool, account_id, "bundle-a@example.com");
+        insert_test_account(&pool, other_account_id, "bundle-b@example.com");
+
+        let session = test_session("bundle-session-a", 10);
+        let other_session = test_session("bundle-session-b", 10);
+        let rag = |chunk_id: &str, session_id: &str| SyncRagChunkRecord {
+            chunk_id: chunk_id.into(),
+            session_id: Some(session_id.into()),
+            source_kind: "memory".into(),
+            source_id: format!("memory-{session_id}"),
+            chunk_index: 0,
+            text: format!("private memory for {session_id}"),
+            embedding: None,
+            embedding_model: None,
+            token_count: Some(4),
+            content_hash: None,
+            updated_at_ms: 10,
+            deleted_at_ms: None,
+            metadata: serde_json::json!({"scope":"session"}),
+        };
+        upsert_batch(
+            &pool,
+            account_id,
+            std::slice::from_ref(&session),
+            &[],
+            &[],
+            &[],
+            &[rag("rag-a", &session.session_id)],
+        )
+        .unwrap();
+        upsert_batch(
+            &pool,
+            other_account_id,
+            std::slice::from_ref(&other_session),
+            &[],
+            &[],
+            &[],
+            &[rag("rag-b", &other_session.session_id)],
+        )
+        .unwrap();
+
+        let conn = pool.get().unwrap();
+        for (child_kind, child_id) in [
+            ("transcript", "transcript-a"),
+            ("response", "response-a"),
+            ("context", "context-a"),
+            ("rag", "deleted-rag-a"),
+        ] {
+            conn.execute(
+                "INSERT INTO cloud_child_tombstones (
+                    account_id, child_kind, child_id, session_id, deleted_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 20)",
+                params![account_id, child_kind, child_id, session.session_id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO cloud_child_tombstones (
+                account_id, child_kind, child_id, session_id, deleted_at_ms
+             ) VALUES (?1, 'response', 'response-b', ?2, 30)",
+            params![other_account_id, other_session.session_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let bundle = load_session(&pool, account_id, &session.session_id)
+            .unwrap()
+            .expect("owned session bundle");
+        assert_eq!(
+            bundle
+                .rag_chunks
+                .iter()
+                .map(|record| record.chunk_id.as_str())
+                .collect::<Vec<_>>(),
+            ["rag-a"]
+        );
+        assert_eq!(bundle.child_tombstones.len(), 4);
+        assert!(bundle.child_tombstones.iter().all(|record| {
+            record.session_id == session.session_id
+                && record.child_id != "response-b"
+                && record.deleted_at_ms == 20
+        }));
+        let legacy_rag_marker = bundle
+            .child_tombstones
+            .iter()
+            .find(|record| record.child_kind == "rag")
+            .expect("legacy RAG tombstone remains visible");
+        assert!(legacy_rag_marker.source_kind.is_none());
+        assert!(legacy_rag_marker.source_id.is_none());
+        assert!(legacy_rag_marker.chunk_index.is_none());
+    }
+
+    #[test]
+    fn retained_child_tombstone_cannot_be_rebound_to_another_session() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_tombstone_parent";
+        insert_test_account(&pool, account_id, "tombstone-parent@example.com");
+        let first = test_session("first-session", 10);
+        let second = test_session("second-session", 10);
+        upsert_batch(
+            &pool,
+            account_id,
+            &[first.clone(), second.clone()],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO cloud_child_tombstones (
+                    account_id, child_kind, child_id, session_id, deleted_at_ms
+                 ) VALUES (?1, 'context', 'stable-artifact-id', ?2, 20)",
+                params![account_id, first.session_id],
+            )
+            .unwrap();
+
+        let error = upsert_batch(
+            &pool,
+            account_id,
+            &[],
+            &[],
+            &[],
+            &[SyncContextArtifactRecord {
+                artifact_id: "stable-artifact-id".into(),
+                session_id: second.session_id,
+                kind: "document".into(),
+                title: "Must not be rebound".into(),
+                note: None,
+                source_uri: None,
+                content_hash: None,
+                text_preview: None,
+                created_at_ms: 30,
+                updated_at_ms: 30,
+                deleted_at_ms: None,
+                metadata: serde_json::json!({}),
+            }],
+            &[],
+        )
+        .expect_err("a retained deletion marker must keep its original parent");
+        assert!(matches!(
+            error.downcast_ref::<SyncWriteError>(),
+            Some(SyncWriteError::ParentMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_retry_backfills_legacy_rag_tombstone_provenance() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_rag_tombstone_upgrade";
+        let session = test_session("rag-tombstone-upgrade", 10);
+        insert_test_account(&pool, account_id, "rag-upgrade@example.com");
+        upsert_batch(
+            &pool,
+            account_id,
+            std::slice::from_ref(&session),
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO cloud_child_tombstones (
+                    account_id, child_kind, child_id, session_id, deleted_at_ms
+                 ) VALUES (?1, 'rag', 'legacy-rag-id', ?2, 20)",
+                params![account_id, session.session_id],
+            )
+            .unwrap();
+
+        let counts = upsert_batch(
+            &pool,
+            account_id,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[SyncRagChunkRecord {
+                chunk_id: "legacy-rag-id".into(),
+                session_id: Some(session.session_id.clone()),
+                source_kind: "conversation_memory".into(),
+                source_id: "memory-epoch-3".into(),
+                chunk_index: 3,
+                text: String::new(),
+                embedding: None,
+                embedding_model: None,
+                token_count: None,
+                content_hash: None,
+                updated_at_ms: 20,
+                deleted_at_ms: Some(20),
+                metadata: serde_json::json!({"tombstone":true}),
+            }],
+        )
+        .unwrap();
+        assert_eq!(counts.rag_chunks, 1);
+
+        let bundle = load_session(&pool, account_id, &session.session_id)
+            .unwrap()
+            .expect("session bundle");
+        let marker = bundle
+            .child_tombstones
+            .iter()
+            .find(|marker| marker.child_id == "legacy-rag-id")
+            .expect("upgraded RAG marker");
+        assert_eq!(marker.source_kind.as_deref(), Some("conversation_memory"));
+        assert_eq!(marker.source_id.as_deref(), Some("memory-epoch-3"));
+        assert_eq!(marker.chunk_index, Some(3));
+    }
+
+    #[test]
+    fn session_pages_are_stable_complete_and_account_scoped() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_page_a";
+        let other_account_id = "acct_page_b";
+        insert_test_account(&pool, account_id, "page-a@example.com");
+        insert_test_account(&pool, other_account_id, "page-b@example.com");
+
+        let live_sessions = [
+            test_session("live-z", 30),
+            test_session("live-b", 20),
+            test_session("live-a", 20),
+            test_session("live-low", 10),
+        ];
+        let live_responses = live_sessions
+            .iter()
+            .map(|session| test_response(&session.session_id, session.updated_at_ms))
+            .collect::<Vec<_>>();
+        upsert_batch(
+            &pool,
+            account_id,
+            &live_sessions,
+            &[],
+            &live_responses,
+            &[],
+            &[],
+        )
+        .unwrap();
+        upsert_batch(
+            &pool,
+            other_account_id,
+            &[test_session("other-private-live", 100)],
+            &[],
+            &[test_response("other-private-live", 100)],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let deleted_sessions = [
+            test_session("deleted-z", 4),
+            test_session("deleted-b", 3),
+            test_session("deleted-a", 2),
+            test_session("deleted-low", 1),
+        ];
+        upsert_batch(&pool, account_id, &deleted_sessions, &[], &[], &[], &[]).unwrap();
+        upsert_batch(
+            &pool,
+            other_account_id,
+            &[test_session("other-private-deleted", 100)],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        let conn = pool.get().unwrap();
+        for (session_id, deleted_at_ms) in [
+            ("deleted-z", 30),
+            ("deleted-b", 20),
+            ("deleted-a", 20),
+            ("deleted-low", 10),
+        ] {
+            conn.execute(
+                "UPDATE cloud_sessions SET deleted_at_ms = ?3
+                 WHERE account_id = ?1 AND session_id = ?2",
+                params![account_id, session_id, deleted_at_ms],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE cloud_sessions SET deleted_at_ms = 100
+             WHERE account_id = ?1 AND session_id = 'other-private-deleted'",
+            params![other_account_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let first = list_sessions_page(&pool, account_id, 2, None).unwrap();
+        assert_eq!(
+            first
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["live-z", "live-b"]
+        );
+        let second = list_sessions_page(&pool, account_id, 2, first.next_cursor.as_ref()).unwrap();
+        assert_eq!(
+            second
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["live-a", "live-low"]
+        );
+        assert!(second.next_cursor.is_none());
+
+        let first = list_deleted_sessions_page(&pool, account_id, 2, None).unwrap();
+        assert_eq!(
+            first
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["deleted-z", "deleted-b"]
+        );
+        let second =
+            list_deleted_sessions_page(&pool, account_id, 2, first.next_cursor.as_ref()).unwrap();
+        assert_eq!(
+            second
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["deleted-a", "deleted-low"]
+        );
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn session_pages_traverse_more_than_the_api_page_limit() {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let account_id = "acct_large_history";
+        insert_test_account(&pool, account_id, "large-history@example.com");
+
+        let live_sessions = (0..425)
+            .map(|index| test_session(&format!("live-{index:04}"), 10_000 - index))
+            .collect::<Vec<_>>();
+        let live_responses = live_sessions
+            .iter()
+            .map(|session| test_response(&session.session_id, session.updated_at_ms))
+            .collect::<Vec<_>>();
+        upsert_batch(
+            &pool,
+            account_id,
+            &live_sessions,
+            &[],
+            &live_responses,
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let deleted_sessions = (0..425)
+            .map(|index| test_session(&format!("deleted-{index:04}"), 20_000 - index))
+            .collect::<Vec<_>>();
+        upsert_batch(&pool, account_id, &deleted_sessions, &[], &[], &[], &[]).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE cloud_sessions
+             SET deleted_at_ms = updated_at_ms
+             WHERE account_id = ?1 AND session_id LIKE 'deleted-%'",
+            params![account_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut live_ids = Vec::new();
+        let mut live_cursor = None;
+        loop {
+            let page = list_sessions_page(&pool, account_id, 200, live_cursor.as_ref()).unwrap();
+            live_ids.extend(page.sessions.into_iter().map(|session| session.session_id));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            live_cursor = Some(next_cursor);
+        }
+
+        let mut deleted_ids = Vec::new();
+        let mut deleted_cursor = None;
+        loop {
+            let page = list_deleted_sessions_page(&pool, account_id, 200, deleted_cursor.as_ref())
+                .unwrap();
+            deleted_ids.extend(page.sessions.into_iter().map(|session| session.session_id));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            deleted_cursor = Some(next_cursor);
+        }
+
+        assert_eq!(live_ids.len(), 425);
+        assert_eq!(deleted_ids.len(), 425);
+        assert_eq!(live_ids.iter().collect::<HashSet<_>>().len(), 425);
+        assert_eq!(deleted_ids.iter().collect::<HashSet<_>>().len(), 425);
     }
 
     #[test]
@@ -3156,6 +4227,8 @@ mod tests {
         assert_eq!(initial_bundle.transcript_segments.len(), 1);
         assert_eq!(initial_bundle.cue_responses.len(), 1);
         assert_eq!(initial_bundle.context_artifacts.len(), 1);
+        assert_eq!(initial_bundle.rag_chunks.len(), 1);
+        assert!(initial_bundle.child_tombstones.is_empty());
         assert_eq!(
             query_rag(&pool, account_id, "private", Some(&[1.0, 0.0]), 5)
                 .unwrap()
@@ -3212,6 +4285,49 @@ mod tests {
         assert!(bundle.transcript_segments.is_empty());
         assert!(bundle.cue_responses.is_empty());
         assert!(bundle.context_artifacts.is_empty());
+        assert!(bundle.rag_chunks.is_empty());
+        assert_eq!(bundle.child_tombstones.len(), 5);
+        let listed = list_sessions(&pool, account_id, 10).unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "tombstone-only sessions must remain discoverable"
+        );
+        assert_eq!(listed[0].updated_at_ms, 20);
+        assert_eq!(listed[0].transcript_count, 0);
+        assert_eq!(listed[0].response_count, 0);
+        assert_eq!(listed[0].context_count, 0);
+        assert_eq!(listed[0].rag_count, 0);
+        assert_eq!(listed[0].child_tombstone_count, 5);
+        assert_eq!(listed[0].child_tombstone_updated_at_ms, Some(20));
+        assert_eq!(
+            bundle
+                .child_tombstones
+                .iter()
+                .map(|record| record.child_kind.as_str())
+                .collect::<Vec<_>>(),
+            ["context", "context", "rag", "response", "transcript"]
+        );
+        assert!(bundle
+            .child_tombstones
+            .iter()
+            .all(|record| record.deleted_at_ms == 20));
+        let tombstone_json = serde_json::to_value(&bundle.child_tombstones).unwrap();
+        for marker in tombstone_json.as_array().unwrap() {
+            let marker = marker.as_object().unwrap();
+            if marker["child_kind"] == "rag" {
+                assert_eq!(marker.len(), 7, "RAG tombstones carry identifiers only");
+                assert_eq!(marker["source_kind"], "context");
+                assert_eq!(marker["source_id"], "artifact-private");
+                assert_eq!(marker["chunk_index"], 0);
+            } else {
+                assert_eq!(marker.len(), 4, "non-RAG tombstones carry no payload");
+            }
+            assert!(!marker.contains_key("text"));
+            assert!(!marker.contains_key("title"));
+            assert!(!marker.contains_key("metadata"));
+            assert!(!marker.contains_key("source_uri"));
+        }
         assert!(
             query_rag(&pool, account_id, "private", Some(&[1.0, 0.0]), 5)
                 .unwrap()
@@ -3270,6 +4386,8 @@ mod tests {
         assert!(stale_bundle.transcript_segments.is_empty());
         assert!(stale_bundle.cue_responses.is_empty());
         assert!(stale_bundle.context_artifacts.is_empty());
+        assert!(stale_bundle.rag_chunks.is_empty());
+        assert_eq!(stale_bundle.child_tombstones.len(), 5);
         assert!(
             query_rag(&pool, account_id, "private", Some(&[1.0, 0.0]), 5)
                 .unwrap()
@@ -3310,6 +4428,15 @@ mod tests {
         );
         assert_eq!(newer_bundle.cue_responses[0].text, "newer response text");
         assert!(newer_bundle.context_artifacts.is_empty());
+        assert!(newer_bundle.rag_chunks.is_empty());
+        assert_eq!(
+            newer_bundle
+                .child_tombstones
+                .iter()
+                .map(|record| record.child_kind.as_str())
+                .collect::<Vec<_>>(),
+            ["context", "context", "rag"]
+        );
         assert!(
             query_rag(&pool, account_id, "newer", Some(&[1.0, 0.0]), 5)
                 .unwrap()

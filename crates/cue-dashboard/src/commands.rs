@@ -1,12 +1,18 @@
-use cue_core::ipc::{DaemonRequest, DaemonResponse, DaemonSessionLifecycle, DaemonSessionRecord};
+use cue_core::ipc::{
+    DaemonMutationFence, DaemonRequest, DaemonResponse, DaemonSessionLifecycle, DaemonSessionRecord,
+};
 use cue_core::session::{Session, SessionStatus};
 use cue_core::{AudioCaptureState, AudioPipelineStatus, AudioSourceKind, AudioSourceState};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::DbState;
@@ -61,6 +67,7 @@ pub(crate) struct ActiveSessionSelection {
 pub(crate) struct DashboardOwnerCache {
     pub(crate) owner: Option<DashboardOwner>,
     transitioning: bool,
+    transition_generation: u64,
 }
 
 pub struct DashboardOwnerState(pub(crate) Mutex<DashboardOwnerCache>);
@@ -122,16 +129,29 @@ pub struct AccountMePayload {
     pub auto_topup_amount_cents: i64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendErrorSource {
+    TauriInvoke,
+    WindowError,
+    UnhandledRejection,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendErrorCategory {
+    InvokeRejected,
+    RuntimeError,
+    UnhandledRejection,
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrontendErrorPayload {
-    pub source: String,
-    pub message: String,
+    pub source: FrontendErrorSource,
+    pub category: FrontendErrorCategory,
     #[serde(default)]
     pub command: Option<String>,
-    #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
-    pub stack: Option<String>,
 }
 
 // ===== Daemon IPC helper =====
@@ -185,6 +205,160 @@ fn dashboard_trace_id() -> String {
     cue_core::new_trace_id()
 }
 
+struct DashboardAccountCloudContext {
+    paths: cue_core::app_paths::AppPaths,
+    owner_account_id: String,
+    credential_generation: u64,
+    client: cue_cloud_client::CloudClient,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DashboardAccountFileStamp {
+    present: bool,
+    provider: String,
+    cloud_account_id: Option<String>,
+    user_id: String,
+    credential_generation: u64,
+    token_configured: bool,
+}
+
+impl DashboardAccountFileStamp {
+    fn from_account(account: Option<&cue_core::AccountConfig>) -> Self {
+        let Some(account) = account else {
+            return Self {
+                present: false,
+                provider: String::new(),
+                cloud_account_id: None,
+                user_id: String::new(),
+                credential_generation: 0,
+                token_configured: false,
+            };
+        };
+        Self {
+            present: true,
+            provider: account.provider.trim().to_ascii_lowercase(),
+            cloud_account_id: account
+                .cloud_account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            user_id: account.user_id.trim().to_string(),
+            credential_generation: account.credential_generation,
+            token_configured: account.token_configured(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DashboardOwnerIdentity {
+    owner: DashboardOwner,
+    credential_generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DashboardOwnerSnapshot {
+    identity: DashboardOwnerIdentity,
+    account_file_stamp: DashboardAccountFileStamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DashboardOwnerGuard {
+    identity: DashboardOwnerIdentity,
+    account_file_stamp: DashboardAccountFileStamp,
+    transition_generation: u64,
+}
+
+#[derive(Clone)]
+struct DashboardOwnerStreamToken {
+    cancelled: watch::Receiver<bool>,
+}
+
+struct DashboardOwnerStreamFence {
+    token: DashboardOwnerStreamToken,
+    stop: Arc<AtomicBool>,
+    _monitor: tokio::task::JoinHandle<()>,
+}
+
+impl DashboardAccountCloudContext {
+    fn snapshot(trace_id: &str) -> Result<Self, String> {
+        let paths = cue_core::app_paths::AppPaths::discover()
+            .map_err(|e| format!("account store unavailable: {e}"))?;
+        let account = cue_core::load_account(&paths)
+            .map_err(|e| format!("account profile unavailable: {e}"))?
+            .ok_or_else(|| "Sign in before changing cloud data controls.".to_string())?;
+        let owner_account_id = account
+            .owner_account_id()
+            .map(ToString::to_string)
+            .ok_or_else(|| "Sign in before changing cloud data controls.".to_string())?;
+        let access = account
+            .access_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| "Sign in before changing cloud data controls.".to_string())?;
+        let tokens = cue_cloud_client::Tokens {
+            access,
+            refresh: account.refresh_token.clone().unwrap_or_default(),
+            email: account.user_id.clone(),
+        };
+        let store = cue_cloud_client::tokens::MemoryStore::new();
+        cue_cloud_client::TokenStore::save(&store, &tokens)
+            .map_err(|e| format!("account credentials unavailable: {e}"))?;
+        let config = cue_cloud_client::client::ClientConfig {
+            base_url: account.api_url.clone(),
+            trace_id: Some(trace_id.to_string()),
+            ..Default::default()
+        };
+        let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))
+            .map_err(|e| format!("account store unavailable: {e}"))?;
+        Ok(Self {
+            paths,
+            owner_account_id,
+            credential_generation: account.credential_generation,
+            client,
+        })
+    }
+
+    fn ensure_current(&self) -> Result<(), String> {
+        let account = cue_core::load_account(&self.paths)
+            .map_err(|e| format!("account profile unavailable: {e}"))?
+            .ok_or_else(account_changed_message)?;
+        let owner_account_id = account
+            .owner_account_id()
+            .ok_or_else(account_changed_message)?;
+        if owner_account_id != self.owner_account_id.as_str()
+            || account.credential_generation != self.credential_generation
+        {
+            return Err(account_changed_message());
+        }
+        Ok(())
+    }
+}
+
+fn account_changed_message() -> String {
+    "The signed-in account changed. No cloud data control was changed; try again.".to_string()
+}
+
+fn captured_managed_llm_client(
+    app: &AppHandle,
+    owner_guard: &DashboardOwnerGuard,
+    trace_id: &str,
+) -> Result<Option<cue_cloud_client::CloudClient>, String> {
+    owner_guard.with_current(app, || {
+        if !owner_guard.identity.owner.signed_in() {
+            return Ok(None);
+        }
+        let account_context = DashboardAccountCloudContext::snapshot(trace_id)?;
+        if owner_guard.identity.owner.db_owner_id()
+            != Some(account_context.owner_account_id.as_str())
+            || owner_guard.identity.credential_generation != account_context.credential_generation
+        {
+            return Err(account_changed_message());
+        }
+        Ok(Some(account_context.client))
+    })
+}
+
 fn cloud_client_with_trace(trace_id: &str) -> Result<cue_cloud_client::CloudClient, String> {
     let paths = cue_core::app_paths::AppPaths::discover()
         .map_err(|e| format!("account store unavailable: {e}"))?;
@@ -226,15 +400,45 @@ fn legacy_keyring_fallback_enabled() -> bool {
         })
 }
 
-fn clear_legacy_keyring_tokens_if_enabled() -> Result<(), String> {
+struct CapturedLegacyKeyringCredentials {
+    store: cue_cloud_client::tokens::KeyringStore,
+    snapshot: cue_cloud_client::CredentialSnapshot,
+}
+
+fn capture_legacy_keyring_credentials_if_enabled(
+) -> Result<Option<CapturedLegacyKeyringCredentials>, String> {
     if !legacy_keyring_fallback_enabled() {
-        return Ok(());
+        return Ok(None);
     }
-    let client = cue_cloud_client::CloudClient::with_default_keyring()
+    let store = cue_cloud_client::tokens::KeyringStore::new();
+    let snapshot = cue_cloud_client::TokenStore::load_snapshot(&store)
         .map_err(|e| format!("legacy account keyring unavailable: {e}"))?;
+    Ok(snapshot.map(|snapshot| CapturedLegacyKeyringCredentials { store, snapshot }))
+}
+
+fn clear_captured_legacy_keyring_credentials(
+    captured: Option<CapturedLegacyKeyringCredentials>,
+) -> Result<bool, String> {
+    let Some(captured) = captured else {
+        return Ok(true);
+    };
+    if cue_cloud_client::TokenStore::clear_if_current(&captured.store, &captured.snapshot)
+        .map_err(|e| format!("legacy sign out failed: {e}"))?
+    {
+        return Ok(true);
+    }
+    cue_cloud_client::TokenStore::load_snapshot(&captured.store)
+        .map(|current| current.is_none())
+        .map_err(|e| format!("legacy account keyring unavailable: {e}"))
+}
+
+fn clear_captured_dashboard_credentials(
+    client: &cue_cloud_client::CloudClient,
+    expected: &cue_cloud_client::CredentialSnapshot,
+) -> Result<bool, String> {
     client
-        .clear_tokens()
-        .map_err(|e| format!("legacy sign out failed: {e}"))
+        .clear_credential_snapshot_if_current(expected)
+        .map_err(|e| format!("local sign out failed: {e}"))
 }
 
 fn resolve_dashboard_owner(
@@ -279,7 +483,7 @@ fn owner_identity_error(reason: &str) -> String {
     "Signed-in account identity could not be verified. Sign out and sign in again.".to_string()
 }
 
-pub(crate) fn current_dashboard_owner() -> Result<DashboardOwner, String> {
+fn current_dashboard_owner_identity() -> Result<DashboardOwnerIdentity, String> {
     let paths = cue_core::app_paths::AppPaths::discover()
         .map_err(|e| format!("account store unavailable: {e}"))?;
     let account =
@@ -287,7 +491,44 @@ pub(crate) fn current_dashboard_owner() -> Result<DashboardOwner, String> {
     let trace_id = dashboard_trace_id();
     let client = cloud_client_with_trace(&trace_id)?;
     let tokens = client.current_tokens();
-    resolve_dashboard_owner(account.as_ref(), tokens.as_ref())
+    let owner = resolve_dashboard_owner(account.as_ref(), tokens.as_ref())?;
+    Ok(DashboardOwnerIdentity {
+        owner,
+        credential_generation: account
+            .as_ref()
+            .map(|account| account.credential_generation)
+            .unwrap_or_default(),
+    })
+}
+
+fn current_dashboard_account_file_stamp() -> Result<DashboardAccountFileStamp, String> {
+    let paths = cue_core::app_paths::AppPaths::discover()
+        .map_err(|e| format!("account store unavailable: {e}"))?;
+    let account =
+        cue_core::load_account(&paths).map_err(|e| format!("account profile unavailable: {e}"))?;
+    Ok(DashboardAccountFileStamp::from_account(account.as_ref()))
+}
+
+/// Resolve credentials only while the lightweight account-profile generation
+/// is stable. This closes the gap where another process could replace the
+/// profile between the account read and token-store read.
+fn current_dashboard_owner_snapshot() -> Result<DashboardOwnerSnapshot, String> {
+    for _ in 0..3 {
+        let before = current_dashboard_account_file_stamp()?;
+        let identity = current_dashboard_owner_identity()?;
+        let after = current_dashboard_account_file_stamp()?;
+        if before == after && identity.credential_generation == after.credential_generation {
+            return Ok(DashboardOwnerSnapshot {
+                identity,
+                account_file_stamp: after,
+            });
+        }
+    }
+    Err(account_changed_message())
+}
+
+pub(crate) fn current_dashboard_owner() -> Result<DashboardOwner, String> {
+    current_dashboard_owner_snapshot().map(|snapshot| snapshot.identity.owner)
 }
 
 fn update_cached_owner(
@@ -322,6 +563,9 @@ fn install_dashboard_owner(
             owner.clone(),
             force_clear,
         );
+        if reset {
+            cached.transition_generation = cached.transition_generation.wrapping_add(1);
+        }
         cached.transitioning = false;
         reset
     };
@@ -333,6 +577,12 @@ fn install_dashboard_owner(
 }
 
 fn current_owner_for_app(app: &AppHandle) -> Result<DashboardOwner, String> {
+    capture_dashboard_owner_guard(app).map(|guard| guard.identity.owner)
+}
+
+pub(crate) fn capture_dashboard_owner_guard(
+    app: &AppHandle,
+) -> Result<DashboardOwnerGuard, String> {
     let owner_state = app.state::<DashboardOwnerState>();
     let active_state = app.state::<ActiveSessionState>();
     let (resolved, reset) = {
@@ -340,16 +590,241 @@ fn current_owner_for_app(app: &AppHandle) -> Result<DashboardOwner, String> {
         if cached.transitioning {
             return Err("Account change in progress. Try again in a moment.".to_string());
         }
-        let resolved = current_dashboard_owner();
-        let next_owner = resolved.as_ref().ok().cloned();
+        let resolved = current_dashboard_owner_snapshot();
+        let next_owner = resolved
+            .as_ref()
+            .ok()
+            .map(|snapshot| snapshot.identity.owner.clone());
         let mut cached_active = active_state.0.lock().map_err(|e| e.to_string())?;
         let reset = update_cached_owner(&mut cached.owner, &mut cached_active, next_owner, false);
-        (resolved, reset)
+        if reset {
+            cached.transition_generation = cached.transition_generation.wrapping_add(1);
+        }
+        let guard = resolved.map(|snapshot| DashboardOwnerGuard {
+            identity: snapshot.identity,
+            account_file_stamp: snapshot.account_file_stamp,
+            transition_generation: cached.transition_generation,
+        });
+        (guard, reset)
     };
     if reset {
-        emit_dashboard_owner_change(app, resolved.as_ref().ok());
+        emit_dashboard_owner_change(
+            app,
+            resolved.as_ref().ok().map(|guard| &guard.identity.owner),
+        );
     }
     resolved
+}
+
+impl DashboardOwnerGuard {
+    pub(crate) fn mutation_fence(
+        &self,
+        meeting_id: Option<Uuid>,
+        audio_session_id: Option<String>,
+    ) -> DaemonMutationFence {
+        DaemonMutationFence {
+            owner_account_id: self.identity.owner.db_owner_id().map(str::to_string),
+            credential_generation: self
+                .identity
+                .owner
+                .signed_in()
+                .then_some(self.identity.credential_generation),
+            meeting_id,
+            audio_session_id,
+            capture_generation: None,
+        }
+    }
+
+    fn validate(
+        &self,
+        cache: &DashboardOwnerCache,
+        current: &DashboardOwnerSnapshot,
+    ) -> Result<(), String> {
+        if cache.transitioning
+            || cache.transition_generation != self.transition_generation
+            || cache.owner.as_ref() != Some(&self.identity.owner)
+            || current.identity != self.identity
+            || current.account_file_stamp != self.account_file_stamp
+        {
+            return Err(account_changed_message());
+        }
+        Ok(())
+    }
+
+    fn validate_cached_epoch(&self, cache: &DashboardOwnerCache) -> Result<(), String> {
+        if cache.transitioning
+            || cache.transition_generation != self.transition_generation
+            || cache.owner.as_ref() != Some(&self.identity.owner)
+        {
+            return Err(account_changed_message());
+        }
+        Ok(())
+    }
+
+    fn validate_account_file_stamp(
+        &self,
+        current: &DashboardAccountFileStamp,
+    ) -> Result<(), String> {
+        if current != &self.account_file_stamp {
+            return Err(account_changed_message());
+        }
+        Ok(())
+    }
+
+    fn with_current<T>(
+        &self,
+        app: &AppHandle,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let owner_state = app.state::<DashboardOwnerState>();
+        let cache = owner_state.0.lock().map_err(|e| e.to_string())?;
+        let current = current_dashboard_owner_snapshot()?;
+        self.validate(&cache, &current)?;
+        let result = action()?;
+        let current = current_dashboard_owner_snapshot()?;
+        self.validate(&cache, &current)?;
+        Ok(result)
+    }
+
+    fn ensure_current(&self, app: &AppHandle) -> Result<(), String> {
+        self.with_current(app, || Ok(()))
+    }
+
+    pub(crate) fn begin_transition_if_current(&self, app: &AppHandle) -> Result<(), String> {
+        let owner_state = app.state::<DashboardOwnerState>();
+        let active_state = app.state::<ActiveSessionState>();
+        let reset = {
+            let mut cached = owner_state.0.lock().map_err(|e| e.to_string())?;
+            let current = current_dashboard_owner_snapshot()?;
+            self.validate(&cached, &current)?;
+            let mut cached_active = active_state.0.lock().map_err(|e| e.to_string())?;
+            let reset = update_cached_owner(&mut cached.owner, &mut cached_active, None, true);
+            cached.transitioning = true;
+            cached.transition_generation = cached.transition_generation.wrapping_add(1);
+            reset
+        };
+        if reset {
+            emit_dashboard_owner_change(app, None);
+        }
+        Ok(())
+    }
+}
+
+impl DashboardOwnerStreamFence {
+    /// Start one bounded account-profile monitor for an answer stream. The
+    /// monitor performs the cross-process file reads; per-chunk checks use
+    /// only the watch bit plus the in-process owner epoch.
+    fn start(app: &AppHandle, owner_guard: &DashboardOwnerGuard) -> Result<Self, String> {
+        owner_guard.ensure_current(app)?;
+        owner_guard.validate_account_file_stamp(&current_dashboard_account_file_stamp()?)?;
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let stop = Arc::new(AtomicBool::new(false));
+        let monitor_stop = stop.clone();
+        let monitor_app = app.clone();
+        let monitor_guard = owner_guard.clone();
+        let monitor = tokio::task::spawn_blocking(move || {
+            while !monitor_stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(20));
+                if monitor_stop.load(Ordering::Acquire) {
+                    break;
+                }
+
+                let cache_is_current = monitor_app
+                    .state::<DashboardOwnerState>()
+                    .0
+                    .lock()
+                    .ok()
+                    .is_some_and(|cache| monitor_guard.validate_cached_epoch(&cache).is_ok());
+                let profile_is_current = current_dashboard_account_file_stamp()
+                    .and_then(|stamp| monitor_guard.validate_account_file_stamp(&stamp))
+                    .is_ok();
+                if !cache_is_current || !profile_is_current {
+                    let _ = cancel_tx.send(true);
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            token: DashboardOwnerStreamToken {
+                cancelled: cancel_rx,
+            },
+            stop,
+            _monitor: monitor,
+        })
+    }
+
+    fn token(&self) -> DashboardOwnerStreamToken {
+        self.token.clone()
+    }
+}
+
+impl Drop for DashboardOwnerStreamFence {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+impl DashboardOwnerStreamToken {
+    fn receiver(&self) -> watch::Receiver<bool> {
+        self.cancelled.clone()
+    }
+
+    fn with_current<T>(
+        &self,
+        owner_guard: &DashboardOwnerGuard,
+        app: &AppHandle,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let owner_state = app.state::<DashboardOwnerState>();
+        let cache = owner_state.0.lock().map_err(|e| e.to_string())?;
+        self.validate_fast(owner_guard, &cache)?;
+        action()
+    }
+
+    fn validate_fast(
+        &self,
+        owner_guard: &DashboardOwnerGuard,
+        cache: &DashboardOwnerCache,
+    ) -> Result<(), String> {
+        if *self.cancelled.borrow() {
+            return Err(account_changed_message());
+        }
+        owner_guard.validate_cached_epoch(cache)
+    }
+}
+
+async fn wait_for_owner_stream_cancellation(cancelled: &mut watch::Receiver<bool>) {
+    if *cancelled.borrow() {
+        return;
+    }
+    while cancelled.changed().await.is_ok() {
+        if *cancelled.borrow() {
+            return;
+        }
+    }
+}
+
+fn dashboard_mutation_fence(
+    app: &AppHandle,
+    owner_guard: &DashboardOwnerGuard,
+    audio_session_id: Option<String>,
+) -> Result<DaemonMutationFence, String> {
+    owner_guard.with_current(app, || {
+        let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+        let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+        let meeting = store.load_active().map_err(|e| e.to_string())?;
+        if meeting.as_ref().is_some_and(|meeting| {
+            !owner_guard
+                .identity
+                .owner
+                .owns_meeting(meeting.owner_account_id.as_deref())
+        }) {
+            return Err("The active session belongs to another account.".to_string());
+        }
+        Ok(owner_guard.mutation_fence(meeting.map(|meeting| meeting.id), audio_session_id))
+    })
 }
 
 fn emit_dashboard_owner_change(app: &AppHandle, owner: Option<&DashboardOwner>) {
@@ -372,6 +847,7 @@ fn suspend_dashboard_owner(app: &AppHandle) -> Result<bool, String> {
         let mut cached_active = active_state.0.lock().map_err(|e| e.to_string())?;
         let reset = update_cached_owner(&mut cached.owner, &mut cached_active, None, true);
         cached.transitioning = true;
+        cached.transition_generation = cached.transition_generation.wrapping_add(1);
         reset
     };
     if reset {
@@ -385,6 +861,7 @@ impl DashboardOwnerCache {
         Self {
             owner,
             transitioning: false,
+            transition_generation: 0,
         }
     }
 }
@@ -423,25 +900,41 @@ pub fn get_app_version() -> String {
 pub async fn get_balance_snapshot(
     app: AppHandle,
 ) -> Result<Option<BalanceSnapshotPayload>, String> {
-    current_owner_for_app(&app)?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let trace_id = dashboard_trace_id();
     let client = cloud_client_with_trace(&trace_id)?;
-    if client.current_tokens().is_none() {
+    let Some(credentials) = client.credential_snapshot() else {
+        owner_guard.ensure_current(&app)?;
         return Ok(None);
-    }
+    };
+    let legacy_credentials = capture_legacy_keyring_credentials_if_enabled()?;
 
     let me: cue_cloud_client::AccountMe = match async {
-        verify_dashboard_device_link(&client).await?;
+        verify_dashboard_device_link(&client, &credentials).await?;
         client.auth_get("/account/me").await
     }
     .await
     {
-        Ok(me) => me,
+        Ok(me) => {
+            owner_guard.ensure_current(&app)?;
+            me
+        }
         Err(error) if dashboard_auth_error_should_clear_tokens(&error) => {
-            clear_revoked_dashboard_account(&client, &app, &trace_id).await;
+            clear_revoked_dashboard_account(
+                &app,
+                &trace_id,
+                &owner_guard,
+                &client,
+                &credentials,
+                legacy_credentials,
+            )
+            .await?;
             return Ok(None);
         }
-        Err(error) => return Err(format!("balance lookup failed: {error}")),
+        Err(error) => {
+            owner_guard.ensure_current(&app)?;
+            return Err(format!("balance lookup failed: {error}"));
+        }
     };
     Ok(Some(BalanceSnapshotPayload {
         balance_cents: me.balance_cents,
@@ -457,25 +950,41 @@ pub async fn get_balance_snapshot(
 
 #[tauri::command]
 pub async fn account_me(app: AppHandle) -> Result<Option<AccountMePayload>, String> {
-    current_owner_for_app(&app)?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let trace_id = dashboard_trace_id();
     let client = cloud_client_with_trace(&trace_id)?;
-    if client.current_tokens().is_none() {
+    let Some(credentials) = client.credential_snapshot() else {
+        owner_guard.ensure_current(&app)?;
         return Ok(None);
-    }
+    };
+    let legacy_credentials = capture_legacy_keyring_credentials_if_enabled()?;
 
     let me: cue_cloud_client::AccountMe = match async {
-        verify_dashboard_device_link(&client).await?;
+        verify_dashboard_device_link(&client, &credentials).await?;
         client.auth_get("/account/me").await
     }
     .await
     {
-        Ok(me) => me,
+        Ok(me) => {
+            owner_guard.ensure_current(&app)?;
+            me
+        }
         Err(error) if dashboard_auth_error_should_clear_tokens(&error) => {
-            clear_revoked_dashboard_account(&client, &app, &trace_id).await;
+            clear_revoked_dashboard_account(
+                &app,
+                &trace_id,
+                &owner_guard,
+                &client,
+                &credentials,
+                legacy_credentials,
+            )
+            .await?;
             return Ok(None);
         }
-        Err(error) => return Err(format!("account lookup failed: {error}")),
+        Err(error) => {
+            owner_guard.ensure_current(&app)?;
+            return Err(format!("account lookup failed: {error}"));
+        }
     };
     Ok(Some(AccountMePayload {
         id: me.id,
@@ -490,14 +999,17 @@ pub async fn account_me(app: AppHandle) -> Result<Option<AccountMePayload>, Stri
 
 async fn verify_dashboard_device_link(
     client: &cue_cloud_client::CloudClient,
+    credentials: &cue_cloud_client::CredentialSnapshot,
 ) -> Result<(), cue_cloud_client::Error> {
-    let Some(device_id) = dashboard_stored_cloud_device_id() else {
+    let Some(device_id) = credentials.authority().device_id() else {
         return Ok(());
     };
     let status: cue_cloud_client::DeviceStatusResponse = client
         .auth_post(
             "/account/devices/status",
-            &cue_cloud_client::DeviceStatusRequest { device_id },
+            &cue_cloud_client::DeviceStatusRequest {
+                device_id: device_id.to_string(),
+            },
         )
         .await?;
     if status.active {
@@ -505,18 +1017,6 @@ async fn verify_dashboard_device_link(
     } else {
         Err(cue_cloud_client::Error::Unauthorized)
     }
-}
-
-fn dashboard_stored_cloud_device_id() -> Option<String> {
-    let paths = cue_core::app_paths::AppPaths::discover().ok()?;
-    cue_core::load_account(&paths)
-        .ok()
-        .flatten()
-        .map(|account| account.device_id)
-        .filter(|device_id| {
-            let value = device_id.trim();
-            !value.is_empty() && value != "local-device"
-        })
 }
 
 fn dashboard_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> bool {
@@ -528,152 +1028,338 @@ fn dashboard_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> 
 }
 
 async fn clear_revoked_dashboard_account(
-    client: &cue_cloud_client::CloudClient,
     app: &AppHandle,
     trace_id: &str,
-) {
-    if let Err(error) = begin_dashboard_owner_change(app) {
-        tracing::warn!(%error, "failed to suspend dashboard owner after auth revocation");
+    owner_guard: &DashboardOwnerGuard,
+    client: &cue_cloud_client::CloudClient,
+    credentials: &cue_cloud_client::CredentialSnapshot,
+    legacy_credentials: Option<CapturedLegacyKeyringCredentials>,
+) -> Result<(), String> {
+    owner_guard.begin_transition_if_current(app)?;
+    let daemon_committed = matches!(
+        daemon_ipc_with_trace(
+            DaemonRequest::CloudLogoutBound {
+                fence: owner_guard.mutation_fence(None, None),
+            },
+            trace_id,
+        )
+        .await,
+        Ok(response) if !matches!(response, DaemonResponse::Error { .. })
+    );
+    if !daemon_committed {
+        tracing::warn!(
+            error_category = "daemon_signout_commit_failed",
+            "daemon cleanup failed after dashboard auth revocation"
+        );
     }
-    if let Err(error) = daemon_ipc_with_trace(DaemonRequest::CloudLogout, trace_id).await {
-        tracing::warn!(%error, "daemon cleanup failed after dashboard auth revocation");
+    if !clear_captured_dashboard_credentials(client, credentials)? {
+        tracing::info!("revoked dashboard credential snapshot was already cleared or replaced");
     }
-    let mut credentials_cleared = true;
-    if let Err(error) = client.clear_tokens() {
-        credentials_cleared = false;
-        tracing::warn!(%error, "failed to clear revoked dashboard credentials");
+    if !clear_captured_legacy_keyring_credentials(legacy_credentials)? {
+        tracing::warn!(
+            "revoked legacy dashboard credentials changed while cleanup was pending; newer credentials were kept"
+        );
     }
-    if let Err(error) = clear_legacy_keyring_tokens_if_enabled() {
-        credentials_cleared = false;
-        tracing::warn!(%error, "failed to clear revoked legacy dashboard credentials");
+    if let Err(error) = refresh_dashboard_owner_after_account_change(app) {
+        tracing::warn!(%error, "failed to refresh dashboard owner after auth revocation");
     }
-    let owner = credentials_cleared.then_some(DashboardOwner::Local);
-    if let Err(error) = install_dashboard_owner(app, owner, true) {
-        tracing::warn!(%error, "failed to reset dashboard owner after auth revocation");
-    }
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn billing_portal_url() -> Result<String, String> {
+pub async fn billing_portal_url(app: AppHandle) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct PortalResponse {
         portal_url: String,
     }
 
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let trace_id = dashboard_trace_id();
     let client = cloud_client_with_trace(&trace_id)?;
-    let resp: PortalResponse = client
+    let credentials = client
+        .credential_snapshot()
+        .ok_or_else(|| "Sign in again before opening billing.".to_string())?;
+    let legacy_credentials = capture_legacy_keyring_credentials_if_enabled()?;
+    let resp: PortalResponse = match client
         .auth_post("/billing/portal", &serde_json::json!({}))
         .await
-        .map_err(|e| format!("billing portal failed: {e}"))?;
+    {
+        Ok(response) => {
+            owner_guard.ensure_current(&app)?;
+            response
+        }
+        Err(error) if dashboard_auth_error_should_clear_tokens(&error) => {
+            clear_revoked_dashboard_account(
+                &app,
+                &trace_id,
+                &owner_guard,
+                &client,
+                &credentials,
+                legacy_credentials,
+            )
+            .await?;
+            return Err("Sign in again before opening billing.".to_string());
+        }
+        Err(error) => {
+            owner_guard.ensure_current(&app)?;
+            return Err(format!("billing portal failed: {error}"));
+        }
+    };
     Ok(resp.portal_url)
 }
 
 #[tauri::command]
 pub async fn sign_out(db: State<'_, DbState>, app: AppHandle) -> Result<(), String> {
     let trace_id = dashboard_trace_id();
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let client = cloud_client_with_trace(&trace_id)?;
+    let credentials = client.credential_snapshot();
+    let legacy_credentials = capture_legacy_keyring_credentials_if_enabled()?;
     begin_dashboard_owner_change(&app)?;
-    let daemon_cleanup_error =
-        match daemon_ipc_with_trace(DaemonRequest::CloudLogout, &trace_id).await {
-            Ok(DaemonResponse::Error { message }) => Some(message),
-            Ok(_) => None,
-            Err(error) => Some(error),
-        };
-    if let Err(error) = client.clear_tokens() {
-        let _ = refresh_dashboard_owner_after_account_change(&app);
-        return Err(format!("sign out failed: {error}"));
-    }
-    if let Err(error) = clear_legacy_keyring_tokens_if_enabled() {
-        let _ = refresh_dashboard_owner_after_account_change(&app);
-        return Err(error);
-    }
-    if let Err(error) = mark_onboarding_incomplete(db) {
-        let _ = refresh_dashboard_owner_after_account_change(&app);
-        return Err(error);
-    }
-    install_dashboard_owner(&app, Some(DashboardOwner::Local), true)?;
-
-    if let Some(error) = daemon_cleanup_error {
-        tracing::warn!(%error, "signed out locally but daemon account cleanup failed");
-        return Err(
-            "Signed out locally, but Bluey's local service could not finish account cleanup."
-                .to_string(),
+    let daemon_signed_out = if credentials.is_some() {
+        matches!(
+            daemon_ipc_with_trace(
+                DaemonRequest::CloudLogoutBound {
+                    fence: owner_guard.mutation_fence(None, None),
+                },
+                &trace_id,
+            )
+            .await,
+            Ok(response) if !matches!(response, DaemonResponse::Error { .. })
+        )
+    } else {
+        true
+    };
+    let _current_credentials_cleared = match credentials.as_ref() {
+        Some(credentials) => clear_captured_dashboard_credentials(&client, credentials)?,
+        None => true,
+    };
+    let legacy_credentials_cleared = clear_captured_legacy_keyring_credentials(legacy_credentials)?;
+    let current_owner = refresh_dashboard_owner_after_account_change(&app)?;
+    if current_owner.signed_in || !legacy_credentials_cleared {
+        tracing::warn!(
+            error_category = "signout_credentials_replaced",
+            "sign out preserved credentials that changed while cleanup was pending"
         );
+        return Err(account_changed_message());
     }
+    if !daemon_signed_out {
+        tracing::warn!(
+            error_category = "daemon_signout_commit_failed",
+            "daemon-owned account sign-out did not commit"
+        );
+        return Err("Bluey couldn't finish signing out on this computer.".to_string());
+    }
+    if mark_onboarding_incomplete(db).is_err() {
+        let _ = refresh_dashboard_owner_after_account_change(&app);
+        tracing::warn!(
+            error_category = "onboarding_reset_failed",
+            "local sign out did not reset onboarding state"
+        );
+        return Err("Bluey couldn't finish signing out on this computer.".to_string());
+    }
+    refresh_dashboard_owner_after_account_change(&app)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn delete_account_now(db: State<'_, DbState>, app: AppHandle) -> Result<(), String> {
-    #[derive(serde::Deserialize)]
-    struct DeleteAck {
-        deleted: bool,
-    }
-
+pub async fn delete_account_now(app: AppHandle) -> Result<(), String> {
     let trace_id = dashboard_trace_id();
-    let client = cloud_client_with_trace(&trace_id)?;
-    let ack: DeleteAck = client
-        .auth_post(
-            "/account/delete",
-            &serde_json::json!({
-                "confirm_text": "DELETE",
-                "accept_data_loss": true,
-                "accept_credit_loss": true
-            }),
-        )
-        .await
-        .map_err(|e| format!("delete account failed: {e}"))?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let account_context = DashboardAccountCloudContext::snapshot(&trace_id).map_err(|_| {
+        tracing::warn!(
+            error_category = "account_snapshot_unavailable",
+            "account deletion could not capture its local account snapshot"
+        );
+        "Bluey could not safely prepare account deletion on this computer.".to_string()
+    })?;
+    if owner_guard.identity.owner.db_owner_id() != Some(account_context.owner_account_id.as_str())
+        || owner_guard.identity.credential_generation != account_context.credential_generation
+    {
+        return Err(account_changed_message());
+    }
+    let owner_account_id = account_context.owner_account_id.clone();
+    let proposed = cue_cloud_client::types::AccountDeletionCapability::new();
+    let prepared = daemon_ipc_with_trace(
+        DaemonRequest::CloudPrepareAccountDeletion {
+            owner_account_id: owner_account_id.clone(),
+            operation_id: proposed.operation_id,
+            recovery_token: proposed.recovery_token,
+        },
+        &trace_id,
+    )
+    .await
+    .map_err(|_| {
+        tracing::warn!(
+            error_category = "daemon_prepare_unavailable",
+            "account deletion local fence request failed"
+        );
+        "Bluey could not safely prepare local account cleanup.".to_string()
+    })?;
+    let capability = match prepared {
+        DaemonResponse::AccountDeletionPrepared {
+            operation_id,
+            recovery_token,
+        } => cue_cloud_client::types::AccountDeletionCapability {
+            operation_id,
+            recovery_token,
+        },
+        DaemonResponse::Error { .. } => {
+            tracing::warn!(
+                error_category = "daemon_prepare_rejected",
+                "account deletion local fence was rejected"
+            );
+            return Err("Bluey could not safely prepare local account cleanup.".to_string());
+        }
+        _ => return Err("Bluey could not verify its local deletion marker.".to_string()),
+    };
+    account_context.ensure_current()?;
+    owner_guard.begin_transition_if_current(&app).map_err(|_| {
+        tracing::warn!(
+            error_category = "owner_transition_failed",
+            "account deletion could not publish its local owner fence"
+        );
+        "Bluey could not safely begin account deletion on this computer.".to_string()
+    })?;
+    account_context.ensure_current()?;
+    let ack = match account_context.client.delete_account(&capability).await {
+        Ok(ack) => ack,
+        Err(_) => match account_context
+            .client
+            .account_deletion_status(&capability)
+            .await
+        {
+            Ok(status) if status.deleted => cue_cloud_client::types::AccountDeletionAck {
+                deleted: true,
+                deleted_at: status.deleted_at,
+                deletion_pending: false,
+                retry_after_ms: None,
+                object_count_deleted: 0,
+                note: None,
+            },
+            Ok(status) if status.deletion_pending => {
+                tracing::warn!(
+                    error_category = "server_deletion_pending",
+                    "account deletion is durably pending; local fence retained"
+                );
+                return Err(
+                    "Account deletion is safely in progress. Local account writes remain paused; try again shortly."
+                        .to_string(),
+                );
+            }
+            Ok(_) | Err(_) => {
+                tracing::warn!(
+                    error_category = "server_result_unknown",
+                    "account deletion result is unknown; local fence retained"
+                );
+                return Err(
+                    "Bluey could not confirm the server result. Local account writes remain paused; try deletion again to reconcile safely."
+                        .to_string(),
+                );
+            }
+        },
+    };
     if ack.deleted {
-        begin_dashboard_owner_change(&app)?;
-        if let Err(error) = daemon_ipc_with_trace(DaemonRequest::CloudLogout, &trace_id).await {
-            tracing::warn!(%error, "daemon cleanup failed after account deletion");
-        }
-        if let Err(error) = client.clear_tokens() {
+        let cleanup = daemon_ipc_with_trace(
+            DaemonRequest::CloudPurgeDeletedAccount {
+                owner_account_id: owner_account_id.clone(),
+            },
+            &trace_id,
+        )
+        .await;
+        let cleanup_failed = !matches!(
+            cleanup,
+            Ok(response) if !matches!(response, DaemonResponse::Error { .. })
+        );
+        if cleanup_failed {
             let _ = refresh_dashboard_owner_after_account_change(&app);
-            return Err(format!(
-                "account deleted, but local sign out failed: {error}"
-            ));
+            tracing::error!(
+                error_category = "daemon_local_purge_failed",
+                "local account purge incomplete after server deletion"
+            );
+            return Err(
+                "Your Bluey account was deleted, but this computer could not finish removing its local copy. Restart Bluey to resume the protected local cleanup before signing in again."
+                    .to_string(),
+            );
         }
-        if let Err(error) = clear_legacy_keyring_tokens_if_enabled() {
-            let _ = refresh_dashboard_owner_after_account_change(&app);
-            return Err(error);
+        // The daemon owns data, profile-token generation, and onboarding
+        // cleanup under the same answer-persistence barrier. The dashboard
+        // publishes its local owner only after that transaction completes.
+        install_dashboard_owner(&app, Some(DashboardOwner::Local), true).map_err(|_| {
+            tracing::error!(
+                error_category = "owner_cleanup_failed",
+                "account deleted but local owner cleanup failed"
+            );
+            "Your account was deleted, but Bluey could not finish local cleanup.".to_string()
+        })?;
+        let acknowledged = daemon_ipc_with_trace(
+            DaemonRequest::CloudAcknowledgeDeletedAccountPurge {
+                owner_account_id: owner_account_id.clone(),
+                operation_id: capability.operation_id.clone(),
+                recovery_token: capability.recovery_token.clone(),
+            },
+            &trace_id,
+        )
+        .await;
+        if !matches!(acknowledged, Ok(response) if !matches!(response, DaemonResponse::Error { .. }))
+        {
+            tracing::error!(
+                error_category = "local_cleanup_ack_failed",
+                "deleted-account cleanup marker remains for restart-safe acknowledgement"
+            );
+            return Err(
+                "Your account was deleted and local data was removed, but Bluey still needs to confirm cleanup. Restart Bluey before signing in again."
+                    .to_string(),
+            );
         }
-        if let Err(error) = mark_onboarding_incomplete(db) {
-            let _ = refresh_dashboard_owner_after_account_change(&app);
-            return Err(error);
+    } else {
+        if ack.deletion_pending {
+            return Err(ack.note.unwrap_or_else(|| {
+                "Deletion is safely fenced and waiting for an in-flight upload. Try again shortly."
+                    .to_string()
+            }));
         }
-        install_dashboard_owner(&app, Some(DashboardOwner::Local), true)?;
+        let abort = daemon_ipc_with_trace(
+            DaemonRequest::CloudAbortAccountDeletion { owner_account_id },
+            &trace_id,
+        )
+        .await;
+        if !matches!(abort, Ok(response) if !matches!(response, DaemonResponse::Error { .. })) {
+            tracing::error!(
+                error_category = "local_fence_abort_failed",
+                "server declined account deletion but local fence cleanup failed"
+            );
+        }
+        let _ = refresh_dashboard_owner_after_account_change(&app);
+        return Err(ack.note.unwrap_or_else(|| {
+            "The server did not delete this account. Local activity has resumed.".to_string()
+        }));
     }
     Ok(())
 }
 
 #[tauri::command]
 pub fn report_frontend_error(payload: FrontendErrorPayload) -> Result<(), String> {
+    let command = payload
+        .command
+        .as_deref()
+        .filter(|value| is_safe_frontend_command(value))
+        .unwrap_or("other");
     tracing::warn!(
-        source = %truncate_log_field(&payload.source, 120),
-        command = %payload.command.as_deref().map(|v| truncate_log_field(v, 120)).unwrap_or_default(),
-        url = %payload.url.as_deref().map(|v| truncate_log_field(v, 240)).unwrap_or_default(),
-        message = %truncate_log_field(&payload.message, 700),
-        stack = %payload.stack.as_deref().map(|v| truncate_log_field(v, 1200)).unwrap_or_default(),
+        source = ?payload.source,
+        category = ?payload.category,
+        command,
         "frontend error captured"
     );
     Ok(())
 }
 
-fn truncate_log_field(value: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for ch in value.chars().take(max_chars) {
-        if ch.is_control() && ch != '\n' && ch != '\t' {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
-    }
-    if value.chars().count() > max_chars {
-        out.push('…');
-    }
-    out
+fn is_safe_frontend_command(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 #[tauri::command]
@@ -682,10 +1368,13 @@ pub fn get_signin_url() -> String {
 }
 
 #[tauri::command]
-pub fn complete_onboarding(db: State<DbState>) -> Result<(), String> {
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.save_setting("onboarding_complete", "true")
-        .map_err(|e| e.to_string())
+pub fn complete_onboarding(db: State<DbState>, app: AppHandle) -> Result<(), String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        db.save_setting("onboarding_complete", "true")
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn mark_onboarding_incomplete(db: State<DbState>) -> Result<(), String> {
@@ -873,9 +1562,11 @@ fn session_lifecycle_from_response(
 
 #[tauri::command]
 pub fn list_sessions(db: State<DbState>, app: AppHandle) -> Result<Vec<Session>, String> {
-    let owner = current_owner_for_app(&app)?;
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    dashboard_list_sessions(&db, &owner)
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        dashboard_list_sessions(&db, &owner_guard.identity.owner)
+    })
 }
 
 #[tauri::command]
@@ -885,29 +1576,34 @@ pub async fn create_session(
     active: State<'_, ActiveSessionState>,
     app: AppHandle,
 ) -> Result<Session, String> {
-    let owner = current_owner_for_app(&app)?;
-    let lifecycle =
-        session_lifecycle_from_response(daemon_ipc(DaemonRequest::SessionCreate { title }).await?)?;
-    let session = {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
+    let lifecycle = session_lifecycle_from_response(
+        daemon_ipc(DaemonRequest::SessionCreateBound { title, fence }).await?,
+    )?;
+    owner_guard.with_current(&app, || {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        project_session_lifecycle(&db, &owner, &lifecycle)?
-            .ok_or_else(|| "daemon did not return the created session".to_string())?
-    };
-    cache_active_session(&active, &owner, lifecycle.active_session_id)?;
-    // Broadcast so any other window / page listening via
-    // `useSessionEvents` picks up the new session without a refetch.
-    if let Err(e) = app.emit("session:created", &session) {
-        tracing::warn!(error = %e, "failed to emit session:created event");
-    }
-    if let Err(e) = app.emit(
-        "session:switched",
-        SessionSwitchedPayload {
-            id: lifecycle.active_session_id.map(|id| id.to_string()),
-        },
-    ) {
-        tracing::warn!(error = %e, "failed to emit session:switched event");
-    }
-    Ok(session)
+        let session = project_session_lifecycle(&db, &owner_guard.identity.owner, &lifecycle)?
+            .ok_or_else(|| "daemon did not return the created session".to_string())?;
+        drop(db);
+        cache_active_session(
+            &active,
+            &owner_guard.identity.owner,
+            lifecycle.active_session_id,
+        )?;
+        if let Err(e) = app.emit("session:created", &session) {
+            tracing::warn!(error = %e, "failed to emit session:created event");
+        }
+        if let Err(e) = app.emit(
+            "session:switched",
+            SessionSwitchedPayload {
+                id: lifecycle.active_session_id.map(|id| id.to_string()),
+            },
+        ) {
+            tracing::warn!(error = %e, "failed to emit session:switched event");
+        }
+        Ok(session)
+    })
 }
 
 #[tauri::command]
@@ -916,10 +1612,12 @@ pub fn get_session(
     db: State<DbState>,
     app: AppHandle,
 ) -> Result<Option<Session>, String> {
-    let owner = current_owner_for_app(&app)?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    dashboard_get_session(&db, &owner, uuid)
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        dashboard_get_session(&db, &owner_guard.identity.owner, uuid)
+    })
 }
 
 #[tauri::command]
@@ -929,29 +1627,35 @@ pub async fn archive_session(
     active: State<'_, ActiveSessionState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let owner = current_owner_for_app(&app)?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    let previous = {
+    let previous = owner_guard.with_current(&app, || {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        active_session_for_owner(&db, &active, &owner)?
-    };
+        active_session_for_owner(&db, &active, &owner_guard.identity.owner)
+    })?;
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
     let lifecycle = session_lifecycle_from_response(
-        daemon_ipc(DaemonRequest::SessionArchive { id: uuid }).await?,
+        daemon_ipc(DaemonRequest::SessionArchiveBound { id: uuid, fence }).await?,
     )?;
-    {
+    owner_guard.with_current(&app, || {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        project_session_lifecycle(&db, &owner, &lifecycle)?;
-    }
-    cache_active_session(&active, &owner, lifecycle.active_session_id)?;
-    if previous != lifecycle.active_session_id {
-        let _ = app.emit(
-            "session:switched",
-            SessionSwitchedPayload {
-                id: lifecycle.active_session_id.map(|id| id.to_string()),
-            },
-        );
-    }
-    Ok(())
+        project_session_lifecycle(&db, &owner_guard.identity.owner, &lifecycle)?;
+        drop(db);
+        cache_active_session(
+            &active,
+            &owner_guard.identity.owner,
+            lifecycle.active_session_id,
+        )?;
+        if previous != lifecycle.active_session_id {
+            let _ = app.emit(
+                "session:switched",
+                SessionSwitchedPayload {
+                    id: lifecycle.active_session_id.map(|id| id.to_string()),
+                },
+            );
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -961,31 +1665,37 @@ pub async fn delete_session(
     active: State<'_, ActiveSessionState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let owner = current_owner_for_app(&app)?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
-    let previous = {
+    let previous = owner_guard.with_current(&app, || {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        active_session_for_owner(&db, &active, &owner)?
-    };
+        active_session_for_owner(&db, &active, &owner_guard.identity.owner)
+    })?;
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
     let lifecycle = session_lifecycle_from_response(
-        daemon_ipc(DaemonRequest::SessionDelete { id: uuid }).await?,
+        daemon_ipc(DaemonRequest::SessionDeleteBound { id: uuid, fence }).await?,
     )?;
-    {
+    owner_guard.with_current(&app, || {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        project_session_lifecycle(&db, &owner, &lifecycle)?;
-    }
-    cache_active_session(&active, &owner, lifecycle.active_session_id)?;
-    if previous != lifecycle.active_session_id {
-        if let Err(e) = app.emit(
-            "session:switched",
-            SessionSwitchedPayload {
-                id: lifecycle.active_session_id.map(|id| id.to_string()),
-            },
-        ) {
-            tracing::warn!(error = %e, "failed to emit session:switched event");
+        project_session_lifecycle(&db, &owner_guard.identity.owner, &lifecycle)?;
+        drop(db);
+        cache_active_session(
+            &active,
+            &owner_guard.identity.owner,
+            lifecycle.active_session_id,
+        )?;
+        if previous != lifecycle.active_session_id {
+            if let Err(e) = app.emit(
+                "session:switched",
+                SessionSwitchedPayload {
+                    id: lifecycle.active_session_id.map(|id| id.to_string()),
+                },
+            ) {
+                tracing::warn!(error = %e, "failed to emit session:switched event");
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -995,14 +1705,22 @@ pub async fn update_session_title(
     db: State<'_, DbState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let owner = current_owner_for_app(&app)?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let uuid = Uuid::parse_str(&id).map_err(|e| e.to_string())?;
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
     let lifecycle = session_lifecycle_from_response(
-        daemon_ipc(DaemonRequest::SessionRename { id: uuid, title }).await?,
+        daemon_ipc(DaemonRequest::SessionRenameBound {
+            id: uuid,
+            title,
+            fence,
+        })
+        .await?,
     )?;
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    project_session_lifecycle(&db, &owner, &lifecycle)?;
-    Ok(())
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        project_session_lifecycle(&db, &owner_guard.identity.owner, &lifecycle)?;
+        Ok(())
+    })
 }
 
 /// Return the currently-active session id, or `None` if no session is selected.
@@ -1012,9 +1730,14 @@ pub fn get_active_session(
     active: State<ActiveSessionState>,
     app: AppHandle,
 ) -> Result<Option<String>, String> {
-    let owner = current_owner_for_app(&app)?;
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    Ok(active_session_for_owner(&db, &active, &owner)?.map(|id| id.to_string()))
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        Ok(
+            active_session_for_owner(&db, &active, &owner_guard.identity.owner)?
+                .map(|id| id.to_string()),
+        )
+    })
 }
 
 /// Set the active session. Pass `None` to clear the selection.
@@ -1029,35 +1752,38 @@ pub async fn set_active_session(
     active: State<'_, ActiveSessionState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let owner = current_owner_for_app(&app)?;
-    let previous = {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let previous = owner_guard.with_current(&app, || {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        active_session_for_owner(&db, &active, &owner)?
-    };
+        active_session_for_owner(&db, &active, &owner_guard.identity.owner)
+    })?;
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
     let request = match id {
-        Some(raw) => DaemonRequest::SessionActivate {
+        Some(raw) => DaemonRequest::SessionActivateBound {
             id: Uuid::parse_str(&raw).map_err(|e| e.to_string())?,
+            fence,
         },
-        None => DaemonRequest::SessionDeactivate,
+        None => DaemonRequest::SessionDeactivateBound { fence },
     };
     let lifecycle = session_lifecycle_from_response(daemon_ipc(request).await?)?;
-    {
+    owner_guard.with_current(&app, || {
         let db = db.0.lock().map_err(|e| e.to_string())?;
-        project_session_lifecycle(&db, &owner, &lifecycle)?;
-    }
-    let new_id = lifecycle.active_session_id;
-    let changed = previous != new_id;
-    cache_active_session(&active, &owner, new_id)?;
+        project_session_lifecycle(&db, &owner_guard.identity.owner, &lifecycle)?;
+        drop(db);
+        let new_id = lifecycle.active_session_id;
+        let changed = previous != new_id;
+        cache_active_session(&active, &owner_guard.identity.owner, new_id)?;
 
-    if changed {
-        let payload = SessionSwitchedPayload {
-            id: new_id.map(|u| u.to_string()),
-        };
-        if let Err(e) = app.emit("session:switched", payload) {
-            tracing::warn!(error = %e, "failed to emit session:switched event");
+        if changed {
+            let payload = SessionSwitchedPayload {
+                id: new_id.map(|u| u.to_string()),
+            };
+            if let Err(e) = app.emit("session:switched", payload) {
+                tracing::warn!(error = %e, "failed to emit session:switched event");
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// List turns for a session (read-only). Used by the session detail page.
@@ -1067,46 +1793,279 @@ pub fn list_turns(
     db: State<DbState>,
     app: AppHandle,
 ) -> Result<Vec<cue_core::session::Turn>, String> {
-    let owner = current_owner_for_app(&app)?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let uuid = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.list_turns_for_owner(owner.db_owner_id(), uuid, None)
-        .map_err(|e| e.to_string())
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        db.list_turns_for_owner(owner_guard.identity.owner.db_owner_id(), uuid, None)
+            .map_err(|e| e.to_string())
+    })
 }
 
 // ===== Settings + Secrets commands (Phase 3 Round 5) =====
 
+const SUPPORT_CLEANUP_OWNER_MESSAGE: &str = concat!(
+    "Support diagnostic cleanup belongs to another or unverified account. ",
+    "Sign in to the original account to finish cleanup."
+);
+
 #[derive(Clone, Serialize)]
 pub struct DataControlsPayload {
+    pub account_scope_available: bool,
     pub cloud_sync_enabled: bool,
+    pub support_diagnostics_upload_enabled: bool,
+    pub support_diagnostics_server_cleanup_pending: bool,
+    pub support_diagnostics_cleanup_waiting_for_another_account: bool,
     pub raw_audio_retained: bool,
     pub training_enabled: bool,
 }
 
-fn data_controls_payload(settings: &cue_core::CueSettings) -> DataControlsPayload {
+fn data_controls_payload(
+    settings: &cue_core::CueSettings,
+    owner: &DashboardOwner,
+) -> DataControlsPayload {
+    let account_id = owner.db_owner_id();
     DataControlsPayload {
-        cloud_sync_enabled: settings.cloud_sync_enabled,
+        account_scope_available: account_id.is_some(),
+        cloud_sync_enabled: settings.cloud_sync_allowed_for_account(account_id),
+        support_diagnostics_upload_enabled: settings
+            .support_diagnostics_upload_allowed_for_account(account_id),
+        support_diagnostics_server_cleanup_pending: settings
+            .support_diagnostics_revocation_pending_for_account(account_id),
+        support_diagnostics_cleanup_waiting_for_another_account: settings
+            .support_diagnostics_revocation_waits_for_other_account(account_id),
         raw_audio_retained: false,
         training_enabled: false,
     }
 }
 
-#[tauri::command]
-pub fn get_data_controls() -> Result<DataControlsPayload, String> {
-    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
-    let settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
-    Ok(data_controls_payload(&settings))
+fn set_cloud_sync_for_account(
+    settings: &mut cue_core::CueSettings,
+    owner_account_id: &str,
+    enabled: bool,
+) {
+    if enabled {
+        settings.cloud_sync_consent_account_id = Some(owner_account_id.to_string());
+        settings.cloud_sync_consent_granted = true;
+        settings.cloud_sync_enabled = true;
+    } else if settings.cloud_sync_consent_scoped_to(Some(owner_account_id)) {
+        settings.cloud_sync_enabled = false;
+        settings.cloud_sync_consent_granted = false;
+        settings.cloud_sync_consent_account_id = None;
+    }
+}
+
+fn begin_support_diagnostics_revocation(
+    settings: &mut cue_core::CueSettings,
+    owner_account_id: &str,
+) -> Result<bool, String> {
+    if settings.support_diagnostics_revocation_waits_for_other_account(Some(owner_account_id)) {
+        return Err(SUPPORT_CLEANUP_OWNER_MESSAGE.to_string());
+    }
+    if !settings.support_diagnostics_consent_scoped_to(Some(owner_account_id))
+        && !settings.support_diagnostics_revocation_pending_for_account(Some(owner_account_id))
+    {
+        return Ok(false);
+    }
+    settings.support_diagnostics_upload_enabled = false;
+    settings.support_diagnostics_upload_consent_granted = false;
+    settings.support_diagnostics_upload_consent_account_id = None;
+    settings.support_diagnostics_server_revocation_pending = true;
+    settings.support_diagnostics_server_revocation_account_id = Some(owner_account_id.to_string());
+    Ok(true)
+}
+
+fn complete_support_diagnostics_revocation(
+    settings: &mut cue_core::CueSettings,
+    owner_account_id: &str,
+) {
+    if settings.support_diagnostics_revocation_pending_for_account(Some(owner_account_id)) {
+        settings.support_diagnostics_server_revocation_pending = false;
+        settings.support_diagnostics_server_revocation_account_id = None;
+        settings.support_diagnostics_upload_enabled = false;
+        settings.support_diagnostics_upload_consent_granted = false;
+        settings.support_diagnostics_upload_consent_account_id = None;
+    }
+}
+
+async fn compensate_support_diagnostic_grant(
+    account_context: &DashboardAccountCloudContext,
+    paths: &cue_core::app_paths::AppPaths,
+) {
+    let remote_cleared = account_context
+        .client
+        .set_support_diagnostic_consent(false)
+        .await
+        .is_ok()
+        && account_context
+            .client
+            .delete_all_support_diagnostics()
+            .await
+            .is_ok();
+    if remote_cleared {
+        return;
+    }
+    let owner_account_id = account_context.owner_account_id.as_str();
+    if cue_core::update_settings(paths, |settings| {
+        settings.support_diagnostics_upload_enabled = false;
+        settings.support_diagnostics_upload_consent_granted = false;
+        settings.support_diagnostics_upload_consent_account_id = None;
+        settings.support_diagnostics_server_revocation_pending = true;
+        settings.support_diagnostics_server_revocation_account_id =
+            Some(owner_account_id.to_string());
+    })
+    .is_err()
+    {
+        tracing::error!(
+            error_category = "support_consent_compensation_persist_failed",
+            "support diagnostic consent compensation could not be persisted"
+        );
+    }
 }
 
 #[tauri::command]
-pub fn set_cloud_sync_enabled(enabled: bool) -> Result<DataControlsPayload, String> {
-    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
-    let settings = cue_core::update_settings(&paths, |settings| {
-        settings.cloud_sync_consent_granted = enabled;
-        settings.cloud_sync_enabled = enabled;
+pub fn get_data_controls(app: AppHandle) -> Result<DataControlsPayload, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+        let settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
+        Ok(data_controls_payload(
+            &settings,
+            &owner_guard.identity.owner,
+        ))
     })
-    .map_err(|e| e.to_string())?;
-    Ok(data_controls_payload(&settings))
+}
+
+#[tauri::command]
+pub fn set_cloud_sync_enabled(
+    enabled: bool,
+    app: AppHandle,
+) -> Result<DataControlsPayload, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let owner = &owner_guard.identity.owner;
+    let owner_account_id = owner
+        .db_owner_id()
+        .ok_or_else(|| "Sign in before enabling saved-session sync.".to_string())?;
+    owner_guard.with_current(&app, || {
+        let account_context = DashboardAccountCloudContext::snapshot(&dashboard_trace_id())?;
+        if account_context.owner_account_id != owner_account_id {
+            return Err(account_changed_message());
+        }
+        account_context.ensure_current()?;
+        let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+        let settings = cue_core::update_settings(&paths, |settings| {
+            set_cloud_sync_for_account(settings, owner_account_id, enabled);
+        })
+        .map_err(|e| e.to_string())?;
+        Ok(data_controls_payload(&settings, owner))
+    })
+}
+
+#[tauri::command]
+pub async fn set_support_diagnostics_upload_enabled(
+    enabled: bool,
+    app: AppHandle,
+) -> Result<DataControlsPayload, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let owner = &owner_guard.identity.owner;
+    let owner_account_id = owner
+        .db_owner_id()
+        .ok_or_else(|| "Sign in before changing support diagnostics.".to_string())?;
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let account_context = DashboardAccountCloudContext::snapshot(&dashboard_trace_id())?;
+    if account_context.owner_account_id != owner_account_id {
+        return Err(account_changed_message());
+    }
+    account_context.ensure_current()?;
+    if enabled {
+        let existing = owner_guard.with_current(&app, || {
+            cue_core::load_settings(&paths).map_err(|e| e.to_string())
+        })?;
+        let remote_consent_was_new =
+            !existing.support_diagnostics_upload_allowed_for_account(Some(owner_account_id));
+        if existing.support_diagnostics_server_revocation_pending {
+            let detail = if existing
+                .support_diagnostics_revocation_pending_for_account(Some(owner_account_id))
+            {
+                "Support diagnostic cleanup is still pending. Try again after cleanup finishes."
+            } else {
+                SUPPORT_CLEANUP_OWNER_MESSAGE
+            };
+            return Err(detail.to_string());
+        }
+        account_context
+            .client
+            .set_support_diagnostic_consent(true)
+            .await
+            .map_err(|_| "Bluey could not confirm support diagnostic consent yet.".to_string())?;
+        if let Err(error) = account_context.ensure_current() {
+            if remote_consent_was_new {
+                compensate_support_diagnostic_grant(&account_context, &paths).await;
+            }
+            return Err(error);
+        }
+        let commit = owner_guard.with_current(&app, || {
+            let settings = cue_core::update_settings(&paths, |settings| {
+                settings.support_diagnostics_upload_consent_granted = true;
+                settings.support_diagnostics_upload_enabled = true;
+                settings.support_diagnostics_upload_consent_account_id =
+                    Some(owner_account_id.to_string());
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(data_controls_payload(&settings, owner))
+        });
+        if commit.is_err() && remote_consent_was_new {
+            compensate_support_diagnostic_grant(&account_context, &paths).await;
+        }
+        return commit;
+    }
+
+    // Stop uploads locally before any network work. If the server is offline,
+    // the durable account-scoped outbox makes cleanup retry only for its owner.
+    let existing = owner_guard.with_current(&app, || {
+        cue_core::load_settings(&paths).map_err(|e| e.to_string())
+    })?;
+    if existing.support_diagnostics_revocation_waits_for_other_account(Some(owner_account_id)) {
+        return Err(SUPPORT_CLEANUP_OWNER_MESSAGE.to_string());
+    }
+    let should_revoke = existing.support_diagnostics_consent_scoped_to(Some(owner_account_id))
+        || existing.support_diagnostics_revocation_pending_for_account(Some(owner_account_id));
+    if !should_revoke {
+        return owner_guard.with_current(&app, || Ok(data_controls_payload(&existing, owner)));
+    }
+    let mut settings = owner_guard.with_current(&app, || {
+        cue_core::update_settings(&paths, |settings| {
+            let _ = begin_support_diagnostics_revocation(settings, owner_account_id);
+        })
+        .map_err(|e| e.to_string())
+    })?;
+
+    let server_cleanup_completed = account_context.ensure_current().is_ok()
+        && account_context
+            .client
+            .set_support_diagnostic_consent(false)
+            .await
+            .is_ok()
+        && account_context.ensure_current().is_ok()
+        && account_context
+            .client
+            .delete_all_support_diagnostics()
+            .await
+            .is_ok()
+        && account_context.ensure_current().is_ok();
+    if server_cleanup_completed {
+        settings = owner_guard.with_current(&app, || {
+            cue_core::update_settings(&paths, |settings| {
+                complete_support_diagnostics_revocation(settings, owner_account_id);
+            })
+            .map_err(|e| e.to_string())
+        })?;
+    } else {
+        tracing::warn!(
+            "support diagnostic upload stopped locally; server cleanup is queued for retry"
+        );
+    }
+    owner_guard.with_current(&app, || Ok(data_controls_payload(&settings, owner)))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1321,10 +2280,18 @@ pub fn search_transcripts(
     query: String,
     limit: Option<usize>,
     db: State<DbState>,
+    app: AppHandle,
 ) -> Result<Vec<cue_daemon::db::search::TranscriptHit>, String> {
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.search_transcripts(&query, limit.unwrap_or(50))
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        db.search_transcripts_for_owner(
+            owner_guard.identity.owner.db_owner_id(),
+            &query,
+            limit.unwrap_or(50),
+        )
         .map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
@@ -1333,17 +2300,27 @@ pub fn export_session_to_clipboard(
     format: String,
     app: AppHandle,
 ) -> Result<String, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let db_state: State<DbState> = app.state();
-    let db = db_state.0.lock().map_err(|e| e.to_string())?;
-    let content = match format.as_str() {
-        "markdown" => db
-            .export_session_markdown(&id, &cue_daemon::export::ExportOptions::default())
-            .map_err(|e| e.to_string())?,
-        "text" => db.export_session_text(&id).map_err(|e| e.to_string())?,
-        "json" => db.export_session_json(&id).map_err(|e| e.to_string())?,
-        _ => return Err(format!("unsupported format: {format}")),
-    };
-    Ok(content)
+    owner_guard.with_current(&app, || {
+        let db = db_state.0.lock().map_err(|e| e.to_string())?;
+        match format.as_str() {
+            "markdown" => db
+                .export_session_markdown_for_owner(
+                    owner_guard.identity.owner.db_owner_id(),
+                    &id,
+                    &cue_daemon::export::ExportOptions::default(),
+                )
+                .map_err(|e| e.to_string()),
+            "text" => db
+                .export_session_text_for_owner(owner_guard.identity.owner.db_owner_id(), &id)
+                .map_err(|e| e.to_string()),
+            "json" => db
+                .export_session_json_for_owner(owner_guard.identity.owner.db_owner_id(), &id)
+                .map_err(|e| e.to_string()),
+            _ => Err(format!("unsupported format: {format}")),
+        }
+    })
 }
 
 #[tauri::command]
@@ -1353,17 +2330,28 @@ pub fn export_session_to_file(
     path: String,
     app: AppHandle,
 ) -> Result<(), String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let db_state: State<DbState> = app.state();
-    let db = db_state.0.lock().map_err(|e| e.to_string())?;
-    let content = match format.as_str() {
-        "markdown" => db
-            .export_session_markdown(&id, &cue_daemon::export::ExportOptions::default())
-            .map_err(|e| e.to_string())?,
-        "text" => db.export_session_text(&id).map_err(|e| e.to_string())?,
-        "json" => db.export_session_json(&id).map_err(|e| e.to_string())?,
-        _ => return Err(format!("unsupported format: {format}")),
-    };
-    std::fs::write(&path, content).map_err(|e| e.to_string())
+    owner_guard.with_current(&app, || {
+        let db = db_state.0.lock().map_err(|e| e.to_string())?;
+        let content = match format.as_str() {
+            "markdown" => db
+                .export_session_markdown_for_owner(
+                    owner_guard.identity.owner.db_owner_id(),
+                    &id,
+                    &cue_daemon::export::ExportOptions::default(),
+                )
+                .map_err(|e| e.to_string())?,
+            "text" => db
+                .export_session_text_for_owner(owner_guard.identity.owner.db_owner_id(), &id)
+                .map_err(|e| e.to_string())?,
+            "json" => db
+                .export_session_json_for_owner(owner_guard.identity.owner.db_owner_id(), &id)
+                .map_err(|e| e.to_string())?,
+            _ => return Err(format!("unsupported format: {format}")),
+        };
+        std::fs::write(&path, content).map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
@@ -1373,19 +2361,34 @@ pub fn set_speaker_name(
     name: String,
     color: Option<String>,
     db: State<DbState>,
+    app: AppHandle,
 ) -> Result<(), String> {
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.set_speaker_name(&session_id, speaker_id, &name, color.as_deref())
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        db.set_speaker_name_for_owner(
+            owner_guard.identity.owner.db_owner_id(),
+            &session_id,
+            speaker_id,
+            &name,
+            color.as_deref(),
+        )
         .map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
 pub fn list_speakers(
     session_id: String,
     db: State<DbState>,
+    app: AppHandle,
 ) -> Result<Vec<cue_daemon::db::speakers::SpeakerMapping>, String> {
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.list_speakers(&session_id).map_err(|e| e.to_string())
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        db.list_speakers_for_owner(owner_guard.identity.owner.db_owner_id(), &session_id)
+            .map_err(|e| e.to_string())
+    })
 }
 
 // ===== Phase 3 Round 6: Hotkey → daemon action commands =====
@@ -1561,17 +2564,26 @@ async fn daemon_listening_status_with<R: DaemonRequester + ?Sized>(
 async fn daemon_toggle_listening_with<R: DaemonRequester + ?Sized>(
     requester: &mut R,
     mic_device_id: Option<String>,
+    fence: DaemonMutationFence,
 ) -> Result<AudioPipelineStatus, String> {
     let current = daemon_listening_status_with(requester).await?;
     let was_active = audio_pipeline_is_active(&current);
+    let mut current_fence = fence.clone();
+    current_fence.audio_session_id = current.session_id.clone();
     let (request, operation) = if was_active {
-        (DaemonRequest::AudioStop, "stop audio capture")
+        (
+            DaemonRequest::AudioStopBound {
+                fence: current_fence,
+            },
+            "stop audio capture",
+        )
     } else {
         (
-            DaemonRequest::AudioStart {
+            DaemonRequest::AudioStartBound {
                 enable_system: true,
                 enable_microphone: true,
                 mic_device_id,
+                fence: current_fence,
             },
             "start audio capture",
         )
@@ -1585,7 +2597,14 @@ async fn daemon_toggle_listening_with<R: DaemonRequester + ?Sized>(
 
     if !was_active && audio_pipeline_is_active(&status) && !audio_pipeline_has_dual_sources(&status)
     {
-        if let Err(message) = requester.request(DaemonRequest::AudioStop).await {
+        let mut cleanup_fence = fence;
+        cleanup_fence.audio_session_id = status.session_id.clone();
+        if let Err(message) = requester
+            .request(DaemonRequest::AudioStopBound {
+                fence: cleanup_fence,
+            })
+            .await
+        {
             tracing::warn!(
                 kind = ?classify_audio_error(&message),
                 "failed to stop partial audio capture"
@@ -1622,6 +2641,7 @@ fn public_end_session_failure(message: &str) -> String {
 async fn daemon_end_session_with<R: DaemonRequester + ?Sized>(
     requester: &mut R,
     settle_delay: Duration,
+    fence: DaemonMutationFence,
 ) -> Result<AudioPipelineStatus, String> {
     let current = daemon_listening_status_with(requester).await?;
     let should_stop = audio_pipeline_is_active(&current);
@@ -1631,8 +2651,10 @@ async fn daemon_end_session_with<R: DaemonRequester + ?Sized>(
             AudioCaptureState::Stopping | AudioCaptureState::Stopped
         );
     let stopped = if should_stop {
+        let mut stop_fence = fence.clone();
+        stop_fence.audio_session_id = current.session_id.clone();
         let response = requester
-            .request(DaemonRequest::AudioStop)
+            .request(DaemonRequest::AudioStopBound { fence: stop_fence })
             .await
             .map_err(|message| public_end_session_failure(&message))?;
         match response {
@@ -1649,7 +2671,7 @@ async fn daemon_end_session_with<R: DaemonRequester + ?Sized>(
     }
 
     let response = requester
-        .request(DaemonRequest::MeetingEnd)
+        .request(DaemonRequest::MeetingEndBound { fence })
         .await
         .map_err(|message| public_end_session_failure(&message))?;
     match response {
@@ -1663,12 +2685,14 @@ async fn daemon_end_session_with<R: DaemonRequester + ?Sized>(
 
 /// Return the daemon's current audio pipeline status.
 #[tauri::command]
-pub async fn daemon_listening_status() -> Result<AudioPipelineStatus, String> {
+pub async fn daemon_listening_status(app: AppHandle) -> Result<AudioPipelineStatus, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let trace_id = dashboard_trace_id();
     let mut requester = AuthenticatedDaemonRequester {
         trace_id: &trace_id,
     };
-    daemon_listening_status_with(&mut requester).await
+    let status = daemon_listening_status_with(&mut requester).await?;
+    owner_guard.with_current(&app, || Ok(status))
 }
 
 /// Toggle dual-source audio capture without ending the active meeting.
@@ -1677,22 +2701,24 @@ pub async fn daemon_toggle_listening(
     db: State<'_, DbState>,
     app: AppHandle,
 ) -> Result<AudioPipelineStatus, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
     let trace_id = dashboard_trace_id();
     let mic_device_id = load_mic_device_from_settings(&db);
     let mut requester = AuthenticatedDaemonRequester {
         trace_id: &trace_id,
     };
-    let result = daemon_toggle_listening_with(&mut requester, mic_device_id).await;
+    let result = daemon_toggle_listening_with(&mut requester, mic_device_id, fence).await;
 
     match result {
-        Ok(status) => {
+        Ok(status) => owner_guard.with_current(&app, || {
             let _ = app.emit("audio_pipeline_status", &status);
             Ok(status)
-        }
-        Err(error) => {
+        }),
+        Err(error) => owner_guard.with_current(&app, || {
             let _ = app.emit("audio_pipeline_error", &error);
             Err(error)
-        }
+        }),
     }
 }
 
@@ -1704,34 +2730,43 @@ pub async fn daemon_end_session(
     active: State<'_, ActiveSessionState>,
     app: AppHandle,
 ) -> Result<AudioPipelineStatus, String> {
-    let owner = current_owner_for_app(&app)?;
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let trace_id = dashboard_trace_id();
     let mut requester = AuthenticatedDaemonRequester {
         trace_id: &trace_id,
     };
-    let status = daemon_end_session_with(&mut requester, END_SESSION_SETTLE_DELAY).await?;
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
+    let status = daemon_end_session_with(&mut requester, END_SESSION_SETTLE_DELAY, fence).await?;
 
-    match db.0.lock() {
-        Ok(db) => {
-            if let Err(error) = db.save_active_session_for_owner(owner.db_owner_id(), None) {
-                tracing::warn!(%error, "failed to clear active session after ending meeting");
+    owner_guard.with_current(&app, || {
+        match db.0.lock() {
+            Ok(db) => {
+                if let Err(error) =
+                    db.save_active_session_for_owner(owner_guard.identity.owner.db_owner_id(), None)
+                {
+                    tracing::warn!(%error, "failed to clear active session after ending meeting");
+                }
             }
+            Err(error) => tracing::warn!(%error, "db lock poisoned after ending meeting"),
         }
-        Err(error) => tracing::warn!(%error, "db lock poisoned after ending meeting"),
-    }
-    cache_active_session(&active, &owner, None)?;
+        cache_active_session(&active, &owner_guard.identity.owner, None)?;
 
-    let _ = app.emit("audio_pipeline_status", &status);
-    let _ = app.emit("session:switched", SessionSwitchedPayload { id: None });
-    let _ = app.emit("live_session_ended", ());
-    Ok(status)
+        let _ = app.emit("audio_pipeline_status", &status);
+        let _ = app.emit("session:switched", SessionSwitchedPayload { id: None });
+        let _ = app.emit("live_session_ended", ());
+        Ok(status)
+    })
 }
 
 /// Push-to-talk toggle. Since global shortcuts don't distinguish press/release,
 /// this toggles audio capture on/off. When PTT is "enabled" conceptually, audio
 /// only streams while toggled on. Each press cycles the state.
 #[tauri::command]
-pub async fn daemon_set_push_to_talk(db: State<'_, DbState>) -> Result<String, String> {
+pub async fn daemon_set_push_to_talk(
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let trace_id = dashboard_trace_id();
     // Toggle audio: if audio is active, stop it; otherwise start mic-only.
     let status = daemon_ipc_with_trace(DaemonRequest::AudioStatus, &trace_id).await?;
@@ -1745,20 +2780,27 @@ pub async fn daemon_set_push_to_talk(db: State<'_, DbState>) -> Result<String, S
         }
         _ => false,
     };
+    let audio_session_id = match &status {
+        DaemonResponse::AudioStatus { status } => status.session_id.clone(),
+        _ => None,
+    };
+    let fence = dashboard_mutation_fence(&app, &owner_guard, audio_session_id)?;
     let resp = if is_active {
-        daemon_ipc_with_trace(DaemonRequest::AudioStop, &trace_id).await?
+        daemon_ipc_with_trace(DaemonRequest::AudioStopBound { fence }, &trace_id).await?
     } else {
         let mic_device_id = load_mic_device_from_settings(&db);
         daemon_ipc_with_trace(
-            DaemonRequest::AudioStart {
+            DaemonRequest::AudioStartBound {
                 enable_system: false,
                 enable_microphone: true,
                 mic_device_id,
+                fence,
             },
             &trace_id,
         )
         .await?
     };
+    owner_guard.ensure_current(&app)?;
     match resp {
         DaemonResponse::AudioStatus { status } => Ok(format!("audio: {:?}", status.capture.state)),
         DaemonResponse::Error { message } => Err(message),
@@ -1782,6 +2824,7 @@ pub struct ContextModeStatusPayload {
     pub active: bool,
     pub interval_secs: Option<u64>,
     pub context_items: usize,
+    pub capture_generation: u64,
 }
 
 fn context_mode_status_from_response(
@@ -1792,6 +2835,7 @@ fn context_mode_status_from_response(
             active: state.screen_capture_active,
             interval_secs: state.screen_capture_interval_secs,
             context_items: state.context_items,
+            capture_generation: state.screen_capture_generation,
         }),
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!("unexpected daemon response: {other:?}")),
@@ -1803,37 +2847,69 @@ async fn current_context_mode_status() -> Result<ContextModeStatusPayload, Strin
 }
 
 #[tauri::command]
-pub async fn daemon_context_status() -> Result<ContextModeStatusPayload, String> {
-    current_context_mode_status().await
+pub async fn daemon_context_status(app: AppHandle) -> Result<ContextModeStatusPayload, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let status = current_context_mode_status().await?;
+    owner_guard.with_current(&app, || Ok(status))
 }
 
 #[tauri::command]
-pub async fn daemon_context_start(interval_secs: u64) -> Result<ContextModeStatusPayload, String> {
+pub async fn daemon_context_start(
+    interval_secs: u64,
+    app: AppHandle,
+) -> Result<ContextModeStatusPayload, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let current = current_context_mode_status().await?;
+    owner_guard.ensure_current(&app)?;
+    let mut fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
+    fence.capture_generation = Some(current.capture_generation);
     let interval_secs = interval_secs.clamp(3, 300);
-    match daemon_ipc(DaemonRequest::ScreenCaptureStart {
+    match daemon_ipc(DaemonRequest::ScreenCaptureStartBound {
         interval_secs: Some(interval_secs),
+        fence,
     })
     .await?
     {
-        DaemonResponse::Text { .. } | DaemonResponse::Ok => current_context_mode_status().await,
+        DaemonResponse::Text { .. } | DaemonResponse::Ok => {
+            owner_guard.ensure_current(&app)?;
+            let status = current_context_mode_status().await?;
+            owner_guard.with_current(&app, || Ok(status))
+        }
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!("unexpected daemon response: {other:?}")),
     }
 }
 
 #[tauri::command]
-pub async fn daemon_context_stop() -> Result<ContextModeStatusPayload, String> {
-    match daemon_ipc(DaemonRequest::ScreenCaptureStop).await? {
-        DaemonResponse::Text { .. } | DaemonResponse::Ok => current_context_mode_status().await,
+pub async fn daemon_context_stop(app: AppHandle) -> Result<ContextModeStatusPayload, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let current = current_context_mode_status().await?;
+    owner_guard.ensure_current(&app)?;
+    let mut fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
+    fence.capture_generation = Some(current.capture_generation);
+    match daemon_ipc(DaemonRequest::ScreenCaptureStopBound { fence }).await? {
+        DaemonResponse::Text { .. } | DaemonResponse::Ok => {
+            owner_guard.ensure_current(&app)?;
+            let status = current_context_mode_status().await?;
+            owner_guard.with_current(&app, || Ok(status))
+        }
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!("unexpected daemon response: {other:?}")),
     }
 }
 
 #[tauri::command]
-pub async fn daemon_capture_active_page() -> Result<ContextModeStatusPayload, String> {
-    match daemon_ipc(DaemonRequest::ActivePageCapture).await? {
-        DaemonResponse::ContextItems { .. } => current_context_mode_status().await,
+pub async fn daemon_capture_active_page(
+    app: AppHandle,
+) -> Result<ContextModeStatusPayload, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
+    match daemon_ipc(DaemonRequest::ActivePageCaptureBound { fence }).await? {
+        DaemonResponse::ContextItems { .. } => {
+            owner_guard.ensure_current(&app)?;
+            let status = current_context_mode_status().await?;
+            owner_guard.with_current(&app, || Ok(status))
+        }
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!("unexpected daemon response: {other:?}")),
     }
@@ -1884,16 +2960,20 @@ pub async fn daemon_set_context_role(
     artifact_id: String,
     answer_context_role: cue_core::AnswerContextRole,
     confirmed_by_user: bool,
+    app: AppHandle,
 ) -> Result<ContextItemSummaryPayload, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     validate_context_role_confirmation(answer_context_role, confirmed_by_user)?;
     let id = Uuid::parse_str(artifact_id.trim())
         .map_err(|error| format!("invalid context artifact ID: {error}"))?;
-    match daemon_ipc(DaemonRequest::ContextRoleSet {
+    let fence = dashboard_mutation_fence(&app, &owner_guard, None)?;
+    let response = daemon_ipc(DaemonRequest::ContextRoleSetBound {
         id,
         answer_context_role,
+        fence,
     })
-    .await?
-    {
+    .await?;
+    owner_guard.with_current(&app, || match response {
         DaemonResponse::ContextItems { items } => items
             .into_iter()
             .find(|item| item.id == id)
@@ -1901,19 +2981,23 @@ pub async fn daemon_set_context_role(
             .ok_or_else(|| "daemon did not return the updated context item".to_string()),
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!("unexpected daemon response: {other:?}")),
-    }
+    })
 }
 
 #[tauri::command]
-pub async fn daemon_context_items() -> Result<Vec<ContextItemSummaryPayload>, String> {
-    match daemon_ipc(DaemonRequest::ContextList).await? {
+pub async fn daemon_context_items(
+    app: AppHandle,
+) -> Result<Vec<ContextItemSummaryPayload>, String> {
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    let response = daemon_ipc(DaemonRequest::ContextList).await?;
+    owner_guard.with_current(&app, || match response {
         DaemonResponse::ContextItems { items } => Ok(items
             .into_iter()
             .map(context_item_summary_payload)
             .collect()),
         DaemonResponse::Error { message } => Err(message),
         other => Err(format!("unexpected daemon response: {other:?}")),
-    }
+    })
 }
 
 /// Read the `audio.mic_device` setting from the dashboard DB.
@@ -2111,10 +3195,18 @@ pub fn list_responses(
     session_id: String,
     limit: usize,
     db: State<DbState>,
+    app: AppHandle,
 ) -> Result<Vec<cue_daemon::llm::CueResponse>, String> {
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.list_cue_responses(&session_id, limit)
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        db.list_cue_responses_for_dashboard_owner(
+            owner_guard.identity.owner.db_owner_id(),
+            &session_id,
+            limit,
+        )
         .map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
@@ -2158,6 +3250,16 @@ mod tests {
         AudioPipelineStatus::simulated("session-active", cue_core::AudioCaptureConfig::default())
     }
 
+    fn test_mutation_fence() -> DaemonMutationFence {
+        DaemonMutationFence {
+            owner_account_id: None,
+            credential_generation: None,
+            meeting_id: None,
+            audio_session_id: None,
+            capture_generation: None,
+        }
+    }
+
     fn linked_account(account_id: Option<&str>, user_id: &str) -> cue_core::AccountConfig {
         let mut account = cue_core::AccountConfig::local();
         account.provider = "bluey".to_string();
@@ -2171,6 +3273,91 @@ mod tests {
             access: "access-token".to_string(),
             refresh: "refresh-token".to_string(),
             email: email.to_string(),
+        }
+    }
+
+    fn credentials(access: &str, email: &str) -> cue_cloud_client::Tokens {
+        cue_cloud_client::Tokens {
+            access: access.to_string(),
+            refresh: format!("refresh-{access}"),
+            email: email.to_string(),
+        }
+    }
+
+    fn dashboard_test_client(
+        store: Arc<cue_cloud_client::tokens::MemoryStore>,
+    ) -> cue_cloud_client::CloudClient {
+        cue_cloud_client::CloudClient::new(
+            cue_cloud_client::client::ClientConfig {
+                base_url: "https://bluey.test".to_string(),
+                user_agent: "bluey-dashboard-test".to_string(),
+                timeout: Duration::from_secs(1),
+                trace_id: None,
+            },
+            store,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dashboard_delayed_clear_preserves_a2_and_b_but_clears_exact_snapshot() {
+        let store = Arc::new(cue_cloud_client::tokens::MemoryStore::new());
+        cue_cloud_client::TokenStore::save(store.as_ref(), &credentials("a1", "a@example.com"))
+            .unwrap();
+        let stale_a1 = dashboard_test_client(store.clone());
+        let captured_a1 = stale_a1.credential_snapshot().unwrap();
+
+        let refreshed_a2 = credentials("a2", "a@example.com");
+        cue_cloud_client::TokenStore::save(store.as_ref(), &refreshed_a2).unwrap();
+        assert!(!clear_captured_dashboard_credentials(&stale_a1, &captured_a1).unwrap());
+        assert_eq!(
+            cue_cloud_client::TokenStore::load(store.as_ref()).unwrap(),
+            Some(refreshed_a2)
+        );
+
+        let stale_a2 = dashboard_test_client(store.clone());
+        let captured_a2 = stale_a2.credential_snapshot().unwrap();
+        let replacement_b = credentials("b1", "b@example.com");
+        cue_cloud_client::TokenStore::save(store.as_ref(), &replacement_b).unwrap();
+        assert!(!clear_captured_dashboard_credentials(&stale_a2, &captured_a2).unwrap());
+        assert_eq!(
+            cue_cloud_client::TokenStore::load(store.as_ref()).unwrap(),
+            Some(replacement_b)
+        );
+
+        let current_b = dashboard_test_client(store.clone());
+        let captured_b = current_b.credential_snapshot().unwrap();
+        assert!(clear_captured_dashboard_credentials(&current_b, &captured_b).unwrap());
+        assert_eq!(
+            cue_cloud_client::TokenStore::load(store.as_ref()).unwrap(),
+            None
+        );
+    }
+
+    fn owner_guard_for_test(owner: DashboardOwner, generation: u64) -> DashboardOwnerGuard {
+        let user_id = match &owner {
+            DashboardOwner::Local => "local-user".to_string(),
+            DashboardOwner::SignedIn(owner) => format!("{owner}@example.test"),
+        };
+        let cloud_account_id = owner.db_owner_id().map(str::to_string);
+        DashboardOwnerGuard {
+            identity: DashboardOwnerIdentity {
+                owner,
+                credential_generation: generation,
+            },
+            account_file_stamp: DashboardAccountFileStamp {
+                present: true,
+                provider: if cloud_account_id.is_some() {
+                    "bluey".to_string()
+                } else {
+                    "local".to_string()
+                },
+                cloud_account_id,
+                user_id,
+                credential_generation: generation,
+                token_configured: generation > 0,
+            },
+            transition_generation: 7,
         }
     }
 
@@ -2197,6 +3384,110 @@ mod tests {
             resolve_dashboard_owner(Some(&cloud_account), None).unwrap(),
             DashboardOwner::Local
         );
+    }
+
+    #[test]
+    fn external_account_replacement_blocks_provider_dispatch_before_network_call() {
+        let guard = owner_guard_for_test(DashboardOwner::SignedIn("account-a".to_string()), 11);
+        let account_b_stamp = DashboardAccountFileStamp {
+            present: true,
+            provider: "bluey".to_string(),
+            cloud_account_id: Some("account-b".to_string()),
+            user_id: "b@example.test".to_string(),
+            credential_generation: 12,
+            token_configured: true,
+        };
+        let network_calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let result = guard
+            .validate_account_file_stamp(&account_b_stamp)
+            .map(|()| {
+                network_calls.fetch_add(1, Ordering::Relaxed);
+            });
+
+        assert!(result.is_err());
+        assert_eq!(network_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stream_chunk_guard_is_memory_only_and_cancels_on_external_writer_signal() {
+        let guard = owner_guard_for_test(DashboardOwner::SignedIn("account-a".to_string()), 11);
+        let cache = DashboardOwnerCache {
+            owner: Some(DashboardOwner::SignedIn("account-a".to_string())),
+            transitioning: false,
+            transition_generation: 7,
+        };
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let token = DashboardOwnerStreamToken {
+            cancelled: cancel_rx,
+        };
+
+        for _ in 0..10_000 {
+            token.validate_fast(&guard, &cache).unwrap();
+        }
+        cancel_tx.send(true).unwrap();
+        assert!(token.validate_fast(&guard, &cache).is_err());
+    }
+
+    #[test]
+    fn data_controls_are_scoped_to_the_current_account() {
+        let owner_a = DashboardOwner::SignedIn("account-a".to_string());
+        let owner_b = DashboardOwner::SignedIn("account-b".to_string());
+        let mut settings = cue_core::CueSettings::default();
+        set_cloud_sync_for_account(&mut settings, "account-a", true);
+        settings.support_diagnostics_upload_enabled = true;
+        settings.support_diagnostics_upload_consent_granted = true;
+        settings.support_diagnostics_upload_consent_account_id = Some("account-a".to_string());
+
+        let controls_a = data_controls_payload(&settings, &owner_a);
+        assert!(controls_a.account_scope_available);
+        assert!(controls_a.cloud_sync_enabled);
+        assert!(controls_a.support_diagnostics_upload_enabled);
+
+        let controls_b = data_controls_payload(&settings, &owner_b);
+        assert!(controls_b.account_scope_available);
+        assert!(!controls_b.cloud_sync_enabled);
+        assert!(!controls_b.support_diagnostics_upload_enabled);
+
+        let local = data_controls_payload(&settings, &DashboardOwner::Local);
+        assert!(!local.account_scope_available);
+        assert!(!local.cloud_sync_enabled);
+        assert!(!local.support_diagnostics_upload_enabled);
+    }
+
+    #[test]
+    fn support_cleanup_outbox_never_changes_owner() {
+        let owner_a = DashboardOwner::SignedIn("account-a".to_string());
+        let owner_b = DashboardOwner::SignedIn("account-b".to_string());
+        let mut settings = cue_core::CueSettings {
+            support_diagnostics_upload_enabled: true,
+            support_diagnostics_upload_consent_granted: true,
+            support_diagnostics_upload_consent_account_id: Some("account-a".to_string()),
+            ..cue_core::CueSettings::default()
+        };
+
+        assert!(begin_support_diagnostics_revocation(&mut settings, "account-a").unwrap());
+        assert_eq!(
+            settings
+                .support_diagnostics_server_revocation_account_id
+                .as_deref(),
+            Some("account-a")
+        );
+        let controls_b = data_controls_payload(&settings, &owner_b);
+        assert!(!controls_b.support_diagnostics_server_cleanup_pending);
+        assert!(controls_b.support_diagnostics_cleanup_waiting_for_another_account);
+        assert!(begin_support_diagnostics_revocation(&mut settings, "account-b").is_err());
+
+        complete_support_diagnostics_revocation(&mut settings, "account-b");
+        assert!(settings.support_diagnostics_server_revocation_pending);
+        complete_support_diagnostics_revocation(&mut settings, "account-a");
+        assert!(!settings.support_diagnostics_server_revocation_pending);
+        assert!(settings
+            .support_diagnostics_server_revocation_account_id
+            .is_none());
+
+        let controls_a = data_controls_payload(&settings, &owner_a);
+        assert!(!controls_a.support_diagnostics_server_cleanup_pending);
     }
 
     #[test]
@@ -2461,18 +3752,23 @@ mod tests {
             },
         ]);
 
-        let result = daemon_toggle_listening_with(&mut daemon, Some("saved-mic-id".to_string()))
-            .await
-            .unwrap();
+        let result = daemon_toggle_listening_with(
+            &mut daemon,
+            Some("saved-mic-id".to_string()),
+            test_mutation_fence(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result, started);
         assert_eq!(daemon.requests.len(), 2);
         assert!(matches!(&daemon.requests[0], DaemonRequest::AudioStatus));
         assert!(matches!(
             &daemon.requests[1],
-            DaemonRequest::AudioStart {
+            DaemonRequest::AudioStartBound {
                 enable_system: true,
                 enable_microphone: true,
                 mic_device_id: Some(mic_device_id),
+                ..
             } if mic_device_id == "saved-mic-id"
         ));
     }
@@ -2490,13 +3786,16 @@ mod tests {
             },
         ]);
 
-        let result = daemon_toggle_listening_with(&mut daemon, None)
+        let result = daemon_toggle_listening_with(&mut daemon, None, test_mutation_fence())
             .await
             .unwrap();
         assert_eq!(result, stopped);
         assert_eq!(daemon.requests.len(), 2);
         assert!(matches!(&daemon.requests[0], DaemonRequest::AudioStatus));
-        assert!(matches!(&daemon.requests[1], DaemonRequest::AudioStop));
+        assert!(matches!(
+            &daemon.requests[1],
+            DaemonRequest::AudioStopBound { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2513,13 +3812,20 @@ mod tests {
             DaemonResponse::AudioStatus { status: stopped },
         ]);
 
-        let error = daemon_toggle_listening_with(&mut daemon, Some("saved-mic-id".to_string()))
-            .await
-            .unwrap_err();
+        let error = daemon_toggle_listening_with(
+            &mut daemon,
+            Some("saved-mic-id".to_string()),
+            test_mutation_fence(),
+        )
+        .await
+        .unwrap_err();
         assert!(error.contains("both audio sources"));
         assert!(!error.contains("saved-mic-id"));
         assert_eq!(daemon.requests.len(), 3);
-        assert!(matches!(&daemon.requests[2], DaemonRequest::AudioStop));
+        assert!(matches!(
+            &daemon.requests[2],
+            DaemonRequest::AudioStopBound { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2551,14 +3857,20 @@ mod tests {
             },
         ]);
 
-        let result = daemon_end_session_with(&mut daemon, Duration::ZERO)
+        let result = daemon_end_session_with(&mut daemon, Duration::ZERO, test_mutation_fence())
             .await
             .unwrap();
         assert_eq!(result, stopped);
         assert_eq!(daemon.requests.len(), 3);
         assert!(matches!(&daemon.requests[0], DaemonRequest::AudioStatus));
-        assert!(matches!(&daemon.requests[1], DaemonRequest::AudioStop));
-        assert!(matches!(&daemon.requests[2], DaemonRequest::MeetingEnd));
+        assert!(matches!(
+            &daemon.requests[1],
+            DaemonRequest::AudioStopBound { .. }
+        ));
+        assert!(matches!(
+            &daemon.requests[2],
+            DaemonRequest::MeetingEndBound { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2574,14 +3886,17 @@ mod tests {
         ]);
 
         assert_eq!(
-            daemon_end_session_with(&mut daemon, Duration::ZERO)
+            daemon_end_session_with(&mut daemon, Duration::ZERO, test_mutation_fence())
                 .await
                 .unwrap(),
             idle
         );
         assert_eq!(daemon.requests.len(), 2);
         assert!(matches!(&daemon.requests[0], DaemonRequest::AudioStatus));
-        assert!(matches!(&daemon.requests[1], DaemonRequest::MeetingEnd));
+        assert!(matches!(
+            &daemon.requests[1],
+            DaemonRequest::MeetingEndBound { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2595,13 +3910,16 @@ mod tests {
             },
         ]);
 
-        let error = daemon_end_session_with(&mut daemon, Duration::ZERO)
+        let error = daemon_end_session_with(&mut daemon, Duration::ZERO, test_mutation_fence())
             .await
             .unwrap_err();
         assert_eq!(error, "Bluey couldn't end the session. Try again.");
         assert!(!error.contains("/private/path"));
         assert_eq!(daemon.requests.len(), 2);
-        assert!(matches!(&daemon.requests[1], DaemonRequest::MeetingEnd));
+        assert!(matches!(
+            &daemon.requests[1],
+            DaemonRequest::MeetingEndBound { .. }
+        ));
     }
 
     #[test]
@@ -2610,10 +3928,36 @@ mod tests {
     }
 
     #[test]
-    fn truncate_log_field_preserves_chars_and_marks_truncation() {
-        assert_eq!(truncate_log_field("hello", 10), "hello");
-        assert_eq!(truncate_log_field("abcdef", 3), "abc…");
-        assert_eq!(truncate_log_field("a\u{0007}b", 10), "a b");
+    fn frontend_error_command_metadata_is_closed() {
+        assert!(is_safe_frontend_command("list_sessions_v2"));
+        assert!(!is_safe_frontend_command("list-sessions"));
+        assert!(!is_safe_frontend_command("https://bluey.sh/?token=secret"));
+        assert!(!is_safe_frontend_command(""));
+        assert!(!is_safe_frontend_command(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn frontend_error_payload_rejects_raw_content_fields() {
+        let payload: FrontendErrorPayload = serde_json::from_value(serde_json::json!({
+            "source": "tauri_invoke",
+            "category": "invoke_rejected",
+            "command": "list_sessions_v2"
+        }))
+        .expect("closed metadata payload should deserialize");
+        assert!(matches!(payload.source, FrontendErrorSource::TauriInvoke));
+        assert!(matches!(
+            payload.category,
+            FrontendErrorCategory::InvokeRejected
+        ));
+
+        let raw_content = serde_json::from_value::<FrontendErrorPayload>(serde_json::json!({
+            "source": "window_error",
+            "category": "runtime_error",
+            "message": "private transcript text",
+            "url": "https://bluey.sh/?token=secret",
+            "stack": "/Users/example/private.rs:42"
+        }));
+        assert!(raw_content.is_err());
     }
 
     #[test]
@@ -2643,6 +3987,7 @@ mod tests {
         let mut state = cue_core::DaemonState::new(42);
         state.screen_capture_active = true;
         state.screen_capture_interval_secs = Some(30);
+        state.screen_capture_generation = 4;
         state.context_items = 7;
 
         let payload = context_mode_status_from_response(DaemonResponse::Status { state })
@@ -2653,6 +3998,7 @@ mod tests {
                 active: true,
                 interval_secs: Some(30),
                 context_items: 7,
+                capture_generation: 4,
             }
         );
     }
@@ -2910,39 +4256,44 @@ pub fn get_live_transcripts(
     since_index: usize,
     app: AppHandle,
 ) -> Result<Vec<LiveTranscriptPayload>, String> {
-    let owner = current_owner_for_app(&app)?;
-    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
-    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
-    let Some(meeting) = store.load_active().map_err(|e| e.to_string())? else {
-        return Ok(Vec::new());
-    };
-    if !owner.owns_meeting(meeting.owner_account_id.as_deref()) {
-        return Ok(Vec::new());
-    }
-    let session_id = meeting.id.to_string();
-    let segments: Vec<LiveTranscriptPayload> = meeting
-        .transcript
-        .iter()
-        .enumerate()
-        .skip(since_index)
-        .map(|(i, seg)| {
-            let source = match seg.speaker {
-                cue_core::Speaker::System => "system",
-                cue_core::Speaker::User => "microphone",
-                _ => "unknown",
-            };
-            LiveTranscriptPayload {
-                index: i,
-                session_id: session_id.clone(),
-                source: source.to_string(),
-                text: seg.text.clone(),
-                is_final: seg.is_final,
-                speaker: None,
-                ts_ms: seg.created_at.parse::<u64>().unwrap_or(0),
-            }
-        })
-        .collect();
-    Ok(segments)
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
+    owner_guard.with_current(&app, || {
+        let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+        let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+        let Some(meeting) = store.load_active().map_err(|e| e.to_string())? else {
+            return Ok(Vec::new());
+        };
+        if !owner_guard
+            .identity
+            .owner
+            .owns_meeting(meeting.owner_account_id.as_deref())
+        {
+            return Ok(Vec::new());
+        }
+        let session_id = meeting.id.to_string();
+        Ok(meeting
+            .transcript
+            .iter()
+            .enumerate()
+            .skip(since_index)
+            .map(|(i, seg)| {
+                let source = match seg.speaker {
+                    cue_core::Speaker::System => "system",
+                    cue_core::Speaker::User => "microphone",
+                    _ => "unknown",
+                };
+                LiveTranscriptPayload {
+                    index: i,
+                    session_id: session_id.clone(),
+                    source: source.to_string(),
+                    text: seg.text.clone(),
+                    is_final: seg.is_final,
+                    speaker: None,
+                    ts_ms: seg.created_at.parse::<u64>().unwrap_or(0),
+                }
+            })
+            .collect())
+    })
 }
 
 // ===== Phase 3 Round 9: Mouse Passthrough Toggle =====
@@ -3285,6 +4636,8 @@ async fn try_speculative_dispatch(
     router_meta: RouterMeta,
     registry: ProviderRegistry,
     app: tauri::AppHandle,
+    owner_guard: DashboardOwnerGuard,
+    stream_token: DashboardOwnerStreamToken,
 ) -> Result<Option<(String, LlmResponseMetadata)>, String> {
     use cue_router::{
         policy::StaticPolicy, speculative::SpeculativeChunk, RoutingPolicy, SpeculativeRouter,
@@ -3343,21 +4696,37 @@ async fn try_speculative_dispatch(
         context: Vec::new(),
     };
 
-    let stream = router
-        .run(&classification, req)
-        .await
-        .map_err(|e| e.to_string())?;
+    owner_guard.ensure_current(&app)?;
+    stream_token.with_current(&owner_guard, &app, || Ok(()))?;
+    let mut dispatch_cancelled = stream_token.receiver();
+    let stream = tokio::select! {
+        stream = router.run(&classification, req) => stream.map_err(|e| e.to_string())?,
+        _ = wait_for_owner_stream_cancellation(&mut dispatch_cancelled) => {
+            return Err(account_changed_message());
+        }
+    };
     let mut stream = Box::pin(stream);
+    let mut stream_cancelled = stream_token.receiver();
 
     let mut accumulated_draft = String::new();
     let mut final_text: Option<String> = None;
     let mut metadata = LlmResponseMetadata::default();
-    // Codex Stage 9 round-2 Blocker 4: collect lane errors for diagnosis
-    // when all-lanes-failed.
-    let mut lane_errors: Vec<String> = Vec::new();
+    // Keep only a count for fallback. Raw provider messages can contain
+    // response bodies, URLs, tokens, local paths, or user-controlled text and
+    // must never enter dashboard logs.
+    let mut lane_error_count = 0usize;
     let mut emitted_meta = false;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk = tokio::select! {
+            chunk = stream.next() => chunk,
+            _ = wait_for_owner_stream_cancellation(&mut stream_cancelled) => {
+                return Err(account_changed_message());
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         match chunk {
             SpeculativeChunk::Draft {
                 text,
@@ -3382,28 +4751,31 @@ async fn try_speculative_dispatch(
                 } else {
                     None
                 };
-                let _ = app.emit(
-                    "cue_response_chunk",
-                    CueResponseChunkPayload {
-                        response_id: response_id.to_string(),
-                        source_session_id: session_id.to_string(),
-                        kind: kind.to_string(),
-                        partial_text: text,
-                        finished,
-                        cost_cents: chunk_cost.as_ref().map(|cost| cost.cost_cents),
-                        balance_cents_after: chunk_cost
-                            .as_ref()
-                            .and_then(|cost| cost.balance_cents_after),
-                        provider: chunk_cost.as_ref().map(|cost| cost.provider.clone()),
-                        model: chunk_cost.as_ref().map(|cost| cost.model.clone()),
-                        cost_label,
-                        artifact_type: artifact_type(&artifact),
-                        artifact_body: artifact_body(&artifact),
-                        artifact_confidence: artifact_confidence(&artifact),
-                        router_meta: meta_for_chunk,
-                        replace_body: None,
-                    },
-                );
+                stream_token.with_current(&owner_guard, &app, || {
+                    let _ = app.emit(
+                        "cue_response_chunk",
+                        CueResponseChunkPayload {
+                            response_id: response_id.to_string(),
+                            source_session_id: session_id.to_string(),
+                            kind: kind.to_string(),
+                            partial_text: text,
+                            finished,
+                            cost_cents: chunk_cost.as_ref().map(|cost| cost.cost_cents),
+                            balance_cents_after: chunk_cost
+                                .as_ref()
+                                .and_then(|cost| cost.balance_cents_after),
+                            provider: chunk_cost.as_ref().map(|cost| cost.provider.clone()),
+                            model: chunk_cost.as_ref().map(|cost| cost.model.clone()),
+                            cost_label,
+                            artifact_type: artifact_type(&artifact),
+                            artifact_body: artifact_body(&artifact),
+                            artifact_confidence: artifact_confidence(&artifact),
+                            router_meta: meta_for_chunk,
+                            replace_body: None,
+                        },
+                    );
+                    Ok(())
+                })?;
             }
             SpeculativeChunk::Final {
                 text,
@@ -3420,48 +4792,55 @@ async fn try_speculative_dispatch(
                 if artifact.is_some() {
                     metadata.artifact = artifact.clone();
                 }
-                let _ = app.emit(
-                    "cue_response_chunk",
-                    CueResponseChunkPayload {
-                        response_id: response_id.to_string(),
-                        source_session_id: session_id.to_string(),
-                        kind: kind.to_string(),
-                        partial_text: text.clone(),
-                        finished: true,
-                        cost_cents: chunk_cost.as_ref().map(|cost| cost.cost_cents),
-                        balance_cents_after: chunk_cost
-                            .as_ref()
-                            .and_then(|cost| cost.balance_cents_after),
-                        provider: chunk_cost.as_ref().map(|cost| cost.provider.clone()),
-                        model: chunk_cost.as_ref().map(|cost| cost.model.clone()),
-                        cost_label,
-                        artifact_type: artifact_type(&artifact),
-                        artifact_body: artifact_body(&artifact),
-                        artifact_confidence: artifact_confidence(&artifact),
-                        router_meta: None,
-                        replace_body: Some(true),
-                    },
-                );
+                stream_token.with_current(&owner_guard, &app, || {
+                    let _ = app.emit(
+                        "cue_response_chunk",
+                        CueResponseChunkPayload {
+                            response_id: response_id.to_string(),
+                            source_session_id: session_id.to_string(),
+                            kind: kind.to_string(),
+                            partial_text: text.clone(),
+                            finished: true,
+                            cost_cents: chunk_cost.as_ref().map(|cost| cost.cost_cents),
+                            balance_cents_after: chunk_cost
+                                .as_ref()
+                                .and_then(|cost| cost.balance_cents_after),
+                            provider: chunk_cost.as_ref().map(|cost| cost.provider.clone()),
+                            model: chunk_cost.as_ref().map(|cost| cost.model.clone()),
+                            cost_label,
+                            artifact_type: artifact_type(&artifact),
+                            artifact_body: artifact_body(&artifact),
+                            artifact_confidence: artifact_confidence(&artifact),
+                            router_meta: None,
+                            replace_body: Some(true),
+                        },
+                    );
+                    Ok(())
+                })?;
                 final_text = Some(text);
             }
-            SpeculativeChunk::Error { lane, message } => {
-                tracing::warn!(lane, message, "speculative router lane error");
-                lane_errors.push(format!("{lane}: {message}"));
+            SpeculativeChunk::Error { lane, .. } => {
+                tracing::warn!(
+                    lane,
+                    error_category = "provider_lane",
+                    "speculative router lane error"
+                );
+                lane_error_count = lane_error_count.saturating_add(1);
                 // Non-fatal individually: keep collecting the other lane.
             }
         }
     }
 
-    // Codex review S9 round-3 blocker: actually use lane_errors. If
+    // Codex review S9 round-3 blocker: actually use the error count. If
     // every lane errored AND no text was produced, return Ok(None) so
     // the caller falls back to the legacy single-shot path. Returning
     // empty Ok(Some("")) made try_speculative_dispatch silently
     // persist an empty cue card.
     let resolved = final_text.unwrap_or(accumulated_draft);
     let trimmed = resolved.trim().to_string();
-    if trimmed.is_empty() && !lane_errors.is_empty() {
+    if trimmed.is_empty() && lane_error_count > 0 {
         tracing::warn!(
-            lane_errors = ?lane_errors,
+            lane_error_count,
             "speculative dispatch: every lane errored; falling back to legacy"
         );
         return Ok(None);
@@ -3529,13 +4908,24 @@ pub async fn request_cue(
 ) -> Result<String, String> {
     use cue_daemon::llm::{ends_with_question, AnswerLlm, WhatToAnswerLlm};
 
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let trace_id = dashboard_trace_id();
-    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
-    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
-    let meeting = store
-        .load_active()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "no active session".to_string())?;
+    let meeting = owner_guard.with_current(&app, || {
+        let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+        let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+        let meeting = store
+            .load_active()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "no active session".to_string())?;
+        if !owner_guard
+            .identity
+            .owner
+            .owns_meeting(meeting.owner_account_id.as_deref())
+        {
+            return Err("no active session".to_string());
+        }
+        Ok(meeting)
+    })?;
 
     let session_id = meeting.id.to_string();
 
@@ -3556,8 +4946,10 @@ pub async fn request_cue(
         return Err("no recent transcript to analyze".to_string());
     }
 
-    let llm = build_llm_provider_from_env(&db, &trace_id)
+    let managed_client = captured_managed_llm_client(&app, &owner_guard, &trace_id)?;
+    let llm = build_llm_provider_from_env(&db, managed_client.clone())
         .ok_or_else(|| "no LLM provider configured".to_string())?;
+    let stream_fence = DashboardOwnerStreamFence::start(&app, &owner_guard)?;
 
     // Generate response_id up-front so chunks and final event share it.
     let response_id = Uuid::new_v4().to_string();
@@ -3575,7 +4967,7 @@ pub async fn request_cue(
     // legacy AnswerLlm / WhatToAnswerLlm path — zero regression.
     {
         use cue_daemon::llm::{answer as answer_mod, suggest as suggest_mod};
-        let registry = ProviderRegistry::from_env_and_secrets(&db, &trace_id);
+        let registry = ProviderRegistry::from_env_and_secrets(&db, managed_client.clone());
         let classification = classify_only_for_router(&recent, true, false);
         let is_question = kind == "answer" && ends_with_question(&recent);
         let user_text = if is_question {
@@ -3604,6 +4996,8 @@ pub async fn request_cue(
             router_meta.clone(),
             registry,
             app.clone(),
+            owner_guard.clone(),
+            stream_fence.token(),
         )
         .await
         .map_err(|e| e.to_string())?
@@ -3621,9 +5015,11 @@ pub async fn request_cue(
                 response_metadata.cost_label.as_deref(),
                 response_metadata.artifact.as_ref(),
             );
-            persist_cue_response(&db, &cue_resp)?;
-            let _ = app.emit("cue_response", &cue_resp);
-            return Ok(text);
+            return owner_guard.with_current(&app, || {
+                persist_cue_response_for_owner(&db, &owner_guard.identity.owner, &cue_resp)?;
+                let _ = app.emit("cue_response", &cue_resp);
+                Ok(text)
+            });
         }
     }
 
@@ -3641,18 +5037,28 @@ pub async fn request_cue(
             .unwrap_or(&recent)
             .trim();
         let app2 = app.clone();
+        let owner_guard2 = owner_guard.clone();
+        let stream_token = stream_fence.token();
+        let chunk_token = stream_token.clone();
+        let mut cancelled = stream_token.receiver();
         let rid = response_id.clone();
-        AnswerLlm
-            .run_streaming(question, &session_id, llm.as_ref(), |partial, finished| {
+        owner_guard.ensure_current(&app)?;
+        let response = tokio::select! {
+            response = AnswerLlm.run_streaming(
+                question,
+                &session_id,
+                llm.as_ref(),
+                |partial, finished| {
                 let meta_for_chunk =
                     if !emitted_meta_a.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         Some(router_meta_a.clone())
                     } else {
                         None
                     };
-                let _ = app2.emit(
-                    "cue_response_chunk",
-                    CueResponseChunkPayload {
+                let _ = chunk_token.with_current(&owner_guard2, &app2, || {
+                    let _ = app2.emit(
+                        "cue_response_chunk",
+                        CueResponseChunkPayload {
                         response_id: rid.clone(),
                         source_session_id: source_session_id_a.clone(),
                         kind: "answer".to_string(),
@@ -3668,25 +5074,40 @@ pub async fn request_cue(
                         artifact_confidence: None,
                         router_meta: meta_for_chunk,
                         replace_body: None,
-                    },
-                );
-            })
-            .await
-            .map_err(|e| e.to_string())?
+                        },
+                    );
+                    Ok(())
+                });
+            }) => response,
+            _ = wait_for_owner_stream_cancellation(&mut cancelled) => {
+                return Err(account_changed_message());
+            }
+        };
+        response.map_err(|e| e.to_string())?
     } else {
         let app2 = app.clone();
+        let owner_guard2 = owner_guard.clone();
+        let stream_token = stream_fence.token();
+        let chunk_token = stream_token.clone();
+        let mut cancelled = stream_token.receiver();
         let rid = response_id.clone();
-        WhatToAnswerLlm
-            .run_streaming(&recent, &session_id, llm.as_ref(), |partial, finished| {
+        owner_guard.ensure_current(&app)?;
+        let response = tokio::select! {
+            response = WhatToAnswerLlm.run_streaming(
+                &recent,
+                &session_id,
+                llm.as_ref(),
+                |partial, finished| {
                 let meta_for_chunk =
                     if !emitted_meta_b.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         Some(router_meta_b.clone())
                     } else {
                         None
                     };
-                let _ = app2.emit(
-                    "cue_response_chunk",
-                    CueResponseChunkPayload {
+                let _ = chunk_token.with_current(&owner_guard2, &app2, || {
+                    let _ = app2.emit(
+                        "cue_response_chunk",
+                        CueResponseChunkPayload {
                         response_id: rid.clone(),
                         source_session_id: source_session_id_b.clone(),
                         kind: "suggestion".to_string(),
@@ -3702,20 +5123,27 @@ pub async fn request_cue(
                         artifact_confidence: None,
                         router_meta: meta_for_chunk,
                         replace_body: None,
-                    },
-                );
-            })
-            .await
-            .map_err(|e| e.to_string())?
+                        },
+                    );
+                    Ok(())
+                });
+            }) => response,
+            _ = wait_for_owner_stream_cancellation(&mut cancelled) => {
+                return Err(account_changed_message());
+            }
+        };
+        response.map_err(|e| e.to_string())?
     };
 
     // Override the CueResponse id with our pre-generated response_id for consistency.
     let mut cue_resp = cue_resp;
     cue_resp.id = response_id;
 
-    persist_cue_response(&db, &cue_resp)?;
-    let _ = app.emit("cue_response", &cue_resp);
-    Ok(cue_resp.text.clone())
+    owner_guard.with_current(&app, || {
+        persist_cue_response_for_owner(&db, &owner_guard.identity.owner, &cue_resp)?;
+        let _ = app.emit("cue_response", &cue_resp);
+        Ok(cue_resp.text.clone())
+    })
 }
 
 /// Auto-recap: runs RecapLlm on a session's full transcript.
@@ -3728,15 +5156,25 @@ pub async fn auto_recap(
 ) -> Result<String, String> {
     use cue_daemon::llm::RecapLlm;
 
+    let owner_guard = capture_dashboard_owner_guard(&app)?;
     let trace_id = dashboard_trace_id();
-    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
-    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
-
-    let meetings = store.all_meetings().map_err(|e| e.to_string())?;
-    let meeting = meetings
-        .iter()
-        .find(|m| m.id.to_string() == session_id)
-        .ok_or_else(|| "session not found".to_string())?;
+    let meeting_id = Uuid::parse_str(&session_id).map_err(|_| "session not found".to_string())?;
+    let meeting = owner_guard.with_current(&app, || {
+        let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+        let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+        let meeting = store
+            .load_by_id(meeting_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "session not found".to_string())?;
+        if !owner_guard
+            .identity
+            .owner
+            .owns_meeting(meeting.owner_account_id.as_deref())
+        {
+            return Err("session not found".to_string());
+        }
+        Ok(meeting)
+    })?;
 
     let transcript: String = meeting
         .transcript
@@ -3749,28 +5187,36 @@ pub async fn auto_recap(
         return Err("empty transcript".to_string());
     }
 
-    let llm = match build_llm_provider_from_env(&db, &trace_id) {
+    let managed_client = captured_managed_llm_client(&app, &owner_guard, &trace_id)?;
+    let llm = match build_llm_provider_from_env(&db, managed_client) {
         Some(p) => p,
         None => {
             tracing::warn!("auto-recap skipped: no LLM provider configured");
             return Err("no LLM provider configured".to_string());
         }
     };
+    let stream_fence = DashboardOwnerStreamFence::start(&app, &owner_guard)?;
 
     let response_id = Uuid::new_v4().to_string();
     let rid = response_id.clone();
     let stream_session_id = session_id.clone();
     let app2 = app.clone();
+    let owner_guard2 = owner_guard.clone();
+    let stream_token = stream_fence.token();
+    let chunk_token = stream_token.clone();
+    let mut cancelled = stream_token.receiver();
 
-    let cue_resp = RecapLlm
-        .run_streaming(
+    owner_guard.ensure_current(&app)?;
+    let cue_resp = tokio::select! {
+        response = RecapLlm.run_streaming(
             &transcript,
             &session_id,
             llm.as_ref(),
             |partial, finished| {
-                let _ = app2.emit(
-                    "cue_response_chunk",
-                    CueResponseChunkPayload {
+                let _ = chunk_token.with_current(&owner_guard2, &app2, || {
+                    let _ = app2.emit(
+                        "cue_response_chunk",
+                        CueResponseChunkPayload {
                         response_id: rid.clone(),
                         source_session_id: stream_session_id.clone(),
                         kind: "recap".to_string(),
@@ -3786,44 +5232,54 @@ pub async fn auto_recap(
                         artifact_confidence: None,
                         router_meta: None, // recap is not yet routed via AutoRouter
                         replace_body: None,
-                    },
-                );
+                        },
+                    );
+                    Ok(())
+                });
             },
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        ) => response.map_err(|e| e.to_string())?,
+        _ = wait_for_owner_stream_cancellation(&mut cancelled) => {
+            return Err(account_changed_message());
+        }
+    };
 
     let mut cue_resp = cue_resp;
     cue_resp.id = response_id;
 
-    persist_cue_response(&db, &cue_resp)?;
-    let _ = app.emit("cue_response", &cue_resp);
-    Ok(cue_resp.text.clone())
+    owner_guard.with_current(&app, || {
+        persist_cue_response_for_owner(&db, &owner_guard.identity.owner, &cue_resp)?;
+        let _ = app.emit("cue_response", &cue_resp);
+        Ok(cue_resp.text.clone())
+    })
 }
 
-fn persist_cue_response(
+fn persist_cue_response_for_owner(
     db: &State<DbState>,
+    owner: &DashboardOwner,
     resp: &cue_daemon::llm::CueResponse,
 ) -> Result<(), String> {
     let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.insert_cue_response(cue_daemon::db::NewCueResponse {
-        id: &resp.id,
-        session_id: &resp.source_session_id,
-        kind: &resp.kind,
-        text: &resp.text,
-        source_text: resp.source_text.as_deref(),
-        ts_ms: resp.ts_ms as i64,
-        cost_cents: resp.cost_cents,
-        balance_cents_after: resp.balance_cents_after,
-        provider: resp.provider.as_deref(),
-        model: resp.model.as_deref(),
-        input_tokens: resp.input_tokens,
-        output_tokens: resp.output_tokens,
-        cost_label: resp.cost_label.as_deref(),
-        artifact_type: resp.artifact_type.as_deref(),
-        artifact_body: resp.artifact_body.as_deref(),
-        artifact_confidence: resp.artifact_confidence,
-    })
+    db.insert_cue_response_for_owner(
+        owner.db_owner_id(),
+        cue_daemon::db::NewCueResponse {
+            id: &resp.id,
+            session_id: &resp.source_session_id,
+            kind: &resp.kind,
+            text: &resp.text,
+            source_text: resp.source_text.as_deref(),
+            ts_ms: resp.ts_ms as i64,
+            cost_cents: resp.cost_cents,
+            balance_cents_after: resp.balance_cents_after,
+            provider: resp.provider.as_deref(),
+            model: resp.model.as_deref(),
+            input_tokens: resp.input_tokens,
+            output_tokens: resp.output_tokens,
+            cost_label: resp.cost_label.as_deref(),
+            artifact_type: resp.artifact_type.as_deref(),
+            artifact_body: resp.artifact_body.as_deref(),
+            artifact_confidence: resp.artifact_confidence,
+        },
+    )
     .map_err(|e| e.to_string())
 }
 
@@ -3839,7 +5295,10 @@ struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
-    fn from_env_and_secrets(_db: &tauri::State<DbState>, trace_id: &str) -> Self {
+    fn from_env_and_secrets(
+        _db: &tauri::State<DbState>,
+        managed_client: Option<cue_cloud_client::CloudClient>,
+    ) -> Self {
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -3854,10 +5313,7 @@ impl ProviderRegistry {
         // secrets) are gated behind BLUEY_DEV_BYOK=1 in debug/dev builds so
         // dev workflows still work while shipped customer binaries stay
         // managed-only.
-        let managed_mode = match cloud_client_with_trace(trace_id) {
-            Ok(client) => client.current_tokens().is_some(),
-            Err(_) => false,
-        };
+        let managed_mode = managed_client.is_some();
 
         if managed_mode {
             tracing::info!("ProviderRegistry: managed mode active (account token found)");
@@ -3865,7 +5321,7 @@ impl ProviderRegistry {
             // name (bluey-managed-{lane}) matches what
             // cue_router::ManagedPolicy emits, so the registry lookup
             // dispatches correctly.
-            if let Ok(client) = cloud_client_with_trace(trace_id) {
+            if let Some(client) = managed_client {
                 for lane in [
                     cue_llm::bluey_managed::ManagedLane::Instant,
                     cue_llm::bluey_managed::ManagedLane::Balanced,
@@ -3993,20 +5449,18 @@ impl cue_router::speculative::SpeculativeProvider for ProviderRegistry {
 /// dispatch`) picks per-lane providers separately.
 fn build_llm_provider_from_env(
     _db: &State<DbState>,
-    trace_id: &str,
+    managed_client: Option<cue_cloud_client::CloudClient>,
 ) -> Option<Box<dyn cue_llm::LlmProvider>> {
     // Managed mode first: Bluey account tokens take priority over BYOK unless
     // a debug/dev build has BLUEY_DEV_BYOK=1 explicitly set (matching the
     // ProviderRegistry policy).
     let allow_byok = dev_byok_enabled();
     if !allow_byok {
-        if let Ok(client) = cloud_client_with_trace(trace_id) {
-            if client.current_tokens().is_some() {
-                return Some(Box::new(cue_llm::bluey_managed::BlueyManagedProvider::new(
-                    client,
-                    cue_llm::bluey_managed::ManagedLane::Balanced,
-                )));
-            }
+        if let Some(client) = managed_client {
+            return Some(Box::new(cue_llm::bluey_managed::BlueyManagedProvider::new(
+                client,
+                cue_llm::bluey_managed::ManagedLane::Balanced,
+            )));
         }
         return None;
     }

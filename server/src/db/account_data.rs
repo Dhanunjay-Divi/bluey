@@ -3,9 +3,46 @@
 use anyhow::{Context, Result};
 use postgres::Row as PgRow;
 use rusqlite::{params, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 use crate::db::{jobs, DbPool};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountDeletionCompletion {
+    Deleted,
+    Pending,
+    NotFound,
+}
+
+pub const ACCOUNT_DELETION_RECEIPT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountDeletionReceiptState {
+    Prepared,
+    Pending,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountDeletionReceipt {
+    pub state: AccountDeletionReceiptState,
+    pub completed_at_ms: Option<i64>,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepareAccountDeletionReceipt {
+    Ready(AccountDeletionReceipt),
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LookupAccountDeletionReceipt {
+    Found(AccountDeletionReceipt),
+    Expired,
+    NotFound,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSummary {
@@ -33,6 +70,8 @@ pub struct ExportBundle {
     pub cloud_rag_chunks_count: i64,
     pub refresh_tokens_count: i64,
     pub stripe_webhook_events_count: i64,
+    pub support_diagnostic_consent_receipts:
+        Vec<crate::db::support_diagnostics::SupportDiagnosticConsentReceipt>,
     pub jobs: Option<jobs::JobsAccountExport>,
     pub exported_at: String,
 }
@@ -77,6 +116,8 @@ pub fn export_bundle(pool: &DbPool, account_id: &str) -> Result<Option<ExportBun
         DbPool::Postgres(_) => export_bundle_postgres(pool, account_id),
     })?;
     if let Some(value) = &mut bundle {
+        value.support_diagnostic_consent_receipts =
+            crate::db::support_diagnostics::consent_history(pool, account_id)?;
         value.jobs = jobs::account_export(pool, account_id, &value.account.email)?;
     }
     Ok(bundle)
@@ -86,6 +127,206 @@ pub fn hard_delete_account(pool: &DbPool, account_id: &str) -> Result<bool> {
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => hard_delete_account_sqlite(pool, account_id),
         DbPool::Postgres(_) => hard_delete_account_postgres(pool, account_id),
+    })
+}
+
+pub fn account_deletion_is_pending(pool: &DbPool, account_id: &str) -> Result<bool> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let pending = conn
+                .query_row(
+                    "SELECT deletion_pending_at_ms FROM accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten()
+                .is_some();
+            Ok(pending)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let pending = conn
+                .query_opt(
+                    "SELECT deletion_pending_at_ms FROM accounts WHERE id = $1",
+                    &[&account_id],
+                )?
+                .and_then(|row| row.get::<_, Option<i64>>(0))
+                .is_some();
+            Ok(pending)
+        }
+    })
+}
+
+/// Publish the account deletion fence before callers enumerate any external
+/// objects. New bearer requests and object reservations fail closed from this
+/// commit onward. Existing object PUT leases remain visible until completion
+/// or lease expiry, preventing a late PUT from being orphaned by hard delete.
+pub fn begin_account_deletion(pool: &DbPool, account_id: &str, now_ms: i64) -> Result<bool> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => begin_account_deletion_sqlite(pool, account_id, now_ms),
+        DbPool::Postgres(_) => begin_account_deletion_postgres(pool, account_id, now_ms),
+    })
+}
+
+pub fn complete_account_deletion(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<AccountDeletionCompletion> {
+    let completed_at_ms = chrono::Utc::now().timestamp_millis();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => complete_account_deletion_sqlite(pool, account_id, completed_at_ms),
+        DbPool::Postgres(_) => {
+            complete_account_deletion_postgres(pool, account_id, completed_at_ms)
+        }
+    })
+}
+
+pub fn prepare_account_deletion_receipt(
+    pool: &DbPool,
+    account_id: &str,
+    operation_id: &str,
+    recovery_token: &str,
+    now_ms: i64,
+) -> Result<PrepareAccountDeletionReceipt> {
+    let account_binding = account_deletion_hash("account", account_id);
+    let capability_hash = account_deletion_hash("capability", recovery_token);
+    let expires_at_ms = now_ms
+        .checked_add(ACCOUNT_DELETION_RECEIPT_TTL_MS)
+        .context("account deletion receipt expiry overflow")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => prepare_account_deletion_receipt_sqlite(
+            pool,
+            operation_id,
+            &account_binding,
+            &capability_hash,
+            now_ms,
+            expires_at_ms,
+        ),
+        DbPool::Postgres(_) => prepare_account_deletion_receipt_postgres(
+            pool,
+            operation_id,
+            &account_binding,
+            &capability_hash,
+            now_ms,
+            expires_at_ms,
+        ),
+    })
+}
+
+pub fn mark_account_deletion_receipt_pending(
+    pool: &DbPool,
+    account_id: &str,
+    operation_id: &str,
+    recovery_token: &str,
+    now_ms: i64,
+) -> Result<Option<AccountDeletionReceipt>> {
+    let account_binding = account_deletion_hash("account", account_id);
+    let capability_hash = account_deletion_hash("capability", recovery_token);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => mark_account_deletion_receipt_pending_sqlite(
+            pool,
+            operation_id,
+            &account_binding,
+            &capability_hash,
+            now_ms,
+        ),
+        DbPool::Postgres(_) => mark_account_deletion_receipt_pending_postgres(
+            pool,
+            operation_id,
+            &account_binding,
+            &capability_hash,
+            now_ms,
+        ),
+    })
+}
+
+pub fn lookup_account_deletion_receipt(
+    pool: &DbPool,
+    operation_id: &str,
+    recovery_token: &str,
+    now_ms: i64,
+) -> Result<LookupAccountDeletionReceipt> {
+    let capability_hash = account_deletion_hash("capability", recovery_token);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            lookup_account_deletion_receipt_sqlite(pool, operation_id, &capability_hash, now_ms)
+        }
+        DbPool::Postgres(_) => {
+            lookup_account_deletion_receipt_postgres(pool, operation_id, &capability_hash, now_ms)
+        }
+    })
+}
+
+pub fn mark_account_deletion_receipt_deleted(
+    pool: &DbPool,
+    account_id: &str,
+    operation_id: &str,
+    recovery_token: &str,
+    completed_at_ms: i64,
+) -> Result<bool> {
+    let account_binding = account_deletion_hash("account", account_id);
+    let capability_hash = account_deletion_hash("capability", recovery_token);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            Ok(conn.execute(
+                "UPDATE account_deletion_receipts
+                    SET state = 'deleted', updated_at_ms = ?4, completed_at_ms = ?4
+                  WHERE operation_id = ?1 AND account_binding = ?2 AND capability_hash = ?3",
+                params![
+                    operation_id,
+                    account_binding,
+                    capability_hash,
+                    completed_at_ms
+                ],
+            )? > 0)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            Ok(conn.execute(
+                "UPDATE account_deletion_receipts
+                    SET state = 'deleted', updated_at_ms = $4, completed_at_ms = $4
+                  WHERE operation_id = $1 AND account_binding = $2 AND capability_hash = $3",
+                &[
+                    &operation_id,
+                    &account_binding,
+                    &capability_hash,
+                    &completed_at_ms,
+                ],
+            )? > 0)
+        }
+    })
+}
+
+fn account_deletion_hash(domain: &str, value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bluey-account-deletion-receipt-v1\0");
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(value.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn receipt_state(value: &str) -> Result<AccountDeletionReceiptState> {
+    match value {
+        "prepared" => Ok(AccountDeletionReceiptState::Prepared),
+        "pending" => Ok(AccountDeletionReceiptState::Pending),
+        "deleted" => Ok(AccountDeletionReceiptState::Deleted),
+        _ => anyhow::bail!("invalid account deletion receipt state"),
+    }
+}
+
+fn receipt_from_parts(
+    state: String,
+    completed_at_ms: Option<i64>,
+    expires_at_ms: i64,
+) -> Result<AccountDeletionReceipt> {
+    Ok(AccountDeletionReceipt {
+        state: receipt_state(&state)?,
+        completed_at_ms,
+        expires_at_ms,
     })
 }
 
@@ -475,6 +716,7 @@ fn export_bundle_sqlite(pool: &DbPool, account_id: &str) -> Result<Option<Export
         cloud_rag_chunks_count,
         refresh_tokens_count,
         stripe_webhook_events_count,
+        support_diagnostic_consent_receipts: Vec::new(),
         jobs: None,
         exported_at: chrono::Utc::now().to_rfc3339(),
     }))
@@ -575,6 +817,7 @@ fn export_bundle_postgres(pool: &DbPool, account_id: &str) -> Result<Option<Expo
         cloud_rag_chunks_count,
         refresh_tokens_count,
         stripe_webhook_events_count,
+        support_diagnostic_consent_receipts: Vec::new(),
         jobs: None,
         exported_at: chrono::Utc::now().to_rfc3339(),
     }))
@@ -603,10 +846,421 @@ fn hard_delete_account_postgres(pool: &DbPool, account_id: &str) -> Result<bool>
                OR body::jsonb #>> '{data,object,metadata,bluey_account_id}' = $1",
         &[&account_id],
     )
-    .ok();
+    .context("delete account Stripe webhook events")?;
     let deleted = tx.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
     tx.commit()?;
     Ok(deleted > 0)
+}
+
+fn begin_account_deletion_sqlite(pool: &DbPool, account_id: &str, now_ms: i64) -> Result<bool> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let exists = tx
+        .query_row(
+            "SELECT 1 FROM accounts WHERE id = ?1",
+            params![account_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE accounts
+            SET deletion_pending_at_ms = COALESCE(deletion_pending_at_ms, ?2)
+          WHERE id = ?1",
+        params![account_id, now_ms],
+    )?;
+    tx.execute(
+        "UPDATE refresh_tokens
+            SET revoked_at = COALESCE(revoked_at, datetime('now'))
+          WHERE account_id = ?1",
+        params![account_id],
+    )?;
+    crate::db::object_uploads::fence_account_deletion_sqlite_tx(&tx, account_id, now_ms)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn begin_account_deletion_postgres(pool: &DbPool, account_id: &str, now_ms: i64) -> Result<bool> {
+    let mut conn = pool.get_pg()?;
+    let mut tx = conn.transaction()?;
+    let exists = tx
+        .query_opt(
+            "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+            &[&account_id],
+        )?
+        .is_some();
+    if !exists {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE accounts
+            SET deletion_pending_at_ms = COALESCE(deletion_pending_at_ms, $2)
+          WHERE id = $1",
+        &[&account_id, &now_ms],
+    )?;
+    tx.execute(
+        "UPDATE refresh_tokens
+            SET revoked_at = COALESCE(revoked_at, now())
+          WHERE account_id = $1",
+        &[&account_id],
+    )?;
+    crate::db::object_uploads::fence_account_deletion_postgres_tx(&mut tx, account_id, now_ms)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn prepare_account_deletion_receipt_sqlite(
+    pool: &DbPool,
+    operation_id: &str,
+    account_binding: &str,
+    capability_hash: &str,
+    now_ms: i64,
+    expires_at_ms: i64,
+) -> Result<PrepareAccountDeletionReceipt> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute(
+        "DELETE FROM account_deletion_receipts WHERE expires_at_ms <= ?1",
+        params![now_ms],
+    )?;
+    let existing = tx
+        .query_row(
+            "SELECT operation_id, account_binding, capability_hash, state,
+                    completed_at_ms, expires_at_ms
+               FROM account_deletion_receipts
+              WHERE operation_id = ?1",
+            params![operation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((stored_operation, stored_account, stored_capability, state, completed, expiry)) =
+        existing
+    {
+        tx.commit()?;
+        if stored_operation != operation_id
+            || stored_account != account_binding
+            || stored_capability != capability_hash
+        {
+            return Ok(PrepareAccountDeletionReceipt::Conflict);
+        }
+        return Ok(PrepareAccountDeletionReceipt::Ready(receipt_from_parts(
+            state, completed, expiry,
+        )?));
+    }
+    tx.execute(
+        "INSERT INTO account_deletion_receipts(
+             operation_id, account_binding, capability_hash, state,
+             created_at_ms, updated_at_ms, completed_at_ms, expires_at_ms
+         ) VALUES (?1, ?2, ?3, 'prepared', ?4, ?4, NULL, ?5)",
+        params![
+            operation_id,
+            account_binding,
+            capability_hash,
+            now_ms,
+            expires_at_ms
+        ],
+    )?;
+    tx.commit()?;
+    Ok(PrepareAccountDeletionReceipt::Ready(
+        AccountDeletionReceipt {
+            state: AccountDeletionReceiptState::Prepared,
+            completed_at_ms: None,
+            expires_at_ms,
+        },
+    ))
+}
+
+fn prepare_account_deletion_receipt_postgres(
+    pool: &DbPool,
+    operation_id: &str,
+    account_binding: &str,
+    capability_hash: &str,
+    now_ms: i64,
+    expires_at_ms: i64,
+) -> Result<PrepareAccountDeletionReceipt> {
+    let mut conn = pool.get_pg()?;
+    let mut tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM account_deletion_receipts WHERE expires_at_ms <= $1",
+        &[&now_ms],
+    )?;
+    tx.execute(
+        "INSERT INTO account_deletion_receipts(
+             operation_id, account_binding, capability_hash, state,
+             created_at_ms, updated_at_ms, completed_at_ms, expires_at_ms
+         ) VALUES ($1, $2, $3, 'prepared', $4, $4, NULL, $5)
+         ON CONFLICT DO NOTHING",
+        &[
+            &operation_id,
+            &account_binding,
+            &capability_hash,
+            &now_ms,
+            &expires_at_ms,
+        ],
+    )?;
+    let row = tx.query_one(
+        "SELECT operation_id, account_binding, capability_hash, state,
+                completed_at_ms, expires_at_ms
+           FROM account_deletion_receipts
+          WHERE operation_id = $1
+          FOR UPDATE",
+        &[&operation_id],
+    )?;
+    let stored_operation = row.get::<_, String>(0);
+    let stored_account = row.get::<_, String>(1);
+    let stored_capability = row.get::<_, String>(2);
+    let state = row.get::<_, String>(3);
+    let completed = row.get::<_, Option<i64>>(4);
+    let expiry = row.get::<_, i64>(5);
+    tx.commit()?;
+    if stored_operation != operation_id
+        || stored_account != account_binding
+        || stored_capability != capability_hash
+    {
+        return Ok(PrepareAccountDeletionReceipt::Conflict);
+    }
+    Ok(PrepareAccountDeletionReceipt::Ready(receipt_from_parts(
+        state, completed, expiry,
+    )?))
+}
+
+fn mark_account_deletion_receipt_pending_sqlite(
+    pool: &DbPool,
+    operation_id: &str,
+    account_binding: &str,
+    capability_hash: &str,
+    now_ms: i64,
+) -> Result<Option<AccountDeletionReceipt>> {
+    let conn = pool.get()?;
+    conn.execute(
+        "UPDATE account_deletion_receipts
+            SET state = CASE WHEN state = 'prepared' THEN 'pending' ELSE state END,
+                updated_at_ms = ?4
+          WHERE operation_id = ?1 AND account_binding = ?2 AND capability_hash = ?3
+            AND expires_at_ms > ?4",
+        params![operation_id, account_binding, capability_hash, now_ms],
+    )?;
+    conn.query_row(
+        "SELECT state, completed_at_ms, expires_at_ms
+           FROM account_deletion_receipts
+          WHERE operation_id = ?1 AND account_binding = ?2 AND capability_hash = ?3
+            AND expires_at_ms > ?4",
+        params![operation_id, account_binding, capability_hash, now_ms],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )
+    .optional()?
+    .map(|(state, completed, expiry)| receipt_from_parts(state, completed, expiry))
+    .transpose()
+}
+
+fn mark_account_deletion_receipt_pending_postgres(
+    pool: &DbPool,
+    operation_id: &str,
+    account_binding: &str,
+    capability_hash: &str,
+    now_ms: i64,
+) -> Result<Option<AccountDeletionReceipt>> {
+    let mut conn = pool.get_pg()?;
+    let row = conn.query_opt(
+        "UPDATE account_deletion_receipts
+            SET state = CASE WHEN state = 'prepared' THEN 'pending' ELSE state END,
+                updated_at_ms = $4
+          WHERE operation_id = $1 AND account_binding = $2 AND capability_hash = $3
+            AND expires_at_ms > $4
+      RETURNING state, completed_at_ms, expires_at_ms",
+        &[&operation_id, &account_binding, &capability_hash, &now_ms],
+    )?;
+    row.map(|row| {
+        receipt_from_parts(
+            row.get::<_, String>(0),
+            row.get::<_, Option<i64>>(1),
+            row.get::<_, i64>(2),
+        )
+    })
+    .transpose()
+}
+
+fn lookup_account_deletion_receipt_sqlite(
+    pool: &DbPool,
+    operation_id: &str,
+    capability_hash: &str,
+    now_ms: i64,
+) -> Result<LookupAccountDeletionReceipt> {
+    let conn = pool.get()?;
+    let row = conn
+        .query_row(
+            "SELECT state, completed_at_ms, expires_at_ms
+               FROM account_deletion_receipts
+              WHERE operation_id = ?1 AND capability_hash = ?2",
+            params![operation_id, capability_hash],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    lookup_receipt_from_row(row, now_ms)
+}
+
+fn lookup_account_deletion_receipt_postgres(
+    pool: &DbPool,
+    operation_id: &str,
+    capability_hash: &str,
+    now_ms: i64,
+) -> Result<LookupAccountDeletionReceipt> {
+    let mut conn = pool.get_pg()?;
+    let row = conn.query_opt(
+        "SELECT state, completed_at_ms, expires_at_ms
+           FROM account_deletion_receipts
+          WHERE operation_id = $1 AND capability_hash = $2",
+        &[&operation_id, &capability_hash],
+    )?;
+    lookup_receipt_from_row(
+        row.map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, Option<i64>>(1),
+                row.get::<_, i64>(2),
+            )
+        }),
+        now_ms,
+    )
+}
+
+fn lookup_receipt_from_row(
+    row: Option<(String, Option<i64>, i64)>,
+    now_ms: i64,
+) -> Result<LookupAccountDeletionReceipt> {
+    let Some((state, completed, expiry)) = row else {
+        return Ok(LookupAccountDeletionReceipt::NotFound);
+    };
+    if expiry <= now_ms {
+        return Ok(LookupAccountDeletionReceipt::Expired);
+    }
+    Ok(LookupAccountDeletionReceipt::Found(receipt_from_parts(
+        state, completed, expiry,
+    )?))
+}
+
+fn mark_account_deletion_receipt_deleted_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    completed_at_ms: i64,
+) -> Result<()> {
+    let account_binding = account_deletion_hash("account", account_id);
+    tx.execute(
+        "UPDATE account_deletion_receipts
+            SET state = 'deleted', updated_at_ms = ?2, completed_at_ms = ?2
+          WHERE account_binding = ?1",
+        params![account_binding, completed_at_ms],
+    )?;
+    Ok(())
+}
+
+fn mark_account_deletion_receipt_deleted_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    completed_at_ms: i64,
+) -> Result<()> {
+    let account_binding = account_deletion_hash("account", account_id);
+    tx.execute(
+        "UPDATE account_deletion_receipts
+            SET state = 'deleted', updated_at_ms = $2, completed_at_ms = $2
+          WHERE account_binding = $1",
+        &[&account_binding, &completed_at_ms],
+    )?;
+    Ok(())
+}
+
+fn complete_account_deletion_sqlite(
+    pool: &DbPool,
+    account_id: &str,
+    completed_at_ms: i64,
+) -> Result<AccountDeletionCompletion> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let state = tx
+        .query_row(
+            "SELECT deletion_pending_at_ms FROM accounts WHERE id = ?1",
+            params![account_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    let Some(state) = state else {
+        return Ok(AccountDeletionCompletion::NotFound);
+    };
+    if state.is_none()
+        || !crate::db::object_uploads::account_deletion_objects_ready_sqlite_tx(&tx, account_id)?
+    {
+        tx.commit()?;
+        return Ok(AccountDeletionCompletion::Pending);
+    }
+    tx.execute(
+        "DELETE FROM stripe_webhook_events
+          WHERE json_extract(body, '$.data.object.client_reference_id') = ?1
+             OR json_extract(body, '$.data.object.metadata.bluey_account_id') = ?1",
+        params![account_id],
+    )?;
+    mark_account_deletion_receipt_deleted_sqlite_tx(&tx, account_id, completed_at_ms)?;
+    tx.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+    tx.commit()?;
+    Ok(AccountDeletionCompletion::Deleted)
+}
+
+fn complete_account_deletion_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    completed_at_ms: i64,
+) -> Result<AccountDeletionCompletion> {
+    let mut conn = pool.get_pg()?;
+    let mut tx = conn.transaction()?;
+    let state = tx.query_opt(
+        "SELECT deletion_pending_at_ms FROM accounts WHERE id = $1 FOR UPDATE",
+        &[&account_id],
+    )?;
+    let Some(state) = state else {
+        return Ok(AccountDeletionCompletion::NotFound);
+    };
+    if state.get::<_, Option<i64>>(0).is_none()
+        || !crate::db::object_uploads::account_deletion_objects_ready_postgres_tx(
+            &mut tx, account_id,
+        )?
+    {
+        tx.commit()?;
+        return Ok(AccountDeletionCompletion::Pending);
+    }
+    tx.execute(
+        "DELETE FROM stripe_webhook_events
+          WHERE body::jsonb #>> '{data,object,client_reference_id}' = $1
+             OR body::jsonb #>> '{data,object,metadata,bluey_account_id}' = $1",
+        &[&account_id],
+    )
+    .context("delete pending account Stripe webhook events")?;
+    mark_account_deletion_receipt_deleted_postgres_tx(&mut tx, account_id, completed_at_ms)?;
+    tx.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
+    tx.commit()?;
+    Ok(AccountDeletionCompletion::Deleted)
 }
 
 fn artifact_object_refs_sqlite(pool: &DbPool, account_id: &str) -> Result<Vec<ArtifactObjectRef>> {
@@ -817,5 +1471,164 @@ fn sqlite_value_to_json(value: rusqlite::types::Value) -> serde_json::Value {
         rusqlite::types::Value::Real(v) => serde_json::json!(v),
         rusqlite::types::Value::Text(v) => serde_json::Value::String(v),
         rusqlite::types::Value::Blob(_) => serde_json::Value::String("<blob>".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletion_receipt_is_idempotent_capability_bound_and_expires() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-account-deletion-receipt-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&path).expect("open receipt test database");
+        crate::db::run_migrations(&pool).expect("migrate receipt test database");
+        {
+            let conn = pool.get().expect("receipt test connection");
+            conn.execute(
+                "INSERT INTO accounts(id, email, password_hash) VALUES (?1, ?2, 'hash')",
+                rusqlite::params!["acct-a", "a@example.test"],
+            )
+            .expect("insert account A");
+            conn.execute(
+                "INSERT INTO accounts(id, email, password_hash) VALUES (?1, ?2, 'hash')",
+                rusqlite::params!["acct-b", "b@example.test"],
+            )
+            .expect("insert account B");
+        }
+
+        let operation = "550e8400-e29b-41d4-a716-446655440301";
+        let capability = "550e8400-e29b-41d4-a716-446655440302";
+        let wrong_capability = "550e8400-e29b-41d4-a716-446655440303";
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let first =
+            prepare_account_deletion_receipt(&pool, "acct-a", operation, capability, now_ms)
+                .unwrap();
+        assert!(matches!(
+            first.clone(),
+            PrepareAccountDeletionReceipt::Ready(AccountDeletionReceipt {
+                state: AccountDeletionReceiptState::Prepared,
+                ..
+            })
+        ));
+        assert_eq!(
+            prepare_account_deletion_receipt(&pool, "acct-a", operation, capability, now_ms + 1,)
+                .unwrap(),
+            first,
+            "the exact operation must replay without changing its capability"
+        );
+        assert_eq!(
+            prepare_account_deletion_receipt(&pool, "acct-b", operation, capability, now_ms + 2,)
+                .unwrap(),
+            PrepareAccountDeletionReceipt::Conflict,
+            "another account cannot claim an existing operation"
+        );
+        assert_eq!(
+            lookup_account_deletion_receipt(&pool, operation, wrong_capability, now_ms + 3,)
+                .unwrap(),
+            LookupAccountDeletionReceipt::NotFound
+        );
+        let stored: (String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT account_binding, capability_hash
+                   FROM account_deletion_receipts
+                  WHERE operation_id = ?1",
+                rusqlite::params![operation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(stored.0, "acct-a");
+        assert_ne!(stored.1, capability);
+        assert!(matches!(
+            mark_account_deletion_receipt_pending(
+                &pool,
+                "acct-a",
+                operation,
+                capability,
+                now_ms + 4,
+            )
+            .unwrap(),
+            Some(AccountDeletionReceipt {
+                state: AccountDeletionReceiptState::Pending,
+                ..
+            })
+        ));
+        assert!(begin_account_deletion(&pool, "acct-a", now_ms + 5).unwrap());
+        assert_eq!(
+            complete_account_deletion(&pool, "acct-a").unwrap(),
+            AccountDeletionCompletion::Deleted
+        );
+        assert!(matches!(
+            lookup_account_deletion_receipt(&pool, operation, capability, now_ms + 6).unwrap(),
+            LookupAccountDeletionReceipt::Found(AccountDeletionReceipt {
+                state: AccountDeletionReceiptState::Deleted,
+                completed_at_ms: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            lookup_account_deletion_receipt(
+                &pool,
+                operation,
+                capability,
+                now_ms + ACCOUNT_DELETION_RECEIPT_TTL_MS,
+            )
+            .unwrap(),
+            LookupAccountDeletionReceipt::Expired
+        );
+
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_webhook_cleanup_failure_preserves_retryable_account_deletion() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = crate::db::open_postgres_pool(&database_url).expect("open Postgres test pool");
+        crate::db::run_migrations(&pool).expect("apply Postgres runtime migrations");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct_delete_retry_{suffix}");
+        let email = format!("delete-retry-{suffix}@example.test");
+        let event_id = format!("evt_delete_retry_{suffix}");
+        {
+            let mut conn = pool.get_pg().expect("Postgres setup connection");
+            conn.execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES ($1, $2, 'hash')",
+                &[&account_id, &email],
+            )
+            .expect("insert deletion test account");
+            conn.execute(
+                "INSERT INTO stripe_webhook_events (event_id, type, body)
+                 VALUES ($1, 'test.invalid_json', '{invalid-json')",
+                &[&event_id],
+            )
+            .expect("insert malformed webhook fixture");
+        }
+
+        assert!(begin_account_deletion(&pool, &account_id, 123).unwrap());
+        let error = complete_account_deletion(&pool, &account_id).unwrap_err();
+        assert!(format!("{error:#}").contains("delete pending account Stripe webhook events"));
+        assert!(account_deletion_is_pending(&pool, &account_id).unwrap());
+
+        {
+            let mut conn = pool.get_pg().expect("Postgres cleanup connection");
+            conn.execute(
+                "DELETE FROM stripe_webhook_events WHERE event_id = $1",
+                &[&event_id],
+            )
+            .expect("remove malformed webhook fixture");
+        }
+        assert_eq!(
+            complete_account_deletion(&pool, &account_id).unwrap(),
+            AccountDeletionCompletion::Deleted
+        );
     }
 }

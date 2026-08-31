@@ -73,6 +73,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const ACCESS_TOKEN_KEY = 'bluey_access_token';
     const REFRESH_TOKEN_KEY = 'bluey_refresh_token';
     const AUTH_PERSISTENCE_KEY = 'bluey_auth_persistence';
+    const ACCOUNT_DELETION_STORAGE_KEY = 'bluey_account_deletion_v1';
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
@@ -1947,14 +1948,62 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       accountMessage('Deleting account...');
-      await apiJson('/account/delete', {
-        method: 'POST',
-        body: JSON.stringify({
-          confirm_text: 'DELETE',
-          accept_data_loss: true,
-          accept_credit_loss: true,
-        }),
-      });
+      const accountId = String(latestAccountForBilling?.id || '').trim();
+      if (!accountId || !window.crypto?.randomUUID) {
+        accountMessage('Bluey could not safely prepare deletion in this browser. Reload and try again.');
+        return;
+      }
+      let capability = null;
+      try {
+        const stored = JSON.parse(localStorage.getItem(ACCOUNT_DELETION_STORAGE_KEY) || 'null');
+        if (stored?.schema === 1 && stored?.account_id === accountId) capability = stored;
+      } catch {
+        capability = null;
+      }
+      if (!capability) {
+        capability = {
+          schema: 1,
+          account_id: accountId,
+          operation_id: window.crypto.randomUUID(),
+          recovery_token: window.crypto.randomUUID(),
+        };
+        localStorage.setItem(ACCOUNT_DELETION_STORAGE_KEY, JSON.stringify(capability));
+      }
+      const request = {
+        confirm_text: 'DELETE',
+        accept_data_loss: true,
+        accept_credit_loss: true,
+        operation_id: capability.operation_id,
+        recovery_token: capability.recovery_token,
+      };
+      let deletion = null;
+      try {
+        deletion = await apiJson('/account/delete', {
+          method: 'POST',
+          body: JSON.stringify(request),
+        });
+      } catch {
+        try {
+          deletion = await apiJson('/account/delete/status', {
+            method: 'POST',
+            skipAuthRefresh: true,
+            body: JSON.stringify({
+              operation_id: capability.operation_id,
+              recovery_token: capability.recovery_token,
+            }),
+          });
+        } catch {
+          accountMessage('Bluey could not confirm the result. Deletion remains safely paused; try again.');
+          return;
+        }
+      }
+      if (!deletion?.deleted) {
+        accountMessage(
+          deletion?.note || 'Deletion is safely paused while an in-flight upload finishes. Try again shortly.',
+        );
+        return;
+      }
+      localStorage.removeItem(ACCOUNT_DELETION_STORAGE_KEY);
       resetDeleteAccountDialog();
       clearAccountToken();
       await loadAccount();

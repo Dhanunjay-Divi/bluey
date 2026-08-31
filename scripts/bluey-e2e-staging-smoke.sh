@@ -13,9 +13,11 @@ API_TOKEN="${BLUEY_API_TOKEN:-}"
 RUN_PAID="${BLUEY_RUN_PAID_SMOKE:-0}"
 
 log "Server routing evals"
-cargo test --manifest-path "$ROOT/server/Cargo.toml" answer_plan --quiet
-cargo test --manifest-path "$ROOT/server/Cargo.toml" web_search --quiet
-cargo test --manifest-path "$ROOT/server/Cargo.toml" streaming_idempotency_guard --quiet
+bash "$ROOT/scripts/run-bluey-tests.sh" -- bash -c '
+  cargo test --manifest-path server/Cargo.toml answer_plan --quiet
+  cargo test --manifest-path server/Cargo.toml web_search --quiet
+  cargo test --manifest-path server/Cargo.toml streaming_idempotency_guard --quiet
+'
 ok "AnswerPlan, web-search guard, and streaming idempotency tests passed"
 
 log "Deploy configuration preflight"

@@ -185,31 +185,59 @@ impl DaemonRequest {
             | Self::OverlaySetOpacity { .. }
             | Self::OverlaySetPosition { .. }
             | Self::PushCard { .. }
+            | Self::PushCardBound { .. }
             | Self::MeetingStart { .. }
+            | Self::MeetingStartBound { .. }
             | Self::MeetingEnd
+            | Self::MeetingEndBound { .. }
             | Self::SessionCreate { .. }
+            | Self::SessionCreateBound { .. }
             | Self::SessionActivate { .. }
+            | Self::SessionActivateBound { .. }
             | Self::SessionContinue
+            | Self::SessionContinueBound { .. }
             | Self::SessionDeactivate
+            | Self::SessionDeactivateBound { .. }
             | Self::SessionRename { .. }
+            | Self::SessionRenameBound { .. }
             | Self::SessionArchive { .. }
+            | Self::SessionArchiveBound { .. }
             | Self::SessionDelete { .. }
+            | Self::SessionDeleteBound { .. }
             | Self::TranscriptAdd { .. }
+            | Self::TranscriptAddBound { .. }
             | Self::Ask { .. }
+            | Self::AskBound { .. }
             | Self::Answer { .. }
+            | Self::AnswerBound { .. }
             | Self::ContextAdd { .. }
+            | Self::ContextAddBound { .. }
             | Self::ContextRoleSet { .. }
+            | Self::ContextRoleSetBound { .. }
             | Self::ActivePageCapture
+            | Self::ActivePageCaptureBound { .. }
             | Self::ScreenCaptureStart { .. }
+            | Self::ScreenCaptureStartBound { .. }
             | Self::ScreenCaptureStop
+            | Self::ScreenCaptureStopBound { .. }
             | Self::MeetingDetectionSettingsReload
             | Self::InstructionsSet { .. }
+            | Self::InstructionsSetBound { .. }
             | Self::InstructionsClear
+            | Self::InstructionsClearBound { .. }
             | Self::AudioStart { .. }
+            | Self::AudioStartBound { .. }
             | Self::AudioStop
+            | Self::AudioStopBound { .. }
             | Self::CloudLogin
             | Self::CloudLogout
+            | Self::CloudLogoutBound { .. }
+            | Self::CloudPrepareAccountDeletion { .. }
+            | Self::CloudAbortAccountDeletion { .. }
+            | Self::CloudPurgeDeletedAccount { .. }
+            | Self::CloudAcknowledgeDeletedAccountPurge { .. }
             | Self::SessionsMoveLocalToCurrentAccount { .. }
+            | Self::SessionsMoveLocalToCurrentAccountBound { .. }
             | Self::CloudSyncNow => IpcAuthorization::Mutation,
         }
     }
@@ -1000,6 +1028,15 @@ mod tests {
             IpcAuthorization::Mutation
         );
         assert_eq!(
+            DaemonRequest::CloudAcknowledgeDeletedAccountPurge {
+                owner_account_id: "account-a".to_string(),
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                recovery_token: uuid::Uuid::new_v4().to_string(),
+            }
+            .ipc_authorization(),
+            IpcAuthorization::Mutation
+        );
+        assert_eq!(
             DaemonRequest::Shutdown.ipc_authorization(),
             IpcAuthorization::Shutdown
         );
@@ -1009,6 +1046,124 @@ mod tests {
                 .ipc_authorization(),
             IpcAuthorization::Shutdown
         );
+    }
+
+    #[test]
+    fn every_account_scoped_bound_request_requires_mutation_authorization() {
+        let id = uuid::Uuid::new_v4();
+        let fence = crate::ipc::DaemonMutationFence {
+            owner_account_id: Some("account-a".to_string()),
+            credential_generation: Some(7),
+            meeting_id: Some(id),
+            audio_session_id: Some("audio-a".to_string()),
+            capture_generation: Some(3),
+        };
+        let requests = vec![
+            DaemonRequest::PushCardBound {
+                card: crate::CueCard::new(crate::CardKind::System, "title", "body"),
+                fence: fence.clone(),
+            },
+            DaemonRequest::MeetingStartBound {
+                title: None,
+                fence: fence.clone(),
+            },
+            DaemonRequest::MeetingEndBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::SessionCreateBound {
+                title: None,
+                fence: fence.clone(),
+            },
+            DaemonRequest::SessionActivateBound {
+                id,
+                fence: fence.clone(),
+            },
+            DaemonRequest::SessionContinueBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::SessionDeactivateBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::SessionRenameBound {
+                id,
+                title: "renamed".to_string(),
+                fence: fence.clone(),
+            },
+            DaemonRequest::SessionArchiveBound {
+                id,
+                fence: fence.clone(),
+            },
+            DaemonRequest::SessionDeleteBound {
+                id,
+                fence: fence.clone(),
+            },
+            DaemonRequest::TranscriptAddBound {
+                speaker: crate::Speaker::User,
+                text: "hello".to_string(),
+                is_final: true,
+                fence: fence.clone(),
+            },
+            DaemonRequest::AskBound {
+                question: "question".to_string(),
+                fence: fence.clone(),
+            },
+            DaemonRequest::AnswerBound {
+                request: crate::AnswerRequest::new(
+                    "question",
+                    crate::ProviderRoute::managed_commercial(),
+                ),
+                fence: fence.clone(),
+            },
+            DaemonRequest::ContextAddBound {
+                path: "/tmp/context".to_string(),
+                title: None,
+                note: None,
+                answer_context_role: crate::AnswerContextRole::Other,
+                fence: fence.clone(),
+            },
+            DaemonRequest::ContextRoleSetBound {
+                id,
+                answer_context_role: crate::AnswerContextRole::CandidateResume,
+                fence: fence.clone(),
+            },
+            DaemonRequest::ActivePageCaptureBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::ScreenCaptureStartBound {
+                interval_secs: Some(5),
+                fence: fence.clone(),
+            },
+            DaemonRequest::ScreenCaptureStopBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::InstructionsSetBound {
+                text: "instruction".to_string(),
+                fence: fence.clone(),
+            },
+            DaemonRequest::InstructionsClearBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::AudioStartBound {
+                enable_system: true,
+                enable_microphone: true,
+                mic_device_id: None,
+                fence: fence.clone(),
+            },
+            DaemonRequest::AudioStopBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::CloudLogoutBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::SessionsMoveLocalToCurrentAccountBound {
+                confirmed: true,
+                fence,
+            },
+        ];
+
+        for request in requests {
+            assert_eq!(request.ipc_authorization(), IpcAuthorization::Mutation);
+        }
     }
 
     #[test]

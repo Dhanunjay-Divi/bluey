@@ -15,6 +15,27 @@ required_files=(
   "docs/work/TEMPLATE-REVIEW.md"
 )
 
+test_launcher="scripts/run-bluey-tests.sh"
+test_launcher_docs=(
+  "AGENTS.md"
+  "AGENT-ONBOARDING.md"
+  "AGENT-HANDOFF.md"
+  "docs/HANDOFF.md"
+  "docs/DELIVERY-LIFECYCLE.md"
+  "docs/MODEL-ROUTING.md"
+  "docs/RELEASE-RUNBOOK.md"
+  "docs/SECURITY-HARDENING.md"
+  "docs/TESTING-RUNBOOK.md"
+  "docs/work/TEMPLATE-IMPL.md"
+  "docs/work/TEMPLATE-REVIEW.md"
+  ".github/PULL_REQUEST_TEMPLATE.md"
+)
+test_launcher_consumers=(
+  "scripts/bluey-e2e-staging-smoke.sh"
+  "scripts/observability-acceptance-smoke.sh"
+  "scripts/smoke-test.sh"
+)
+
 while IFS= read -r runbook; do
   required_files+=("$runbook")
 done < <(
@@ -34,6 +55,30 @@ for file in "${required_files[@]}"; do
 
   if ! grep -Fq '$bluey-ops' "$file"; then
     echo "bluey-ops docs check: missing preflight in $file" >&2
+    missing=1
+  fi
+done
+
+if [[ ! -x "$test_launcher" ]]; then
+  echo "bluey-ops docs check: test launcher is missing or not executable: $test_launcher" >&2
+  missing=1
+fi
+
+for file in "${test_launcher_docs[@]}"; do
+  if [[ ! -f "$file" ]]; then
+    echo "bluey-ops docs check: test-launcher entry point is missing: $file" >&2
+    missing=1
+    continue
+  fi
+  if ! grep -Fq "$test_launcher" "$file"; then
+    echo "bluey-ops docs check: isolated test launcher is not documented in $file" >&2
+    missing=1
+  fi
+done
+
+for file in "${test_launcher_consumers[@]}"; do
+  if [[ ! -f "$file" ]] || ! grep -Fq "$test_launcher" "$file"; then
+    echo "bluey-ops docs check: Rust test entry point bypasses $test_launcher: $file" >&2
     missing=1
   fi
 done

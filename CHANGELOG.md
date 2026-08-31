@@ -7,6 +7,16 @@ under `docs/release/`.
 
 ### Added
 
+- Added an opt-in, account-scoped, metadata-only diagnostic spine that
+  correlates native input, audio/STT, RAG, model streaming, persistence, and
+  native rendering without storing transcript, question, answer, prompt, path,
+  URL, token, or provider-response content.
+- Added append-only support-diagnostic consent receipts, consent-epoch and
+  deletion tombstones, and capability-bound account-deletion reconciliation so
+  revocation, response loss, and stale uploads fail closed.
+- Added a disposable local Rust-test launcher that isolates Cargo, databases,
+  application state, logs, temporary files, and external authority, then cleans
+  the complete owned process group after success, failure, or interruption.
 - Added a one-time, keyboard-accessible macOS shortcut coachmark after visible
   desktop sign-in, anchored to the real Shortcuts control without enlarging the
   112 by 30 Bluey pill.
@@ -24,6 +34,15 @@ under `docs/release/`.
 
 ### Changed
 
+- Bound cloud clients and delayed daemon work to one exact credential snapshot
+  across owner, profile generation, API origin, device, and token pair, while
+  keeping OS Keychain use opt-in rather than enabling new prompts.
+- Routed active Bluey test, smoke, CI, handoff, review, and release runbooks
+  through the isolated launcher; release/package artifacts remain outside its
+  cleanup boundary so the exact tested artifact can be promoted.
+- Routed opt-in pre-commit Clippy through the same isolated launcher and
+  expanded its authority scrub to managed tokens, API aliases, FFmpeg, and the
+  context-picker override.
 - Simplified desktop account linking to one explicit `Connect this Bluey`
   confirmation because the browser URL already carries the one-time code;
   manual code entry remains an explicit fallback.
@@ -52,6 +71,19 @@ under `docs/release/`.
 
 ### Fixed
 
+- Prevented stale Account A balance, listen, audio/STT, sync, RAG, answer, and
+  deletion work from clearing or publishing against refreshed Account A2 or
+  replacement Account B authority.
+- Prevented support-diagnostic, session, account, object, and derived-memory
+  resurrection after consent revocation or deletion, including reserved-upload
+  and response-loss races.
+- Removed transcript text, provider error bodies, credentials, endpoints,
+  vocabulary, and local paths from STT error/debug/trace formatting across
+  OpenAI, Deepgram, the provider factory, and local Whisper.
+- Kept disposable overlay-protocol smoke helpers debug-only and accepted them
+  only beneath the exact marked test workspace. The marked-root verifier now
+  compiles only for debug/tests, keeping release builds warning-free while
+  release helper verification remains unchanged.
 - Kept shortcut help fully readable in macOS light mode at every overlay
   opacity, including live theme changes, while delayed onboarding now preserves
   active modals, history, and composer focus.

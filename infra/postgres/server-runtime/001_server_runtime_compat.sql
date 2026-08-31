@@ -320,6 +320,9 @@ CREATE TABLE IF NOT EXISTS cloud_child_tombstones (
   child_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
   deleted_at_ms BIGINT NOT NULL,
+  source_kind TEXT,
+  source_id TEXT,
+  chunk_index BIGINT,
   PRIMARY KEY (account_id, child_kind, child_id)
 );
 CREATE INDEX IF NOT EXISTS idx_cloud_child_tombstones_session

@@ -62,11 +62,31 @@ impl Database {
     }
 
     pub fn search_transcripts(&self, query: &str, limit: usize) -> Result<Vec<TranscriptHit>> {
+        self.search_transcripts_for_owner(None, query, limit)
+    }
+
+    /// Search only transcript rows whose parent session belongs to the exact
+    /// dashboard owner. `None` is the local namespace; it never includes a
+    /// signed-in account's rows.
+    pub fn search_transcripts_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TranscriptHit>> {
+        let owner_account_id = owner_account_id
+            .map(super::validate_cloud_owner_account_id)
+            .transpose()?;
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, text, snippet(transcript_fts, 2, '\u{00AB}', '\u{00BB}', '\u{2026}', 8), source, ts, rank \
-             FROM transcript_fts WHERE text MATCH ?1 ORDER BY rank LIMIT ?2",
+            "SELECT transcript_fts.session_id, transcript_fts.text, \
+                    snippet(transcript_fts, 2, '\u{00AB}', '\u{00BB}', '\u{2026}', 8), \
+                    transcript_fts.source, transcript_fts.ts, transcript_fts.rank \
+             FROM transcript_fts \
+             INNER JOIN sessions ON sessions.id = transcript_fts.session_id \
+             WHERE transcript_fts.text MATCH ?1 AND sessions.owner_account_id IS ?2 \
+             ORDER BY transcript_fts.rank LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
+        let rows = stmt.query_map(params![query, owner_account_id, limit as i64], |row| {
             Ok(TranscriptHit {
                 session_id: row.get(0)?,
                 text: row.get(1)?,
@@ -88,11 +108,27 @@ impl Database {
     }
 
     pub fn list_transcripts(&self, session_id: &str) -> Result<Vec<TranscriptRow>> {
+        self.list_transcripts_for_owner(None, session_id)
+    }
+
+    pub fn list_transcripts_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<Vec<TranscriptRow>> {
+        let owner_account_id = owner_account_id
+            .map(super::validate_cloud_owner_account_id)
+            .transpose()?;
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, text, source, speaker_id, is_final, created_at \
-             FROM transcripts WHERE session_id = ?1 ORDER BY created_at ASC",
+            "SELECT transcripts.id, transcripts.session_id, transcripts.text, \
+                    transcripts.source, transcripts.speaker_id, transcripts.is_final, \
+                    transcripts.created_at \
+             FROM transcripts \
+             INNER JOIN sessions ON sessions.id = transcripts.session_id \
+             WHERE transcripts.session_id = ?1 AND sessions.owner_account_id IS ?2 \
+             ORDER BY transcripts.created_at ASC",
         )?;
-        let rows = stmt.query_map(params![session_id], |row| {
+        let rows = stmt.query_map(params![session_id, owner_account_id], |row| {
             Ok(TranscriptRow {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -112,12 +148,24 @@ impl Database {
         session_id: &str,
         opts: &ExportOptions,
     ) -> Result<String> {
+        self.export_session_markdown_for_owner(None, session_id, opts)
+    }
+
+    pub fn export_session_markdown_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        session_id: &str,
+        opts: &ExportOptions,
+    ) -> Result<String> {
+        let owner_account_id = owner_account_id
+            .map(super::validate_cloud_owner_account_id)
+            .transpose()?;
         let session = self
-            .get_session(uuid::Uuid::parse_str(session_id)?)
+            .get_session_for_owner(owner_account_id, uuid::Uuid::parse_str(session_id)?)
             .context("session lookup")?
             .context("session not found")?;
-        let transcripts = self.list_transcripts(session_id)?;
-        let speakers = self.list_speakers(session_id)?;
+        let transcripts = self.list_transcripts_for_owner(owner_account_id, session_id)?;
+        let speakers = self.list_speakers_for_owner(owner_account_id, session_id)?;
 
         let mut out = String::new();
         out.push_str(&format!("# {}\n\n", session.title));
@@ -153,12 +201,23 @@ impl Database {
     }
 
     pub fn export_session_text(&self, session_id: &str) -> Result<String> {
+        self.export_session_text_for_owner(None, session_id)
+    }
+
+    pub fn export_session_text_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<String> {
+        let owner_account_id = owner_account_id
+            .map(super::validate_cloud_owner_account_id)
+            .transpose()?;
         let session = self
-            .get_session(uuid::Uuid::parse_str(session_id)?)
+            .get_session_for_owner(owner_account_id, uuid::Uuid::parse_str(session_id)?)
             .context("session lookup")?
             .context("session not found")?;
-        let transcripts = self.list_transcripts(session_id)?;
-        let speakers = self.list_speakers(session_id)?;
+        let transcripts = self.list_transcripts_for_owner(owner_account_id, session_id)?;
+        let speakers = self.list_speakers_for_owner(owner_account_id, session_id)?;
 
         let mut out = String::new();
         out.push_str(&format!("{}\n", session.title));
@@ -178,12 +237,23 @@ impl Database {
     }
 
     pub fn export_session_json(&self, session_id: &str) -> Result<String> {
+        self.export_session_json_for_owner(None, session_id)
+    }
+
+    pub fn export_session_json_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<String> {
+        let owner_account_id = owner_account_id
+            .map(super::validate_cloud_owner_account_id)
+            .transpose()?;
         let session = self
-            .get_session(uuid::Uuid::parse_str(session_id)?)
+            .get_session_for_owner(owner_account_id, uuid::Uuid::parse_str(session_id)?)
             .context("session lookup")?
             .context("session not found")?;
-        let transcripts = self.list_transcripts(session_id)?;
-        let speakers = self.list_speakers(session_id)?;
+        let transcripts = self.list_transcripts_for_owner(owner_account_id, session_id)?;
+        let speakers = self.list_speakers_for_owner(owner_account_id, session_id)?;
 
         #[derive(Serialize)]
         struct Export {

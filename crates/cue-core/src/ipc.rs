@@ -32,6 +32,24 @@ pub struct DaemonSessionLifecycle {
     pub active_session_id: Option<uuid::Uuid>,
 }
 
+/// Caller-captured authority for a destructive or account-scoped daemon
+/// mutation. The daemon revalidates every field immediately before changing
+/// state, so a queued request from an earlier account/session cannot affect a
+/// newly signed-in owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonMutationFence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<uuid::Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_generation: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
@@ -64,38 +82,90 @@ pub enum DaemonRequest {
     PushCard {
         card: CueCard,
     },
+    PushCardBound {
+        card: CueCard,
+        fence: DaemonMutationFence,
+    },
     MeetingStart {
         title: Option<String>,
     },
+    MeetingStartBound {
+        title: Option<String>,
+        fence: DaemonMutationFence,
+    },
     MeetingEnd,
+    MeetingEndBound {
+        fence: DaemonMutationFence,
+    },
     SessionCreate {
         title: Option<String>,
+    },
+    SessionCreateBound {
+        title: Option<String>,
+        fence: DaemonMutationFence,
     },
     SessionActivate {
         id: uuid::Uuid,
     },
+    SessionActivateBound {
+        id: uuid::Uuid,
+        fence: DaemonMutationFence,
+    },
     SessionContinue,
+    SessionContinueBound {
+        fence: DaemonMutationFence,
+    },
     SessionDeactivate,
+    SessionDeactivateBound {
+        fence: DaemonMutationFence,
+    },
     SessionRename {
         id: uuid::Uuid,
         title: String,
     },
+    SessionRenameBound {
+        id: uuid::Uuid,
+        title: String,
+        fence: DaemonMutationFence,
+    },
     SessionArchive {
         id: uuid::Uuid,
     },
+    SessionArchiveBound {
+        id: uuid::Uuid,
+        fence: DaemonMutationFence,
+    },
     SessionDelete {
         id: uuid::Uuid,
+    },
+    SessionDeleteBound {
+        id: uuid::Uuid,
+        fence: DaemonMutationFence,
     },
     TranscriptAdd {
         speaker: Speaker,
         text: String,
         is_final: bool,
     },
+    TranscriptAddBound {
+        speaker: Speaker,
+        text: String,
+        is_final: bool,
+        fence: DaemonMutationFence,
+    },
     Ask {
         question: String,
     },
+    AskBound {
+        question: String,
+        fence: DaemonMutationFence,
+    },
     Answer {
         request: AnswerRequest,
+    },
+    AnswerBound {
+        request: AnswerRequest,
+        fence: DaemonMutationFence,
     },
     ContextAdd {
         path: String,
@@ -104,22 +174,52 @@ pub enum DaemonRequest {
         #[serde(default)]
         answer_context_role: AnswerContextRole,
     },
+    ContextAddBound {
+        path: String,
+        title: Option<String>,
+        note: Option<String>,
+        #[serde(default)]
+        answer_context_role: AnswerContextRole,
+        fence: DaemonMutationFence,
+    },
     ContextRoleSet {
         id: uuid::Uuid,
         answer_context_role: AnswerContextRole,
     },
+    ContextRoleSetBound {
+        id: uuid::Uuid,
+        answer_context_role: AnswerContextRole,
+        fence: DaemonMutationFence,
+    },
     ContextList,
     ActivePageCapture,
+    ActivePageCaptureBound {
+        fence: DaemonMutationFence,
+    },
     ScreenCaptureStart {
         interval_secs: Option<u64>,
     },
+    ScreenCaptureStartBound {
+        interval_secs: Option<u64>,
+        fence: DaemonMutationFence,
+    },
     ScreenCaptureStop,
+    ScreenCaptureStopBound {
+        fence: DaemonMutationFence,
+    },
     MeetingDetectionSettingsReload,
     InstructionsSet {
         text: String,
     },
+    InstructionsSetBound {
+        text: String,
+        fence: DaemonMutationFence,
+    },
     InstructionsGet,
     InstructionsClear,
+    InstructionsClearBound {
+        fence: DaemonMutationFence,
+    },
     MemorySearch {
         query: String,
         limit: usize,
@@ -131,13 +231,57 @@ pub enum DaemonRequest {
         #[serde(default)]
         mic_device_id: Option<String>,
     },
+    AudioStartBound {
+        enable_system: bool,
+        enable_microphone: bool,
+        #[serde(default)]
+        mic_device_id: Option<String>,
+        fence: DaemonMutationFence,
+    },
     AudioStop,
+    AudioStopBound {
+        fence: DaemonMutationFence,
+    },
     AiStatus,
     CloudStatus,
     CloudLogin,
     CloudLogout,
+    CloudLogoutBound {
+        fence: DaemonMutationFence,
+    },
+    /// Durably fence local account-owned writes before the dashboard asks the
+    /// server to perform permanent account deletion.
+    CloudPrepareAccountDeletion {
+        owner_account_id: String,
+        operation_id: String,
+        recovery_token: String,
+    },
+    /// Remove a prepared local fence only after the server explicitly reports
+    /// that permanent deletion did not occur.
+    CloudAbortAccountDeletion {
+        owner_account_id: String,
+    },
+    /// Purge every local artifact owned by an account after the server has
+    /// acknowledged permanent account deletion. The dashboard supplies the
+    /// exact owner captured before deletion; the daemon revalidates it against
+    /// the still-persisted account profile before touching local data.
+    CloudPurgeDeletedAccount {
+        owner_account_id: String,
+    },
+    /// Finalize the durable local deletion marker only after account data,
+    /// credentials/profile, onboarding, and dashboard ownership cleanup have
+    /// all completed. The capability must match the original prepared marker.
+    CloudAcknowledgeDeletedAccountPurge {
+        owner_account_id: String,
+        operation_id: String,
+        recovery_token: String,
+    },
     SessionsMoveLocalToCurrentAccount {
         confirmed: bool,
+    },
+    SessionsMoveLocalToCurrentAccountBound {
+        confirmed: bool,
+        fence: DaemonMutationFence,
     },
     CloudSyncNow,
     Recap,
@@ -211,6 +355,10 @@ pub enum DaemonResponse {
     },
     CloudStatus {
         status: CloudSyncStatus,
+    },
+    AccountDeletionPrepared {
+        operation_id: String,
+        recovery_token: String,
     },
     SessionLifecycle {
         lifecycle: DaemonSessionLifecycle,

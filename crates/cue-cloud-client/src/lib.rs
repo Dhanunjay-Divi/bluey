@@ -35,7 +35,8 @@ pub use auth::{DeviceFlow, DeviceFlowState};
 pub use client::CloudClient;
 pub use error::Error;
 pub use tokens::{
-    save_account_profile_and_tokens, save_account_profile_without_tokens, AccountFileStore,
+    save_account_profile_and_tokens, save_account_profile_and_tokens_if_generation,
+    save_account_profile_without_tokens, AccountFileStore, CredentialAuthority, CredentialSnapshot,
     SecureAccountStore, TokenStore, Tokens,
 };
 pub use types::*;

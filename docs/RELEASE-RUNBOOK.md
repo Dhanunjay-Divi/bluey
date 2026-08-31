@@ -135,7 +135,7 @@ git -P pull --rebase
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo build --all-targets --release
-cargo test --all-targets
+bash scripts/run-bluey-tests.sh all
 ( cd crates/cue-dashboard/ui && npm test && npm run build )
 swift build -c release --package-path native/macos/cue-overlay
 swift build -c release --package-path native/macos/cue-whisper

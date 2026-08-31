@@ -22,5 +22,11 @@ describe("cloud sync consent copy", () => {
     expect(cloudSyncConsentCopy.signedOutBalance).toContain(
       "explicitly enable Cloud session sync",
     );
+    expect(cloudSyncConsentCopy.dataControls).toContain("Each account stays off");
+    expect(cloudSyncConsentCopy.toggle).toContain("only to this signed-in account");
+    expect(cloudSyncConsentCopy.toggle).toContain("your questions");
+    expect(cloudSyncConsentCopy.toggle).toContain("final answers");
+    expect(cloudSyncConsentCopy.toggle).toContain("meeting transcripts");
+    expect(cloudSyncConsentCopy.toggle).toContain("previously synced copies remain");
   });
 });

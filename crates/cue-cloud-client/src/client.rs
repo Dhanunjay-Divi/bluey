@@ -10,18 +10,21 @@ use reqwest::{header, Client, Method, Response, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use cue_core::{
-    new_request_id, sanitize_observability_id, trace_id_from_env, BLUEY_REQUEST_ID_HEADER,
-    BLUEY_TRACE_ID_HEADER,
+    new_request_id, sanitize_interaction_id, trace_id_from_env, BLUEY_INTERACTION_ID_HEADER,
+    BLUEY_REQUEST_ID_HEADER, BLUEY_TRACE_ID_HEADER,
 };
 
 use crate::{
     error::{Error, Result},
-    tokens::{TokenStore, Tokens},
+    tokens::{CredentialAuthority, CredentialSnapshot, TokenStore, Tokens},
     types::{
-        ArtifactObjectResponse, AuthResponse, CloudSessionBundle, EmbedBatchRequest,
-        EmbedBatchResponse, EmbedRequest, EmbedResponse, InsufficientBalanceBody, RagQueryRequest,
-        RagQueryResponse, SessionAuditBundleResponse, SessionListResponse, SttSessionCancelRequest,
-        SttSessionCancelResponse, SttSessionRequest, SttSessionResponse, SyncBatchRequest,
+        AccountDeletionAck, AccountDeletionCapability, AccountDeletionStatus,
+        AccountDeletionStatusRequest, ArtifactObjectResponse, AuthResponse, CloudSessionBundle,
+        DeleteAccountRequest, EmbedBatchRequest, EmbedBatchResponse, EmbedRequest, EmbedResponse,
+        InsufficientBalanceBody, RagQueryRequest, RagQueryResponse, SessionAuditBundleResponse,
+        SessionListResponse, SttSessionCancelRequest, SttSessionCancelResponse, SttSessionRequest,
+        SttSessionResponse, SupportDiagnosticConsentReceipt, SupportDiagnosticConsentRequest,
+        SupportDiagnosticConsentStatus, SupportDiagnosticDeleteResponse, SyncBatchRequest,
         SyncBatchResponse,
     },
 };
@@ -111,18 +114,31 @@ pub struct CloudClient {
     http: Client,
     tokens: Arc<dyn TokenStore>,
     cached: Arc<Mutex<CachedCredentials>>,
+    interaction_id: Option<String>,
 }
 
 #[derive(Debug)]
 struct CachedCredentials {
     generation: u64,
-    tokens: Option<Tokens>,
+    bound_authority: Option<CredentialAuthority>,
+    snapshot: Option<CredentialSnapshot>,
 }
 
 impl CachedCredentials {
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        self.tokens = None;
+        self.snapshot = None;
+    }
+
+    fn bind(&mut self, snapshot: CredentialSnapshot) {
+        self.generation = self.generation.wrapping_add(1);
+        self.bound_authority = Some(snapshot.authority().clone());
+        self.snapshot = Some(snapshot);
+    }
+
+    fn replace_within_bound_authority(&mut self, snapshot: CredentialSnapshot) {
+        self.generation = self.generation.wrapping_add(1);
+        self.snapshot = Some(snapshot);
     }
 }
 
@@ -132,15 +148,20 @@ impl CloudClient {
             .user_agent(&config.user_agent)
             .timeout(config.timeout)
             .build()?;
+        let snapshot = tokens.load_snapshot()?;
         let cached = Arc::new(Mutex::new(CachedCredentials {
             generation: 0,
-            tokens: tokens.load()?,
+            bound_authority: snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.authority().clone()),
+            snapshot,
         }));
         Ok(Self {
             config,
             http,
             tokens,
             cached,
+            interaction_id: None,
         })
     }
 
@@ -159,18 +180,58 @@ impl CloudClient {
     /// Save tokens both to the persistent store and the in-memory cache.
     pub fn save_tokens(&self, tokens: Tokens) -> Result<()> {
         let mut cached = self.cached.lock().unwrap();
+        let previous = cached.snapshot.clone();
         cached.invalidate();
-        // A normal save represents login/account replacement. Clear the old
-        // bearer first so a failed replacement cannot leave it active.
-        self.tokens.clear()?;
-        self.tokens.save(&tokens)?;
-        cached.tokens = Some(tokens);
+        if let Err(error) = self.tokens.save(&tokens) {
+            if let Some(previous) = previous.as_ref() {
+                let _ = self.tokens.clear_if_current(previous);
+            }
+            return Err(error);
+        }
+        let snapshot = self.tokens.load_snapshot()?.ok_or_else(|| {
+            Error::TokenStore("credential store lost a completed token save".to_string())
+        })?;
+        if snapshot.tokens() != &tokens {
+            return Err(Error::TokenStore(
+                "credential store changed during token save".to_string(),
+            ));
+        }
+        cached.bind(snapshot);
         Ok(())
     }
 
     /// Load tokens from cache (no I/O on the hot path).
     pub fn current_tokens(&self) -> Option<Tokens> {
-        self.cached.lock().unwrap().tokens.clone()
+        self.cached
+            .lock()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.tokens().clone())
+    }
+
+    /// Return the immutable, non-secret authority captured with the current
+    /// credential pair. The owner and device fields must not be logged.
+    pub fn credential_authority(&self) -> Option<CredentialAuthority> {
+        self.cached
+            .lock()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.authority().clone())
+    }
+
+    /// Return the exact captured snapshot for in-process authority fencing.
+    /// Its Debug implementation redacts all secrets.
+    pub fn credential_snapshot(&self) -> Option<CredentialSnapshot> {
+        self.cached.lock().unwrap().snapshot.clone()
+    }
+
+    /// Check that the persistent store still owns this exact credential
+    /// snapshot. This performs store I/O and must not be used on hot audio or
+    /// streaming chunk paths.
+    pub fn credential_snapshot_is_current(&self, expected: &CredentialSnapshot) -> Result<bool> {
+        Ok(self.tokens.load_snapshot()?.as_ref() == Some(expected))
     }
 
     /// Reload tokens from the persistent store into the in-memory cache.
@@ -180,18 +241,37 @@ impl CloudClient {
     /// store while that client still holds stale cached tokens. This gives those
     /// background tasks a safe recovery path without restarting Bluey.
     pub fn reload_tokens_from_store(&self) -> Result<bool> {
+        let loaded = self.tokens.load_snapshot()?;
         let mut cached = self.cached.lock().unwrap();
-        cached.invalidate();
-        let loaded = self.tokens.load()?;
-        let present = loaded.is_some();
-        cached.tokens = loaded;
-        Ok(present)
+        let Some(bound_authority) = cached.bound_authority.as_ref() else {
+            cached.invalidate();
+            return Ok(false);
+        };
+        let Some(loaded) = loaded else {
+            cached.invalidate();
+            return Ok(false);
+        };
+        if !bound_authority.same_profile_scope(loaded.authority()) {
+            // A long-lived client belongs to the account/profile scope it was
+            // created for. Never transplant a replacement login into it.
+            cached.invalidate();
+            return Ok(false);
+        }
+        cached.replace_within_bound_authority(loaded);
+        Ok(true)
     }
 
     /// Return a copy of this client that attaches a fixed trace id to all
     /// outgoing HTTP calls.
     pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
-        self.config.trace_id = sanitize_observability_id(&trace_id.into());
+        self.config.trace_id = sanitize_interaction_id(&trace_id.into());
+        self
+    }
+
+    /// Return a copy of this client that attaches one validated interaction
+    /// UUID to all outgoing HTTP calls in the answer path.
+    pub fn with_interaction_id(mut self, interaction_id: impl Into<String>) -> Self {
+        self.interaction_id = sanitize_interaction_id(&interaction_id.into());
         self
     }
 
@@ -199,8 +279,40 @@ impl CloudClient {
     pub fn logout(&self) -> Result<()> {
         let mut cached = self.cached.lock().unwrap();
         cached.invalidate();
+        cached.bound_authority = None;
         self.tokens.clear()?;
         Ok(())
+    }
+
+    /// Invalidate this client's captured bearer and clear persistent tokens
+    /// only if they are still the exact pair this client observed.
+    ///
+    /// Returns false after another process logs in or refreshes the same
+    /// account. The replacement credentials are never loaded into this client.
+    pub fn clear_tokens_if_current(&self) -> Result<bool> {
+        let expected = match self.credential_snapshot() {
+            Some(snapshot) => snapshot,
+            None => return Ok(false),
+        };
+        self.clear_credential_snapshot_if_current(&expected)
+    }
+
+    /// Clear only the exact credential snapshot captured by a delayed caller.
+    ///
+    /// Callers must capture `expected` before any prompt, network request, or
+    /// other await boundary. Unlike [`Self::clear_tokens_if_current`], this
+    /// method never substitutes a newer snapshot from this client's cache, so
+    /// a late A1 response cannot clear refreshed A2 credentials.
+    pub fn clear_credential_snapshot_if_current(
+        &self,
+        expected: &CredentialSnapshot,
+    ) -> Result<bool> {
+        let cleared = self.tokens.clear_if_current(expected)?;
+        let mut cached = self.cached.lock().unwrap();
+        if cached.snapshot.as_ref() == Some(expected) {
+            cached.invalidate();
+        }
+        Ok(cleared)
     }
 
     /// POST + parse JSON. No auth header (used for /auth/* endpoints).
@@ -256,14 +368,63 @@ impl CloudClient {
         self.auth_request(Method::POST, path, Some(body)).await
     }
 
+    /// Begin or replay one capability-bound account deletion operation.
+    ///
+    /// The operation is idempotent on the server. If the authenticated response
+    /// is lost, call [`Self::account_deletion_status`] with the same capability;
+    /// an authorization error alone is never proof of deletion.
+    pub async fn delete_account(
+        &self,
+        capability: &AccountDeletionCapability,
+    ) -> Result<AccountDeletionAck> {
+        self.auth_post(
+            "/account/delete",
+            &DeleteAccountRequest::confirmed(capability),
+        )
+        .await
+    }
+
+    /// Confirm a response-lost account deletion without reviving authentication.
+    /// The server stores only a hash of the recovery token and returns no
+    /// account identity or customer content.
+    pub async fn account_deletion_status(
+        &self,
+        capability: &AccountDeletionCapability,
+    ) -> Result<AccountDeletionStatus> {
+        self.post_json(
+            "/account/delete/status",
+            &AccountDeletionStatusRequest::from(capability),
+        )
+        .await
+    }
+
     pub async fn sync_batch(&self, batch: &SyncBatchRequest) -> Result<SyncBatchResponse> {
         self.auth_post("/sync/batch", batch).await
     }
 
     pub async fn list_cloud_sessions(&self, limit: Option<i64>) -> Result<SessionListResponse> {
-        let path = match limit {
-            Some(limit) => format!("/sync/sessions?limit={}", limit.clamp(1, 200)),
-            None => "/sync/sessions".to_string(),
+        self.list_cloud_sessions_page(limit, None).await
+    }
+
+    pub async fn list_cloud_sessions_page(
+        &self,
+        limit: Option<i64>,
+        cursor: Option<&str>,
+    ) -> Result<SessionListResponse> {
+        let query = {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.clamp(1, 200).to_string());
+            }
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+            query.finish()
+        };
+        let path = if query.is_empty() {
+            "/sync/sessions".to_string()
+        } else {
+            format!("/sync/sessions?{query}")
         };
         self.auth_get(&path).await
     }
@@ -310,9 +471,51 @@ impl CloudClient {
     ) -> Result<SessionAuditBundleResponse> {
         let path = format!("/sync/session-audit/{session_id}/{bundle_id}");
         let resp = self
-            .send_bytes_with_auth(Method::POST, &path, bytes, content_type, &[])
+            .send_bytes_with_auth(
+                Method::POST,
+                &path,
+                bytes,
+                content_type,
+                &[
+                    ("x-bluey-audit-schema-version", "1"),
+                    ("x-bluey-content-policy", "metadata_only"),
+                ],
+            )
             .await?;
         Self::parse_or_err(resp).await
+    }
+
+    pub async fn get_support_diagnostic_consent(&self) -> Result<SupportDiagnosticConsentStatus> {
+        self.auth_get("/sync/support-diagnostics/consent").await
+    }
+
+    pub async fn set_support_diagnostic_consent(
+        &self,
+        enabled: bool,
+    ) -> Result<SupportDiagnosticConsentReceipt> {
+        self.auth_request(
+            Method::PUT,
+            "/sync/support-diagnostics/consent",
+            Some(&SupportDiagnosticConsentRequest::current(enabled)),
+        )
+        .await
+    }
+
+    pub async fn delete_all_support_diagnostics(&self) -> Result<SupportDiagnosticDeleteResponse> {
+        self.auth_request(Method::DELETE, "/sync/support-diagnostics", None::<&()>)
+            .await
+    }
+
+    pub async fn delete_session_support_diagnostics(
+        &self,
+        session_id: &str,
+    ) -> Result<SupportDiagnosticDeleteResponse> {
+        self.auth_request(
+            Method::DELETE,
+            &format!("/sync/support-diagnostics/{session_id}"),
+            None::<&()>,
+        )
+        .await
     }
 
     pub async fn download_artifact_object(&self, artifact_id: &str) -> Result<Vec<u8>> {
@@ -423,6 +626,7 @@ impl CloudClient {
         content_type: &str,
         headers: &[(&str, &str)],
     ) -> Result<Response> {
+        let bytes = bytes::Bytes::from(bytes);
         let access = self.current_tokens().ok_or(Error::Unauthorized)?.access;
         let mut request = self
             .request_builder(method.clone(), path)
@@ -459,6 +663,9 @@ impl CloudClient {
         if let Some(trace_id) = self.current_trace_id() {
             req = req.header(BLUEY_TRACE_ID_HEADER, trace_id);
         }
+        if let Some(interaction_id) = self.interaction_id.as_deref() {
+            req = req.header(BLUEY_INTERACTION_ID_HEADER, interaction_id);
+        }
         req
     }
 
@@ -466,16 +673,17 @@ impl CloudClient {
         self.config
             .trace_id
             .as_deref()
-            .and_then(sanitize_observability_id)
+            .and_then(sanitize_interaction_id)
             .or_else(trace_id_from_env)
     }
 
     /// Try to refresh the token pair. Returns true on success.
     async fn refresh_tokens(&self) -> Result<bool> {
-        let (generation, cur) = match self.credential_snapshot() {
+        let (generation, current_snapshot) = match self.credential_snapshot_with_generation() {
             Some(snapshot) => snapshot,
             None => return Ok(false),
         };
+        let cur = current_snapshot.tokens().clone();
         if cur.refresh.is_empty() {
             return Ok(false);
         }
@@ -501,20 +709,32 @@ impl CloudClient {
         };
 
         let mut cached = self.cached.lock().unwrap();
-        if cached.generation != generation || cached.tokens.as_ref() != Some(&cur) {
+        if cached.generation != generation || cached.snapshot.as_ref() != Some(&current_snapshot) {
             return Ok(false);
         }
-        match self.tokens.compare_and_swap(&cur, &replacement) {
+        match self
+            .tokens
+            .compare_and_swap_snapshot(&current_snapshot, &replacement)
+        {
             Ok(true) => {
-                cached.invalidate();
-                cached.tokens = Some(replacement);
+                let stored = self.tokens.load_snapshot()?.ok_or_else(|| {
+                    Error::TokenStore("credential store lost a completed token refresh".to_string())
+                })?;
+                if stored.tokens() != &replacement
+                    || !current_snapshot
+                        .authority()
+                        .same_profile_scope(stored.authority())
+                {
+                    cached.invalidate();
+                    return Ok(false);
+                }
+                cached.replace_within_bound_authority(stored);
                 Ok(true)
             }
             Ok(false) => {
                 // Another client/process changed the persistent account. Do
                 // not retry the original request with that account's bearer.
                 cached.invalidate();
-                cached.tokens = self.tokens.load()?;
                 Ok(false)
             }
             Err(error) => {
@@ -524,12 +744,12 @@ impl CloudClient {
         }
     }
 
-    fn credential_snapshot(&self) -> Option<(u64, Tokens)> {
+    fn credential_snapshot_with_generation(&self) -> Option<(u64, CredentialSnapshot)> {
         let cached = self.cached.lock().unwrap();
         cached
-            .tokens
+            .snapshot
             .clone()
-            .map(|tokens| (cached.generation, tokens))
+            .map(|snapshot| (cached.generation, snapshot))
     }
 
     /// Map server response to either parsed JSON or a typed error.
@@ -735,73 +955,27 @@ fn is_capacity_busy_reason(reason: &str) -> bool {
 }
 
 pub(crate) fn log_safe_response_body(body: &str) -> String {
-    const MAX_LOG_BYTES: usize = 256;
     if body.trim().is_empty() {
         return "<empty>".to_string();
     }
-
-    let redacted = match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(mut value) => {
-            redact_json_value(&mut value);
-            value.to_string()
-        }
-        Err(_) => body.to_string(),
+    let shape = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(values)) => format!("json_object_fields={}", values.len()),
+        Ok(serde_json::Value::Array(values)) => format!("json_array_items={}", values.len()),
+        Ok(_) => "json_scalar".to_string(),
+        Err(_) => "non_json".to_string(),
     };
-
-    truncate_log_value(&redacted, MAX_LOG_BYTES)
-}
-
-fn redact_json_value(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, value) in map.iter_mut() {
-                if is_sensitive_log_key(key) {
-                    *value = serde_json::Value::String("<redacted>".to_string());
-                } else {
-                    redact_json_value(value);
-                }
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                redact_json_value(value);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_sensitive_log_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key.contains("token")
-        || key.contains("secret")
-        || key.contains("password")
-        || key.contains("authorization")
-        || key == "code"
-        || key.ends_with("_code")
-        || key == "nonce"
-        || key.ends_with("_nonce")
-        || key == "url"
-        || key.ends_with("_url")
-}
-
-fn truncate_log_value(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...<truncated>", &value[..end])
+    format!("<{shape};bytes={}>", body.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tokens::MemoryStore;
-    use wiremock::matchers::{header, header_exists, method, path};
+    use wiremock::matchers::{header, header_exists, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TEST_INTERACTION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const TEST_TRACE_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
 
     struct FailingReplacementStore {
         inner: Mutex<Option<Tokens>>,
@@ -829,6 +1003,15 @@ mod tests {
             Ok(())
         }
 
+        fn clear_if_current(&self, expected: &CredentialSnapshot) -> Result<bool> {
+            let mut current = self.inner.lock().unwrap();
+            if current.as_ref() != Some(expected.tokens()) {
+                return Ok(false);
+            }
+            *current = None;
+            Ok(true)
+        }
+
         fn compare_and_swap(&self, expected: &Tokens, replacement: &Tokens) -> Result<bool> {
             let mut current = self.inner.lock().unwrap();
             if current.as_ref() != Some(expected) {
@@ -836,6 +1019,14 @@ mod tests {
             }
             *current = Some(replacement.clone());
             Ok(true)
+        }
+
+        fn compare_and_swap_snapshot(
+            &self,
+            expected: &CredentialSnapshot,
+            replacement: &Tokens,
+        ) -> Result<bool> {
+            self.compare_and_swap(expected.tokens(), replacement)
         }
     }
 
@@ -907,6 +1098,211 @@ mod tests {
         assert_eq!(response.session_id, session_id);
     }
 
+    #[tokio::test]
+    async fn session_list_page_encodes_and_returns_the_opaque_cursor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sync/sessions"))
+            .and(query_param("limit", "25"))
+            .and(query_param("cursor", "opaque.cursor/with symbols"))
+            .and(header("authorization", "Bearer access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessions": [],
+                "deleted_sessions": [],
+                "next_cursor": "next.opaque-cursor"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "owner@example.test".into(),
+            })
+            .unwrap();
+
+        let response = client
+            .list_cloud_sessions_page(Some(25), Some("opaque.cursor/with symbols"))
+            .await
+            .unwrap();
+        assert_eq!(response.next_cursor.as_deref(), Some("next.opaque-cursor"));
+    }
+
+    #[test]
+    fn session_list_response_accepts_legacy_payload_without_a_cursor() {
+        let response: SessionListResponse = serde_json::from_value(serde_json::json!({
+            "sessions": [],
+            "deleted_sessions": []
+        }))
+        .unwrap();
+        assert!(response.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn support_diagnostic_consent_and_cleanup_use_closed_authenticated_contracts() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/sync/support-diagnostics/consent"))
+            .and(header("authorization", "Bearer access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "receipt_id": "receipt-1",
+                "enabled": true,
+                "policy_version": crate::types::SUPPORT_DIAGNOSTIC_POLICY_VERSION,
+                "content_policy": crate::types::SUPPORT_DIAGNOSTIC_CONTENT_POLICY,
+                "revision": 1,
+                "recorded_at_ms": 1234
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/sync/support-diagnostics"))
+            .and(header("authorization", "Bearer access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "scope": "all",
+                "session_id": null,
+                "scheduled_objects": 2,
+                "server_time_ms": 1235
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "owner@example.test".into(),
+            })
+            .unwrap();
+
+        let receipt = client.set_support_diagnostic_consent(true).await.unwrap();
+        assert!(receipt.enabled);
+        let deleted = client.delete_all_support_diagnostics().await.unwrap();
+        assert_eq!(deleted.scheduled_objects, 2);
+
+        let requests = server.received_requests().await.unwrap();
+        let consent_request = requests
+            .iter()
+            .find(|request| request.url.path() == "/sync/support-diagnostics/consent")
+            .expect("consent request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&consent_request.body).expect("consent JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "enabled": true,
+                "policy_version": crate::types::SUPPORT_DIAGNOSTIC_POLICY_VERSION,
+                "content_policy": crate::types::SUPPORT_DIAGNOSTIC_CONTENT_POLICY,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn support_diagnostic_upload_sends_schema_and_content_policy_headers() {
+        let server = MockServer::start().await;
+        let session_id = "550e8400-e29b-41d4-a716-446655440000";
+        let bundle_id = "diagnostic-test";
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/sync/session-audit/{session_id}/{bundle_id}"
+            )))
+            .and(header("authorization", "Bearer access"))
+            .and(header("content-type", "application/json"))
+            .and(header("x-bluey-audit-schema-version", "1"))
+            .and(header("x-bluey-content-policy", "metadata_only"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": session_id,
+                "bundle_id": bundle_id,
+                "object_key": "support/object",
+                "size_bytes": 2,
+                "sha256": "a".repeat(64),
+                "content_type": "application/json",
+                "expires_at_ms": 1234
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "owner@example.test".into(),
+            })
+            .unwrap();
+        client
+            .upload_session_audit_bundle(session_id, bundle_id, b"{}".to_vec(), "application/json")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_deletion_reuses_exact_operation_and_status_is_capability_only() {
+        let server = MockServer::start().await;
+        let capability = AccountDeletionCapability {
+            operation_id: "550e8400-e29b-41d4-a716-446655440401".to_string(),
+            recovery_token: "550e8400-e29b-41d4-a716-446655440402".to_string(),
+        };
+        Mock::given(method("POST"))
+            .and(path("/account/delete"))
+            .and(header("authorization", "Bearer access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deleted": true,
+                "deleted_at": "2026-08-30T00:00:00Z",
+                "deletion_pending": false,
+                "retry_after_ms": null,
+                "object_count_deleted": 0,
+                "note": "deleted"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/account/delete/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deleted": true,
+                "deletion_pending": false,
+                "deleted_at": "2026-08-30T00:00:00Z",
+                "expires_at_ms": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "owner@example.test".into(),
+            })
+            .unwrap();
+        assert!(client.delete_account(&capability).await.unwrap().deleted);
+        assert!(
+            client
+                .account_deletion_status(&capability)
+                .await
+                .unwrap()
+                .deleted
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        for request in requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["operation_id"], capability.operation_id);
+            assert_eq!(body["recovery_token"], capability.recovery_token);
+            if request.url.path() == "/account/delete/status" {
+                assert!(!request.headers.contains_key("authorization"));
+            }
+        }
+    }
+
     #[test]
     fn is_retryable_get_error_classifies_transient_only() {
         // Gateway-class 5xx + 408 are transient -> retry.
@@ -948,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_tokens_from_store_refreshes_cached_tokens() {
+    fn reload_tokens_from_store_accepts_same_authority_refresh() {
         let config = ClientConfig {
             base_url: "https://bluey.test".to_string(),
             user_agent: "test".into(),
@@ -961,7 +1357,7 @@ mod tests {
             &Tokens {
                 access: "old-access".to_string(),
                 refresh: "old-refresh".to_string(),
-                email: "old@example.com".to_string(),
+                email: "owner@example.com".to_string(),
             },
         )
         .unwrap();
@@ -976,7 +1372,7 @@ mod tests {
             &Tokens {
                 access: "new-access".to_string(),
                 refresh: "new-refresh".to_string(),
-                email: "new@example.com".to_string(),
+                email: "owner@example.com".to_string(),
             },
         )
         .unwrap();
@@ -986,6 +1382,90 @@ mod tests {
             client.current_tokens().unwrap().access.as_str(),
             "new-access"
         );
+    }
+
+    #[test]
+    fn reload_tokens_from_store_rejects_replacement_authority() {
+        let config = ClientConfig {
+            base_url: "https://bluey.test".to_string(),
+            user_agent: "test".into(),
+            timeout: Duration::from_secs(10),
+            trace_id: None,
+        };
+        let store = Arc::new(MemoryStore::new());
+        let account_a = Tokens {
+            access: "access-a".to_string(),
+            refresh: "refresh-a".to_string(),
+            email: "a@example.com".to_string(),
+        };
+        TokenStore::save(store.as_ref(), &account_a).unwrap();
+        let client = CloudClient::new(config, store.clone()).unwrap();
+
+        let account_b = Tokens {
+            access: "access-b".to_string(),
+            refresh: "refresh-b".to_string(),
+            email: "b@example.com".to_string(),
+        };
+        TokenStore::save(store.as_ref(), &account_b).unwrap();
+
+        assert!(!client.reload_tokens_from_store().unwrap());
+        assert_eq!(client.current_tokens(), None);
+        assert_eq!(TokenStore::load(store.as_ref()).unwrap(), Some(account_b));
+    }
+
+    #[test]
+    fn conditional_client_clear_does_not_remove_replacement_or_refreshed_tokens() {
+        let config = ClientConfig {
+            base_url: "https://bluey.test".to_string(),
+            user_agent: "test".into(),
+            timeout: Duration::from_secs(10),
+            trace_id: None,
+        };
+        let store = Arc::new(MemoryStore::new());
+        let account_a1 = Tokens {
+            access: "access-a1".to_string(),
+            refresh: "refresh-a1".to_string(),
+            email: "a@example.com".to_string(),
+        };
+        TokenStore::save(store.as_ref(), &account_a1).unwrap();
+        let stale_a1 = CloudClient::new(config.clone(), store.clone()).unwrap();
+        let captured_a1 = stale_a1.credential_snapshot().unwrap();
+
+        let account_a2 = Tokens {
+            access: "access-a2".to_string(),
+            refresh: "refresh-a2".to_string(),
+            email: "a@example.com".to_string(),
+        };
+        TokenStore::save(store.as_ref(), &account_a2).unwrap();
+        assert!(stale_a1.reload_tokens_from_store().unwrap());
+        assert!(!stale_a1
+            .clear_credential_snapshot_if_current(&captured_a1)
+            .unwrap());
+        assert_eq!(stale_a1.current_tokens(), Some(account_a2.clone()));
+        assert_eq!(TokenStore::load(store.as_ref()).unwrap(), Some(account_a2));
+
+        let current_a2 = CloudClient::new(config.clone(), store.clone()).unwrap();
+        let captured_a2 = current_a2.credential_snapshot().unwrap();
+        let account_b = Tokens {
+            access: "access-b".to_string(),
+            refresh: "refresh-b".to_string(),
+            email: "b@example.com".to_string(),
+        };
+        TokenStore::save(store.as_ref(), &account_b).unwrap();
+        assert!(!current_a2
+            .clear_credential_snapshot_if_current(&captured_a2)
+            .unwrap());
+        assert_eq!(
+            TokenStore::load(store.as_ref()).unwrap(),
+            Some(account_b.clone())
+        );
+
+        let current_b = CloudClient::new(config, store.clone()).unwrap();
+        let captured_b = current_b.credential_snapshot().unwrap();
+        assert!(current_b
+            .clear_credential_snapshot_if_current(&captured_b)
+            .unwrap());
+        assert_eq!(TokenStore::load(store.as_ref()).unwrap(), None);
     }
 
     #[test]
@@ -1299,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn log_safe_response_body_redacts_tokens_and_urls() {
+    fn log_safe_response_body_records_shape_only() {
         let body = serde_json::json!({
             "error": "bad",
             "access_token": "secret-access",
@@ -1315,7 +1795,11 @@ mod tests {
         assert!(!safe.contains("device-secret"));
         assert!(!safe.contains("handoff-secret"));
         assert!(!safe.contains("https://bluey.sh/link"));
-        assert!(safe.contains("<redacted>"));
+        assert!(safe.contains("json_object_fields=5"));
+        assert!(safe.contains("bytes="));
+        let non_json = log_safe_response_body("secret bearer response");
+        assert!(!non_json.contains("secret bearer response"));
+        assert!(non_json.contains("non_json"));
     }
 
     #[tokio::test]
@@ -1598,12 +2082,14 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/router/complete/stream"))
             .and(header("authorization", "Bearer old-access"))
+            .and(header(BLUEY_INTERACTION_ID_HEADER, TEST_INTERACTION_ID))
             .respond_with(ResponseTemplate::new(401))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
+            .and(header(BLUEY_INTERACTION_ID_HEADER, TEST_INTERACTION_ID))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "new-access",
                 "refresh_token": "new-refresh",
@@ -1621,6 +2107,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/router/complete/stream"))
             .and(header("authorization", "Bearer new-access"))
+            .and(header(BLUEY_INTERACTION_ID_HEADER, TEST_INTERACTION_ID))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "application/x-ndjson")
@@ -1630,7 +2117,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = client_for(server.uri());
+        let client = client_for(server.uri()).with_interaction_id(TEST_INTERACTION_ID);
         client
             .save_tokens(Tokens {
                 access: "old-access".into(),
@@ -1661,7 +2148,8 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/account/me"))
-            .and(header(BLUEY_TRACE_ID_HEADER, "trace-test"))
+            .and(header(BLUEY_TRACE_ID_HEADER, TEST_TRACE_ID))
+            .and(header(BLUEY_INTERACTION_ID_HEADER, TEST_INTERACTION_ID))
             .and(header_exists(BLUEY_REQUEST_ID_HEADER))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true
@@ -1669,7 +2157,9 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let client = client_for(server.uri()).with_trace_id("trace-test");
+        let client = client_for(server.uri())
+            .with_trace_id(TEST_TRACE_ID)
+            .with_interaction_id(TEST_INTERACTION_ID);
         client
             .save_tokens(Tokens {
                 access: "a".into(),
@@ -1694,5 +2184,27 @@ mod tests {
             .await;
         let client = client_for(server.uri());
         let _: serde_json::Value = client.public_get("/pricing/tiers").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_interaction_id_is_not_sent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pricing/tiers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tiers": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri()).with_interaction_id("person@example.com");
+        let _: serde_json::Value = client.public_get("/pricing/tiers").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0]
+            .headers
+            .contains_key(BLUEY_INTERACTION_ID_HEADER));
     }
 }

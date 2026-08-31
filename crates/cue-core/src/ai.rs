@@ -754,6 +754,9 @@ pub struct AnswerRequestMetadata {
     pub created_at: String,
     pub meeting_id: Option<Uuid>,
     pub correlation_id: Option<String>,
+    /// Ephemeral UUID for one user ask through its visible answer render.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<Uuid>,
     pub stream: bool,
     #[serde(default)]
     pub required_capabilities: Vec<AiCapability>,
@@ -773,6 +776,7 @@ impl AnswerRequestMetadata {
             created_at: clock::now_epoch_ms_string(),
             meeting_id: None,
             correlation_id: None,
+            interaction_id: None,
             stream: false,
             required_capabilities: vec![AiCapability::Chat],
             visible_context_ids: Vec::new(),
@@ -787,6 +791,11 @@ impl AnswerRequestMetadata {
 
     pub fn with_correlation_id(mut self, correlation_id: impl Into<String>) -> Self {
         self.correlation_id = Some(correlation_id.into());
+        self
+    }
+
+    pub fn with_interaction_id(mut self, interaction_id: Uuid) -> Self {
+        self.interaction_id = Some(interaction_id);
         self
     }
 
@@ -1124,6 +1133,9 @@ pub struct AnswerResponseMetadata {
     pub response_id: Uuid,
     pub created_at: String,
     pub provider: ProviderSelector,
+    /// Interaction UUID copied from the originating answer request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_id: Option<Uuid>,
     #[serde(default)]
     pub requested_route: Option<ProviderRoute>,
     #[serde(default)]
@@ -1145,6 +1157,7 @@ impl AnswerResponseMetadata {
             response_id: Uuid::new_v4(),
             created_at: clock::now_epoch_ms_string(),
             provider,
+            interaction_id: None,
             requested_route: None,
             attempts: Vec::new(),
             latency_ms: None,
@@ -1158,6 +1171,11 @@ impl AnswerResponseMetadata {
 
     pub fn with_requested_route(mut self, route: ProviderRoute) -> Self {
         self.requested_route = Some(route);
+        self
+    }
+
+    pub fn with_interaction_id(mut self, interaction_id: Uuid) -> Self {
+        self.interaction_id = Some(interaction_id);
         self
     }
 
@@ -1528,18 +1546,33 @@ mod tests {
 
     #[test]
     fn request_response_and_stream_events_serialize() {
+        let interaction_id =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid UUID");
         let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"));
-        let request = AnswerRequest::new("What changed?", route)
+        let mut request = AnswerRequest::new("What changed?", route)
             .with_context(AnswerContext::transcript(
                 "Alice: We moved the launch date.",
             ))
             .streaming();
+        request.metadata = request.metadata.with_interaction_id(interaction_id);
 
         let request_json = serde_json::to_string(&request).expect("serialize request");
         let round_trip: AnswerRequest =
             serde_json::from_str(&request_json).expect("deserialize request");
         assert_eq!(round_trip.question, "What changed?");
         assert!(round_trip.metadata.stream);
+        assert_eq!(round_trip.metadata.interaction_id, Some(interaction_id));
+
+        let response_metadata = AnswerResponseMetadata::new(
+            request.metadata.request_id,
+            ProviderSelector::openai("gpt-4.1-mini"),
+        )
+        .with_interaction_id(interaction_id);
+        let response_json =
+            serde_json::to_string(&response_metadata).expect("serialize response metadata");
+        let response_round_trip: AnswerResponseMetadata =
+            serde_json::from_str(&response_json).expect("deserialize response metadata");
+        assert_eq!(response_round_trip.interaction_id, Some(interaction_id));
 
         let event = AnswerStreamEvent::delta(request.metadata.request_id, "The launch moved.");
         let event_json = serde_json::to_string(&event).expect("serialize event");
@@ -1555,6 +1588,18 @@ mod tests {
         let status_json = serde_json::to_string(&status).expect("serialize status event");
         assert!(status_json.contains(r#""type":"retrieval_status""#));
         assert!(status_json.contains("Checking conversation context"));
+    }
+
+    #[test]
+    fn legacy_answer_metadata_defaults_interaction_id_to_none() {
+        let metadata: AnswerRequestMetadata = serde_json::from_str(
+            r#"{"request_id":"00000000-0000-0000-0000-000000000000","created_at":"0","meeting_id":null,"correlation_id":null,"stream":false}"#,
+        )
+        .expect("deserialize legacy request metadata");
+
+        assert_eq!(metadata.interaction_id, None);
+        let encoded = serde_json::to_string(&metadata).expect("serialize legacy request metadata");
+        assert!(!encoded.contains("interaction_id"));
     }
 
     #[test]

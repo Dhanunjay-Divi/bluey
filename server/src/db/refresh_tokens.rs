@@ -1,9 +1,9 @@
 //! Refresh token storage. Tokens are stored sha256-hashed so a DB
 //! leak does not expose live tokens.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::db::DbPool;
@@ -56,16 +56,36 @@ pub fn store_with_device(
         let device_id = device_id.map(str::trim).filter(|value| !value.is_empty());
         match pool {
             DbPool::Sqlite(_) => {
-                let conn = pool.get()?;
-                conn.execute(
+                let mut conn = pool.get()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let account_state = tx
+                    .query_row(
+                        "SELECT deletion_pending_at_ms FROM accounts WHERE id = ?1",
+                        params![account_id],
+                        |row| row.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?;
+                if !matches!(account_state, Some(None)) {
+                    bail!("account unavailable for refresh token storage");
+                }
+                tx.execute(
                 "INSERT OR REPLACE INTO refresh_tokens (token_hash, account_id, device_label, device_id, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![token_hash, account_id, device_label, device_id, expires_at_text],
             )?;
+                tx.commit()?;
             }
             DbPool::Postgres(_) => {
                 let mut conn = pool.get_pg()?;
-                conn.execute(
+                let mut tx = conn.transaction()?;
+                let account_state = tx.query_opt(
+                    "SELECT deletion_pending_at_ms FROM accounts WHERE id = $1 FOR UPDATE",
+                    &[&account_id],
+                )?;
+                if !account_state.is_some_and(|row| row.get::<_, Option<i64>>(0).is_none()) {
+                    bail!("account unavailable for refresh token storage");
+                }
+                tx.execute(
                     "INSERT INTO refresh_tokens (token_hash, account_id, device_label, device_id, expires_at)
                  VALUES ($1, $2, $3, $4, $5::timestamptz)
                  ON CONFLICT (token_hash) DO UPDATE SET
@@ -76,6 +96,7 @@ pub fn store_with_device(
                     revoked_at = NULL",
                     &[&token_hash, &account_id, &device_label, &device_id, &expires_at],
                 )?;
+                tx.commit()?;
             }
         }
         Ok(())
@@ -471,6 +492,16 @@ mod tests {
             validate_and_touch(&pool, "tok-1").unwrap(),
             Some(account_id)
         );
+    }
+
+    #[test]
+    fn deletion_fence_rejects_new_refresh_token_storage() {
+        let pool = temp_pool();
+        let account_id = make_account(&pool);
+        assert!(crate::db::account_data::begin_account_deletion(&pool, &account_id, 100).unwrap());
+
+        assert!(store(&pool, "tok-after-delete", &account_id, Some("browser")).is_err());
+        assert_eq!(validate_and_touch(&pool, "tok-after-delete").unwrap(), None);
     }
 
     #[test]

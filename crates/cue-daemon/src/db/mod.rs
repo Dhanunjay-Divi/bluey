@@ -74,6 +74,8 @@ impl Database {
             include_str!("../../../../infra/migrations/009_cue_responses.sql");
         const MIGRATION_012: &str =
             include_str!("../../../../infra/migrations/012_session_ownership.sql");
+        const MIGRATION_013: &str =
+            include_str!("../../../../infra/migrations/013_cloud_session_tombstones.sql");
         self.conn
             .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
@@ -103,6 +105,9 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_012)
             .context("failed to run session ownership migration")?;
+        self.conn
+            .execute_batch(MIGRATION_013)
+            .context("failed to run cloud session tombstone migration")?;
         self.ensure_cue_response_billing_columns()
             .context("failed to ensure cue_response billing columns")?;
         Ok(())
@@ -201,7 +206,12 @@ impl Database {
         let changed = self.conn.execute(
             "INSERT INTO sessions (
                 id, owner_account_id, title, status, created_at, updated_at, last_active_at
-             ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)
+             )
+             SELECT ?1, ?2, ?3, 'active', ?4, ?5, ?5
+             WHERE NOT EXISTS (
+                SELECT 1 FROM cloud_session_tombstones
+                WHERE owner_account_id IS ?2 AND session_id = ?1
+             )
              ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 updated_at = MAX(sessions.updated_at, excluded.updated_at),
@@ -347,7 +357,11 @@ impl Database {
         let result = (|| {
             let changed = self.conn.execute(
                 "UPDATE sessions SET owner_account_id = ?1, updated_at = ?2 \
-                 WHERE id = ?3 AND owner_account_id IS ?4",
+                 WHERE id = ?3 AND owner_account_id IS ?4
+                   AND NOT EXISTS (
+                       SELECT 1 FROM cloud_session_tombstones
+                       WHERE owner_account_id IS ?1 AND session_id = ?3
+                   )",
                 params![to_owner_account_id, now_ms(), id, from_owner_account_id],
             )?;
             if changed == 0 {
@@ -434,6 +448,129 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Remove every local SQL projection owned by a permanently deleted
+    /// account. Session children cascade in the same immediate transaction;
+    /// local and other-account rows are never selected.
+    pub fn purge_account_data_for_owner(&self, owner_account_id: &str) -> Result<usize> {
+        let owner_account_id = validate_cloud_owner_account_id(owner_account_id)?;
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let removed = self.conn.execute(
+                "DELETE FROM sessions WHERE owner_account_id = ?1",
+                params![owner_account_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM cloud_session_tombstones WHERE owner_account_id = ?1",
+                params![owner_account_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM app_state WHERE key = ?1",
+                params![active_session_state_key(Some(owner_account_id))],
+            )?;
+            Ok(removed)
+        })();
+        match result {
+            Ok(removed) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(removed)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Persist an account-scoped cloud deletion fence and remove its local SQL
+    /// projection in one transaction.
+    ///
+    /// The tombstone is recorded even when no projection exists. A projection
+    /// owned by another account (or the local namespace) is never removed.
+    pub fn purge_cloud_tombstoned_session_for_owner(
+        &self,
+        owner_account_id: &str,
+        id: Uuid,
+    ) -> Result<bool> {
+        let owner_account_id = validate_cloud_owner_account_id(owner_account_id)?;
+        let id = id.to_string();
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.conn.execute(
+                "INSERT INTO cloud_session_tombstones (
+                    owner_account_id, session_id, deleted_at_ms
+                 ) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(owner_account_id, session_id) DO UPDATE SET
+                    deleted_at_ms = MAX(
+                        cloud_session_tombstones.deleted_at_ms,
+                        excluded.deleted_at_ms
+                    )",
+                params![owner_account_id, id, now_ms()],
+            )?;
+            let removed = self.conn.execute(
+                "DELETE FROM sessions
+                 WHERE id = ?1 AND owner_account_id = ?2",
+                params![id, owner_account_id],
+            )?;
+            self.conn.execute(
+                "UPDATE app_state SET value = NULL, updated_at = ?1
+                 WHERE key = ?2 AND value = ?3",
+                params![
+                    now_ms(),
+                    active_session_state_key(Some(owner_account_id)),
+                    id
+                ],
+            )?;
+            Ok(removed > 0)
+        })();
+        match result {
+            Ok(removed) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(removed)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn is_cloud_session_tombstoned_for_owner(
+        &self,
+        owner_account_id: &str,
+        id: Uuid,
+    ) -> Result<bool> {
+        let owner_account_id = validate_cloud_owner_account_id(owner_account_id)?;
+        let exists = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM cloud_session_tombstones
+                WHERE owner_account_id = ?1 AND session_id = ?2
+             )",
+            params![owner_account_id, id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// Return whether a session UUID is already bound to another account or
+    /// to the local (NULL-owner) namespace. Callers use this before touching
+    /// legacy session-ID-keyed files that cannot enforce account scope alone.
+    pub fn session_exists_for_different_owner(
+        &self,
+        owner_account_id: &str,
+        id: Uuid,
+    ) -> Result<bool> {
+        let owner_account_id = validate_cloud_owner_account_id(owner_account_id)?;
+        let exists = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sessions
+                WHERE id = ?1 AND owner_account_id IS NOT ?2
+             )",
+            params![id.to_string(), owner_account_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(exists)
     }
 
     pub fn append_turn(&self, session_id: Uuid, turn: NewTurn) -> Result<Turn> {
@@ -600,7 +737,14 @@ impl Database {
     ) -> Result<()> {
         let key = active_session_state_key(owner_account_id);
         match id {
-            Some(u) => self.set_app_state(&key, Some(&u.to_string())),
+            Some(u) => {
+                if let Some(owner_account_id) = owner_account_id {
+                    if self.is_cloud_session_tombstoned_for_owner(owner_account_id, u)? {
+                        anyhow::bail!("cannot activate a cloud-deleted session");
+                    }
+                }
+                self.set_app_state(&key, Some(&u.to_string()))
+            }
             None => self.set_app_state(&key, None),
         }
     }
@@ -688,6 +832,77 @@ impl Database {
         Ok(())
     }
 
+    /// Insert or update a response only when its parent session belongs to the
+    /// exact dashboard owner. `None` addresses only the local NULL-owner
+    /// namespace. A colliding response ID owned by another session cannot be
+    /// moved or overwritten.
+    pub fn insert_cue_response_for_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        response: NewCueResponse<'_>,
+    ) -> Result<()> {
+        let owner_account_id = owner_account_id
+            .map(validate_cloud_owner_account_id)
+            .transpose()?;
+        let changed = self.conn.execute(
+            "INSERT INTO cue_responses (
+                id, session_id, kind, text, source_text, ts_ms,
+                cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens,
+                cost_label, artifact_type, artifact_body, artifact_confidence
+             )
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+             WHERE EXISTS (
+                 SELECT 1 FROM sessions
+                 WHERE sessions.id = ?2 AND sessions.owner_account_id IS ?17
+             )
+             ON CONFLICT(id) DO UPDATE SET
+                session_id = excluded.session_id,
+                kind = excluded.kind,
+                text = excluded.text,
+                source_text = excluded.source_text,
+                ts_ms = excluded.ts_ms,
+                cost_cents = excluded.cost_cents,
+                balance_cents_after = excluded.balance_cents_after,
+                provider = excluded.provider,
+                model = excluded.model,
+                input_tokens = excluded.input_tokens,
+                output_tokens = excluded.output_tokens,
+                cost_label = excluded.cost_label,
+                artifact_type = excluded.artifact_type,
+                artifact_body = excluded.artifact_body,
+                artifact_confidence = excluded.artifact_confidence
+             WHERE cue_responses.session_id = excluded.session_id
+               AND EXISTS (
+                   SELECT 1 FROM sessions
+                   WHERE sessions.id = cue_responses.session_id
+                     AND sessions.owner_account_id IS ?17
+               )",
+            params![
+                response.id,
+                response.session_id,
+                response.kind,
+                response.text,
+                response.source_text,
+                response.ts_ms,
+                response.cost_cents,
+                response.balance_cents_after,
+                response.provider,
+                response.model,
+                response.input_tokens,
+                response.output_tokens,
+                response.cost_label,
+                response.artifact_type,
+                response.artifact_body,
+                response.artifact_confidence,
+                owner_account_id,
+            ],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("response session not found for requested owner scope");
+        }
+        Ok(())
+    }
+
     // ===== Keybinds (Phase 3 Round 9) =====
 
     /// Ensure the user_keybinds table exists.
@@ -712,28 +927,148 @@ impl Database {
                     cost_label, artifact_type, artifact_body, artifact_confidence \
              FROM cue_responses WHERE session_id = ?1 ORDER BY ts_ms DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
-            Ok(crate::llm::CueResponse {
-                id: row.get(0)?,
-                source_session_id: row.get(1)?,
-                kind: row.get(2)?,
-                text: row.get(3)?,
-                source_text: row.get(4)?,
-                ts_ms: row.get::<_, i64>(5)? as u64,
-                cost_cents: row.get(6)?,
-                balance_cents_after: row.get(7)?,
-                provider: row.get(8)?,
-                model: row.get(9)?,
-                input_tokens: row.get(10)?,
-                output_tokens: row.get(11)?,
-                cost_label: row.get(12)?,
-                artifact_type: row.get(13)?,
-                artifact_body: row.get(14)?,
-                artifact_confidence: row.get(15)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![session_id, limit as i64], row_to_cue_response)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Load display response history for the exact dashboard owner. `None`
+    /// means local-only and never includes rows owned by a signed-in account.
+    pub fn list_cue_responses_for_dashboard_owner(
+        &self,
+        owner_account_id: Option<&str>,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::llm::CueResponse>> {
+        let owner_account_id = owner_account_id
+            .map(validate_cloud_owner_account_id)
+            .transpose()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT cue_responses.id, cue_responses.session_id, cue_responses.kind,
+                    cue_responses.text, cue_responses.source_text, cue_responses.ts_ms,
+                    cue_responses.cost_cents, cue_responses.balance_cents_after,
+                    cue_responses.provider, cue_responses.model,
+                    cue_responses.input_tokens, cue_responses.output_tokens,
+                    cue_responses.cost_label, cue_responses.artifact_type,
+                    cue_responses.artifact_body, cue_responses.artifact_confidence
+             FROM cue_responses
+             INNER JOIN sessions ON sessions.id = cue_responses.session_id
+             WHERE cue_responses.session_id = ?1 AND sessions.owner_account_id IS ?2
+             ORDER BY cue_responses.ts_ms DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, owner_account_id, limit as i64],
+            row_to_cue_response,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Load display-oriented response history for one signed-in cloud owner.
+    ///
+    /// This deliberately joins through the owning session instead of trusting
+    /// the caller-supplied session id. Rows owned by another account, and
+    /// legacy sessions whose owner is NULL, are therefore inaccessible.
+    pub fn list_cue_responses_for_owner(
+        &self,
+        owner_account_id: &str,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::llm::CueResponse>> {
+        let owner_account_id = validate_cloud_owner_account_id(owner_account_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT cue_responses.id, cue_responses.session_id, cue_responses.kind,
+                    cue_responses.text, cue_responses.source_text, cue_responses.ts_ms,
+                    cue_responses.cost_cents, cue_responses.balance_cents_after,
+                    cue_responses.provider, cue_responses.model,
+                    cue_responses.input_tokens, cue_responses.output_tokens,
+                    cue_responses.cost_label, cue_responses.artifact_type,
+                    cue_responses.artifact_body, cue_responses.artifact_confidence
+             FROM cue_responses
+             INNER JOIN sessions ON sessions.id = cue_responses.session_id
+             WHERE cue_responses.session_id = ?1 AND sessions.owner_account_id = ?2
+             ORDER BY cue_responses.ts_ms DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![session_id, owner_account_id, limit as i64],
+            row_to_cue_response,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Load the complete response history used to reconcile cloud state.
+    ///
+    /// Cloud deletion is inferred by comparing this authoritative local set
+    /// with the last successful upload. A display-oriented LIMIT must never be
+    /// used here because records outside that window would look deleted.
+    pub fn list_all_cue_responses(&self, session_id: &str) -> Result<Vec<crate::llm::CueResponse>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, kind, text, source_text, ts_ms,
+                    cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens,
+                    cost_label, artifact_type, artifact_body, artifact_confidence \
+             FROM cue_responses WHERE session_id = ?1 ORDER BY ts_ms ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], row_to_cue_response)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Load the complete response history for one signed-in cloud owner.
+    ///
+    /// Cloud reconciliation must use this method rather than the legacy local
+    /// lookup above. Ownership is proved by the parent session row, so an
+    /// owner mismatch or legacy NULL owner returns no responses.
+    pub fn list_all_cue_responses_for_owner(
+        &self,
+        owner_account_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<crate::llm::CueResponse>> {
+        let owner_account_id = validate_cloud_owner_account_id(owner_account_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT cue_responses.id, cue_responses.session_id, cue_responses.kind,
+                    cue_responses.text, cue_responses.source_text, cue_responses.ts_ms,
+                    cue_responses.cost_cents, cue_responses.balance_cents_after,
+                    cue_responses.provider, cue_responses.model,
+                    cue_responses.input_tokens, cue_responses.output_tokens,
+                    cue_responses.cost_label, cue_responses.artifact_type,
+                    cue_responses.artifact_body, cue_responses.artifact_confidence
+             FROM cue_responses
+             INNER JOIN sessions ON sessions.id = cue_responses.session_id
+             WHERE cue_responses.session_id = ?1 AND sessions.owner_account_id = ?2
+             ORDER BY cue_responses.ts_ms ASC, cue_responses.id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id, owner_account_id], row_to_cue_response)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Delete one cloud response only when its parent session belongs to the
+    /// exact signed-in account.
+    ///
+    /// Wrong-owner sessions, legacy NULL-owner sessions, and mismatched
+    /// session/response pairs are left untouched.
+    pub fn delete_cue_response_for_owner(
+        &self,
+        owner_account_id: &str,
+        session_id: &str,
+        response_id: &str,
+    ) -> Result<bool> {
+        let owner_account_id = validate_cloud_owner_account_id(owner_account_id)?;
+        let removed = self.conn.execute(
+            "DELETE FROM cue_responses
+             WHERE id = ?1
+               AND session_id = ?2
+               AND EXISTS (
+                   SELECT 1 FROM sessions
+                   WHERE sessions.id = cue_responses.session_id
+                     AND sessions.owner_account_id = ?3
+               )",
+            params![response_id, session_id, owner_account_id],
+        )?;
+        Ok(removed > 0)
     }
 
     /// Load a keybind for a given action.
@@ -769,6 +1104,14 @@ fn active_session_state_key(owner_account_id: Option<&str>) -> String {
         Some(owner_account_id) => format!("active_session_id:owner:{owner_account_id}"),
         None => "active_session_id:local".to_string(),
     }
+}
+
+fn validate_cloud_owner_account_id(owner_account_id: &str) -> Result<&str> {
+    let trimmed = owner_account_id.trim();
+    if trimmed.is_empty() || trimmed != owner_account_id {
+        anyhow::bail!("cloud session owner account id is invalid");
+    }
+    Ok(trimmed)
 }
 
 fn should_harden_db_parent(parent: &Path) -> bool {
@@ -899,6 +1242,27 @@ fn row_to_turn(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
         input_tokens: row.get(10)?,
         output_tokens: row.get(11)?,
         cost_cents: row.get(12)?,
+    })
+}
+
+fn row_to_cue_response(row: &rusqlite::Row) -> rusqlite::Result<crate::llm::CueResponse> {
+    Ok(crate::llm::CueResponse {
+        id: row.get(0)?,
+        source_session_id: row.get(1)?,
+        kind: row.get(2)?,
+        text: row.get(3)?,
+        source_text: row.get(4)?,
+        ts_ms: row.get::<_, i64>(5)? as u64,
+        cost_cents: row.get(6)?,
+        balance_cents_after: row.get(7)?,
+        provider: row.get(8)?,
+        model: row.get(9)?,
+        input_tokens: row.get(10)?,
+        output_tokens: row.get(11)?,
+        cost_label: row.get(12)?,
+        artifact_type: row.get(13)?,
+        artifact_body: row.get(14)?,
+        artifact_confidence: row.get(15)?,
     })
 }
 
@@ -1209,6 +1573,163 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn account_purge_removes_only_the_named_owners_sql_history() {
+        let db = test_db();
+        let owner_a = "acct-purge-a";
+        let owner_b = "acct-purge-b";
+        let session_a = db
+            .create_session_for_owner(Some(owner_a), Some("Owner A".into()))
+            .unwrap();
+        let session_b = db
+            .create_session_for_owner(Some(owner_b), Some("Owner B".into()))
+            .unwrap();
+        let local = db.create_session(Some("Local".into())).unwrap();
+        for session in [&session_a, &session_b] {
+            db.append_turn(
+                session.id,
+                NewTurn {
+                    user_message: "question".into(),
+                    model_response: "answer".into(),
+                    lane: Lane::Solve,
+                    provider: "test".into(),
+                    model: "test".into(),
+                    created_at: 100,
+                    duration_ms: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_cents: None,
+                },
+            )
+            .unwrap();
+        }
+        db.save_active_session_for_owner(Some(owner_a), Some(session_a.id))
+            .unwrap();
+        let tombstoned_session_id = Uuid::new_v4();
+        db.purge_cloud_tombstoned_session_for_owner(owner_a, tombstoned_session_id)
+            .unwrap();
+
+        assert_eq!(db.purge_account_data_for_owner(owner_a).unwrap(), 1);
+        assert!(db
+            .get_session_for_owner(Some(owner_a), session_a.id)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .list_turns_for_owner(Some(owner_a), session_a.id, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.load_active_session_for_owner(Some(owner_a)).unwrap(),
+            None
+        );
+        assert!(!db
+            .is_cloud_session_tombstoned_for_owner(owner_a, tombstoned_session_id)
+            .unwrap());
+        assert!(db
+            .get_session_for_owner(Some(owner_b), session_b.id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            db.list_turns_for_owner(Some(owner_b), session_b.id, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(db.get_session(local.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn cloud_tombstone_purge_is_durable_and_account_scoped() {
+        let db = test_db();
+        let owner_a = "acct-cloud-delete-a";
+        let owner_b = "acct-cloud-delete-b";
+        let local = db.create_session(Some("Local owner".into())).unwrap();
+        assert!(db
+            .session_exists_for_different_owner(owner_a, local.id)
+            .unwrap());
+        let session = db
+            .create_session_for_owner(Some(owner_a), Some("Delete from cloud".into()))
+            .unwrap();
+        db.save_active_session_for_owner(Some(owner_a), Some(session.id))
+            .unwrap();
+        db.append_turn(
+            session.id,
+            NewTurn {
+                user_message: "question".into(),
+                model_response: "answer".into(),
+                lane: Lane::Solve,
+                provider: "test".into(),
+                model: "test".into(),
+                created_at: 100,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_cents: None,
+            },
+        )
+        .unwrap();
+        let session_id = session.id.to_string();
+        db.insert_cue_response(NewCueResponse {
+            id: "cloud-delete-response",
+            session_id: &session_id,
+            kind: "answer",
+            text: "answer",
+            source_text: Some("question"),
+            ts_ms: 100,
+            cost_cents: None,
+            balance_cents_after: None,
+            provider: Some("test"),
+            model: Some("test"),
+            input_tokens: None,
+            output_tokens: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
+        })
+        .unwrap();
+
+        assert!(db
+            .purge_cloud_tombstoned_session_for_owner(owner_a, session.id)
+            .unwrap());
+        assert!(db
+            .is_cloud_session_tombstoned_for_owner(owner_a, session.id)
+            .unwrap());
+        assert!(db
+            .get_session_for_owner(Some(owner_a), session.id)
+            .unwrap()
+            .is_none());
+        assert!(db.list_cue_responses(&session_id, 10).unwrap().is_empty());
+        assert!(db
+            .list_turns_for_owner(Some(owner_a), session.id, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.load_active_session_for_owner(Some(owner_a)).unwrap(),
+            None
+        );
+
+        assert!(db
+            .ensure_session_record_for_owner(Some(owner_a), session.id, "Late write", 100, 200)
+            .is_err());
+
+        db.ensure_session_record_for_owner(Some(owner_b), session.id, "Owner B", 100, 200)
+            .unwrap();
+        assert!(db
+            .session_exists_for_different_owner(owner_a, session.id)
+            .unwrap());
+        assert!(!db
+            .session_exists_for_different_owner(owner_b, session.id)
+            .unwrap());
+        assert!(!db
+            .purge_cloud_tombstoned_session_for_owner(owner_a, session.id)
+            .unwrap());
+        assert!(db
+            .get_session_for_owner(Some(owner_b), session.id)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1745,6 +2266,80 @@ mod fts_tests {
     }
 
     #[test]
+    fn transcript_search_export_and_speakers_are_exact_owner_scoped() {
+        let db = test_db();
+        let local = db.create_session(Some("Local".into())).unwrap();
+        let owner_a = db
+            .create_session_for_owner(Some("acct-a"), Some("Owner A".into()))
+            .unwrap();
+        let owner_b = db
+            .create_session_for_owner(Some("acct-b"), Some("Owner B".into()))
+            .unwrap();
+        for (session, text) in [
+            (&local, "boundary local phrase"),
+            (&owner_a, "boundary owner a phrase"),
+            (&owner_b, "boundary owner b phrase"),
+        ] {
+            db.insert_transcript(&session.id.to_string(), text, "mic", Some(0), true, 1000)
+                .unwrap();
+        }
+
+        let local_hits = db
+            .search_transcripts_for_owner(None, "boundary", 10)
+            .unwrap();
+        assert_eq!(local_hits.len(), 1);
+        assert_eq!(local_hits[0].session_id, local.id.to_string());
+        let owner_a_hits = db
+            .search_transcripts_for_owner(Some("acct-a"), "boundary", 10)
+            .unwrap();
+        assert_eq!(owner_a_hits.len(), 1);
+        assert_eq!(owner_a_hits[0].session_id, owner_a.id.to_string());
+        let owner_b_hits = db
+            .search_transcripts_for_owner(Some("acct-b"), "boundary", 10)
+            .unwrap();
+        assert_eq!(owner_b_hits.len(), 1);
+        assert_eq!(owner_b_hits[0].session_id, owner_b.id.to_string());
+
+        let owner_a_id = owner_a.id.to_string();
+        db.set_speaker_name_for_owner(Some("acct-a"), &owner_a_id, 0, "Alice", None)
+            .unwrap();
+        assert!(db
+            .set_speaker_name_for_owner(Some("acct-b"), &owner_a_id, 0, "Mallory", None)
+            .is_err());
+        assert!(db
+            .list_speakers_for_owner(Some("acct-b"), &owner_a_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.list_speakers_for_owner(Some("acct-a"), &owner_a_id)
+                .unwrap()[0]
+                .name,
+            "Alice"
+        );
+
+        assert!(db
+            .export_session_markdown_for_owner(
+                Some("acct-b"),
+                &owner_a_id,
+                &super::search::ExportOptions::default(),
+            )
+            .is_err());
+        assert!(db.export_session_text_for_owner(None, &owner_a_id).is_err());
+        assert!(db
+            .export_session_json_for_owner(Some("acct-b"), &owner_a_id)
+            .is_err());
+        let markdown = db
+            .export_session_markdown_for_owner(
+                Some("acct-a"),
+                &owner_a_id,
+                &super::search::ExportOptions::default(),
+            )
+            .unwrap();
+        assert!(markdown.contains("boundary owner a phrase"));
+        assert!(!markdown.contains("owner b"));
+    }
+
+    #[test]
     fn test_fts_ranking_sanity() {
         let db = test_db();
         let session = db.create_session(Some("Rank Test".into())).unwrap();
@@ -1973,6 +2568,189 @@ mod fts_tests {
             Some("CODE\n----\nfn main() {}")
         );
         assert_eq!(response.artifact_confidence, Some(0.95));
+    }
+
+    #[test]
+    fn owner_scoped_cue_response_lookups_fail_closed() {
+        fn insert_response(db: &Database, session_id: Uuid, id: &str, text: &str, ts_ms: i64) {
+            let session_id = session_id.to_string();
+            db.insert_cue_response(NewCueResponse {
+                id,
+                session_id: &session_id,
+                kind: "answer",
+                text,
+                source_text: Some("question"),
+                ts_ms,
+                cost_cents: None,
+                balance_cents_after: None,
+                provider: Some("test"),
+                model: Some("test"),
+                input_tokens: None,
+                output_tokens: None,
+                cost_label: None,
+                artifact_type: None,
+                artifact_body: None,
+                artifact_confidence: None,
+            })
+            .unwrap();
+        }
+
+        let db = test_db();
+        let local = db.create_session(Some("Legacy local".into())).unwrap();
+        let owner_a = db
+            .create_session_for_owner(Some("acct-a"), Some("Owner A".into()))
+            .unwrap();
+        let owner_b = db
+            .create_session_for_owner(Some("acct-b"), Some("Owner B".into()))
+            .unwrap();
+        insert_response(&db, local.id, "local-response", "local", 100);
+        insert_response(&db, owner_a.id, "owner-a-first", "first", 200);
+        insert_response(&db, owner_a.id, "owner-a-second", "second", 300);
+        insert_response(&db, owner_b.id, "owner-b-response", "private b", 400);
+
+        let owner_a_id = owner_a.id.to_string();
+        let owner_b_id = owner_b.id.to_string();
+        let owner_a_latest = db
+            .list_cue_responses_for_owner("acct-a", &owner_a_id, 1)
+            .unwrap();
+        assert_eq!(owner_a_latest.len(), 1);
+        assert_eq!(owner_a_latest[0].id, "owner-a-second");
+
+        let owner_a_complete = db
+            .list_all_cue_responses_for_owner("acct-a", &owner_a_id)
+            .unwrap();
+        assert_eq!(
+            owner_a_complete
+                .iter()
+                .map(|response| response.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["owner-a-first", "owner-a-second"]
+        );
+
+        assert!(db
+            .list_cue_responses_for_owner("acct-b", &owner_a_id, 10)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_all_cue_responses_for_owner("acct-b", &owner_a_id)
+            .unwrap()
+            .is_empty());
+
+        let local_id = local.id.to_string();
+        assert!(db
+            .list_cue_responses_for_owner("acct-a", &local_id, 10)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_all_cue_responses_for_owner("acct-a", &local_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.list_cue_responses(&local_id, 10).unwrap().len(), 1);
+        assert_eq!(db.list_all_cue_responses(&local_id).unwrap().len(), 1);
+
+        assert!(!db
+            .delete_cue_response_for_owner("acct-b", &owner_a_id, "owner-a-first")
+            .unwrap());
+        assert!(!db
+            .delete_cue_response_for_owner("acct-a", &owner_b_id, "owner-a-first")
+            .unwrap());
+        assert!(!db
+            .delete_cue_response_for_owner("acct-a", &local_id, "local-response")
+            .unwrap());
+        assert_eq!(db.list_all_cue_responses(&local_id).unwrap().len(), 1);
+
+        assert!(db
+            .delete_cue_response_for_owner("acct-a", &owner_a_id, "owner-a-first")
+            .unwrap());
+        assert!(!db
+            .delete_cue_response_for_owner("acct-a", &owner_a_id, "owner-a-first")
+            .unwrap());
+        let remaining = db
+            .list_all_cue_responses_for_owner("acct-a", &owner_a_id)
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "owner-a-second");
+
+        assert!(db
+            .list_all_cue_responses_for_owner("", &owner_a_id)
+            .is_err());
+        assert!(db
+            .list_cue_responses_for_owner(" acct-a", &owner_a_id, 10)
+            .is_err());
+    }
+
+    #[test]
+    fn owner_scoped_cue_response_insert_cannot_cross_or_move_sessions() {
+        fn response<'a>(id: &'a str, session_id: &'a str, text: &'a str) -> NewCueResponse<'a> {
+            NewCueResponse {
+                id,
+                session_id,
+                kind: "answer",
+                text,
+                source_text: Some("question"),
+                ts_ms: 100,
+                cost_cents: None,
+                balance_cents_after: None,
+                provider: Some("test"),
+                model: Some("test"),
+                input_tokens: None,
+                output_tokens: None,
+                cost_label: None,
+                artifact_type: None,
+                artifact_body: None,
+                artifact_confidence: None,
+            }
+        }
+
+        let db = test_db();
+        let local = db.create_session(Some("Local".into())).unwrap();
+        let owner_a = db
+            .create_session_for_owner(Some("acct-a"), Some("Owner A".into()))
+            .unwrap();
+        let owner_b = db
+            .create_session_for_owner(Some("acct-b"), Some("Owner B".into()))
+            .unwrap();
+        let owner_a_id = owner_a.id.to_string();
+        let owner_b_id = owner_b.id.to_string();
+        let local_id = local.id.to_string();
+
+        db.insert_cue_response_for_owner(
+            Some("acct-a"),
+            response("stable-response", &owner_a_id, "owner a"),
+        )
+        .unwrap();
+        assert!(db
+            .insert_cue_response_for_owner(
+                Some("acct-b"),
+                response("stable-response", &owner_b_id, "owner b overwrite"),
+            )
+            .is_err());
+        assert!(db
+            .insert_cue_response_for_owner(
+                Some("acct-b"),
+                response("foreign-parent", &owner_a_id, "foreign"),
+            )
+            .is_err());
+        assert!(db
+            .insert_cue_response_for_owner(
+                Some("acct-a"),
+                response("local-parent", &local_id, "local"),
+            )
+            .is_err());
+
+        let owner_a_rows = db
+            .list_cue_responses_for_dashboard_owner(Some("acct-a"), &owner_a_id, 10)
+            .unwrap();
+        assert_eq!(owner_a_rows.len(), 1);
+        assert_eq!(owner_a_rows[0].text, "owner a");
+        assert!(db
+            .list_cue_responses_for_dashboard_owner(Some("acct-b"), &owner_a_id, 10)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_cue_responses_for_dashboard_owner(None, &owner_a_id, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

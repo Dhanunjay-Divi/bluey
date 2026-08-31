@@ -31,7 +31,7 @@
 
 - [ ] `cargo fmt --check` passes
 - [ ] `cargo clippy -- -D warnings` passes
-- [ ] `cargo test` passes
+- [ ] `bash scripts/run-bluey-tests.sh all` passes and cleans its temporary workspace
 - [ ] Manual verification (describe below)
 
 **How verified:**

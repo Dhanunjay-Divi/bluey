@@ -78,7 +78,7 @@ pub async fn build_stt_chain(
             Ok(p) => providers.push(Box::new(p)),
             Err(e) => tracing::warn!(
                 provider = "deepgram",
-                error = %e,
+                error_category = super::deepgram::stt_trace_error_category(&e),
                 "primary STT unavailable; trying configured fallbacks"
             ),
         }
@@ -100,7 +100,11 @@ pub async fn build_stt_chain(
                 .await
             {
                 Ok(p) => providers.push(Box::new(p)),
-                Err(e) => tracing::warn!(provider = "openai", error = %e, "fallback unavailable"),
+                Err(e) => tracing::warn!(
+                    provider = "openai",
+                    error_category = super::deepgram::stt_trace_error_category(&e),
+                    "fallback unavailable"
+                ),
             }
         } else {
             tracing::info!(
@@ -114,9 +118,9 @@ pub async fn build_stt_chain(
     if is_local_whisper_enabled() {
         match super::whisper::LocalWhisperProvider::connect(stt_cfg.clone()) {
             Ok(p) => providers.push(Box::new(p)),
-            Err(e) => tracing::warn!(
+            Err(error) => tracing::warn!(
                 provider = "local_whisper",
-                error = %e,
+                error_category = super::whisper::whisper_error_category(&error),
                 "fallback unavailable"
             ),
         }

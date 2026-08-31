@@ -55,6 +55,14 @@ Cue is a cross-platform AI meeting copilot built with Tauri 2 (Rust backend + Re
 
 ## Test Discipline
 
+- Run local Rust tests through `bash scripts/run-bluey-tests.sh ...`, including
+  focused tests via `bash scripts/run-bluey-tests.sh -- cargo test ...`. The
+  launcher owns isolated temporary Cargo, SQLite, application-data, config,
+  runtime, log, and general temp directories and removes them after success,
+  failure, SIGINT, or SIGTERM. Do not point it at release/package targets or
+  signed artifacts. The launcher must not inherit production or test PostgreSQL
+  URLs. Ephemeral CI runners may retain their workflow-owned Cargo cache; local
+  agent runs may not leave per-task target or database trees.
 - Every task has acceptance criteria defined in the plan docs.
 - Unit tests for all pure logic (>80% coverage target for core).
 - Integration tests for IPC commands and daemon workflows.

@@ -4,14 +4,15 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    mpsc as std_mpsc, Arc,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
+use cue_cloud_client::{CredentialSnapshot, SecureAccountStore, TokenStore};
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
     CostBudget, CostEstimate, LatencyBudget, ProviderClientConfig, ProviderRequestPayload,
@@ -21,7 +22,7 @@ use cue_core::app_paths::AppPaths;
 use cue_core::audio::{AudioPlatformCapability, AudioRuntimeMode};
 #[cfg(target_os = "windows")]
 use cue_core::capture_windows_screen;
-use cue_core::ipc::{DaemonRequest, DaemonResponse};
+use cue_core::ipc::{DaemonMutationFence, DaemonRequest, DaemonResponse};
 use cue_core::ipc_auth::{DaemonWireRequest, IpcAuthErrorCode, IpcAuthenticator};
 use cue_core::ipc_transport::{
     read_bounded_frame, serialize_daemon_response, write_frame, IpcFrameReadError,
@@ -49,21 +50,20 @@ use cue_core::{
     analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
     new_trace_id, sanitize_observability_id, trace_id_from_env, update_settings, AiCapabilities,
     AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerContext, AnswerContextKind,
-    AnswerContextRole, AudioCaptureConfig, AudioCaptureStatus, AudioChunkMetadata,
-    AudioDeviceDescriptor, AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind,
-    CloudEndpointConfig, CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact,
-    ContextKind, ContextProcessingStatus, ContextWatchSettings, ConversationTurn, CueCard,
-    CueCardArtifact, CueCardAttachment, DaemonSessionLifecycle, DaemonSessionRecord, DaemonState,
-    MeetingRecord, MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent,
-    OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
-    Speaker, TranscriptSegment,
+    AnswerContextRole, AnswerRenderAckPhase, AudioCaptureConfig, AudioCaptureStatus,
+    AudioChunkMetadata, AudioDeviceDescriptor, AudioPipelineStatus, AudioSourceKind,
+    CardArtifactType, CardKind, CloudEndpointConfig, CloudEnvironment, CloudSyncState,
+    CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus, ContextWatchSettings,
+    ConversationTurn, CueCard, CueCardArtifact, CueCardAttachment, DaemonSessionLifecycle,
+    DaemonSessionRecord, DaemonState, MeetingRecord, MeetingState, MemoryHit, OverlayCommand,
+    OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute,
+    ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use cue_llm::{
     bluey_managed::{BlueyManagedProvider, ManagedLane},
     LlmArtifactMetadata, LlmProvider as _, LlmRequest, LlmSourceMetadata,
 };
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -81,8 +81,13 @@ use tracing::{debug, error, info, trace, warn};
 use crate::audio::system_capture::{
     find_native_audio_helper, spawn_native_audio_helper_stream, NativeAudioHelperMode,
 };
+use crate::cloud::balance::{BalanceEvent, BalancePollTask, BalanceSnapshot};
 use crate::cloud::meeting_detect::{MeetingTransition, MeetingWatch};
-use crate::cloud::sync::append_session_audit_event;
+use crate::cloud::sync::SessionAuditScope;
+use crate::diagnostics::{
+    DiagnosticComponent, DiagnosticEvent, DiagnosticEventKind, DiagnosticOutcome,
+    DiagnosticPriority, DiagnosticRuntime,
+};
 use crate::doc_conversion::{
     build_markdown_preview, classify_context_path, convert_context_file_to_markdown,
     is_supported_context_file, supported_context_formats_message, write_markdown_artifact,
@@ -98,6 +103,14 @@ use crate::rag_indexer::RagIndexCoordinator;
 use crate::storage::MeetingStore;
 
 const AUTO_CLOUD_SYNC_DEBOUNCE_SECS: u64 = 20;
+const CLOUD_SESSION_SYNC_RETRY_TICK_SECS: u64 = 60;
+const CLOUD_SESSION_SYNC_HEARTBEAT_SECS: u64 = 5 * 60;
+const CLOUD_SESSION_SYNC_MAX_BACKOFF_SECS: u64 = 15 * 60;
+const CLOUD_SESSION_SYNC_JITTER_SECS: u64 = 17;
+const CLOUD_SESSION_AUTO_SYNC_BUDGET_SECS: u64 = 45;
+const CLOUD_SESSION_MANUAL_SYNC_BUDGET_SECS: u64 = 5 * 60;
+const SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS: u64 = 60;
+const SUPPORT_DIAGNOSTIC_SYNC_MAX_BACKOFF_SECS: u64 = 15 * 60;
 const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
 const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
 const LIVE_STT_PREFACE_CHUNKS: usize = 8;
@@ -119,6 +132,14 @@ const OVERLAY_EVENT_QUEUE_CAPACITY: usize = 256;
 const OVERLAY_PRIORITY_EVENT_QUEUE_CAPACITY: usize = 8;
 const OVERLAY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 const OVERLAY_HYDRATION_TIMEOUT: Duration = Duration::from_secs(12);
+const OVERLAY_ACCOUNT_HYDRATION_MAX_ATTEMPTS: usize = 3;
+const OVERLAY_WRITE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
+const OVERLAY_CONTROL_COMMAND_QUEUE_CAPACITY: usize = 64;
+const OVERLAY_LOSSY_COMMAND_QUEUE_CAPACITY: usize = 128;
+const OVERLAY_CONTROL_COMMAND_MAX_BYTES: usize = 1024 * 1024;
+const OVERLAY_LOSSY_COMMAND_MAX_BYTES: usize = 512 * 1024;
+const OVERLAY_CONTROL_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const OVERLAY_LOSSY_QUEUE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const OVERLAY_MAX_RESTART_ATTEMPTS: u32 = 5;
 const OVERLAY_RESTART_BASE_DELAY_MS: u64 = 250;
 const OVERLAY_RESTART_MAX_DELAY_MS: u64 = 5_000;
@@ -397,15 +418,6 @@ fn elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn stable_text_hash_prefix(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return "none".to_string();
-    }
-    let digest = Sha256::digest(trimmed.as_bytes());
-    hex::encode(&digest[..8])
-}
-
 fn contains_any_text(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -599,7 +611,6 @@ fn log_answer_request_diagnostics(
     let context = answer_context_shape(&request.context);
     info!(
         request_id = %request.metadata.request_id,
-        question_hash = %stable_text_hash_prefix(&request.question),
         source = %source,
         route_primary = %request.route.primary.provider.display_label(),
         route_fallbacks = request.route.fallbacks.len(),
@@ -708,10 +719,10 @@ fn log_answer_failure_diagnostics(
     error: &anyhow::Error,
 ) {
     let context = answer_context_shape(&request.context);
+    let raw_error = format!("{error:#}");
     warn!(
         request_id = %request.metadata.request_id,
         request_ref = %short_request_ref(request.metadata.request_id),
-        question_hash = %stable_text_hash_prefix(&request.question),
         meeting_id = %meeting.id,
         session_code = %meeting.session_code(),
         source = %source,
@@ -729,9 +740,113 @@ fn log_answer_failure_diagnostics(
         context_transcripts = context.transcripts,
         context_memory = context.memory,
         context_other = context.other,
-        error = %format!("{error:#}"),
+        error_category = answer_diagnostic_error_category(error),
+        error_ref = %closed_diagnostic_ref("answer", &raw_error),
         "answer request failed before completion"
     );
+}
+
+fn closed_diagnostic_ref(domain: &str, value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bluey-closed-diagnostic-ref-v1\0");
+    digest.update((domain.len() as u64).to_be_bytes());
+    digest.update(domain.as_bytes());
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+    hex::encode(&digest.finalize()[..8])
+}
+
+fn transport_error_category(value: &str) -> &'static str {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        "timeout"
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("auth")
+        || lower.contains("unauthorized")
+    {
+        "authentication"
+    } else if lower.contains("429") || lower.contains("rate limit") {
+        "rate_limit"
+    } else if lower.contains("permission") || lower.contains("access denied") {
+        "permission"
+    } else if lower.contains("connect")
+        || lower.contains("network")
+        || lower.contains("socket")
+        || lower.contains("dns")
+        || lower.contains("tls")
+    {
+        "network"
+    } else if lower.contains("json") || lower.contains("parse") || lower.contains("protocol") {
+        "protocol"
+    } else {
+        "provider"
+    }
+}
+
+fn stt_error_category(error: &cue_core::stt::SttError) -> &'static str {
+    match error {
+        cue_core::stt::SttError::Auth => "authentication",
+        cue_core::stt::SttError::Quota(_) => "quota",
+        cue_core::stt::SttError::Network(_) => "network",
+        cue_core::stt::SttError::Protocol(_) => "protocol",
+        cue_core::stt::SttError::Provider(_) => "provider",
+        cue_core::stt::SttError::AudioFormat(_) => "audio_format",
+        cue_core::stt::SttError::NotActive => "not_active",
+    }
+}
+
+fn closed_transport_error(service: &str, raw_error: &str) -> anyhow::Error {
+    anyhow!(
+        "{service} failed: {}; diagnostic_ref={}",
+        transport_error_category(raw_error),
+        closed_diagnostic_ref(service, raw_error)
+    )
+}
+
+fn closed_http_response_error(service: &str, status: u16, body: &str) -> anyhow::Error {
+    anyhow!(
+        "{service} returned HTTP {status}; response_ref={}; response_bytes={}",
+        closed_diagnostic_ref(service, body),
+        body.len()
+    )
+}
+
+fn closed_invalid_response_error(service: &str, body: &str) -> anyhow::Error {
+    anyhow!(
+        "{service} returned an invalid response; response_ref={}; response_bytes={}",
+        closed_diagnostic_ref(service, body),
+        body.len()
+    )
+}
+
+fn answer_diagnostic_error_category(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("timeout") || message.contains("timed out") {
+        "timeout"
+    } else if message.contains("capacity") || message.contains("busy") {
+        "capacity"
+    } else if message.contains("rate limit") || message.contains("429") {
+        "rate_limit"
+    } else if message.contains("auth") || message.contains("unauthorized") {
+        "authentication"
+    } else if message.contains("billing")
+        || message.contains("balance")
+        || message.contains("payment")
+    {
+        "billing"
+    } else if message.contains("network")
+        || message.contains("connect")
+        || message.contains("socket")
+    {
+        "network"
+    } else if message.contains("cancel") || message.contains("superseded") {
+        "cancelled"
+    } else if message.contains("safety") || message.contains("disclosure") {
+        "safety"
+    } else {
+        "internal"
+    }
 }
 
 fn is_provider_status_line(line: &str) -> bool {
@@ -863,10 +978,162 @@ struct PreparedImageContext {
     converted: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnswerAccountContext {
+    owner_account_id: Option<String>,
+    credential_generation: Option<u64>,
+}
+
+impl AnswerAccountContext {
+    fn from_account(account: Option<&cue_core::AccountConfig>) -> Self {
+        let owner_account_id = account
+            .and_then(cue_core::AccountConfig::owner_account_id)
+            .map(ToString::to_string);
+        let credential_generation = owner_account_id
+            .as_ref()
+            .and_then(|_| account.map(|account| account.credential_generation));
+        Self {
+            owner_account_id,
+            credential_generation,
+        }
+    }
+
+    fn capture(paths: &AppPaths) -> Result<Self> {
+        let account = load_account(paths)?;
+        let context = Self::from_account(account.as_ref());
+        if load_pending_deleted_account_purge(paths)?.is_some_and(|pending| {
+            context.owner_account_id.as_deref() == Some(pending.owner_account_id.as_str())
+        }) {
+            return Err(anyhow!(AnswerAccountContextChanged));
+        }
+        Ok(context)
+    }
+
+    fn ensure_owner_current(&self, paths: &AppPaths) -> Result<()> {
+        let current = Self::capture(paths).map_err(|_| anyhow!(AnswerAccountContextChanged))?;
+        if current.owner_account_id.as_deref() != self.owner_account_id.as_deref() {
+            return Err(anyhow!(AnswerAccountContextChanged));
+        }
+        Ok(())
+    }
+
+    fn ensure_current(&self, paths: &AppPaths) -> Result<()> {
+        let current = Self::capture(paths).map_err(|_| anyhow!(AnswerAccountContextChanged))?;
+        if current != *self {
+            return Err(anyhow!(AnswerAccountContextChanged));
+        }
+        Ok(())
+    }
+}
+
+fn validate_account_mutation_fence(
+    paths: &AppPaths,
+    fence: &DaemonMutationFence,
+) -> Result<AnswerAccountContext> {
+    let expected = AnswerAccountContext {
+        owner_account_id: fence.owner_account_id.clone(),
+        credential_generation: fence.credential_generation,
+    };
+    let current = AnswerAccountContext::capture(paths)
+        .map_err(|_| anyhow!("account mutation authority changed"))?;
+    ensure!(current == expected, "account mutation authority changed");
+    Ok(current)
+}
+
+async fn validate_session_mutation_fence(
+    daemon: &Arc<Daemon>,
+    fence: &DaemonMutationFence,
+    check_audio_session: bool,
+) -> Result<AnswerAccountContext> {
+    let account = validate_account_mutation_fence(&daemon.paths, fence)?;
+    let meeting = daemon.meeting.lock().await.clone();
+    ensure!(
+        meeting.as_ref().map(|meeting| meeting.id) == fence.meeting_id,
+        "active session mutation authority changed"
+    );
+    if let Some(meeting) = meeting.as_ref() {
+        ensure!(
+            meeting_visible_for_owner(meeting, account.owner_account_id.as_deref()),
+            "active session does not belong to the expected account"
+        );
+    }
+    if check_audio_session {
+        let audio_session_id = daemon.audio_runtime.lock().await.session_id.clone();
+        ensure!(
+            audio_session_id == fence.audio_session_id,
+            "audio capture mutation authority changed"
+        );
+    }
+    Ok(account)
+}
+
+async fn current_session_mutation_fence(
+    daemon: &Arc<Daemon>,
+    include_audio_session: bool,
+) -> Result<DaemonMutationFence> {
+    let account = AnswerAccountContext::capture(&daemon.paths)?;
+    let meeting = daemon.meeting.lock().await.clone();
+    if let Some(meeting) = meeting.as_ref() {
+        ensure!(
+            meeting_visible_for_owner(meeting, account.owner_account_id.as_deref()),
+            "active session does not belong to the current account"
+        );
+    }
+    let audio_session_id = if include_audio_session {
+        daemon.audio_runtime.lock().await.session_id.clone()
+    } else {
+        None
+    };
+    Ok(DaemonMutationFence {
+        owner_account_id: account.owner_account_id,
+        credential_generation: account.credential_generation,
+        meeting_id: meeting.map(|meeting| meeting.id),
+        audio_session_id,
+        capture_generation: None,
+    })
+}
+
+#[derive(Debug)]
+struct AnswerAccountContextChanged;
+
+impl std::fmt::Display for AnswerAccountContextChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("signed-in account changed during answer generation")
+    }
+}
+
+impl std::error::Error for AnswerAccountContextChanged {}
+
+fn answer_account_context_changed(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<AnswerAccountContextChanged>()
+        .is_some()
+}
+
+fn answer_owner_transitioned(
+    previous: &AnswerAccountContext,
+    current: &AnswerAccountContext,
+) -> bool {
+    previous.owner_account_id.as_deref() != current.owner_account_id.as_deref()
+}
+
+fn ensure_answer_account_context_for_provider(
+    context: &AnswerAccountContext,
+    paths: &AppPaths,
+    provider: &ProviderSelector,
+) -> Result<()> {
+    if matches!(provider.provider_kind, AiProviderKind::CueManaged) {
+        context.ensure_current(paths)
+    } else {
+        context.ensure_owner_current(paths)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveAnswerSnapshot {
     generation_id: u64,
     card_id: uuid::Uuid,
+    interaction_id: uuid::Uuid,
     body: String,
     sequence: u64,
     done: bool,
@@ -874,10 +1141,25 @@ struct ActiveAnswerSnapshot {
     artifact: Option<CueCardArtifact>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingAnswerRenderAck {
+    scope: SessionAuditScope,
+    card_id: uuid::Uuid,
+    interaction_id: uuid::Uuid,
+    phase: AnswerRenderAckPhase,
+    sequence: u64,
+    answer_generation: u64,
+    pipeline_started_at: Instant,
+    final_is_first_visible_text: bool,
+}
+
 struct OverlayAnswerStream {
     daemon: Arc<Daemon>,
     card_id: uuid::Uuid,
     generation_id: u64,
+    interaction_id: uuid::Uuid,
+    request_id: uuid::Uuid,
+    audit_scope: SessionAuditScope,
     started_at: Instant,
     first_answer_at: Option<Instant>,
     body: String,
@@ -887,15 +1169,31 @@ struct OverlayAnswerStream {
     last_flush_at: Instant,
     pending_chars_since_flush: usize,
     delta_count: u64,
+    first_render_ack_requested: bool,
+    answer_account_context: AnswerAccountContext,
+    require_credential_generation: bool,
+}
+
+struct OverlayAnswerStreamConfig {
+    card_id: uuid::Uuid,
+    generation_id: u64,
+    interaction_id: uuid::Uuid,
+    request_id: uuid::Uuid,
+    audit_scope: SessionAuditScope,
+    started_at: Instant,
+    answer_account_context: AnswerAccountContext,
 }
 
 impl OverlayAnswerStream {
-    fn new(daemon: Arc<Daemon>, card_id: uuid::Uuid, generation_id: u64) -> Self {
+    fn new(daemon: Arc<Daemon>, config: OverlayAnswerStreamConfig) -> Self {
         Self {
             daemon,
-            card_id,
-            generation_id,
-            started_at: Instant::now(),
+            card_id: config.card_id,
+            generation_id: config.generation_id,
+            interaction_id: config.interaction_id,
+            request_id: config.request_id,
+            audit_scope: config.audit_scope,
+            started_at: config.started_at,
             first_answer_at: None,
             body: String::new(),
             showing_status: false,
@@ -904,11 +1202,32 @@ impl OverlayAnswerStream {
             last_flush_at: Instant::now(),
             pending_chars_since_flush: 0,
             delta_count: 0,
+            first_render_ack_requested: false,
+            answer_account_context: config.answer_account_context,
+            require_credential_generation: false,
+        }
+    }
+
+    fn require_managed_account_context(&mut self) {
+        self.require_credential_generation = true;
+    }
+
+    fn ensure_answer_account_context(&self) -> Result<()> {
+        if self.require_credential_generation {
+            self.answer_account_context
+                .ensure_current(&self.daemon.paths)
+        } else {
+            self.answer_account_context
+                .ensure_owner_current(&self.daemon.paths)
         }
     }
 
     fn has_text(&self) -> bool {
         !self.body.trim().is_empty()
+    }
+
+    async fn emit_diagnostic(&self, event: DiagnosticEvent, priority: DiagnosticPriority) {
+        emit_diagnostic_for_scope(&self.daemon, self.audit_scope.clone(), event, priority);
     }
 
     fn recoverable_partial_answer(&self) -> Option<String> {
@@ -929,7 +1248,7 @@ impl OverlayAnswerStream {
             self.body.clear();
             self.showing_status = false;
         }
-        self.mark_answer_started();
+        self.mark_answer_started(delta.chars().count()).await;
         self.body.push_str(&delta);
         self.pending_chars_since_flush = self
             .pending_chars_since_flush
@@ -950,14 +1269,18 @@ impl OverlayAnswerStream {
         self.body = message;
         self.showing_status = true;
         self.pending_chars_since_flush = self.body.chars().count();
-        record_visible_audit_event(
-            &self.daemon,
-            "ui_answer_status",
-            json!({
-                "card_id": self.card_id.to_string(),
-                "generation_id": self.generation_id,
-                "message": self.body.clone(),
-            }),
+        self.emit_diagnostic(
+            DiagnosticEvent::new(
+                DiagnosticEventKind::AnswerStatusPresented,
+                DiagnosticComponent::Daemon,
+                DiagnosticOutcome::Started,
+            )
+            .card_id(self.card_id)
+            .interaction_id(Some(self.interaction_id))
+            .request_id(self.request_id)
+            .generation(self.generation_id)
+            .output_chars(self.body.chars().count()),
+            DiagnosticPriority::Ordinary,
         )
         .await;
         self.flush(false).await
@@ -967,18 +1290,24 @@ impl OverlayAnswerStream {
         let text = sanitize_answer_text(text);
         self.body.clear();
         self.showing_status = false;
-        record_visible_audit_event(
-            &self.daemon,
-            "ui_answer_replay_text",
-            json!({
-                "card_id": self.card_id.to_string(),
-                "generation_id": self.generation_id,
-                "text": compact_snippet(&text, 64_000),
-            }),
+        self.emit_diagnostic(
+            DiagnosticEvent::new(
+                DiagnosticEventKind::AnswerReplayStarted,
+                DiagnosticComponent::Daemon,
+                DiagnosticOutcome::Started,
+            )
+            .card_id(self.card_id)
+            .interaction_id(Some(self.interaction_id))
+            .request_id(self.request_id)
+            .generation(self.generation_id)
+            .output_chars(text.chars().count()),
+            DiagnosticPriority::Ordinary,
         )
         .await;
+        if !text.trim().is_empty() {
+            self.mark_answer_started(text.chars().count()).await;
+        }
         for chunk in streaming_word_chunks(&text) {
-            self.mark_answer_started();
             self.body.push_str(&chunk);
             self.pending_chars_since_flush = self
                 .pending_chars_since_flush
@@ -1014,7 +1343,7 @@ impl OverlayAnswerStream {
         let final_body = visible_answer_body_for_artifact(final_body, artifact.as_ref());
         if self.body != final_body {
             if !final_body.trim().is_empty() {
-                self.mark_answer_started();
+                self.mark_answer_started(final_body.chars().count()).await;
             }
             self.body = final_body;
             self.showing_status = false;
@@ -1057,33 +1386,48 @@ impl OverlayAnswerStream {
             artifact_body_chars,
             "overlay final answer diagnostics"
         );
-        record_visible_audit_event(
-            &self.daemon,
-            "ui_answer_update_done",
-            json!({
-                "card_id": self.card_id.to_string(),
-                "generation_id": self.generation_id,
-                "final_body": compact_snippet(&self.body, 64_000),
-                "cost_label": cost_label.clone(),
-                "answer_chars": shape.chars,
-                "answer_lines": shape.lines,
-                "answer_closed_code_blocks": shape.closed_code_blocks,
-                "answer_has_unclosed_code_fence": shape.has_unclosed_code_fence,
-                "artifact_type": artifact_type,
-                "artifact_confidence_pct": artifact_confidence_pct,
-                "artifact_body_chars": artifact_body_chars,
-                "presentation_sequence": self.sequence.saturating_add(1),
-                "provider_delta_count": self.delta_count,
-            }),
+        self.flush_with_cost_label(true, cost_label).await?;
+        self.emit_diagnostic(
+            DiagnosticEvent::new(
+                DiagnosticEventKind::AnswerCompleted,
+                DiagnosticComponent::Daemon,
+                DiagnosticOutcome::Succeeded,
+            )
+            .interaction_id(Some(self.interaction_id))
+            .request_id(self.request_id)
+            .card_id(self.card_id)
+            .generation(self.generation_id)
+            .sequence(self.sequence)
+            .output_chars(shape.chars)
+            .count(self.delta_count as usize)
+            .artifact_type(artifact_type)
+            .duration_ms(Some(elapsed_ms(self.started_at))),
+            DiagnosticPriority::Terminal,
         )
         .await;
-        self.flush_with_cost_label(true, cost_label).await
+        Ok(())
     }
 
-    fn mark_answer_started(&mut self) {
-        if self.first_answer_at.is_none() {
-            self.first_answer_at = Some(Instant::now());
+    async fn mark_answer_started(&mut self, first_text_chars: usize) {
+        if self.first_answer_at.is_some() {
+            return;
         }
+        self.first_answer_at = Some(Instant::now());
+        self.emit_diagnostic(
+            DiagnosticEvent::new(
+                DiagnosticEventKind::AnswerFirstText,
+                DiagnosticComponent::Daemon,
+                DiagnosticOutcome::Succeeded,
+            )
+            .interaction_id(Some(self.interaction_id))
+            .request_id(self.request_id)
+            .card_id(self.card_id)
+            .generation(self.generation_id)
+            .duration_ms(self.answer_start_latency_ms())
+            .output_chars(first_text_chars),
+            DiagnosticPriority::Ordinary,
+        )
+        .await;
     }
 
     fn answer_start_latency_ms(&self) -> Option<u64> {
@@ -1115,6 +1459,7 @@ impl OverlayAnswerStream {
         done: bool,
         cost_label: Option<String>,
     ) -> Result<()> {
+        self.ensure_answer_account_context()?;
         if !is_answer_generation_current(&self.daemon, self.generation_id) {
             return Ok(());
         }
@@ -1128,30 +1473,130 @@ impl OverlayAnswerStream {
                 None
             }
         });
+        let render_ack = if done {
+            Some(AnswerRenderAckPhase::Final)
+        } else if !self.showing_status
+            && self.first_answer_at.is_some()
+            && !self.first_render_ack_requested
+        {
+            Some(AnswerRenderAckPhase::FirstText)
+        } else {
+            None
+        };
+        let final_is_first_visible_text =
+            done && self.first_answer_at.is_some() && !self.first_render_ack_requested;
+        if render_ack.is_some() {
+            self.first_render_ack_requested = true;
+        }
         *self.daemon.active_answer_snapshot.lock().await = Some(ActiveAnswerSnapshot {
             generation_id: self.generation_id,
             card_id: self.card_id,
+            interaction_id: self.interaction_id,
             body: self.body.clone(),
             sequence: self.sequence,
             done,
             cost_label: cost_label.clone(),
             artifact: artifact.clone(),
         });
-        let _ = send_overlay(
+        if let Some(phase) = render_ack {
+            register_pending_answer_render_ack(
+                &self.daemon,
+                PendingAnswerRenderAck {
+                    scope: self.audit_scope.clone(),
+                    card_id: self.card_id,
+                    interaction_id: self.interaction_id,
+                    phase,
+                    sequence: self.sequence,
+                    answer_generation: self.generation_id,
+                    pipeline_started_at: self.started_at,
+                    final_is_first_visible_text,
+                },
+            )
+            .await;
+        }
+        let send_result = send_overlay(
             &self.daemon,
             OverlayCommand::UpdateCard {
                 id: self.card_id,
+                interaction_id: Some(self.interaction_id),
                 body: self.body.clone(),
                 done,
                 sequence: self.sequence,
                 snapshot: false,
                 cost_label,
                 artifact,
+                render_ack,
             },
         )
         .await;
+        if let Err(error) = send_result {
+            if let Some(phase) = render_ack {
+                discard_pending_answer_render_ack(
+                    &self.daemon,
+                    self.card_id,
+                    self.interaction_id,
+                    phase,
+                    self.sequence,
+                )
+                .await;
+            }
+            return Err(error);
+        }
         Ok(())
     }
+}
+
+const MAX_PENDING_ANSWER_RENDER_ACKS: usize = 64;
+const MAX_PENDING_ANSWER_RENDER_ACK_AGE: Duration = Duration::from_secs(300);
+
+async fn register_pending_answer_render_ack(daemon: &Arc<Daemon>, pending: PendingAnswerRenderAck) {
+    let mut acknowledgements = daemon.pending_answer_render_acks.lock().await;
+    acknowledgements.retain(|candidate| {
+        candidate.pipeline_started_at.elapsed() <= MAX_PENDING_ANSWER_RENDER_ACK_AGE
+    });
+    while acknowledgements.len() >= MAX_PENDING_ANSWER_RENDER_ACKS {
+        acknowledgements.pop_front();
+    }
+    acknowledgements.push_back(pending);
+}
+
+async fn discard_pending_answer_render_ack(
+    daemon: &Arc<Daemon>,
+    card_id: uuid::Uuid,
+    interaction_id: uuid::Uuid,
+    phase: AnswerRenderAckPhase,
+    sequence: u64,
+) {
+    daemon
+        .pending_answer_render_acks
+        .lock()
+        .await
+        .retain(|candidate| {
+            !(candidate.card_id == card_id
+                && candidate.interaction_id == interaction_id
+                && candidate.phase == phase
+                && candidate.sequence == sequence)
+        });
+}
+
+async fn take_pending_answer_render_ack(
+    daemon: &Arc<Daemon>,
+    card_id: uuid::Uuid,
+    interaction_id: uuid::Uuid,
+    phase: AnswerRenderAckPhase,
+    sequence: u64,
+) -> Option<PendingAnswerRenderAck> {
+    let mut acknowledgements = daemon.pending_answer_render_acks.lock().await;
+    acknowledgements.retain(|candidate| {
+        candidate.pipeline_started_at.elapsed() <= MAX_PENDING_ANSWER_RENDER_ACK_AGE
+    });
+    let index = acknowledgements.iter().position(|candidate| {
+        candidate.card_id == card_id
+            && candidate.interaction_id == interaction_id
+            && candidate.phase == phase
+            && candidate.sequence == sequence
+    })?;
+    acknowledgements.remove(index)
 }
 
 fn overlay_answer_frame_due(sequence: u64, pending_chars: usize, elapsed: Duration) -> bool {
@@ -1203,12 +1648,14 @@ async fn register_active_answer_card(
                 daemon,
                 OverlayCommand::UpdateCard {
                     id: previous_card_id,
+                    interaction_id: None,
                     body: "Superseded by a newer Bluey answer.".to_string(),
                     done: true,
                     sequence: 0,
                     snapshot: true,
                     cost_label: None,
                     artifact: None,
+                    render_ack: None,
                 },
             )
             .await;
@@ -1237,6 +1684,9 @@ async fn invalidate_active_answer(daemon: &Arc<Daemon>, reason: &'static str) {
     if let Some((generation_id, card_id)) = active {
         let message = match reason {
             "account_signed_out" => "Answer stopped because this computer signed out.",
+            "account_switched" | "answer_account_changed" => {
+                "Answer stopped because the signed-in account changed."
+            }
             "session_deleted" => "Answer stopped because this session was deleted.",
             _ => "Answer stopped because the active session changed.",
         };
@@ -1244,12 +1694,14 @@ async fn invalidate_active_answer(daemon: &Arc<Daemon>, reason: &'static str) {
             daemon,
             OverlayCommand::UpdateCard {
                 id: card_id,
+                interaction_id: None,
                 body: message.to_string(),
                 done: true,
                 sequence: 0,
                 snapshot: true,
                 cost_label: None,
                 artifact: None,
+                render_ack: None,
             },
         )
         .await;
@@ -1263,10 +1715,42 @@ async fn invalidate_active_answer(daemon: &Arc<Daemon>, reason: &'static str) {
     }
 }
 
+async fn invalidate_active_answer_if_owner_changed(
+    daemon: &Arc<Daemon>,
+    previous: &AnswerAccountContext,
+    current: &AnswerAccountContext,
+) -> bool {
+    if !answer_owner_transitioned(previous, current) {
+        return false;
+    }
+    invalidate_active_answer(daemon, "account_switched").await;
+    true
+}
+
+async fn discard_answer_after_account_context_change(
+    daemon: &Arc<Daemon>,
+    generation_id: u64,
+    card_id: uuid::Uuid,
+    request_id: uuid::Uuid,
+) -> anyhow::Error {
+    if is_answer_generation_current(daemon, generation_id) {
+        invalidate_active_answer(daemon, "answer_account_changed").await;
+    } else {
+        clear_active_answer_card(daemon, generation_id, card_id).await;
+    }
+    warn!(
+        request_id = %request_id,
+        generation_id,
+        card_id = %card_id,
+        "discarded answer after the signed-in account context changed"
+    );
+    anyhow!(AnswerAccountContextChanged)
+}
+
 async fn prepare_runtime_for_session_change(daemon: &Arc<Daemon>, reason: &'static str) {
     invalidate_active_answer(daemon, reason).await;
     let _ = stop_audio_capture(daemon).await;
-    let _ = stop_screen_capture(daemon, reason).await;
+    let _ = stop_screen_capture_under_transition(daemon, reason, None).await;
     set_overlay_listening_state(daemon, ListeningState::Paused).await;
     *daemon.last_live_transcript.lock().await = None;
 }
@@ -1660,6 +2144,16 @@ impl RelayFailureClass {
     fn is_terminal(self) -> bool {
         self != Self::Transient
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::Authentication => "authentication",
+            Self::Billing => "billing",
+            Self::Permission => "permission",
+            Self::Configuration => "configuration",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1681,9 +2175,15 @@ struct RelaySourceProgress {
     attempt: u32,
 }
 
+#[derive(Clone)]
+struct RelaySourceAuthority {
+    last_audible_activity_at: Arc<Mutex<Instant>>,
+    account_context: AnswerAccountContext,
+}
+
 struct RelayAttemptState<'a> {
     stop_rx: &'a mut watch::Receiver<bool>,
-    last_audible_activity_at: Arc<Mutex<Instant>>,
+    authority: &'a RelaySourceAuthority,
     progress: &'a mut RelaySourceProgress,
     deduper: &'a mut RelayTranscriptDeduper,
 }
@@ -1790,17 +2290,27 @@ struct Daemon {
     meeting_watch: MeetingWatch,
     audio: Mutex<AudioPipelineStatus>,
     audio_runtime: Mutex<AudioRuntime>,
+    audio_diagnostics: AudioDiagnosticRuntime,
     meeting_end_in_progress: AtomicBool,
     cloud: Mutex<CloudSyncStatus>,
     cloud_login: Mutex<Option<CloudLoginTask>>,
-    listen_account_verified_until: Mutex<Option<Instant>>,
+    listen_account_verification: Mutex<Option<ListenAccountVerification>>,
     auto_cloud_sync_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    balance_poll_shutdown: Mutex<Option<watch::Sender<bool>>>,
+    /// Orders account publication/invalidation against the final answer
+    /// presentation and every irreversible local answer write.
+    account_answer_transition: Mutex<()>,
+    /// One daemon-wide delete-outbox flight. Event, startup, and retry paths
+    /// may all request a flush, but only one may touch an intent at a time.
+    cloud_delete_flush: Mutex<()>,
+    /// Serializes manual, event-driven, retry, and heartbeat session sync.
+    cloud_sync_flight: Mutex<()>,
+    balance_poll_task: Mutex<Option<BalancePollTask>>,
     balance_watch: crate::cloud::balance::BalanceWatch,
     overlay_answer_active: Mutex<bool>,
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
     active_answer_snapshot: Mutex<Option<ActiveAnswerSnapshot>>,
+    pending_answer_render_acks: Mutex<VecDeque<PendingAnswerRenderAck>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
     last_live_transcript: Mutex<Option<LiveTranscriptEvent>>,
@@ -1826,6 +2336,8 @@ struct Daemon {
     /// while AttachRequested + InstructionsRequested are entry-point events
     /// allowed from any state.
     overlay_ui_state: SharedOverlayUiState,
+    diagnostic_scope: parking_lot::RwLock<Option<SessionAuditScope>>,
+    diagnostics: DiagnosticRuntime,
 }
 
 enum DaemonIpcListener {
@@ -1888,25 +2400,213 @@ struct CloudLoginTask {
     started_at: Instant,
 }
 
-async fn record_visible_audit_event(daemon: &Arc<Daemon>, kind: &str, payload: serde_json::Value) {
-    let meeting = daemon.meeting.lock().await.clone();
-    let Some(meeting) = meeting else {
+async fn emit_session_diagnostic(
+    daemon: &Arc<Daemon>,
+    event: DiagnosticEvent,
+    priority: DiagnosticPriority,
+) {
+    let scope = daemon.diagnostic_scope.read().clone();
+    let Some(scope) = scope else {
         return;
     };
-    if let Err(error) = append_session_audit_event(&daemon.paths.data_dir, &meeting, kind, payload)
-    {
-        debug!(
-            session_id = %meeting.id,
-            kind,
-            error = %error,
-            "session audit event append failed"
-        );
+    emit_diagnostic_for_scope(daemon, scope, event, priority);
+}
+
+fn emit_diagnostic_for_scope(
+    daemon: &Arc<Daemon>,
+    scope: SessionAuditScope,
+    event: DiagnosticEvent,
+    priority: DiagnosticPriority,
+) {
+    daemon.diagnostics.emit(scope, event, priority);
+}
+
+fn begin_audio_diagnostics(
+    daemon: &Arc<Daemon>,
+    scope: SessionAuditScope,
+    audio_session_id: &str,
+) -> ActiveAudioDiagnostic {
+    let active = daemon
+        .audio_diagnostics
+        .start(scope.clone(), audio_session_id.to_string());
+    emit_diagnostic_for_scope(
+        daemon,
+        scope,
+        DiagnosticEvent::new(
+            DiagnosticEventKind::AudioStartRequested,
+            DiagnosticComponent::Audio,
+            DiagnosticOutcome::Started,
+        )
+        .audio_run_id(Some(active.run_id)),
+        DiagnosticPriority::Terminal,
+    );
+    active
+}
+
+fn emit_audio_capture_ready_diagnostic(
+    daemon: &Arc<Daemon>,
+    audio_session_id: &str,
+    stt_provider: &str,
+    source_count: usize,
+    outcome: DiagnosticOutcome,
+    error_category: Option<&str>,
+) {
+    let Some(active) = daemon.audio_diagnostics.for_session(audio_session_id) else {
+        return;
+    };
+    let mut event = DiagnosticEvent::new(
+        DiagnosticEventKind::AudioCaptureReady,
+        DiagnosticComponent::Audio,
+        outcome,
+    )
+    .audio_run_id(Some(active.run_id))
+    .provider(stt_provider)
+    .source_count(source_count)
+    .duration_ms(Some(elapsed_ms(active.started_at)));
+    if let Some(category) = error_category {
+        event = event.error_category(category);
     }
+    emit_diagnostic_for_scope(daemon, active.scope, event, DiagnosticPriority::Terminal);
+}
+
+fn emit_first_audio_chunk_diagnostic(
+    daemon: &Arc<Daemon>,
+    audio_session_id: &str,
+    bytes: usize,
+    sequence: u64,
+) {
+    let Some(active) = daemon.audio_diagnostics.for_session(audio_session_id) else {
+        return;
+    };
+    if active
+        .milestones
+        .first_chunk_emitted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    emit_diagnostic_for_scope(
+        daemon,
+        active.scope,
+        DiagnosticEvent::new(
+            DiagnosticEventKind::AudioFirstChunk,
+            DiagnosticComponent::Audio,
+            DiagnosticOutcome::Succeeded,
+        )
+        .audio_run_id(Some(active.run_id))
+        .sequence(sequence)
+        .bytes(bytes)
+        .duration_ms(Some(elapsed_ms(active.started_at))),
+        DiagnosticPriority::Ordinary,
+    );
+}
+
+fn emit_stt_connected_diagnostic(daemon: &Arc<Daemon>, audio_session_id: &str) {
+    let Some(active) = daemon.audio_diagnostics.for_session(audio_session_id) else {
+        return;
+    };
+    if active
+        .milestones
+        .stt_connected_emitted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    emit_diagnostic_for_scope(
+        daemon,
+        active.scope,
+        DiagnosticEvent::new(
+            DiagnosticEventKind::SttConnected,
+            DiagnosticComponent::Stt,
+            DiagnosticOutcome::Succeeded,
+        )
+        .audio_run_id(Some(active.run_id))
+        .duration_ms(Some(elapsed_ms(active.started_at))),
+        DiagnosticPriority::Ordinary,
+    );
+}
+
+fn emit_first_stt_text_diagnostic(
+    daemon: &Arc<Daemon>,
+    audio_session_id: &str,
+    is_final: bool,
+    chars: usize,
+) {
+    let Some(active) = daemon.audio_diagnostics.for_session(audio_session_id) else {
+        return;
+    };
+    let emitted = if is_final {
+        &active.milestones.first_final_emitted
+    } else {
+        &active.milestones.first_partial_emitted
+    };
+    if emitted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let kind = if is_final {
+        DiagnosticEventKind::SttFirstFinal
+    } else {
+        DiagnosticEventKind::SttFirstPartial
+    };
+    emit_diagnostic_for_scope(
+        daemon,
+        active.scope,
+        DiagnosticEvent::new(kind, DiagnosticComponent::Stt, DiagnosticOutcome::Succeeded)
+            .audio_run_id(Some(active.run_id))
+            .output_chars(chars)
+            .duration_ms(Some(elapsed_ms(active.started_at))),
+        DiagnosticPriority::Ordinary,
+    );
+}
+
+fn emit_audio_stop_requested_diagnostic(daemon: &Arc<Daemon>, audio_session_id: &str) {
+    let Some(active) = daemon.audio_diagnostics.for_session(audio_session_id) else {
+        return;
+    };
+    emit_diagnostic_for_scope(
+        daemon,
+        active.scope,
+        DiagnosticEvent::new(
+            DiagnosticEventKind::AudioStopRequested,
+            DiagnosticComponent::Audio,
+            DiagnosticOutcome::Started,
+        )
+        .audio_run_id(Some(active.run_id))
+        .duration_ms(Some(elapsed_ms(active.started_at))),
+        DiagnosticPriority::Terminal,
+    );
+}
+
+fn finish_audio_diagnostics(
+    daemon: &Arc<Daemon>,
+    audio_session_id: &str,
+    outcome: DiagnosticOutcome,
+) {
+    let Some(active) = daemon.audio_diagnostics.finish(audio_session_id) else {
+        return;
+    };
+    emit_diagnostic_for_scope(
+        daemon,
+        active.scope,
+        DiagnosticEvent::new(
+            DiagnosticEventKind::AudioCaptureStopped,
+            DiagnosticComponent::Audio,
+            outcome,
+        )
+        .audio_run_id(Some(active.run_id))
+        .duration_ms(Some(elapsed_ms(active.started_at))),
+        DiagnosticPriority::Terminal,
+    );
 }
 
 struct OverlayProcess {
     child: Child,
-    transport: OverlayTransport,
+    writer: OverlayCommandWriter,
     generation: u64,
 }
 
@@ -1935,24 +2635,177 @@ enum OverlayTransport {
     Socket(std::os::unix::net::UnixStream),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayWriteFailure {
+    Encode,
+    Transport(std::io::ErrorKind),
+    RecordTooLarge,
+    ByteBudgetExceeded,
+    ControlQueueFull,
+    QueueClosed,
+}
+
+impl std::fmt::Display for OverlayWriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encode => formatter.write_str("overlay command encoding failed"),
+            Self::Transport(kind) => {
+                write!(formatter, "overlay transport write failed: {kind:?}")
+            }
+            Self::RecordTooLarge => formatter.write_str("overlay command exceeds the size limit"),
+            Self::ByteBudgetExceeded => {
+                formatter.write_str("overlay command queue byte budget is exhausted")
+            }
+            Self::ControlQueueFull => formatter.write_str("overlay control queue is full"),
+            Self::QueueClosed => formatter.write_str("overlay writer is closed"),
+        }
+    }
+}
+
+impl std::error::Error for OverlayWriteFailure {}
+
+#[derive(Debug)]
+struct OverlayWriteRequest {
+    line: Vec<u8>,
+    completion: Option<oneshot::Sender<Result<(), OverlayWriteFailure>>>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for OverlayWriteRequest {
+    fn drop(&mut self) {
+        self.queued_bytes
+            .fetch_sub(self.line.len(), Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayEnqueueOutcome {
+    Queued,
+    DroppedLossy,
+}
+
+struct OverlayCommandWriter {
+    control_tx: Option<std_mpsc::SyncSender<OverlayWriteRequest>>,
+    lossy_tx: Option<std_mpsc::SyncSender<OverlayWriteRequest>>,
+    control_bytes: Arc<AtomicUsize>,
+    lossy_bytes: Arc<AtomicUsize>,
+    failure: Arc<parking_lot::Mutex<Option<OverlayWriteFailure>>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
 struct CaptureRuntime {
     stop: Option<oneshot::Sender<()>>,
     interval_secs: u64,
     last_context_fingerprint: Option<String>,
+    generation: u64,
 }
 
 struct AudioRuntime {
     stop: Option<oneshot::Sender<()>>,
     session_id: Option<String>,
     meeting_id: Option<uuid::Uuid>,
+    account_context: Option<AnswerAccountContext>,
     finalizing_session: Option<AudioFinalizingSession>,
     start_generation: u64,
     starting: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveAudioDiagnostic {
+    run_id: uuid::Uuid,
+    audio_session_id: String,
+    scope: SessionAuditScope,
+    started_at: Instant,
+    milestones: Arc<AudioDiagnosticMilestones>,
+}
+
+#[derive(Debug, Default)]
+struct AudioDiagnosticMilestones {
+    first_chunk_emitted: AtomicBool,
+    stt_connected_emitted: AtomicBool,
+    first_partial_emitted: AtomicBool,
+    first_final_emitted: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct AudioDiagnosticRuntime {
+    active: parking_lot::RwLock<Option<ActiveAudioDiagnostic>>,
+    recent: parking_lot::RwLock<VecDeque<ActiveAudioDiagnostic>>,
+}
+
+impl AudioDiagnosticRuntime {
+    fn start(&self, scope: SessionAuditScope, audio_session_id: String) -> ActiveAudioDiagnostic {
+        let active = ActiveAudioDiagnostic {
+            run_id: uuid::Uuid::new_v4(),
+            audio_session_id,
+            scope,
+            started_at: Instant::now(),
+            milestones: Arc::new(AudioDiagnosticMilestones::default()),
+        };
+        if let Some(previous) = self.active.write().replace(active.clone()) {
+            self.remember(previous);
+        }
+        active
+    }
+
+    fn for_session(&self, audio_session_id: &str) -> Option<ActiveAudioDiagnostic> {
+        self.active
+            .read()
+            .as_ref()
+            .filter(|active| active.audio_session_id == audio_session_id)
+            .cloned()
+            .or_else(|| {
+                self.recent
+                    .read()
+                    .iter()
+                    .rev()
+                    .find(|recent| {
+                        recent.audio_session_id == audio_session_id
+                            && recent.started_at.elapsed() <= Duration::from_secs(300)
+                    })
+                    .cloned()
+            })
+    }
+
+    fn finish(&self, audio_session_id: &str) -> Option<ActiveAudioDiagnostic> {
+        let active = {
+            let mut active = self.active.write();
+            let matches = active
+                .as_ref()
+                .is_some_and(|active| active.audio_session_id == audio_session_id);
+            if matches {
+                active.take()
+            } else {
+                None
+            }
+        };
+        if active.is_some() {
+            return active;
+        }
+        let mut recent = self.recent.write();
+        let index = recent
+            .iter()
+            .position(|candidate| candidate.audio_session_id == audio_session_id)?;
+        recent.remove(index)
+    }
+
+    fn remember(&self, diagnostic: ActiveAudioDiagnostic) {
+        let mut recent = self.recent.write();
+        recent.retain(|candidate| {
+            candidate.audio_session_id != diagnostic.audio_session_id
+                && candidate.started_at.elapsed() <= Duration::from_secs(300)
+        });
+        while recent.len() >= 4 {
+            recent.pop_front();
+        }
+        recent.push_back(diagnostic);
+    }
+}
+
 struct AudioFinalizingSession {
     session_id: String,
     meeting_id: uuid::Uuid,
+    account_context: AnswerAccountContext,
     expires_at: Instant,
 }
 
@@ -1986,6 +2839,7 @@ impl Drop for MeetingEndInProgressGuard<'_> {
 struct AudioTranscriptSession {
     session_id: String,
     meeting_id: uuid::Uuid,
+    account_context: AnswerAccountContext,
     finalizing: bool,
 }
 
@@ -1999,6 +2853,17 @@ enum AudioRuntimeConfigResolution {
 struct ListenStartBlock {
     message: String,
     open_login: bool,
+}
+
+struct ListenVerificationFailure {
+    block: ListenStartBlock,
+    revoked_credentials: Option<Box<(cue_cloud_client::CloudClient, CredentialSnapshot)>>,
+}
+
+#[derive(Clone)]
+struct ListenAccountVerification {
+    expires_at: Instant,
+    credentials: CredentialSnapshot,
 }
 
 impl ListenStartBlock {
@@ -2034,24 +2899,305 @@ const CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS: u64 = 6_000;
 const BACKGROUND_DEVICE_LOGIN_TIMEOUT_SECS: u64 = 600;
 const LISTEN_ACCOUNT_VERIFICATION_TTL_SECS: u64 = 30;
 
-impl OverlayProcess {
-    fn send(&mut self, command: &OverlayCommand) -> Result<()> {
-        let line = serde_json::to_string(command)?;
-        match &mut self.transport {
-            OverlayTransport::Stdio(stdin) => {
-                stdin.write_all(line.as_bytes())?;
-                stdin.write_all(b"\n")?;
-                stdin.flush()?;
-            }
+impl OverlayTransport {
+    fn write_line(&mut self, line: &[u8]) -> Result<(), OverlayWriteFailure> {
+        let write_result = match self {
+            Self::Stdio(stdin) => stdin.write_all(line).and_then(|()| stdin.flush()),
             #[cfg(target_os = "macos")]
-            OverlayTransport::Socket(stream) => {
-                stream.write_all(line.as_bytes())?;
-                stream.write_all(b"\n")?;
-                stream.flush()?;
+            Self::Socket(stream) => stream.write_all(line).and_then(|()| stream.flush()),
+        };
+        write_result.map_err(|error| OverlayWriteFailure::Transport(error.kind()))
+    }
+}
+
+impl OverlayCommandWriter {
+    fn spawn(transport: OverlayTransport) -> Self {
+        let (control_tx, control_rx) =
+            std_mpsc::sync_channel(OVERLAY_CONTROL_COMMAND_QUEUE_CAPACITY);
+        let (lossy_tx, lossy_rx) = std_mpsc::sync_channel(OVERLAY_LOSSY_COMMAND_QUEUE_CAPACITY);
+        let control_bytes = Arc::new(AtomicUsize::new(0));
+        let lossy_bytes = Arc::new(AtomicUsize::new(0));
+        let failure = Arc::new(parking_lot::Mutex::new(None));
+        let writer_failure = Arc::clone(&failure);
+        let join = std::thread::Builder::new()
+            .name("bluey-overlay-writer".to_string())
+            .spawn(move || {
+                run_overlay_writer(transport, control_rx, lossy_rx, writer_failure);
+            })
+            .ok();
+        if join.is_none() {
+            *failure.lock() = Some(OverlayWriteFailure::QueueClosed);
+        }
+        Self {
+            control_tx: Some(control_tx),
+            lossy_tx: Some(lossy_tx),
+            control_bytes,
+            lossy_bytes,
+            failure,
+            join,
+        }
+    }
+
+    fn enqueue(&self, command: OverlayCommand) -> Result<OverlayEnqueueOutcome> {
+        if let Some(failure) = *self.failure.lock() {
+            return Err(failure.into());
+        }
+        if overlay_command_is_lossy(&command) {
+            let request = match build_overlay_write_request(
+                command,
+                None,
+                Arc::clone(&self.lossy_bytes),
+                OVERLAY_LOSSY_COMMAND_MAX_BYTES,
+                OVERLAY_LOSSY_QUEUE_MAX_BYTES,
+            ) {
+                Ok(request) => request,
+                Err(
+                    OverlayWriteFailure::RecordTooLarge | OverlayWriteFailure::ByteBudgetExceeded,
+                ) => {
+                    return Ok(OverlayEnqueueOutcome::DroppedLossy);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let sender = self
+                .lossy_tx
+                .as_ref()
+                .ok_or(OverlayWriteFailure::QueueClosed)?;
+            return match sender.try_send(request) {
+                Ok(()) => Ok(OverlayEnqueueOutcome::Queued),
+                Err(std_mpsc::TrySendError::Full(_)) => Ok(OverlayEnqueueOutcome::DroppedLossy),
+                Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                    Err(self.recorded_failure_or_closed().into())
+                }
+            };
+        }
+
+        let request = build_overlay_write_request(
+            command,
+            None,
+            Arc::clone(&self.control_bytes),
+            OVERLAY_CONTROL_COMMAND_MAX_BYTES,
+            OVERLAY_CONTROL_QUEUE_MAX_BYTES,
+        )?;
+        self.enqueue_control(request)?;
+        Ok(OverlayEnqueueOutcome::Queued)
+    }
+
+    fn enqueue_confirmed(
+        &self,
+        command: OverlayCommand,
+    ) -> Result<oneshot::Receiver<Result<(), OverlayWriteFailure>>> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let request = build_overlay_write_request(
+            command,
+            Some(completion_tx),
+            Arc::clone(&self.control_bytes),
+            OVERLAY_CONTROL_COMMAND_MAX_BYTES,
+            OVERLAY_CONTROL_QUEUE_MAX_BYTES,
+        )?;
+        self.enqueue_control(request)?;
+        Ok(completion_rx)
+    }
+
+    fn enqueue_control(&self, request: OverlayWriteRequest) -> Result<(), OverlayWriteFailure> {
+        if let Some(failure) = *self.failure.lock() {
+            return Err(failure);
+        }
+        let sender = self
+            .control_tx
+            .as_ref()
+            .ok_or(OverlayWriteFailure::QueueClosed)?;
+        match sender.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(std_mpsc::TrySendError::Full(_)) => Err(OverlayWriteFailure::ControlQueueFull),
+            Err(std_mpsc::TrySendError::Disconnected(_)) => Err(self.recorded_failure_or_closed()),
+        }
+    }
+
+    fn recorded_failure_or_closed(&self) -> OverlayWriteFailure {
+        (*self.failure.lock()).unwrap_or(OverlayWriteFailure::QueueClosed)
+    }
+
+    fn shutdown_blocking(&mut self) {
+        self.control_tx.take();
+        self.lossy_tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn build_overlay_write_request(
+    command: OverlayCommand,
+    completion: Option<oneshot::Sender<Result<(), OverlayWriteFailure>>>,
+    queued_bytes: Arc<AtomicUsize>,
+    max_record_bytes: usize,
+    max_queue_bytes: usize,
+) -> Result<OverlayWriteRequest, OverlayWriteFailure> {
+    let mut line = serde_json::to_vec(&command).map_err(|_| OverlayWriteFailure::Encode)?;
+    line.push(b'\n');
+    if line.len() > max_record_bytes {
+        return Err(OverlayWriteFailure::RecordTooLarge);
+    }
+    reserve_overlay_queue_bytes(&queued_bytes, line.len(), max_queue_bytes)?;
+    Ok(OverlayWriteRequest {
+        line,
+        completion,
+        queued_bytes,
+    })
+}
+
+fn reserve_overlay_queue_bytes(
+    queued_bytes: &AtomicUsize,
+    additional_bytes: usize,
+    max_queue_bytes: usize,
+) -> Result<(), OverlayWriteFailure> {
+    let mut current = queued_bytes.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(additional_bytes) else {
+            return Err(OverlayWriteFailure::ByteBudgetExceeded);
+        };
+        if next > max_queue_bytes {
+            return Err(OverlayWriteFailure::ByteBudgetExceeded);
+        }
+        match queued_bytes.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+impl Drop for OverlayCommandWriter {
+    fn drop(&mut self) {
+        self.control_tx.take();
+        self.lossy_tx.take();
+        self.join.take();
+    }
+}
+
+impl OverlayProcess {
+    fn new(child: Child, transport: OverlayTransport, generation: u64) -> Self {
+        Self {
+            child,
+            writer: OverlayCommandWriter::spawn(transport),
+            generation,
+        }
+    }
+
+    fn send(&self, command: OverlayCommand) -> Result<OverlayEnqueueOutcome> {
+        self.writer.enqueue(command)
+    }
+
+    fn send_confirmed(
+        &self,
+        command: OverlayCommand,
+    ) -> Result<oneshot::Receiver<Result<(), OverlayWriteFailure>>> {
+        self.writer.enqueue_confirmed(command)
+    }
+}
+
+fn overlay_command_is_lossy(command: &OverlayCommand) -> bool {
+    match command {
+        OverlayCommand::TranscriptPartial { .. } => true,
+        OverlayCommand::UpdateCard {
+            done,
+            sequence: _,
+            snapshot,
+            render_ack,
+            ..
+        } => !*done && !*snapshot && render_ack.is_none(),
+        _ => false,
+    }
+}
+
+fn run_overlay_writer(
+    mut transport: OverlayTransport,
+    control_rx: std_mpsc::Receiver<OverlayWriteRequest>,
+    lossy_rx: std_mpsc::Receiver<OverlayWriteRequest>,
+    failure: Arc<parking_lot::Mutex<Option<OverlayWriteFailure>>>,
+) {
+    let mut control_closed = false;
+    let mut lossy_closed = false;
+    loop {
+        let mut handled = false;
+        for _ in 0..8 {
+            match control_rx.try_recv() {
+                Ok(request) => {
+                    handled = true;
+                    if write_overlay_request(&mut transport, request, &failure).is_err() {
+                        return;
+                    }
+                }
+                Err(std_mpsc::TryRecvError::Empty) => break,
+                Err(std_mpsc::TryRecvError::Disconnected) => {
+                    control_closed = true;
+                    break;
+                }
             }
         }
-        Ok(())
+
+        match lossy_rx.try_recv() {
+            Ok(request) => {
+                handled = true;
+                if write_overlay_request(&mut transport, request, &failure).is_err() {
+                    return;
+                }
+            }
+            Err(std_mpsc::TryRecvError::Empty) => {}
+            Err(std_mpsc::TryRecvError::Disconnected) => lossy_closed = true,
+        }
+
+        if control_closed && lossy_closed {
+            return;
+        }
+        if handled {
+            continue;
+        }
+
+        if !control_closed {
+            match control_rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(request) => {
+                    if write_overlay_request(&mut transport, request, &failure).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => control_closed = true,
+            }
+        }
+        if !lossy_closed {
+            match lossy_rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(request) => {
+                    if write_overlay_request(&mut transport, request, &failure).is_err() {
+                        return;
+                    }
+                }
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => lossy_closed = true,
+            }
+        }
     }
+}
+
+fn write_overlay_request(
+    transport: &mut OverlayTransport,
+    mut request: OverlayWriteRequest,
+    failure: &parking_lot::Mutex<Option<OverlayWriteFailure>>,
+) -> Result<(), OverlayWriteFailure> {
+    let result = transport.write_line(&request.line);
+    if let Some(completion) = request.completion.take() {
+        let completion_result = match &result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(*error),
+        };
+        let _ = completion.send(completion_result);
+    }
+    if let Err(error) = result {
+        *failure.lock() = Some(error);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -2083,7 +3229,9 @@ pub async fn run() -> Result<()> {
     let session_db = crate::db::Database::open(session_db_path.to_str().unwrap_or("sessions.db"))?;
     reconcile_session_projection(&session_db, &store, active_meeting.as_ref(), &paths)?;
     let initial_state = state_from_active_meeting(active_meeting.as_ref());
+    let initial_diagnostic_scope = active_meeting.as_ref().map(SessionAuditScope::from_meeting);
     let cloud_status = cloud_status_from_env(&paths);
+    let diagnostics = DiagnosticRuntime::start(paths.data_dir.clone());
     let (overlay_events_tx, overlay_events_rx) = mpsc::channel(OVERLAY_EVENT_QUEUE_CAPACITY);
     let (overlay_priority_events_tx, overlay_priority_events_rx) =
         mpsc::channel(OVERLAY_PRIORITY_EVENT_QUEUE_CAPACITY);
@@ -2122,6 +3270,7 @@ pub async fn run() -> Result<()> {
             stop: None,
             interval_secs: 12,
             last_context_fingerprint: None,
+            generation: 0,
         }),
         meeting_watch,
         audio: Mutex::new(AudioPipelineStatus::idle()),
@@ -2129,21 +3278,27 @@ pub async fn run() -> Result<()> {
             stop: None,
             session_id: None,
             meeting_id: None,
+            account_context: None,
             finalizing_session: None,
             start_generation: 0,
             starting: false,
         }),
+        audio_diagnostics: AudioDiagnosticRuntime::default(),
         meeting_end_in_progress: AtomicBool::new(false),
         cloud: Mutex::new(cloud_status),
         cloud_login: Mutex::new(None),
-        listen_account_verified_until: Mutex::new(None),
+        listen_account_verification: Mutex::new(None),
         auto_cloud_sync_debounce: Mutex::new(None),
-        balance_poll_shutdown: Mutex::new(None),
+        account_answer_transition: Mutex::new(()),
+        cloud_delete_flush: Mutex::new(()),
+        cloud_sync_flight: Mutex::new(()),
+        balance_poll_task: Mutex::new(None),
         balance_watch,
         overlay_answer_active: Mutex::new(false),
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
         active_answer_snapshot: Mutex::new(None),
+        pending_answer_render_acks: Mutex::new(VecDeque::new()),
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
         last_live_transcript: Mutex::new(None),
@@ -2151,12 +3306,22 @@ pub async fn run() -> Result<()> {
         overlay_session_token: crate::overlay::generate_session_token()
             .context("failed to generate overlay session token")?,
         overlay_ui_state: new_shared_overlay_ui_state(),
+        diagnostic_scope: parking_lot::RwLock::new(initial_diagnostic_scope),
+        diagnostics,
     });
 
+    if let Err(error) = resume_pending_deleted_account_purge(&daemon).await {
+        warn!(
+            error_category = %context_watch_safe_error_category(&error),
+            "pending deleted-account local cleanup remains fenced for retry"
+        );
+    }
     maybe_spawn_balance_polling(&daemon).await;
     spawn_cloud_delete_outbox_flush(&daemon, None);
     spawn_cloud_delete_outbox_retry(daemon.clone());
+    spawn_support_diagnostic_upload_retry(daemon.clone());
     spawn_auto_cloud_sync(&daemon, "startup", None);
+    spawn_cloud_session_sync_retry(daemon.clone());
 
     if !args.no_overlay {
         match spawn_overlay_for_daemon(&daemon) {
@@ -2184,7 +3349,11 @@ pub async fn run() -> Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false)
     {
-        let stt_enabled = crate::audio::system_capture::is_system_audio_stt_enabled();
+        // A continuous capture task must never survive an account/profile
+        // generation change and feed buffered A audio into B's session.
+        let continuous_account_context = AnswerAccountContext::capture(&daemon.paths).ok();
+        let stt_enabled = crate::audio::system_capture::is_system_audio_stt_enabled()
+            && continuous_account_context.is_some();
         let (sys_tx, mut sys_rx) = crate::audio::system_capture::system_audio_channel();
         match crate::audio::system_capture::SystemAudioCapture::start(sys_tx) {
             Ok(handle) => {
@@ -2194,12 +3363,18 @@ pub async fn run() -> Result<()> {
                 );
                 *daemon.system_audio.lock().await = Some(handle);
                 let daemon_sys = daemon.clone();
+                let continuous_account_context = continuous_account_context.clone();
                 tokio::spawn(async move {
                     let mut stt: Option<Box<dyn cue_core::stt::SttProvider>> = if stt_enabled {
                         match build_system_audio_stt_provider().await {
                             Ok(provider) => Some(provider),
                             Err(e) => {
-                                warn!("system audio STT provider failed to start: {e:#}");
+                                let raw_error = format!("{e:#}");
+                                warn!(
+                                    error_category = transport_error_category(&raw_error),
+                                    error_ref = %closed_diagnostic_ref("system STT startup", &raw_error),
+                                    "system audio STT provider failed to start"
+                                );
                                 None
                             }
                         }
@@ -2219,12 +3394,26 @@ pub async fn run() -> Result<()> {
 
                     // Single-task select! loop: send audio AND drain events
                     // from the SAME provider instance.
-                    loop {
+                    while let Some(account_context) = continuous_account_context.as_ref() {
+                        if !continuous_audio_account_is_current(&daemon_sys.paths, account_context)
+                        {
+                            break;
+                        }
                         if let Some(ref mut provider) = stt {
                             tokio::select! {
                                 chunk_opt = sys_rx.recv() => {
                                     match chunk_opt {
                                         Some(chunk) => {
+                                            // Account replacement may happen while recv() is
+                                            // pending. Recheck after dequeue and before the
+                                            // first provider-facing use so buffered A audio can
+                                            // never become a B-era upload.
+                                            if !continuous_audio_account_is_current(
+                                                &daemon_sys.paths,
+                                                account_context,
+                                            ) {
+                                                break;
+                                            }
                                             debug!("[system audio chunk: {}ms]", chunk.duration_ms());
                                             if let Some(vad) = vad.as_mut() {
                                                 let action = vad.process(&chunk);
@@ -2240,8 +3429,19 @@ pub async fn run() -> Result<()> {
                                                     "system audio VAD forwarded frame"
                                                 );
                                             }
+                                            if !continuous_audio_account_is_current(
+                                                &daemon_sys.paths,
+                                                account_context,
+                                            ) {
+                                                break;
+                                            }
                                             if let Err(e) = provider.send_audio(&chunk).await {
-                                                warn!("system audio STT send failed: {e}");
+                                                let raw_error = e.to_string();
+                                                warn!(
+                                                    error_category = stt_error_category(&e),
+                                                    error_ref = %closed_diagnostic_ref("system STT send", &raw_error),
+                                                    "system audio STT send failed"
+                                                );
                                             }
                                         }
                                         None => break,
@@ -2251,13 +3451,27 @@ pub async fn run() -> Result<()> {
                                     match event_opt {
                                         Some(Ok(event)) => {
                                             if let Some(segment) = transcript_event_to_stt_segment(&event) {
-                                                if let Err(e) = add_audio_transcript_segment_allowing_session_start(&daemon_sys, &segment).await {
-                                                    warn!("system audio STT drain: forward failed: {e:#}");
+                                                if let Err(e) = add_audio_transcript_segment_allowing_session_start(
+                                                    &daemon_sys,
+                                                    account_context,
+                                                    &segment,
+                                                ).await {
+                                                    let raw_error = format!("{e:#}");
+                                                    warn!(
+                                                        error_category = transport_error_category(&raw_error),
+                                                        error_ref = %closed_diagnostic_ref("system STT forward", &raw_error),
+                                                        "system audio STT drain forward failed"
+                                                    );
                                                 }
                                             }
                                         }
                                         Some(Err(e)) => {
-                                            warn!("system audio STT drain: provider error: {e}");
+                                            let raw_error = e.to_string();
+                                            warn!(
+                                                error_category = stt_error_category(&e),
+                                                error_ref = %closed_diagnostic_ref("system STT provider", &raw_error),
+                                                "system audio STT drain provider error"
+                                            );
                                             if !e.is_retryable() {
                                                 break;
                                             }
@@ -2295,6 +3509,13 @@ pub async fn run() -> Result<()> {
         boot_id: ipc_capability.boot_id,
     };
     serve_daemon_ipc(ipc_listener, daemon, ipc_auth).await
+}
+
+fn continuous_audio_account_is_current(
+    paths: &AppPaths,
+    account_context: &AnswerAccountContext,
+) -> bool {
+    account_context.ensure_current(paths).is_ok()
 }
 
 async fn serve_daemon_ipc(
@@ -2571,11 +3792,21 @@ async fn handle_request_inner(
             send_overlay(daemon, OverlayCommand::SetPosition { position }).await?;
             Ok(DaemonResponse::Ok)
         }
-        DaemonRequest::PushCard { card } => {
+        DaemonRequest::PushCard { .. } => {
+            anyhow::bail!("card push requires account-bound mutation authority")
+        }
+        DaemonRequest::PushCardBound { card, fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            validate_session_mutation_fence(daemon, &fence, false).await?;
             send_overlay(daemon, OverlayCommand::PushCard { card }).await?;
             Ok(DaemonResponse::Ok)
         }
-        DaemonRequest::MeetingStart { title } => {
+        DaemonRequest::MeetingStart { .. } => {
+            anyhow::bail!("meeting start requires account-bound mutation authority")
+        }
+        DaemonRequest::MeetingStartBound { title, fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
             let meeting = {
                 let mut meeting_guard = daemon.meeting.lock().await;
                 if meeting_guard.is_some() {
@@ -2584,8 +3815,10 @@ async fn handle_request_inner(
                     });
                 }
 
-                let meeting = new_owned_meeting(&daemon.paths, title);
+                account_context.ensure_current(&daemon.paths)?;
+                let meeting = new_meeting_for_account(&account_context, title);
                 daemon.store.save_active(&meeting)?;
+                account_context.ensure_current(&daemon.paths)?;
                 *meeting_guard = Some(meeting.clone());
                 meeting
             };
@@ -2606,6 +3839,9 @@ async fn handle_request_inner(
             })
         }
         DaemonRequest::MeetingEnd => {
+            anyhow::bail!("meeting end requires account-bound mutation authority")
+        }
+        DaemonRequest::MeetingEndBound { fence } => {
             let Some(_meeting_end_guard) =
                 MeetingEndInProgressGuard::try_acquire(&daemon.meeting_end_in_progress)
             else {
@@ -2613,14 +3849,47 @@ async fn handle_request_inner(
                     text: "Meeting end is already in progress.".to_string(),
                 });
             };
+            // Capture the exact owner/session authority before settling audio,
+            // but do not hold the account barrier while the final STT tail is
+            // persisting through that same barrier.
+            let (account_context, audio_stop_transition) = {
+                let _account_transition = daemon.account_answer_transition.lock().await;
+                let account_context = validate_session_mutation_fence(daemon, &fence, true).await?;
+                let (_, transition) = request_audio_stop(daemon).await;
+                (account_context, transition)
+            };
+            let stopped_audio = settle_audio_stop_transition(daemon, audio_stop_transition).await;
 
-            let stopped_audio = settle_audio_before_meeting_end(daemon).await;
+            // Account/profile files may be replaced by another process while
+            // the STT tail settles. Reacquire the barrier and prove the exact
+            // captured owner, credential generation, and meeting are still
+            // current before any archive/delete/projection mutation.
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            account_context.ensure_current(&daemon.paths)?;
+            let current_account = validate_account_mutation_fence(&daemon.paths, &fence)?;
+            ensure!(
+                current_account == account_context,
+                "meeting end account authority changed during audio settlement"
+            );
             if stopped_audio {
                 set_overlay_listening_state(daemon, ListeningState::Paused).await;
             }
 
             let meeting = {
                 let mut meeting_guard = daemon.meeting.lock().await;
+                ensure!(
+                    meeting_guard.as_ref().map(|meeting| meeting.id) == fence.meeting_id,
+                    "active session changed during meeting end"
+                );
+                if let Some(meeting) = meeting_guard.as_ref() {
+                    ensure!(
+                        meeting_visible_for_owner(
+                            meeting,
+                            account_context.owner_account_id.as_deref(),
+                        ),
+                        "active session does not belong to the authorized account"
+                    );
+                }
                 meeting_guard.take()
             };
             let Some(mut meeting) = meeting else {
@@ -2668,53 +3937,87 @@ async fn handle_request_inner(
             set_overlay_listening_state(daemon, ListeningState::Idle).await;
             Ok(DaemonResponse::Recap { recap })
         }
-        DaemonRequest::SessionCreate { title } => {
-            let lifecycle = create_canonical_session(daemon, title).await?;
+        DaemonRequest::SessionCreate { .. }
+        | DaemonRequest::SessionActivate { .. }
+        | DaemonRequest::SessionContinue
+        | DaemonRequest::SessionDeactivate
+        | DaemonRequest::SessionRename { .. }
+        | DaemonRequest::SessionArchive { .. }
+        | DaemonRequest::SessionDelete { .. } => {
+            anyhow::bail!("session mutation requires account-bound mutation authority")
+        }
+        DaemonRequest::SessionCreateBound { title, fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let lifecycle = create_canonical_session(daemon, title, &account_context).await?;
             Ok(DaemonResponse::SessionLifecycle { lifecycle })
         }
-        DaemonRequest::SessionActivate { id } => {
-            let lifecycle = activate_canonical_session(daemon, id).await?;
+        DaemonRequest::SessionActivateBound { id, fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let lifecycle = activate_canonical_session(daemon, id, &account_context).await?;
             Ok(DaemonResponse::SessionLifecycle { lifecycle })
         }
-        DaemonRequest::SessionContinue => {
-            let continued = continue_session(daemon, "daemon IPC").await?;
+        DaemonRequest::SessionContinueBound { fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let continued = continue_session(daemon, "daemon IPC", &account_context).await?;
             let lifecycle = canonical_session_lifecycle(daemon, Some(continued), None, None).await;
             Ok(DaemonResponse::SessionLifecycle { lifecycle })
         }
-        DaemonRequest::SessionDeactivate => {
-            let lifecycle = deactivate_canonical_session(daemon).await?;
+        DaemonRequest::SessionDeactivateBound { fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let lifecycle = deactivate_canonical_session(daemon, &account_context).await?;
             Ok(DaemonResponse::SessionLifecycle { lifecycle })
         }
-        DaemonRequest::SessionRename { id, title } => {
-            let renamed = rename_meeting_session(daemon, id, &title).await?;
+        DaemonRequest::SessionRenameBound { id, title, fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let renamed = rename_meeting_session(daemon, id, &title, &account_context).await?;
             let lifecycle = canonical_session_lifecycle(daemon, Some(renamed), None, None).await;
             Ok(DaemonResponse::SessionLifecycle { lifecycle })
         }
-        DaemonRequest::SessionArchive { id } => {
-            let archived = archive_canonical_session(daemon, id).await?;
+        DaemonRequest::SessionArchiveBound { id, fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let archived = archive_canonical_session(daemon, id, &account_context).await?;
             let lifecycle = canonical_session_lifecycle(daemon, Some(archived), None, None).await;
             Ok(DaemonResponse::SessionLifecycle { lifecycle })
         }
-        DaemonRequest::SessionDelete { id } => {
-            let deleted = delete_meeting_session(daemon, id).await?;
+        DaemonRequest::SessionDeleteBound { id, fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let deleted = delete_meeting_session(daemon, id, &account_context).await?;
             let lifecycle = canonical_session_lifecycle(daemon, None, None, Some(deleted)).await;
             Ok(DaemonResponse::SessionLifecycle { lifecycle })
         }
-        DaemonRequest::TranscriptAdd {
+        DaemonRequest::TranscriptAdd { .. } => {
+            anyhow::bail!("transcript mutation requires account-bound mutation authority")
+        }
+        DaemonRequest::TranscriptAddBound {
             speaker,
             text,
             is_final,
+            fence,
         } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
             let Some((meeting_snapshot, cards, indexed_segment)) = ({
                 let mut meeting_guard = daemon.meeting.lock().await;
                 if meeting_guard.is_none() {
-                    *meeting_guard = Some(new_owned_meeting(
-                        &daemon.paths,
+                    account_context.ensure_current(&daemon.paths)?;
+                    *meeting_guard = Some(new_meeting_for_account(
+                        &account_context,
                         Some("New recording".to_string()),
                     ));
                 }
 
                 let meeting = meeting_guard.as_mut().expect("meeting exists");
+                ensure!(
+                    meeting_visible_for_owner(meeting, account_context.owner_account_id.as_deref(),),
+                    "active transcript session does not belong to the authorized account"
+                );
                 if is_near_duplicate_transcript(meeting, speaker, &text, is_final) {
                     info!(
                         speaker = %speaker,
@@ -2735,7 +4038,9 @@ async fn handle_request_inner(
                     let analysis = analyze_segment(&segment, meeting);
                     meeting.action_items.extend(analysis.action_items);
                     meeting.decisions.extend(analysis.decisions);
+                    account_context.ensure_current(&daemon.paths)?;
                     daemon.store.save_active(meeting)?;
+                    account_context.ensure_current(&daemon.paths)?;
                     let indexed_segment = segment
                         .is_final
                         .then(|| (meeting.id.to_string(), segment.text.clone()));
@@ -2779,27 +4084,40 @@ async fn handle_request_inner(
                 text: format!("Added transcript segment from {speaker}."),
             })
         }
-        DaemonRequest::Ask { question } => {
-            let response = answer_question(daemon, question, "manual ask").await?;
+        DaemonRequest::Ask { .. } => {
+            anyhow::bail!("answer request requires account-bound mutation authority")
+        }
+        DaemonRequest::AskBound { question, fence } => {
+            let response = answer_question(daemon, question, "manual ask", Some(fence)).await?;
             Ok(DaemonResponse::Text {
                 text: response.answer,
             })
         }
-        DaemonRequest::Answer { request } => {
+        DaemonRequest::Answer { .. } => {
+            anyhow::bail!("answer request requires account-bound mutation authority")
+        }
+        DaemonRequest::AnswerBound { request, fence } => {
             let (response, events) =
-                answer_with_provider_runtime(daemon, request, "answer ipc").await?;
+                answer_with_provider_runtime(daemon, request, "answer ipc", Some(fence)).await?;
             Ok(DaemonResponse::Answer { response, events })
         }
-        DaemonRequest::ContextAdd {
+        DaemonRequest::ContextAdd { .. } => {
+            anyhow::bail!("context mutation requires account-bound mutation authority")
+        }
+        DaemonRequest::ContextAddBound {
             path,
             title,
             note,
             answer_context_role,
+            fence,
         } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
             let artifact = build_context_artifact(&daemon.paths, path, title, note)?
                 .with_answer_context_role(answer_context_role);
             let mut artifact_files = ContextArtifactFileGuard::new(&daemon.paths, artifact.clone());
-            let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
+            let meeting_snapshot =
+                attach_context_artifacts(daemon, vec![artifact.clone()], &account_context).await?;
             artifact_files.commit();
 
             if let Err(error) = update_state_from_meeting(daemon, Some(&meeting_snapshot)).await {
@@ -2843,21 +4161,24 @@ async fn handle_request_inner(
             })
         }
         DaemonRequest::ContextList => {
-            let meeting = if let Some(active) = daemon.meeting.lock().await.as_ref() {
-                Some(active.clone())
-            } else {
-                daemon.store.last_meeting()?
-            };
+            let meeting = current_or_last_meeting(daemon).await?;
             Ok(DaemonResponse::ContextItems {
                 items: meeting.map(|m| m.context).unwrap_or_default(),
             })
         }
-        DaemonRequest::ContextRoleSet {
+        DaemonRequest::ContextRoleSet { .. } => {
+            anyhow::bail!("context mutation requires account-bound mutation authority")
+        }
+        DaemonRequest::ContextRoleSetBound {
             id,
             answer_context_role,
+            fence,
         } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
             let (meeting_snapshot, artifact) =
-                set_context_artifact_role(daemon, id, answer_context_role).await?;
+                set_context_artifact_role(daemon, id, answer_context_role, &account_context)
+                    .await?;
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
             refresh_overlay_context_items(daemon, &meeting_snapshot).await;
             refresh_overlay_sessions(daemon).await;
@@ -2867,20 +4188,38 @@ async fn handle_request_inner(
             })
         }
         DaemonRequest::ActivePageCapture => {
-            let artifact = capture_active_page_context(daemon, "CLI").await?;
+            anyhow::bail!("page capture requires account-bound mutation authority")
+        }
+        DaemonRequest::ActivePageCaptureBound { fence } => {
+            {
+                let _account_transition = daemon.account_answer_transition.lock().await;
+                validate_session_mutation_fence(daemon, &fence, false).await?;
+            }
+            let artifact = capture_active_page_context(daemon, "CLI", Some(&fence)).await?;
             Ok(DaemonResponse::ContextItems {
                 items: vec![artifact],
             })
         }
-        DaemonRequest::ScreenCaptureStart { interval_secs } => {
+        DaemonRequest::ScreenCaptureStart { .. } => {
+            anyhow::bail!("context capture requires account-bound mutation authority")
+        }
+        DaemonRequest::ScreenCaptureStartBound {
+            interval_secs,
+            fence,
+        } => {
             let interval_secs = interval_secs.unwrap_or(12).clamp(3, 300);
-            start_screen_capture(daemon, interval_secs, "CLI").await?;
+            start_screen_capture(daemon, interval_secs, "CLI", Some(fence)).await?;
             Ok(DaemonResponse::Text {
                 text: format!("Context mode started every {interval_secs}s."),
             })
         }
         DaemonRequest::ScreenCaptureStop => {
-            stop_screen_capture(daemon, "CLI").await?;
+            anyhow::bail!("context capture stop requires account-bound mutation authority")
+        }
+        DaemonRequest::ScreenCaptureStopBound { fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            validate_session_mutation_fence(daemon, &fence, false).await?;
+            stop_screen_capture_under_transition(daemon, "CLI", Some(&fence)).await?;
             Ok(DaemonResponse::Text {
                 text: "Context mode stopped.".to_string(),
             })
@@ -2914,8 +4253,14 @@ async fn handle_request_inner(
                 ),
             })
         }
-        DaemonRequest::InstructionsSet { text } => {
-            let meeting_snapshot = set_answer_instructions(daemon, Some(text)).await?;
+        DaemonRequest::InstructionsSet { .. } => {
+            anyhow::bail!("instruction mutation requires account-bound mutation authority")
+        }
+        DaemonRequest::InstructionsSetBound { text, fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let meeting_snapshot =
+                set_answer_instructions(daemon, Some(text), &account_context).await?;
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
             push_system_card(
                 daemon,
@@ -2933,11 +4278,7 @@ async fn handle_request_inner(
             })
         }
         DaemonRequest::InstructionsGet => {
-            let meeting = if let Some(active) = daemon.meeting.lock().await.as_ref() {
-                Some(active.clone())
-            } else {
-                daemon.store.last_meeting()?
-            };
+            let meeting = current_or_last_meeting(daemon).await?;
             Ok(DaemonResponse::Text {
                 text: meeting
                     .and_then(|meeting| meeting.answer_instructions)
@@ -2945,7 +4286,12 @@ async fn handle_request_inner(
             })
         }
         DaemonRequest::InstructionsClear => {
-            let meeting_snapshot = set_answer_instructions(daemon, None).await?;
+            anyhow::bail!("instruction mutation requires account-bound mutation authority")
+        }
+        DaemonRequest::InstructionsClearBound { fence } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
+            let meeting_snapshot = set_answer_instructions(daemon, None, &account_context).await?;
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
             push_system_card(
                 daemon,
@@ -2963,7 +4309,14 @@ async fn handle_request_inner(
             if query.is_empty() {
                 return Ok(DaemonResponse::MemoryHits { hits: Vec::new() });
             }
-            let meetings = daemon.store.all_meetings()?;
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let owner_account_id = current_owner_account_id(&daemon.paths);
+            let meetings = daemon
+                .store
+                .all_meetings()?
+                .into_iter()
+                .filter(|meeting| meeting_visible_for_owner(meeting, owner_account_id.as_deref()))
+                .collect::<Vec<_>>();
             Ok(DaemonResponse::MemoryHits {
                 hits: search_memory(&meetings, &query, limit.clamp(1, 20)),
             })
@@ -2971,11 +4324,17 @@ async fn handle_request_inner(
         DaemonRequest::AudioStatus => Ok(DaemonResponse::AudioStatus {
             status: current_audio_status(daemon).await,
         }),
-        DaemonRequest::AudioStart {
+        DaemonRequest::AudioStart { .. } => {
+            anyhow::bail!("audio start requires account-bound mutation authority")
+        }
+        DaemonRequest::AudioStartBound {
             enable_system,
             enable_microphone,
             mic_device_id,
+            fence,
         } => {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_session_mutation_fence(daemon, &fence, true).await?;
             if !enable_system && !enable_microphone {
                 return Ok(DaemonResponse::Text {
                     text: "Choose at least one audio source.".to_string(),
@@ -2992,13 +4351,15 @@ async fn handle_request_inner(
                 &config,
                 "ipc audio start",
                 Some(trace_id),
+                &account_context,
             )
             .await
             {
                 return Ok(DaemonResponse::AudioStatus { status });
             }
+            account_context.ensure_current(&daemon.paths)?;
             set_overlay_listening_state(daemon, ListeningState::Connecting).await;
-            let status = match start_audio_capture(daemon, config).await {
+            let status = match start_audio_capture(daemon, config, &account_context).await {
                 Ok(status) => status,
                 Err(error) => {
                     set_overlay_listening_state(daemon, ListeningState::Failed).await;
@@ -3013,8 +4374,14 @@ async fn handle_request_inner(
             Ok(DaemonResponse::AudioStatus { status })
         }
         DaemonRequest::AudioStop => {
+            anyhow::bail!("audio stop requires account-bound mutation authority")
+        }
+        DaemonRequest::AudioStopBound { fence } => {
+            let account_transition = daemon.account_answer_transition.lock().await;
+            validate_session_mutation_fence(daemon, &fence, true).await?;
             let status = stop_audio_capture(daemon).await;
             set_overlay_listening_state(daemon, ListeningState::Paused).await;
+            drop(account_transition);
             let _ = refresh_overlay_balance(daemon, Some(trace_id)).await;
             Ok(DaemonResponse::AudioStatus { status })
         }
@@ -3041,18 +4408,78 @@ async fn handle_request_inner(
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::CloudLogout => {
-            apply_cloud_account_signed_out(daemon, "cloud_logout", true).await;
+            anyhow::bail!("cloud logout requires account-bound mutation authority")
+        }
+        DaemonRequest::CloudLogoutBound { fence } => {
+            apply_cloud_account_signed_out_bound(daemon, "cloud_logout", &fence).await?;
             let status = cloud_status_from_env(&daemon.paths);
             *daemon.cloud.lock().await = status.clone();
             Ok(DaemonResponse::CloudStatus { status })
         }
+        DaemonRequest::CloudPrepareAccountDeletion {
+            owner_account_id,
+            operation_id,
+            recovery_token,
+        } => {
+            let marker = prepare_deleted_account_local_purge(
+                daemon,
+                &owner_account_id,
+                &operation_id,
+                &recovery_token,
+            )
+            .await?;
+            Ok(DaemonResponse::AccountDeletionPrepared {
+                operation_id: marker.operation_id,
+                recovery_token: marker.recovery_token,
+            })
+        }
+        DaemonRequest::CloudAbortAccountDeletion { owner_account_id } => {
+            abort_deleted_account_local_purge(daemon, &owner_account_id).await?;
+            Ok(DaemonResponse::Text {
+                text: "Account deletion local cleanup was cancelled.".to_string(),
+            })
+        }
+        DaemonRequest::CloudPurgeDeletedAccount { owner_account_id } => {
+            let removed_sessions =
+                purge_deleted_account_local_data(daemon, &owner_account_id).await?;
+            let status = cloud_status_from_env(&daemon.paths);
+            *daemon.cloud.lock().await = status;
+            Ok(DaemonResponse::Text {
+                text: format!(
+                    "Deleted account local cleanup complete ({removed_sessions} session(s) removed)."
+                ),
+            })
+        }
+        DaemonRequest::CloudAcknowledgeDeletedAccountPurge {
+            owner_account_id,
+            operation_id,
+            recovery_token,
+        } => {
+            let _transition = daemon.account_answer_transition.lock().await;
+            acknowledge_deleted_account_local_purge(
+                &daemon.paths,
+                &owner_account_id,
+                &operation_id,
+                &recovery_token,
+            )?;
+            Ok(DaemonResponse::Text {
+                text: "Deleted account local cleanup acknowledged.".to_string(),
+            })
+        }
         DaemonRequest::SessionsMoveLocalToCurrentAccount { confirmed } => {
+            let _ = confirmed;
+            anyhow::bail!("local session migration requires account-bound mutation authority")
+        }
+        DaemonRequest::SessionsMoveLocalToCurrentAccountBound { confirmed, fence } => {
             if !confirmed {
                 return Err(anyhow!(
                     "moving local sessions requires explicit confirmation"
                 ));
             }
-            let text = move_unowned_local_sessions_to_current_account(daemon).await?;
+            let _transition = daemon.account_answer_transition.lock().await;
+            let account_context = validate_account_mutation_fence(&daemon.paths, &fence)?;
+            let text =
+                move_unowned_local_sessions_to_current_account(daemon, &account_context).await?;
             Ok(DaemonResponse::Text { text })
         }
         DaemonRequest::CloudSyncNow => {
@@ -3064,71 +4491,59 @@ async fn handle_request_inner(
             status.mark_syncing();
             *daemon.cloud.lock().await = status.clone();
 
-            let status = match build_cloud_client(&daemon.paths, Some(trace_id)) {
-                Ok(client) => {
-                    let owner_account_id = current_owner_account_id(&daemon.paths);
-                    match crate::cloud::sync::sync_local_meetings(
-                        &daemon.store,
-                        &daemon.paths.data_dir,
-                        &client,
-                        owner_account_id.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(upload_summary) => {
-                            match crate::cloud::sync::hydrate_missing_cloud_meetings(
-                                &daemon.store,
-                                &daemon.paths.data_dir,
-                                &client,
-                                owner_account_id.as_deref(),
-                                100,
-                            )
-                            .await
-                            {
-                                Ok(hydrate_summary) => {
-                                    if hydrate_summary.restored_sessions > 0 {
-                                        for meeting in daemon.store.all_meetings()? {
-                                            reindex_meeting_for_rag(daemon, meeting);
-                                        }
-                                        refresh_overlay_sessions(daemon).await;
-                                    }
-                                    let mut synced = cloud_status_from_env(&daemon.paths);
-                                    synced.mark_synced();
-                                    if upload_summary.total_records() == 0
-                                        && hydrate_summary.restored_sessions == 0
-                                    {
-                                        synced.last_error = Some(
-                                            "No local or cloud sessions needed syncing."
-                                                .to_string(),
-                                        );
-                                    } else {
-                                        info!(
-                                            batches = upload_summary.batches,
-                                            uploaded_records = upload_summary.total_records(),
-                                            restored_sessions = hydrate_summary.restored_sessions,
-                                            skipped_sessions = hydrate_summary.skipped_sessions,
-                                            "cloud sync complete"
-                                        );
-                                    }
-                                    synced
-                                }
-                                Err(error) => {
-                                    let mut failed = cloud_status_from_env(&daemon.paths);
-                                    failed.mark_failed(format!("{error:#}"));
-                                    failed
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            let mut failed = cloud_status_from_env(&daemon.paths);
-                            failed.mark_failed(format!("{error:#}"));
-                            failed
-                        }
+            let status = match sync_and_hydrate_cloud_meetings(
+                daemon,
+                Some(trace_id),
+                Duration::from_secs(CLOUD_SESSION_MANUAL_SYNC_BUDGET_SECS),
+            )
+            .await
+            {
+                Ok((upload_summary, hydrate_summary)) => {
+                    let mut synced = cloud_status_from_env(&daemon.paths);
+                    if hydrate_summary.continuation_pending {
+                        synced.mark_degraded(
+                            "Cloud history is current through this bounded page; Bluey will continue shortly.",
+                        );
+                        synced.pending_downloads = 1;
+                    } else {
+                        synced.mark_synced();
                     }
+                    if upload_summary.total_records() == 0
+                        && hydrate_summary.restored_sessions == 0
+                        && hydrate_summary.purged_session_ids.is_empty()
+                        && !hydrate_summary.continuation_pending
+                    {
+                        synced.last_error =
+                            Some("No local or cloud sessions needed syncing.".to_string());
+                    } else {
+                        info!(
+                            batches = upload_summary.batches,
+                            uploaded_records = upload_summary.total_records(),
+                            restored_sessions = hydrate_summary.restored_sessions,
+                            skipped_sessions = hydrate_summary.skipped_sessions,
+                            purged_deleted_sessions = hydrate_summary.purged_deleted_sessions,
+                            tombstoned_session_ids = hydrate_summary.purged_session_ids.len(),
+                            reconciled_child_session_ids =
+                                hydrate_summary.reconciled_session_ids.len(),
+                            continuation_pending = hydrate_summary.continuation_pending,
+                            "cloud sync complete"
+                        );
+                    }
+                    if hydrate_summary.continuation_pending {
+                        schedule_auto_cloud_sync(daemon, "hydration_continuation", None).await;
+                    }
+                    synced
                 }
                 Err(error) => {
                     let mut failed = cloud_status_from_env(&daemon.paths);
-                    failed.mark_failed(format!("{error:#}"));
+                    failed.mark_degraded(
+                        "Cloud sync is incomplete and will retry without uploading unreconciled data.",
+                    );
+                    failed.pending_downloads = 1;
+                    debug!(
+                        error_category = %context_watch_safe_error_category(&error),
+                        "manual cloud sync deferred"
+                    );
                     failed
                 }
             };
@@ -3136,11 +4551,7 @@ async fn handle_request_inner(
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::Recap => {
-            let meeting = if let Some(active) = daemon.meeting.lock().await.as_ref() {
-                Some(active.clone())
-            } else {
-                daemon.store.last_meeting()?
-            };
+            let meeting = current_or_last_meeting(daemon).await?;
             let Some(meeting) = meeting else {
                 return Ok(DaemonResponse::Text {
                     text: "No meeting has been captured yet.".to_string(),
@@ -3151,11 +4562,7 @@ async fn handle_request_inner(
             })
         }
         DaemonRequest::ActionItems => {
-            let meeting = if let Some(active) = daemon.meeting.lock().await.as_ref() {
-                Some(active.clone())
-            } else {
-                daemon.store.last_meeting()?
-            };
+            let meeting = current_or_last_meeting(daemon).await?;
             Ok(DaemonResponse::ActionItems {
                 items: meeting.map(|m| m.action_items).unwrap_or_default(),
             })
@@ -3165,6 +4572,7 @@ async fn handle_request_inner(
 
 async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<()> {
     let mut last_error = None;
+    let require_write_confirmation = overlay_command_requires_write_confirmation(&command);
     for _attempt in 1..=3 {
         let generation = {
             let mut overlay_guard = daemon.overlay.lock().await;
@@ -3197,7 +4605,7 @@ async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<(
             }
         }
 
-        let send_result = {
+        let enqueue_result = {
             let mut overlay_guard = daemon.overlay.lock().await;
             let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
             let Some(process) = overlay_guard.as_mut() else {
@@ -3210,13 +4618,43 @@ async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<(
                 Ok(Some(status)) => Err(anyhow!(
                     "overlay generation {generation} exited before command: {status}"
                 )),
-                Ok(None) => process.send(&command),
+                Ok(None) if require_write_confirmation => {
+                    process.send_confirmed(command.clone()).map(Some)
+                }
+                Ok(None) => process.send(command.clone()).map(|outcome| {
+                    if outcome == OverlayEnqueueOutcome::DroppedLossy {
+                        trace!(
+                            generation,
+                            "dropped supersedable overlay update under backpressure"
+                        );
+                    }
+                    None
+                }),
                 Err(error) => Err(error).context("failed to poll overlay before command"),
             }
         };
 
+        let send_result = match enqueue_result {
+            Ok(Some(completion)) => {
+                match timeout(OVERLAY_WRITE_CONFIRM_TIMEOUT, completion).await {
+                    Ok(Ok(result)) => result.map_err(anyhow::Error::from),
+                    Ok(Err(_)) => Err(anyhow!("overlay writer closed before confirmation")),
+                    Err(_) => Err(anyhow!("overlay command write confirmation timed out")),
+                }
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+
         match send_result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if daemon.overlay_generation.load(Ordering::Acquire) == generation {
+                    return Ok(());
+                }
+                last_error = Some(anyhow!(
+                    "overlay generation changed after confirmed command write"
+                ));
+            }
             Err(error) => {
                 warn!(generation, error = %error, "overlay command failed; replacing helper");
                 invalidate_overlay_generation(daemon, generation).await;
@@ -3227,6 +4665,17 @@ async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<(
 
     schedule_overlay_restart(daemon);
     Err(last_error.unwrap_or_else(|| anyhow!("overlay command retry budget exhausted")))
+}
+
+fn overlay_command_requires_write_confirmation(command: &OverlayCommand) -> bool {
+    matches!(
+        command,
+        OverlayCommand::UpdateCard { done: true, .. }
+            | OverlayCommand::UpdateCard {
+                render_ack: Some(_),
+                ..
+            }
+    )
 }
 
 async fn wait_for_overlay_hydration(
@@ -3260,22 +4709,36 @@ async fn send_overlay_for_generation(
     generation: u64,
     command: OverlayCommand,
 ) -> Result<()> {
-    let mut overlay_guard = daemon.overlay.lock().await;
+    let completion = {
+        let mut overlay_guard = daemon.overlay.lock().await;
+        let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
+        let process = overlay_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("overlay process is absent during hydration"))?;
+        if current_generation != generation || process.generation != generation {
+            return Err(anyhow!(
+                "overlay generation changed during hydration: expected {generation}, current {current_generation}"
+            ));
+        }
+        if let Some(status) = process.child.try_wait()? {
+            return Err(anyhow!(
+                "overlay generation {generation} exited during hydration: {status}"
+            ));
+        }
+        process.send_confirmed(command.clone())?
+    };
+    timeout(OVERLAY_WRITE_CONFIRM_TIMEOUT, completion)
+        .await
+        .context("overlay hydration write confirmation timed out")?
+        .map_err(|_| anyhow!("overlay hydration writer closed before confirmation"))?
+        .map_err(anyhow::Error::from)?;
+
     let current_generation = daemon.overlay_generation.load(Ordering::Acquire);
-    let process = overlay_guard
-        .as_mut()
-        .ok_or_else(|| anyhow!("overlay process is absent during hydration"))?;
-    if current_generation != generation || process.generation != generation {
+    if current_generation != generation {
         return Err(anyhow!(
-            "overlay generation changed during hydration: expected {generation}, current {current_generation}"
+            "overlay generation changed after hydration write: expected {generation}, current {current_generation}"
         ));
     }
-    if let Some(status) = process.child.try_wait()? {
-        return Err(anyhow!(
-            "overlay generation {generation} exited during hydration: {status}"
-        ));
-    }
-    process.send(&command)?;
     let mut feedback = daemon.overlay_hydration_feedback.lock();
     match command {
         OverlayCommand::Show => feedback.expect_visibility(generation, true),
@@ -3302,8 +4765,8 @@ async fn invalidate_overlay_generation(daemon: &Arc<Daemon>, generation: u64) {
 }
 
 async fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
-    let mut shutdown_guard = daemon.balance_poll_shutdown.lock().await;
-    if shutdown_guard.is_some() {
+    let mut task_guard = daemon.balance_poll_task.lock().await;
+    if task_guard.is_some() {
         return;
     }
 
@@ -3311,50 +4774,76 @@ async fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
         debug!("balance polling skipped; account store unavailable");
         return;
     };
-    if client.current_tokens().is_none() {
+    let Some(credentials) = client.credential_snapshot() else {
         debug!("balance polling skipped; no Bluey account token");
+        return;
+    };
+    if !client
+        .credential_snapshot_is_current(&credentials)
+        .unwrap_or(false)
+    {
+        debug!("balance polling skipped; captured credentials are no longer current");
         return;
     }
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let device_id = stored_cloud_device_id(&daemon.paths);
-    crate::cloud::balance::spawn_loop_with_shutdown_for_device(
-        client,
-        daemon.balance_watch.clone(),
-        Some(shutdown_rx),
-        device_id,
-    );
-    *shutdown_guard = Some(shutdown_tx);
-}
-
-async fn stop_balance_polling(daemon: &Arc<Daemon>) {
-    if let Some(shutdown_tx) = daemon.balance_poll_shutdown.lock().await.take() {
-        let _ = shutdown_tx.send(true);
+    match crate::cloud::balance::spawn_authority_loop(client, daemon.balance_watch.clone()) {
+        Ok(task) => *task_guard = Some(task),
+        Err(error) => warn!(
+            error_category = %context_watch_safe_error_category(&error),
+            "balance polling skipped because credential authority could not be captured"
+        ),
     }
 }
 
+async fn stop_balance_polling(daemon: &Arc<Daemon>) -> bool {
+    let task = daemon.balance_poll_task.lock().await.take();
+    let Some(task) = task else {
+        return false;
+    };
+    if let Err(error) = task.shutdown().await {
+        warn!(
+            error_category = "task_join",
+            cancelled = error.is_cancelled(),
+            "balance polling task did not shut down cleanly"
+        );
+    }
+    true
+}
+
 async fn restart_balance_polling(daemon: &Arc<Daemon>) {
-    stop_balance_polling(daemon).await;
+    let _ = stop_balance_polling(daemon).await;
     maybe_spawn_balance_polling(daemon).await;
 }
 
-async fn mark_cloud_account_signed_out(daemon: &Arc<Daemon>, reason: &'static str) {
-    apply_cloud_account_signed_out(daemon, reason, true).await;
-}
-
-async fn apply_cloud_account_signed_out(
+async fn apply_cloud_account_signed_out_bound(
     daemon: &Arc<Daemon>,
     reason: &'static str,
-    clear_balance_watch: bool,
+    fence: &DaemonMutationFence,
+) -> Result<()> {
+    let _transition = daemon.account_answer_transition.lock().await;
+    let account_context = validate_account_mutation_fence(&daemon.paths, fence)?;
+    let prepared = PreparedCloudAccountSignOut::from_account_context(&account_context);
+    account_context.ensure_current(&daemon.paths)?;
+    apply_cloud_account_runtime_signed_out_under_transition(daemon, reason, true).await;
+    prepared.commit(&daemon.paths)?;
+    daemon.rag_indexer.refresh_from_paths(&daemon.paths);
+    Ok(())
+}
+
+async fn apply_cloud_account_runtime_signed_out_under_transition(
+    daemon: &Arc<Daemon>,
+    reason: &'static str,
+    render_signed_out: bool,
 ) {
     let audio_session_id = daemon.audio.lock().await.session_id.clone();
     clear_listen_account_verification(daemon).await;
-    stop_balance_polling(daemon).await;
+    let _ = stop_balance_polling(daemon).await;
     invalidate_active_answer(daemon, "account_signed_out").await;
     // Also cancel a racing startup generation so a delayed audio start
     // cannot flip the overlay back to Listening after auth is gone.
     let _ = stop_audio_capture(daemon).await;
-    let _ = stop_screen_capture(daemon, reason).await;
+    stop_continuous_system_audio(daemon).await;
+    let _ = stop_screen_capture_under_transition(daemon, reason, None).await;
     set_overlay_listening_state(daemon, ListeningState::Paused).await;
     let displaced_meeting = {
         let mut meeting_guard = daemon.meeting.lock().await;
@@ -3375,15 +4864,27 @@ async fn apply_cloud_account_signed_out(
     }
     let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
     refresh_overlay_sessions(daemon).await;
-    if clear_balance_watch {
-        daemon.balance_watch.clear();
-    }
     info!(
         reason,
         audio_session_id = audio_session_id.as_deref().unwrap_or("none"),
-        "local Bluey account tokens cleared; overlay marked signed out and live audio stopped"
+        "overlay marked signed out and live audio stopped"
     );
+    if render_signed_out {
+        let _ = render_overlay_signed_out(daemon, None).await;
+    }
+}
+
+async fn render_overlay_signed_out(
+    daemon: &Arc<Daemon>,
+    expected_successor: Option<&RevokedCredentialSuccessor>,
+) -> Result<()> {
+    if let Some(expected) = expected_successor {
+        expected.ensure_current(&daemon.paths)?;
+    }
     let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: false }).await;
+    if let Some(expected) = expected_successor {
+        expected.ensure_current(&daemon.paths)?;
+    }
     let _ = send_overlay(
         daemon,
         OverlayCommand::SetBalance {
@@ -3391,6 +4892,764 @@ async fn apply_cloud_account_signed_out(
         },
     )
     .await;
+    if let Some(expected) = expected_successor {
+        expected.ensure_current(&daemon.paths)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevokedCredentialSuccessor {
+    owner_account_id: String,
+    credential_generation: u64,
+    api_url: String,
+    device_id: Option<String>,
+}
+
+impl RevokedCredentialSuccessor {
+    fn capture(paths: &AppPaths, credentials: &CredentialSnapshot) -> Result<Self> {
+        let account = load_account(paths)?
+            .context("revoked Bluey credential profile disappeared after conditional clear")?;
+        let authority = credentials.authority();
+        let owner_account_id = account
+            .owner_account_id_with_token_state(true)
+            .context("revoked Bluey credential profile lost its owner identity")?;
+        ensure!(
+            owner_account_id == authority.owner_account_id()
+                && account.credential_generation > authority.credential_generation()
+                && !account.token_configured()
+                && account
+                    .refresh_token
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                && account.api_url.trim() == authority.api_url().trim()
+                && persisted_cloud_device_id(&account) == authority.device_id(),
+            "revoked Bluey credential profile was replaced during conditional clear"
+        );
+        Ok(Self {
+            owner_account_id: owner_account_id.to_string(),
+            credential_generation: account.credential_generation,
+            api_url: account.api_url.trim().to_string(),
+            device_id: persisted_cloud_device_id(&account).map(ToString::to_string),
+        })
+    }
+
+    fn ensure_current(&self, paths: &AppPaths) -> Result<()> {
+        let account = load_account(paths)?
+            .context("revoked Bluey credential successor profile disappeared")?;
+        ensure!(
+            account.owner_account_id_with_token_state(true) == Some(self.owner_account_id.as_str())
+                && account.credential_generation == self.credential_generation
+                && !account.token_configured()
+                && account
+                    .refresh_token
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .is_empty()
+                && account.api_url.trim() == self.api_url
+                && persisted_cloud_device_id(&account) == self.device_id.as_deref(),
+            "revoked Bluey credential successor was replaced"
+        );
+        ensure!(
+            SecureAccountStore::new(paths.clone())
+                .load_snapshot()?
+                .is_none(),
+            "revoked Bluey credential successor unexpectedly contains credentials"
+        );
+        Ok(())
+    }
+}
+
+fn persisted_cloud_device_id(account: &cue_core::AccountConfig) -> Option<&str> {
+    let device_id = account.device_id.trim();
+    is_persisted_cloud_device_id(device_id).then_some(device_id)
+}
+
+fn credentials_are_current(paths: &AppPaths, credentials: &CredentialSnapshot) -> Result<bool> {
+    Ok(SecureAccountStore::new(paths.clone())
+        .load_snapshot()?
+        .as_ref()
+        == Some(credentials))
+}
+
+async fn clear_revoked_credentials(
+    daemon: &Arc<Daemon>,
+    credentials: &CredentialSnapshot,
+    reason: &'static str,
+) -> Result<bool> {
+    let _transition = daemon.account_answer_transition.lock().await;
+    clear_revoked_credentials_under_transition(daemon, credentials, reason).await
+}
+
+async fn clear_revoked_credentials_under_transition(
+    daemon: &Arc<Daemon>,
+    credentials: &CredentialSnapshot,
+    reason: &'static str,
+) -> Result<bool> {
+    if !credentials_are_current(&daemon.paths, credentials)? {
+        return Ok(false);
+    }
+    let store = SecureAccountStore::new(daemon.paths.clone());
+    if !store.clear_if_current(credentials)? {
+        return Ok(false);
+    }
+    finish_revoked_credentials_clear_under_transition(daemon, credentials, reason).await
+}
+
+async fn clear_revoked_client_credentials(
+    daemon: &Arc<Daemon>,
+    client: &cue_cloud_client::CloudClient,
+    credentials: &CredentialSnapshot,
+    reason: &'static str,
+) -> Result<bool> {
+    let _transition = daemon.account_answer_transition.lock().await;
+    clear_revoked_client_credentials_under_transition(daemon, client, credentials, reason).await
+}
+
+async fn clear_revoked_client_credentials_under_transition(
+    daemon: &Arc<Daemon>,
+    client: &cue_cloud_client::CloudClient,
+    credentials: &CredentialSnapshot,
+    reason: &'static str,
+) -> Result<bool> {
+    if !credentials_are_current(&daemon.paths, credentials)? {
+        return Ok(false);
+    }
+    if !client.clear_credential_snapshot_if_current(credentials)? {
+        return Ok(false);
+    }
+    finish_revoked_credentials_clear_under_transition(daemon, credentials, reason).await
+}
+
+async fn finish_revoked_credentials_clear_under_transition(
+    daemon: &Arc<Daemon>,
+    credentials: &CredentialSnapshot,
+    reason: &'static str,
+) -> Result<bool> {
+    let successor = RevokedCredentialSuccessor::capture(&daemon.paths, credentials)?;
+    successor.ensure_current(&daemon.paths)?;
+    apply_cloud_account_runtime_signed_out_under_transition(daemon, reason, false).await;
+    // A newer login or same-account refresh always wins. Runtime cleanup may
+    // stop the rejected account's work, but stale authority never renders B/A2
+    // as signed out or clears its credentials.
+    if successor.ensure_current(&daemon.paths).is_err() {
+        return Ok(false);
+    }
+    daemon.rag_indexer.refresh_from_paths(&daemon.paths);
+    render_overlay_signed_out(daemon, Some(&successor)).await?;
+    successor.ensure_current(&daemon.paths)?;
+    daemon.balance_watch.publish_cleared(credentials.clone());
+    Ok(true)
+}
+
+#[derive(Debug, Clone)]
+struct PreparedCloudAccountSignOut {
+    owner_account_id: Option<String>,
+    credential_generation: Option<u64>,
+}
+
+impl PreparedCloudAccountSignOut {
+    #[cfg(test)]
+    fn capture(paths: &AppPaths) -> Result<Self> {
+        let account = load_account(paths)?;
+        Ok(Self {
+            owner_account_id: account
+                .as_ref()
+                .and_then(cue_core::AccountConfig::owner_account_id)
+                .map(ToString::to_string),
+            credential_generation: account
+                .as_ref()
+                .map(|account| account.credential_generation),
+        })
+    }
+
+    fn from_account_context(context: &AnswerAccountContext) -> Self {
+        Self {
+            owner_account_id: context.owner_account_id.clone(),
+            credential_generation: context.credential_generation,
+        }
+    }
+
+    fn commit(&self, paths: &AppPaths) -> Result<()> {
+        let Some(expected_generation) = self.credential_generation else {
+            return Ok(());
+        };
+        let current = load_account(paths)?;
+        anyhow::ensure!(
+            current
+                .as_ref()
+                .map(|account| account.credential_generation)
+                == Some(expected_generation)
+                && current
+                    .as_ref()
+                    .and_then(cue_core::AccountConfig::owner_account_id)
+                    == self.owner_account_id.as_deref(),
+            "account profile changed before sign-out commit"
+        );
+        anyhow::ensure!(
+            cue_core::config::save_account_if_generation(
+                paths,
+                expected_generation,
+                &cue_core::AccountConfig::local(),
+            )?,
+            "account profile changed during sign-out commit"
+        );
+        Ok(())
+    }
+}
+
+struct AccountCloudContext {
+    paths: AppPaths,
+    owner_account_id: String,
+    credential_generation: u64,
+    client: cue_cloud_client::CloudClient,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingDeletedAccountPurge {
+    schema_version: u8,
+    owner_account_id: String,
+    operation_id: String,
+    recovery_token: String,
+    requested_at_ms: i64,
+    state: DeletedAccountPurgeState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeletedAccountPurgeState {
+    Prepared,
+    ServerConfirmed,
+    LocalDataPurged,
+    ProfilePurged,
+    OnboardingReset,
+    FinalAcknowledged,
+}
+
+impl DeletedAccountPurgeState {
+    fn rank(self) -> u8 {
+        match self {
+            Self::Prepared => 0,
+            Self::ServerConfirmed => 1,
+            Self::LocalDataPurged => 2,
+            Self::ProfilePurged => 3,
+            Self::OnboardingReset => 4,
+            Self::FinalAcknowledged => 5,
+        }
+    }
+
+    fn at_least(self, other: Self) -> bool {
+        self.rank() >= other.rank()
+    }
+}
+
+fn pending_deleted_account_purge_path(paths: &AppPaths) -> PathBuf {
+    paths.data_dir.join("pending-deleted-account-purge.json")
+}
+
+fn validate_deleted_account_owner(owner_account_id: &str) -> Result<&str> {
+    let owner = owner_account_id.trim();
+    anyhow::ensure!(
+        !owner.is_empty() && owner == owner_account_id && owner.len() <= 256,
+        "invalid deleted account owner"
+    );
+    Ok(owner)
+}
+
+fn validate_account_deletion_uuid<'a>(value: &'a str, label: &str) -> Result<&'a str> {
+    let parsed = uuid::Uuid::parse_str(value).with_context(|| format!("invalid {label}"))?;
+    anyhow::ensure!(
+        parsed.get_version_num() == 4 && parsed.to_string() == value,
+        "invalid {label}"
+    );
+    Ok(value)
+}
+
+fn persist_pending_deleted_account_purge(
+    paths: &AppPaths,
+    owner_account_id: &str,
+    operation_id: &str,
+    recovery_token: &str,
+    requested_state: DeletedAccountPurgeState,
+) -> Result<PendingDeletedAccountPurge> {
+    let owner_account_id = validate_deleted_account_owner(owner_account_id)?;
+    let operation_id = validate_account_deletion_uuid(operation_id, "deletion operation")?;
+    let recovery_token = validate_account_deletion_uuid(recovery_token, "deletion recovery token")?;
+    let marker = match load_pending_deleted_account_purge(paths)? {
+        Some(marker) => {
+            anyhow::ensure!(
+                marker.owner_account_id == owner_account_id,
+                "another account deletion cleanup is already pending"
+            );
+            PendingDeletedAccountPurge {
+                schema_version: 3,
+                state: if marker.state.at_least(requested_state) {
+                    marker.state
+                } else {
+                    requested_state
+                },
+                ..marker
+            }
+        }
+        None => PendingDeletedAccountPurge {
+            schema_version: 3,
+            owner_account_id: owner_account_id.to_string(),
+            operation_id: operation_id.to_string(),
+            recovery_token: recovery_token.to_string(),
+            requested_at_ms: chrono::Utc::now().timestamp_millis(),
+            state: requested_state,
+        },
+    };
+    crate::storage::write_private_atomic_bytes(
+        &pending_deleted_account_purge_path(paths),
+        &serde_json::to_vec(&marker)?,
+    )
+    .context("persist deleted-account local purge marker")?;
+    Ok(marker)
+}
+
+fn load_pending_deleted_account_purge(
+    paths: &AppPaths,
+) -> Result<Option<PendingDeletedAccountPurge>> {
+    let path = pending_deleted_account_purge_path(paths);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read deleted-account local purge marker"),
+    };
+    let marker: PendingDeletedAccountPurge =
+        serde_json::from_slice(&bytes).context("parse deleted-account local purge marker")?;
+    anyhow::ensure!(
+        matches!(marker.schema_version, 2 | 3) && marker.requested_at_ms > 0,
+        "invalid deleted-account local purge marker"
+    );
+    validate_deleted_account_owner(&marker.owner_account_id)?;
+    validate_account_deletion_uuid(&marker.operation_id, "deletion operation")?;
+    validate_account_deletion_uuid(&marker.recovery_token, "deletion recovery token")?;
+    Ok(Some(marker))
+}
+
+pub(crate) fn account_deletion_is_pending_for(
+    paths: &AppPaths,
+    owner_account_id: &str,
+) -> Result<bool> {
+    Ok(load_pending_deleted_account_purge(paths)?
+        .is_some_and(|pending| pending.owner_account_id == owner_account_id))
+}
+
+fn remove_pending_deleted_account_purge(paths: &AppPaths) -> Result<()> {
+    let path = pending_deleted_account_purge_path(paths);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .context("sync deleted-account purge marker removal")?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove deleted-account local purge marker"),
+    }
+}
+
+async fn prepare_deleted_account_local_purge(
+    daemon: &Arc<Daemon>,
+    owner_account_id: &str,
+    operation_id: &str,
+    recovery_token: &str,
+) -> Result<PendingDeletedAccountPurge> {
+    let owner_account_id = validate_deleted_account_owner(owner_account_id)?;
+    let _transition = daemon.account_answer_transition.lock().await;
+    let current = load_account(&daemon.paths)?
+        .and_then(|account| account.owner_account_id().map(ToString::to_string));
+    anyhow::ensure!(
+        current.as_deref() == Some(owner_account_id),
+        "refusing account deletion fence outside the current account"
+    );
+    if let Some(pending) = load_pending_deleted_account_purge(&daemon.paths)? {
+        anyhow::ensure!(
+            pending.owner_account_id == owner_account_id,
+            "another account deletion cleanup is already pending"
+        );
+    }
+    let marker = persist_pending_deleted_account_purge(
+        &daemon.paths,
+        owner_account_id,
+        operation_id,
+        recovery_token,
+        DeletedAccountPurgeState::Prepared,
+    )?;
+    // Refresh after the durable marker exists. This clears the active managed
+    // pipeline, advances its scope epoch, and wakes/cancels retained workers.
+    daemon.rag_indexer.refresh_from_paths(&daemon.paths);
+    invalidate_active_answer(daemon, "account_signed_out").await;
+    // Deletion preparation is a durable write fence, not merely an answer
+    // cancellation. Stop every producer while still holding the same account
+    // transition barrier so no newly captured content can race the marker.
+    let _ = stop_audio_capture(daemon).await;
+    stop_continuous_system_audio(daemon).await;
+    // Normal meeting shutdown accepts a short final STT tail. Account deletion
+    // must not: discard that tail authority after signaling the capture worker.
+    daemon.audio_runtime.lock().await.finalizing_session = None;
+    let _ = stop_screen_capture_under_transition(daemon, "account deletion", None).await;
+    set_overlay_listening_state(daemon, ListeningState::Paused).await;
+    *daemon.last_live_transcript.lock().await = None;
+    Ok(marker)
+}
+
+async fn abort_deleted_account_local_purge(
+    daemon: &Arc<Daemon>,
+    owner_account_id: &str,
+) -> Result<()> {
+    let owner_account_id = validate_deleted_account_owner(owner_account_id)?;
+    let _transition = daemon.account_answer_transition.lock().await;
+    let current = load_account(&daemon.paths)?
+        .and_then(|account| account.owner_account_id().map(ToString::to_string));
+    anyhow::ensure!(
+        current.as_deref() == Some(owner_account_id),
+        "refusing account deletion fence removal outside the current account"
+    );
+    anyhow::ensure!(
+        load_pending_deleted_account_purge(&daemon.paths)?
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.owner_account_id == owner_account_id
+                    && pending.state == DeletedAccountPurgeState::Prepared
+            }),
+        "account deletion cleanup fence is not pending"
+    );
+    remove_pending_deleted_account_purge(&daemon.paths)?;
+    daemon.rag_indexer.refresh_from_paths(&daemon.paths);
+    Ok(())
+}
+
+async fn purge_deleted_account_local_data(
+    daemon: &Arc<Daemon>,
+    owner_account_id: &str,
+) -> Result<usize> {
+    let owner_account_id = validate_deleted_account_owner(owner_account_id)?.to_string();
+    let _transition = daemon.account_answer_transition.lock().await;
+    let mut pending = load_pending_deleted_account_purge(&daemon.paths)?
+        .context("deleted-account local purge was not prepared")?;
+    anyhow::ensure!(
+        pending.owner_account_id == owner_account_id,
+        "refusing deleted-account purge outside its prepared account"
+    );
+    if !pending
+        .state
+        .at_least(DeletedAccountPurgeState::ServerConfirmed)
+    {
+        pending = persist_pending_deleted_account_purge(
+            &daemon.paths,
+            &owner_account_id,
+            &pending.operation_id,
+            &pending.recovery_token,
+            DeletedAccountPurgeState::ServerConfirmed,
+        )?;
+    }
+
+    let mut removed_sessions = 0usize;
+    if !pending
+        .state
+        .at_least(DeletedAccountPurgeState::LocalDataPurged)
+    {
+        let current = load_account(&daemon.paths)?
+            .and_then(|account| account.owner_account_id().map(ToString::to_string));
+        anyhow::ensure!(
+            current.as_deref() == Some(owner_account_id.as_str()),
+            "refusing deleted-account purge outside the current account"
+        );
+        apply_cloud_account_runtime_signed_out_under_transition(daemon, "account_deleted", true)
+            .await;
+        let meetings = daemon
+            .store
+            .all_meetings()?
+            .into_iter()
+            .filter(|meeting| meeting.owner_account_id.as_deref() == Some(&owner_account_id))
+            .collect::<Vec<_>>();
+        let mut session_ids = meetings
+            .iter()
+            .map(|meeting| meeting.id)
+            .collect::<std::collections::HashSet<_>>();
+        session_ids.extend(
+            daemon
+                .session_db
+                .lock()
+                .list_sessions_for_owner(Some(&owner_account_id), None, u32::MAX)?
+                .into_iter()
+                .map(|session| session.id),
+        );
+        removed_sessions = session_ids.len();
+
+        for meeting in &meetings {
+            remove_markdown_artifact_files(&daemon.paths, &meeting.context);
+        }
+        // The RAG database and its durable queue are independently
+        // owner-scoped authorities. Sweep them directly so orphan rows and
+        // prior workspaces cannot survive merely because their session parent
+        // has disappeared from MeetingStore.
+        daemon
+            .rag_indexer
+            .purge_account_for_owner(&owner_account_id)
+            .await
+            .context("purge owner-wide RAG for deleted account")?;
+        for session_id in session_ids.iter().copied() {
+            daemon
+                .diagnostics
+                .purge_cloud_tombstoned_session_for_owner(&owner_account_id, session_id)
+                .context("purge diagnostics for deleted account session")?;
+            crate::cloud::sync::purge_session_audit_state(
+                &daemon.paths.data_dir,
+                Some(&owner_account_id),
+                session_id,
+            )?;
+            daemon.store.delete(session_id)?;
+        }
+
+        daemon
+            .session_db
+            .lock()
+            .purge_account_data_for_owner(&owner_account_id)?;
+        crate::cloud::sync::purge_cloud_account_local_state(
+            &daemon.paths.data_dir,
+            &owner_account_id,
+        )?;
+        update_settings(&daemon.paths, |settings| {
+            if settings.cloud_sync_consent_account_id.as_deref() == Some(&owner_account_id) {
+                settings.cloud_sync_enabled = false;
+                settings.cloud_sync_consent_granted = false;
+                settings.cloud_sync_consent_account_id = None;
+            }
+            if settings
+                .support_diagnostics_upload_consent_account_id
+                .as_deref()
+                == Some(&owner_account_id)
+            {
+                settings.support_diagnostics_upload_enabled = false;
+                settings.support_diagnostics_upload_consent_granted = false;
+                settings.support_diagnostics_upload_consent_account_id = None;
+            }
+            if settings
+                .support_diagnostics_server_revocation_account_id
+                .as_deref()
+                == Some(&owner_account_id)
+            {
+                settings.support_diagnostics_server_revocation_pending = false;
+                settings.support_diagnostics_server_revocation_account_id = None;
+            }
+        })?;
+        pending = persist_pending_deleted_account_purge(
+            &daemon.paths,
+            &owner_account_id,
+            &pending.operation_id,
+            &pending.recovery_token,
+            DeletedAccountPurgeState::LocalDataPurged,
+        )?;
+    }
+
+    if !pending
+        .state
+        .at_least(DeletedAccountPurgeState::ProfilePurged)
+    {
+        if let Some(current) = load_account(&daemon.paths)? {
+            if current.owner_account_id() == Some(owner_account_id.as_str()) {
+                anyhow::ensure!(
+                    cue_core::config::save_account_if_generation(
+                        &daemon.paths,
+                        current.credential_generation,
+                        &cue_core::AccountConfig::local(),
+                    )?,
+                    "account profile changed during deleted-account cleanup"
+                );
+            } else {
+                anyhow::ensure!(
+                    current.owner_account_id().is_none(),
+                    "a different account replaced the deleted profile"
+                );
+            }
+        }
+        pending = persist_pending_deleted_account_purge(
+            &daemon.paths,
+            &owner_account_id,
+            &pending.operation_id,
+            &pending.recovery_token,
+            DeletedAccountPurgeState::ProfilePurged,
+        )?;
+    }
+
+    if !pending
+        .state
+        .at_least(DeletedAccountPurgeState::OnboardingReset)
+    {
+        daemon
+            .session_db
+            .lock()
+            .save_setting("onboarding_complete", "false")?;
+        persist_pending_deleted_account_purge(
+            &daemon.paths,
+            &owner_account_id,
+            &pending.operation_id,
+            &pending.recovery_token,
+            DeletedAccountPurgeState::OnboardingReset,
+        )?;
+    }
+    write_state(daemon).await?;
+    Ok(removed_sessions)
+}
+
+fn acknowledge_deleted_account_local_purge(
+    paths: &AppPaths,
+    owner_account_id: &str,
+    operation_id: &str,
+    recovery_token: &str,
+) -> Result<()> {
+    let owner_account_id = validate_deleted_account_owner(owner_account_id)?;
+    let operation_id = validate_account_deletion_uuid(operation_id, "deletion operation")?;
+    let recovery_token = validate_account_deletion_uuid(recovery_token, "deletion recovery token")?;
+    let pending = load_pending_deleted_account_purge(paths)?
+        .context("deleted-account cleanup acknowledgement has no pending marker")?;
+    anyhow::ensure!(
+        pending.owner_account_id == owner_account_id
+            && pending.operation_id == operation_id
+            && pending.recovery_token == recovery_token,
+        "deleted-account cleanup acknowledgement capability mismatch"
+    );
+    anyhow::ensure!(
+        pending
+            .state
+            .at_least(DeletedAccountPurgeState::OnboardingReset),
+        "deleted-account local cleanup is not complete"
+    );
+    anyhow::ensure!(
+        load_account(paths)?
+            .as_ref()
+            .and_then(cue_core::AccountConfig::owner_account_id)
+            .is_none(),
+        "deleted-account profile cleanup is not durable"
+    );
+    persist_pending_deleted_account_purge(
+        paths,
+        owner_account_id,
+        operation_id,
+        recovery_token,
+        DeletedAccountPurgeState::FinalAcknowledged,
+    )?;
+    remove_pending_deleted_account_purge(paths)
+}
+
+async fn resume_pending_deleted_account_purge(daemon: &Arc<Daemon>) -> Result<Option<usize>> {
+    let Some(pending) = load_pending_deleted_account_purge(&daemon.paths)? else {
+        return Ok(None);
+    };
+    if !pending
+        .state
+        .at_least(DeletedAccountPurgeState::ServerConfirmed)
+    {
+        return Ok(None);
+    }
+    if pending
+        .state
+        .at_least(DeletedAccountPurgeState::FinalAcknowledged)
+    {
+        remove_pending_deleted_account_purge(&daemon.paths)?;
+        return Ok(Some(0));
+    }
+    let removed = purge_deleted_account_local_data(daemon, &pending.owner_account_id).await?;
+    let resumed = load_pending_deleted_account_purge(&daemon.paths)?
+        .context("deleted-account cleanup marker disappeared before restart acknowledgement")?;
+    acknowledge_deleted_account_local_purge(
+        &daemon.paths,
+        &resumed.owner_account_id,
+        &resumed.operation_id,
+        &resumed.recovery_token,
+    )?;
+    Ok(Some(removed))
+}
+
+impl AccountCloudContext {
+    fn snapshot(paths: &AppPaths, trace_id: Option<&str>) -> Result<Self> {
+        let account = load_account(paths)?
+            .ok_or_else(|| anyhow!("Bluey cloud account is not linked; run `bluey login`"))?;
+        let owner_account_id = account
+            .owner_account_id()
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow!("Bluey cloud account credentials are unavailable"))?;
+        anyhow::ensure!(
+            !load_pending_deleted_account_purge(paths)?
+                .is_some_and(|pending| { pending.owner_account_id == owner_account_id.as_str() }),
+            "deleted account local cleanup is pending"
+        );
+        let access = account
+            .access_token
+            .clone()
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| anyhow!("Bluey cloud account credentials are unavailable"))?;
+        let store = cue_cloud_client::tokens::MemoryStore::new();
+        cue_cloud_client::TokenStore::save(
+            &store,
+            &cue_cloud_client::Tokens {
+                access,
+                refresh: account.refresh_token.clone().unwrap_or_default(),
+                email: account.user_id.clone(),
+            },
+        )?;
+        let config = cue_cloud_client::client::ClientConfig {
+            base_url: if account.api_url.trim().is_empty() {
+                "https://bluey.sh".to_string()
+            } else {
+                account.api_url.clone()
+            },
+            ..Default::default()
+        };
+        let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))?;
+        Ok(Self {
+            paths: paths.clone(),
+            owner_account_id,
+            credential_generation: account.credential_generation,
+            client: cloud_client_with_optional_trace(client, trace_id),
+        })
+    }
+
+    fn ensure_current(&self) -> Result<()> {
+        let account = load_account(&self.paths)?
+            .ok_or_else(|| anyhow!("signed-in account changed during cloud operation"))?;
+        if account.owner_account_id() != Some(self.owner_account_id.as_str())
+            || account.credential_generation != self.credential_generation
+        {
+            return Err(anyhow!("signed-in account changed during cloud operation"));
+        }
+        if load_pending_deleted_account_purge(&self.paths)?
+            .is_some_and(|pending| pending.owner_account_id == self.owner_account_id)
+        {
+            return Err(anyhow!("deleted account local cleanup is pending"));
+        }
+        Ok(())
+    }
+
+    fn ensure_answer_context(&self, expected: &AnswerAccountContext) -> Result<()> {
+        if expected.owner_account_id.as_deref() != Some(self.owner_account_id.as_str())
+            || expected.credential_generation != Some(self.credential_generation)
+        {
+            return Err(anyhow!(AnswerAccountContextChanged));
+        }
+        self.ensure_current()
+            .map_err(|_| anyhow!(AnswerAccountContextChanged))
+    }
+
+    fn ensure_cloud_sync_consent(&self) -> Result<()> {
+        let settings = load_settings(&self.paths)?;
+        if !settings.cloud_sync_allowed_for_account(Some(&self.owner_account_id)) {
+            return Err(anyhow!(
+                "cloud session sync is off for the signed-in account; enable it in Data controls"
+            ));
+        }
+        self.ensure_current()
+    }
 }
 
 fn spawn_auto_cloud_sync(daemon: &Arc<Daemon>, reason: &'static str, trace_id: Option<String>) {
@@ -3414,87 +5673,310 @@ fn spawn_auto_cloud_sync(daemon: &Arc<Daemon>, reason: &'static str, trace_id: O
             *cloud = status;
         }
 
-        match sync_and_hydrate_cloud_meetings(&daemon, trace_id.as_deref()).await {
+        match sync_and_hydrate_cloud_meetings(
+            &daemon,
+            trace_id.as_deref(),
+            Duration::from_secs(CLOUD_SESSION_AUTO_SYNC_BUDGET_SECS),
+        )
+        .await
+        {
             Ok((upload_summary, hydrate_summary)) => {
                 let mut synced = cloud_status_from_env(&daemon.paths);
-                synced.mark_synced();
+                if hydrate_summary.continuation_pending {
+                    synced.mark_degraded(
+                        "Cloud history is current through this bounded page; Bluey will continue shortly.",
+                    );
+                    synced.pending_downloads = 1;
+                } else {
+                    synced.mark_synced();
+                }
                 *daemon.cloud.lock().await = synced;
                 info!(
                     reason,
                     uploaded_records = upload_summary.total_records(),
                     restored_sessions = hydrate_summary.restored_sessions,
                     skipped_sessions = hydrate_summary.skipped_sessions,
+                    purged_deleted_sessions = hydrate_summary.purged_deleted_sessions,
+                    tombstoned_session_ids = hydrate_summary.purged_session_ids.len(),
+                    reconciled_child_session_ids = hydrate_summary.reconciled_session_ids.len(),
+                    continuation_pending = hydrate_summary.continuation_pending,
                     "cloud auto-sync complete"
                 );
+                if hydrate_summary.continuation_pending {
+                    schedule_auto_cloud_sync(&daemon, "hydration_continuation", None).await;
+                }
             }
             Err(error) => {
                 let mut failed = cloud_status_from_env(&daemon.paths);
-                failed.mark_failed(format!("{error:#}"));
+                failed.mark_degraded(
+                    "Cloud sync is incomplete and will retry without uploading unreconciled data.",
+                );
+                failed.pending_downloads = 1;
                 *daemon.cloud.lock().await = failed;
-                warn!(reason, error = %error, "cloud auto-sync failed");
+                warn!(
+                    reason,
+                    error_category = %cloud_sync_safe_error_category(&error),
+                    "cloud auto-sync deferred"
+                );
             }
         }
     });
 }
 
-fn spawn_cloud_delete_outbox_flush(daemon: &Arc<Daemon>, trace_id: Option<String>) {
-    let Some(owner_account_id) = current_owner_account_id(&daemon.paths) else {
-        return;
-    };
-    if let Err(error) = crate::cloud::sync::reconcile_prepared_cloud_session_deletes(
-        &daemon.paths.data_dir,
-        &daemon.store,
-        Some(&owner_account_id),
-    ) {
-        warn!(
-            error = %error,
-            "could not reconcile interrupted local session deletions before outbox flush"
-        );
-    }
-    let Ok(client) = build_cloud_client(&daemon.paths, trace_id.as_deref()) else {
-        return;
-    };
-    let data_dir = daemon.paths.data_dir.clone();
+fn spawn_cloud_session_sync_retry(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
-        crate::cloud::sync::flush_pending_cloud_session_deletes(
-            &data_dir,
-            &client,
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(CLOUD_SESSION_SYNC_RETRY_TICK_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Startup already performs an immediate event-driven sync.
+        interval.tick().await;
+        let mut retry_backoff_secs = CLOUD_SESSION_SYNC_RETRY_TICK_SECS;
+        let mut retry_not_before = Instant::now();
+        let mut heartbeat_not_before =
+            Instant::now() + Duration::from_secs(CLOUD_SESSION_SYNC_HEARTBEAT_SECS);
+
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let state = daemon.cloud.lock().await.sync_state;
+            match state {
+                CloudSyncState::Failed | CloudSyncState::Degraded => {
+                    if now < retry_not_before {
+                        continue;
+                    }
+                    spawn_auto_cloud_sync(&daemon, "periodic_retry", None);
+                    retry_not_before = now
+                        + Duration::from_secs(cloud_retry_delay_with_jitter(retry_backoff_secs));
+                    retry_backoff_secs = next_cloud_session_sync_backoff(retry_backoff_secs);
+                }
+                CloudSyncState::Ready => {
+                    retry_backoff_secs = CLOUD_SESSION_SYNC_RETRY_TICK_SECS;
+                    retry_not_before = now;
+                    if now >= heartbeat_not_before {
+                        spawn_auto_cloud_sync(&daemon, "periodic_heartbeat", None);
+                        heartbeat_not_before =
+                            now + Duration::from_secs(CLOUD_SESSION_SYNC_HEARTBEAT_SECS);
+                    }
+                }
+                CloudSyncState::Disabled => {
+                    retry_backoff_secs = CLOUD_SESSION_SYNC_RETRY_TICK_SECS;
+                    retry_not_before = now;
+                    heartbeat_not_before =
+                        now + Duration::from_secs(CLOUD_SESSION_SYNC_HEARTBEAT_SECS);
+                }
+                CloudSyncState::Syncing => {}
+            }
+        }
+    });
+}
+
+fn next_cloud_session_sync_backoff(current_secs: u64) -> u64 {
+    current_secs
+        .max(CLOUD_SESSION_SYNC_RETRY_TICK_SECS)
+        .saturating_mul(2)
+        .min(CLOUD_SESSION_SYNC_MAX_BACKOFF_SECS)
+}
+
+fn cloud_retry_delay_with_jitter(base_secs: u64) -> u64 {
+    let jitter =
+        u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % CLOUD_SESSION_SYNC_JITTER_SECS.max(1);
+    base_secs.saturating_add(jitter)
+}
+
+fn spawn_cloud_delete_outbox_flush(daemon: &Arc<Daemon>, trace_id: Option<String>) {
+    let Ok(account_context) = AccountCloudContext::snapshot(&daemon.paths, trace_id.as_deref())
+    else {
+        return;
+    };
+    if account_context.ensure_current().is_err() {
+        return;
+    }
+    let owner_account_id = account_context.owner_account_id.clone();
+    let daemon = Arc::clone(daemon);
+    tokio::spawn(async move {
+        let _single_flight = daemon.cloud_delete_flush.lock().await;
+        if account_context.ensure_current().is_err() {
+            return;
+        }
+        if let Err(error) = crate::cloud::sync::reconcile_prepared_cloud_session_deletes(
+            &daemon.paths.data_dir,
+            &daemon.store,
             Some(&owner_account_id),
+        ) {
+            warn!(
+                error_category = %context_watch_safe_error_category(&error),
+                "could not reconcile interrupted local session deletions before outbox flush"
+            );
+        }
+        if account_context.ensure_current().is_err() {
+            return;
+        }
+        if crate::cloud::sync::flush_pending_cloud_session_deletes(
+            &daemon.paths.data_dir,
+            &account_context.client,
+            Some(&owner_account_id),
+            &|| account_context.ensure_current(),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            debug!("cloud session deletion flush stopped after account context changed");
+        }
     });
 }
 
 fn spawn_cloud_delete_outbox_retry(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Startup performs an immediate flush separately; avoid duplicating it.
-        interval.tick().await;
+        let mut retry_delay_secs = CLOUD_SESSION_SYNC_RETRY_TICK_SECS;
         loop {
-            interval.tick().await;
-            let Some(owner_account_id) = current_owner_account_id(&daemon.paths) else {
+            sleep(Duration::from_secs(cloud_retry_delay_with_jitter(
+                retry_delay_secs,
+            )))
+            .await;
+            let Ok(account_context) = AccountCloudContext::snapshot(&daemon.paths, None) else {
+                retry_delay_secs = next_cloud_session_sync_backoff(retry_delay_secs);
                 continue;
             };
+            if account_context.ensure_current().is_err() {
+                retry_delay_secs = next_cloud_session_sync_backoff(retry_delay_secs);
+                continue;
+            }
+            let _single_flight = daemon.cloud_delete_flush.lock().await;
+            if account_context.ensure_current().is_err() {
+                retry_delay_secs = next_cloud_session_sync_backoff(retry_delay_secs);
+                continue;
+            }
+            let owner_account_id = account_context.owner_account_id.clone();
             if let Err(error) = crate::cloud::sync::reconcile_prepared_cloud_session_deletes(
                 &daemon.paths.data_dir,
                 &daemon.store,
                 Some(&owner_account_id),
             ) {
                 warn!(
-                    error = %error,
+                    error_category = %context_watch_safe_error_category(&error),
                     "could not reconcile interrupted local session deletions before retry"
                 );
             }
-            let Ok(client) = build_cloud_client(&daemon.paths, None) else {
+            if account_context.ensure_current().is_err() {
+                retry_delay_secs = next_cloud_session_sync_backoff(retry_delay_secs);
                 continue;
-            };
-            crate::cloud::sync::flush_pending_cloud_session_deletes(
+            }
+            let result = crate::cloud::sync::flush_pending_cloud_session_deletes(
                 &daemon.paths.data_dir,
-                &client,
+                &account_context.client,
                 Some(&owner_account_id),
+                &|| account_context.ensure_current(),
             )
             .await;
+            if result.is_err() {
+                retry_delay_secs = next_cloud_session_sync_backoff(retry_delay_secs);
+                debug!("cloud session deletion retry deferred");
+            } else {
+                retry_delay_secs = CLOUD_SESSION_SYNC_RETRY_TICK_SECS;
+            }
+        }
+    });
+}
+
+fn spawn_support_diagnostic_upload_retry(daemon: Arc<Daemon>) {
+    tokio::spawn(async move {
+        let mut delay_secs = 0u64;
+        loop {
+            if delay_secs > 0 {
+                let jitter_secs = u64::from(uuid::Uuid::new_v4().as_bytes()[0] % 7);
+                sleep(Duration::from_secs(delay_secs.saturating_add(jitter_secs))).await;
+            }
+            let settings = load_settings(&daemon.paths).unwrap_or_default();
+            if settings.support_diagnostics_server_revocation_pending {
+                let Ok(account_context) = AccountCloudContext::snapshot(&daemon.paths, None) else {
+                    delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                    continue;
+                };
+                if !settings.support_diagnostics_revocation_pending_for_account(Some(
+                    &account_context.owner_account_id,
+                )) {
+                    delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                    continue;
+                }
+                if account_context.ensure_current().is_err() {
+                    delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                    continue;
+                }
+                let consent_revoked = account_context
+                    .client
+                    .set_support_diagnostic_consent(false)
+                    .await
+                    .is_ok();
+                let cleaned = consent_revoked
+                    && account_context.ensure_current().is_ok()
+                    && account_context
+                        .client
+                        .delete_all_support_diagnostics()
+                        .await
+                        .is_ok()
+                    && account_context.ensure_current().is_ok();
+                if cleaned {
+                    let cleanup_owner = account_context.owner_account_id.clone();
+                    if update_settings(&daemon.paths, |settings| {
+                        if settings.support_diagnostics_revocation_pending_for_account(Some(
+                            &cleanup_owner,
+                        )) {
+                            settings.support_diagnostics_server_revocation_pending = false;
+                            settings.support_diagnostics_server_revocation_account_id = None;
+                            settings.support_diagnostics_upload_enabled = false;
+                            settings.support_diagnostics_upload_consent_granted = false;
+                            settings.support_diagnostics_upload_consent_account_id = None;
+                        }
+                    })
+                    .is_err()
+                    {
+                        warn!("support diagnostic server cleanup completed but local receipt update failed");
+                    }
+                }
+                delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                continue;
+            }
+            let Ok(account_context) = AccountCloudContext::snapshot(&daemon.paths, None) else {
+                delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                continue;
+            };
+            let owner_account_id = account_context.owner_account_id.clone();
+            if !settings.support_diagnostics_upload_allowed_for_account(Some(&owner_account_id)) {
+                delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                continue;
+            }
+            if account_context.ensure_current().is_err() {
+                delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                continue;
+            }
+            let sync_result = crate::cloud::sync::sync_support_diagnostic_bundles(
+                &daemon.store,
+                &daemon.paths,
+                &account_context.client,
+                Some(&owner_account_id),
+                &|| account_context.ensure_current(),
+            )
+            .await;
+            if account_context.ensure_current().is_err() {
+                delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                continue;
+            }
+            match sync_result {
+                Ok(uploaded) if uploaded > 0 => {
+                    debug!(uploaded, "metadata-only support diagnostics uploaded");
+                    delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                }
+                Ok(_) => {
+                    delay_secs = SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS;
+                }
+                Err(_) => {
+                    debug!("metadata-only support diagnostic sync deferred");
+                    delay_secs = delay_secs
+                        .max(SUPPORT_DIAGNOSTIC_SYNC_INTERVAL_SECS)
+                        .saturating_mul(2)
+                        .min(SUPPORT_DIAGNOSTIC_SYNC_MAX_BACKOFF_SECS);
+                }
+            }
         }
     });
 }
@@ -3523,34 +6005,410 @@ async fn schedule_auto_cloud_sync(
 async fn sync_and_hydrate_cloud_meetings(
     daemon: &Arc<Daemon>,
     trace_id: Option<&str>,
+    operation_budget: Duration,
 ) -> Result<(
     crate::cloud::sync::LocalSyncSummary,
     crate::cloud::sync::CloudHydrationSummary,
 )> {
-    let client = build_cloud_client(&daemon.paths, trace_id)?;
-    let owner_account_id = current_owner_account_id(&daemon.paths);
-    let upload_summary = crate::cloud::sync::sync_local_meetings(
-        &daemon.store,
-        &daemon.paths.data_dir,
-        &client,
-        owner_account_id.as_deref(),
-    )
-    .await?;
+    let _sync_flight = daemon.cloud_sync_flight.lock().await;
+    let account_context = AccountCloudContext::snapshot(&daemon.paths, trace_id)?;
+    account_context.ensure_cloud_sync_consent()?;
+    let owner_account_id = account_context.owner_account_id.clone();
+    let started_at = Instant::now();
+    let operation_is_active = || {
+        account_context.ensure_cloud_sync_consent()?;
+        if started_at.elapsed() > operation_budget {
+            anyhow::bail!("cloud session sync exceeded its bounded work window");
+        }
+        Ok(())
+    };
+    // Server tombstones and cloud-side edits must win before the daemon
+    // considers any local upload. Otherwise an old local copy can resurrect
+    // content that another device already deleted.
     let hydrate_summary = crate::cloud::sync::hydrate_missing_cloud_meetings(
         &daemon.store,
         &daemon.paths.data_dir,
-        &client,
-        owner_account_id.as_deref(),
+        &account_context.client,
+        Some(&owner_account_id),
         100,
+        &operation_is_active,
+        &daemon.account_answer_transition,
     )
     .await?;
-    if hydrate_summary.restored_sessions > 0 {
-        for meeting in daemon.store.all_meetings()? {
-            reindex_meeting_for_rag(daemon, meeting);
+    operation_is_active()?;
+    purge_cloud_tombstoned_sessions_for_owner(
+        daemon,
+        &account_context,
+        &hydrate_summary.purged_session_ids,
+    )
+    .await?;
+    operation_is_active()?;
+
+    // Publish the complete cloud-first view before deciding whether this pass
+    // is safe to upload. Hydration can durably restore session metadata while
+    // still reporting that one or more attachment transfers need another
+    // bounded pass. Tombstones already observed above must remain authoritative,
+    // but no local record may upload until those transfers reconcile.
+    if hydrate_summary.restored_sessions > 0 || !hydrate_summary.reconciled_session_ids.is_empty() {
+        reload_active_meeting_after_cloud_hydration(
+            daemon,
+            &account_context,
+            &hydrate_summary.reconciled_session_ids,
+            hydrate_summary.restored_sessions > 0,
+        )
+        .await?;
+        operation_is_active()?;
+        if hydrate_summary.restored_sessions > 0 {
+            for meeting in daemon.store.all_meetings()? {
+                reindex_meeting_for_rag(daemon, meeting);
+            }
         }
+        reconcile_hydrated_child_rag(
+            daemon,
+            &account_context,
+            &hydrate_summary.reconciled_session_ids,
+            hydrate_summary.restored_sessions > 0,
+        )
+        .await?;
         refresh_overlay_sessions(daemon).await;
+        write_state(daemon).await?;
     }
+    if cloud_hydration_blocks_upload(&hydrate_summary) {
+        anyhow::bail!("cloud hydration cleanup requires another bounded pass before upload");
+    }
+
+    let delete_single_flight = daemon.cloud_delete_flush.lock().await;
+    operation_is_active()?;
+    let upload_summary = crate::cloud::sync::sync_local_meetings(
+        &daemon.store,
+        &daemon.paths.data_dir,
+        &account_context.client,
+        Some(&owner_account_id),
+        &operation_is_active,
+    )
+    .await?;
+    drop(delete_single_flight);
+    operation_is_active()?;
     Ok((upload_summary, hydrate_summary))
+}
+
+fn cloud_hydration_blocks_upload(summary: &crate::cloud::sync::CloudHydrationSummary) -> bool {
+    summary.attachment_retry_count > 0 || summary.local_cleanup_retry_count > 0
+}
+
+async fn reload_active_meeting_after_cloud_hydration(
+    daemon: &Arc<Daemon>,
+    account_context: &AccountCloudContext,
+    reconciled_session_ids: &[uuid::Uuid],
+    reload_any_owned_active: bool,
+) -> Result<()> {
+    // Use the same publication barrier as final answer persistence and account
+    // transitions. Once hydration removes a child record, a late answer cannot
+    // publish an older in-memory clone over the reconciled MeetingStore copy.
+    let _transition = daemon.account_answer_transition.lock().await;
+    account_context.ensure_current()?;
+    let reloaded = {
+        let mut active = daemon.meeting.lock().await;
+        let Some(current) = active.as_ref() else {
+            return Ok(());
+        };
+        if current.owner_account_id.as_deref() != Some(account_context.owner_account_id.as_str()) {
+            return Ok(());
+        }
+        if !reload_any_owned_active && !reconciled_session_ids.contains(&current.id) {
+            return Ok(());
+        }
+        let persisted = daemon
+            .store
+            .load_active()?
+            .ok_or_else(|| anyhow!("hydrated active meeting disappeared before publication"))?;
+        anyhow::ensure!(
+            persisted.id == current.id
+                && persisted.owner_account_id.as_deref()
+                    == Some(account_context.owner_account_id.as_str()),
+            "hydrated active meeting changed owner or identity before publication"
+        );
+        *active = Some(persisted.clone());
+        persisted
+    };
+    account_context.ensure_current()?;
+    update_state_from_meeting(daemon, Some(&reloaded)).await?;
+    refresh_current_overlay_context_items(daemon).await;
+    Ok(())
+}
+
+async fn reconcile_hydrated_child_rag(
+    daemon: &Arc<Daemon>,
+    account_context: &AccountCloudContext,
+    reconciled_session_ids: &[uuid::Uuid],
+    all_stored_meetings_already_queued: bool,
+) -> Result<()> {
+    for session_id in reconciled_session_ids.iter().copied() {
+        account_context.ensure_current()?;
+        match daemon.store.load_by_id(session_id)? {
+            Some(meeting)
+                if meeting.owner_account_id.as_deref()
+                    == Some(account_context.owner_account_id.as_str()) =>
+            {
+                if !all_stored_meetings_already_queued {
+                    reindex_meeting_for_rag(daemon, meeting);
+                }
+            }
+            Some(_) => {
+                anyhow::bail!("refusing child-tombstone RAG reconciliation across owners");
+            }
+            None => {
+                daemon
+                    .rag_indexer
+                    .purge_cloud_tombstoned_session_for_owner(
+                        &account_context.owner_account_id,
+                        session_id,
+                    )
+                    .await?;
+            }
+        }
+    }
+    account_context.ensure_current()
+}
+
+async fn cloud_tombstone_has_different_local_owner(
+    daemon: &Arc<Daemon>,
+    owner_account_id: &str,
+    session_id: uuid::Uuid,
+) -> Result<bool> {
+    let in_memory_mismatch = daemon.meeting.lock().await.as_ref().is_some_and(|meeting| {
+        meeting.id == session_id && meeting.owner_account_id.as_deref() != Some(owner_account_id)
+    });
+    let store_mismatch = daemon
+        .store
+        .load_by_id(session_id)?
+        .is_some_and(|meeting| meeting.owner_account_id.as_deref() != Some(owner_account_id));
+    let projection_mismatch = daemon
+        .session_db
+        .lock()
+        .session_exists_for_different_owner(owner_account_id, session_id)?;
+    Ok(in_memory_mismatch || store_mismatch || projection_mismatch)
+}
+
+async fn purge_cloud_tombstoned_sessions_for_owner(
+    daemon: &Arc<Daemon>,
+    account_context: &AccountCloudContext,
+    session_ids: &[uuid::Uuid],
+) -> Result<bool> {
+    account_context.ensure_current()?;
+    let owner_account_id = account_context.owner_account_id.as_str();
+    let owner_account_hash = cue_core::account_id_hash_prefix(owner_account_id);
+    if session_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let active_is_tombstoned = daemon.meeting.lock().await.as_ref().is_some_and(|meeting| {
+        meeting.owner_account_id.as_deref() == Some(owner_account_id)
+            && session_ids.contains(&meeting.id)
+    });
+    if active_is_tombstoned {
+        // Stop all known writers before the final MeetingStore delete. Audio
+        // finalization may briefly rewrite the active file, so storage is
+        // deleted again only after the in-memory owner-scoped session is gone.
+        {
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            account_context.ensure_current()?;
+            prepare_runtime_for_session_change(daemon, "session_deleted").await;
+        }
+        account_context.ensure_current()?;
+    }
+    let cleared_active = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if meeting_guard.as_ref().is_some_and(|meeting| {
+            meeting.owner_account_id.as_deref() == Some(owner_account_id)
+                && session_ids.contains(&meeting.id)
+        }) {
+            meeting_guard.take()
+        } else {
+            None
+        }
+    };
+    if let Some(meeting) = cleared_active.as_ref() {
+        remove_markdown_artifact_files(&daemon.paths, &meeting.context);
+        update_state_from_meeting(daemon, None).await?;
+        let _ = send_overlay(daemon, OverlayCommand::Clear).await;
+        let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
+        set_overlay_listening_state(daemon, ListeningState::Idle).await;
+    }
+
+    let mut first_error = None;
+    for session_id in session_ids.iter().copied() {
+        account_context.ensure_current()?;
+        let session_id_hash = cue_core::account_id_hash_prefix(&session_id.to_string());
+        let mut shared_cleanup_allowed =
+            match cloud_tombstone_has_different_local_owner(daemon, owner_account_id, session_id)
+                .await
+            {
+                Ok(owner_scope_mismatch) => !owner_scope_mismatch,
+                Err(error) => {
+                    warn!(
+                        owner_account_hash = %owner_account_hash,
+                        session_id_hash = %session_id_hash,
+                        error_category = %context_watch_safe_error_category(&error),
+                        "cloud tombstone could not verify shared local cleanup ownership"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(anyhow!(
+                            "cloud-deleted local session ownership verification was incomplete"
+                        ));
+                    }
+                    false
+                }
+            };
+        let projection_result = daemon
+            .session_db
+            .lock()
+            .purge_cloud_tombstoned_session_for_owner(owner_account_id, session_id);
+        match projection_result {
+            Ok(projection_removed) => {
+                debug!(
+                    owner_account_hash = %owner_account_hash,
+                    session_id_hash = %session_id_hash,
+                    projection_removed,
+                    "cloud tombstone fenced the local session projection"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    owner_account_hash = %owner_account_hash,
+                    session_id_hash = %session_id_hash,
+                    error_category = %context_watch_safe_error_category(&error),
+                    "cloud tombstone could not purge the local session projection"
+                );
+                if first_error.is_none() {
+                    first_error = Some(anyhow!(
+                        "cloud-deleted local session projection cleanup was incomplete"
+                    ));
+                }
+            }
+        }
+
+        account_context.ensure_current()?;
+        if let Err(error) = daemon
+            .rag_indexer
+            .purge_cloud_tombstoned_session_for_owner(owner_account_id, session_id)
+            .await
+        {
+            warn!(
+                owner_account_hash = %owner_account_hash,
+                session_id_hash = %session_id_hash,
+                error_category = %context_watch_safe_error_category(&error),
+                "cloud tombstone could not purge local session RAG state"
+            );
+            if first_error.is_none() {
+                first_error = Some(anyhow!(
+                    "cloud-deleted local session RAG cleanup was incomplete"
+                ));
+            }
+        }
+        account_context.ensure_current()?;
+
+        if shared_cleanup_allowed {
+            shared_cleanup_allowed = match cloud_tombstone_has_different_local_owner(
+                daemon,
+                owner_account_id,
+                session_id,
+            )
+            .await
+            {
+                Ok(owner_scope_mismatch) => !owner_scope_mismatch,
+                Err(error) => {
+                    warn!(
+                        owner_account_hash = %owner_account_hash,
+                        session_id_hash = %session_id_hash,
+                        error_category = %context_watch_safe_error_category(&error),
+                        "cloud tombstone could not reverify shared local cleanup ownership"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(anyhow!(
+                            "cloud-deleted local session ownership verification was incomplete"
+                        ));
+                    }
+                    false
+                }
+            };
+        }
+        if !shared_cleanup_allowed {
+            warn!(
+                owner_account_hash = %owner_account_hash,
+                session_id_hash = %session_id_hash,
+                owner_scope_mismatch = true,
+                "skipping shared-path cloud tombstone cleanup for a different local owner"
+            );
+            continue;
+        }
+
+        if let Err(error) = daemon
+            .diagnostics
+            .purge_cloud_tombstoned_session_for_owner(owner_account_id, session_id)
+        {
+            warn!(
+                owner_account_hash = %owner_account_hash,
+                session_id_hash = %session_id_hash,
+                error_category = %context_watch_safe_error_category(&error),
+                "cloud tombstone could not purge local session diagnostics"
+            );
+            if first_error.is_none() {
+                first_error = Some(anyhow!(
+                    "cloud-deleted local session diagnostics cleanup was incomplete"
+                ));
+            }
+        }
+
+        match daemon.store.load_by_id(session_id) {
+            Ok(Some(meeting)) if meeting.owner_account_id.as_deref() == Some(owner_account_id) => {
+                remove_markdown_artifact_files(&daemon.paths, &meeting.context);
+                if let Err(error) = daemon.store.delete(session_id) {
+                    warn!(
+                        owner_account_hash = %owner_account_hash,
+                        session_id_hash = %session_id_hash,
+                        error_category = %context_watch_safe_error_category(&error),
+                        "cloud tombstone could not remove a resurrected MeetingStore session"
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(anyhow!(
+                            "cloud-deleted local session storage cleanup was incomplete"
+                        ));
+                    }
+                }
+            }
+            Ok(Some(_)) => {
+                warn!(
+                    owner_account_hash = %owner_account_hash,
+                    session_id_hash = %session_id_hash,
+                    owner_scope_mismatch = true,
+                    "refusing to remove a cloud-tombstoned session owned by another account"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    owner_account_hash = %owner_account_hash,
+                    session_id_hash = %session_id_hash,
+                    error_category = %context_watch_safe_error_category(&error),
+                    "cloud tombstone could not inspect MeetingStore cleanup state"
+                );
+                if first_error.is_none() {
+                    first_error = Some(anyhow!(
+                        "cloud-deleted local session storage inspection was incomplete"
+                    ));
+                }
+            }
+        }
+    }
+
+    account_context.ensure_current()?;
+    refresh_overlay_sessions(daemon).await;
+    write_state(daemon).await?;
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(cleared_active.is_some())
 }
 
 fn auto_cloud_sync_enabled(paths: &AppPaths) -> bool {
@@ -3559,8 +6417,9 @@ fn auto_cloud_sync_enabled(paths: &AppPaths) -> bool {
     }
     // Environment configuration may stop automation for an installation,
     // but only persisted user settings may grant cloud-processing consent.
+    let owner_account_id = current_owner_account_id(paths);
     load_settings(paths)
-        .map(|settings| settings.cloud_sync_allowed())
+        .map(|settings| settings.cloud_sync_allowed_for_account(owner_account_id.as_deref()))
         .unwrap_or(false)
 }
 
@@ -3576,32 +6435,143 @@ fn env_flag_disabled(name: &str) -> bool {
 }
 
 fn spawn_overlay_balance_bridge(daemon: Arc<Daemon>) {
-    let mut rx = daemon.balance_watch.subscribe();
+    let mut rx = daemon.balance_watch.subscribe_events();
     tokio::spawn(async move {
-        let initial = rx.borrow().clone();
-        if let Some(snapshot) = initial {
-            push_overlay_balance_snapshot(&daemon, snapshot).await;
-        }
+        let initial = rx.borrow_and_update().clone();
+        apply_balance_event(&daemon, initial).await;
 
         while rx.changed().await.is_ok() {
-            let next = rx.borrow().clone();
-            match next {
-                Some(snapshot) => push_overlay_balance_snapshot(&daemon, snapshot).await,
-                None => {
-                    apply_cloud_account_signed_out(&daemon, "balance_watch_clear", false).await;
-                }
-            }
+            let next = rx.borrow_and_update().clone();
+            apply_balance_event(&daemon, next).await;
         }
     });
 }
 
+async fn apply_balance_event(daemon: &Arc<Daemon>, event: BalanceEvent) {
+    let result = match event {
+        BalanceEvent::Initial | BalanceEvent::Cleared { .. } => Ok(None),
+        BalanceEvent::Snapshot {
+            credentials,
+            snapshot,
+        } => push_overlay_balance_snapshot(daemon, &credentials, &snapshot).await,
+        BalanceEvent::Revoked { credentials } => {
+            clear_revoked_credentials(daemon, &credentials, "balance_credentials_revoked")
+                .await
+                .map(|_| None)
+        }
+    };
+    if let Err(error) = result {
+        warn!(
+            error_category = %context_watch_safe_error_category(&error),
+            "account-authoritative balance event was rejected"
+        );
+    }
+}
+
 async fn push_overlay_balance_snapshot(
     daemon: &Arc<Daemon>,
-    snapshot: crate::cloud::balance::BalanceSnapshot,
-) {
-    let label = format_balance_snapshot_label(&snapshot);
+    credentials: &CredentialSnapshot,
+    snapshot: &BalanceSnapshot,
+) -> Result<Option<String>> {
+    let _transition = daemon.account_answer_transition.lock().await;
+    if !credentials_are_current(&daemon.paths, credentials)? {
+        return Ok(None);
+    }
+    let label = format_balance_snapshot_label(snapshot);
     let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
-    let _ = send_overlay(daemon, OverlayCommand::SetBalance { label }).await;
+    if !credentials_are_current(&daemon.paths, credentials)? {
+        return Ok(None);
+    }
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetBalance {
+            label: label.clone(),
+        },
+    )
+    .await;
+    if !credentials_are_current(&daemon.paths, credentials)? {
+        return Ok(None);
+    }
+    Ok(Some(label))
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct OverlayAccountHydrationSnapshot {
+    credentials: Option<CredentialSnapshot>,
+    balance_event: BalanceEvent,
+}
+
+impl OverlayAccountHydrationSnapshot {
+    fn capture(daemon: &Daemon) -> Result<Self> {
+        Ok(Self {
+            credentials: SecureAccountStore::new(daemon.paths.clone()).load_snapshot()?,
+            balance_event: daemon.balance_watch.current_event(),
+        })
+    }
+
+    fn rendered_state(&self) -> (bool, String) {
+        let signed_in = self.credentials.is_some();
+        let balance_label = match &self.balance_event {
+            BalanceEvent::Snapshot {
+                credentials,
+                snapshot,
+            } if self.credentials.as_ref() == Some(credentials) => {
+                format_balance_snapshot_label(snapshot)
+            }
+            _ if signed_in => "Balance --".to_string(),
+            _ => "Sign in".to_string(),
+        };
+        (signed_in, balance_label)
+    }
+}
+
+async fn hydrate_overlay_account_state_for_generation(
+    daemon: &Arc<Daemon>,
+    generation: u64,
+) -> Result<()> {
+    hydrate_overlay_account_state_with_attempt_hook(daemon, generation, |_| {}).await
+}
+
+async fn hydrate_overlay_account_state_with_attempt_hook<F>(
+    daemon: &Arc<Daemon>,
+    generation: u64,
+    mut after_render: F,
+) -> Result<()>
+where
+    F: FnMut(usize),
+{
+    for attempt in 1..=OVERLAY_ACCOUNT_HYDRATION_MAX_ATTEMPTS {
+        let rendered = OverlayAccountHydrationSnapshot::capture(daemon)?;
+        let (signed_in, balance_label) = rendered.rendered_state();
+        send_overlay_for_generation(
+            daemon,
+            generation,
+            OverlayCommand::SetAccountState { signed_in },
+        )
+        .await?;
+        send_overlay_for_generation(
+            daemon,
+            generation,
+            OverlayCommand::SetBalance {
+                label: balance_label,
+            },
+        )
+        .await?;
+
+        after_render(attempt);
+        if OverlayAccountHydrationSnapshot::capture(daemon)? == rendered {
+            return Ok(());
+        }
+        debug!(
+            attempt,
+            generation, "overlay account state changed during hydration; retrying"
+        );
+    }
+
+    Err(anyhow!(
+        "overlay account state did not stabilize after {} hydration attempts",
+        OVERLAY_ACCOUNT_HYDRATION_MAX_ATTEMPTS
+    ))
 }
 
 async fn set_overlay_listening_state(daemon: &Arc<Daemon>, state: ListeningState) {
@@ -3688,6 +6658,7 @@ fn default_overlay_capture_excluded_state() -> bool {
 fn dispose_overlay_process(process: Option<OverlayProcess>) {
     if let Some(mut process) = process {
         let _ = process.child.kill();
+        process.writer.shutdown_blocking();
         let _ = process.child.wait();
     }
 }
@@ -3909,18 +6880,57 @@ async fn handle_current_overlay_process_event(
         );
         return;
     }
-    let event_kind = overlay_event_label(&process_event.event);
-    if overlay_event_is_user_interaction(&process_event.event) {
+    let generation = process_event.generation;
+    let mut event = process_event.event;
+    if let OverlayEvent::AskRequested { interaction_id, .. } = &mut event {
+        interaction_id.get_or_insert_with(uuid::Uuid::new_v4);
+    }
+    let event_kind = overlay_event_label(&event);
+    let (interaction_id, native_dispatch_ms) = match &event {
+        OverlayEvent::AskRequested {
+            interaction_id,
+            initiated_at_unix_ms,
+            ..
+        } => {
+            let duration = epoch_ms()
+                .ok()
+                .and_then(|now| u64::try_from(now).ok())
+                .and_then(|now| bounded_native_dispatch_ms(*initiated_at_unix_ms, now));
+            (*interaction_id, duration)
+        }
+        _ => (None, None),
+    };
+    if overlay_event_is_user_interaction(&event) {
         info!(
-            overlay_generation = process_event.generation,
+            overlay_generation = generation,
             event_kind, "overlay user interaction accepted"
         );
+        emit_session_diagnostic(
+            daemon,
+            DiagnosticEvent::new(
+                DiagnosticEventKind::OverlayUserAction,
+                DiagnosticComponent::NativeOverlay,
+                DiagnosticOutcome::Succeeded,
+            )
+            .generation(generation)
+            .interaction_id(interaction_id)
+            .duration_ms(native_dispatch_ms)
+            .action(event_kind),
+            DiagnosticPriority::Ordinary,
+        )
+        .await;
     }
-    if let Err(error) =
-        handle_overlay_event(daemon, process_event.generation, process_event.event).await
-    {
+    if let Err(error) = handle_overlay_event(daemon, generation, event).await {
         warn!(event_kind, "failed to handle overlay event: {error:#}");
     }
+}
+
+fn bounded_native_dispatch_ms(initiated_at_unix_ms: Option<u64>, now_unix_ms: u64) -> Option<u64> {
+    initiated_at_unix_ms.and_then(|initiated| {
+        now_unix_ms
+            .checked_sub(initiated)
+            .filter(|duration| *duration <= 5 * 60 * 1_000)
+    })
 }
 
 fn spawn_meeting_watch_tick(daemon: Arc<Daemon>) {
@@ -4047,6 +7057,7 @@ fn overlay_event_label(event: &OverlayEvent) -> &'static str {
         OverlayEvent::SignInRequested => "sign_in_requested",
         OverlayEvent::CloseRequested => "close_requested",
         OverlayEvent::CardRendered { .. } => "card_rendered",
+        OverlayEvent::AnswerRenderAcknowledged { .. } => "answer_render_acknowledged",
         OverlayEvent::Error { .. } => "error",
         OverlayEvent::Lifecycle { .. } => "lifecycle",
         OverlayEvent::Exited => "exited",
@@ -4103,6 +7114,40 @@ fn overlay_lifecycle_detail_is_safe(stage: &str) -> bool {
     )
 }
 
+fn overlay_lifecycle_status_category(status: Option<&str>) -> &'static str {
+    match status
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("ok" | "ready" | "shown" | "completed" | "success") => "ok",
+        Some("timeout" | "timed_out") => "timed_out",
+        Some("dropped") => "dropped",
+        Some("failed" | "error") => "failed",
+        _ => "unknown",
+    }
+}
+
+async fn emit_overlay_lifecycle_event(
+    daemon: &Arc<Daemon>,
+    generation: u64,
+    action: &'static str,
+    outcome: DiagnosticOutcome,
+) {
+    emit_session_diagnostic(
+        daemon,
+        DiagnosticEvent::new(
+            DiagnosticEventKind::OverlayLifecycle,
+            DiagnosticComponent::NativeOverlay,
+            outcome,
+        )
+        .generation(generation)
+        .action(action),
+        DiagnosticPriority::Ordinary,
+    )
+    .await;
+}
+
 async fn try_begin_overlay_answer(daemon: &Arc<Daemon>) -> bool {
     let mut active = daemon.overlay_answer_active.lock().await;
     if *active {
@@ -4145,15 +7190,6 @@ async fn hydrate_overlay_generation(
             cue_core::AudioCaptureState::Idle => ListeningState::Idle,
         }
     };
-    let signed_in = build_cloud_client(&daemon.paths, None)
-        .ok()
-        .and_then(|client| client.current_tokens())
-        .is_some();
-    let balance_label = daemon
-        .balance_watch
-        .current()
-        .map(|snapshot| format_balance_snapshot_label(&snapshot))
-        .or_else(|| (!signed_in).then(|| "Sign in".to_string()));
     let active = *daemon.active_answer_card.lock().await;
     let active_snapshot = daemon.active_answer_snapshot.lock().await.clone();
     let (overlay_visible, overlay_opacity, overlay_position) = {
@@ -4209,16 +7245,7 @@ async fn hydrate_overlay_generation(
         },
     )
     .await?;
-    send_overlay_for_generation(
-        daemon,
-        generation,
-        OverlayCommand::SetAccountState { signed_in },
-    )
-    .await?;
-    if let Some(label) = balance_label {
-        send_overlay_for_generation(daemon, generation, OverlayCommand::SetBalance { label })
-            .await?;
-    }
+    hydrate_overlay_account_state_for_generation(daemon, generation).await?;
 
     if let Some(meeting) = meeting {
         if meeting_has_overlay_history(&meeting) {
@@ -4254,12 +7281,14 @@ async fn hydrate_overlay_generation(
                 generation,
                 OverlayCommand::UpdateCard {
                     id: snapshot.card_id,
+                    interaction_id: Some(snapshot.interaction_id),
                     body: snapshot.body,
                     done: snapshot.done,
                     sequence: snapshot.sequence,
                     snapshot: true,
                     cost_label: snapshot.cost_label,
                     artifact: snapshot.artifact,
+                    render_ack: None,
                 },
             )
             .await?;
@@ -4295,6 +7324,8 @@ async fn handle_overlay_event(
                 return Ok(());
             }
             daemon.overlay_restart.lock().consecutive_failures = 0;
+            emit_overlay_lifecycle_event(daemon, generation, "ready", DiagnosticOutcome::Succeeded)
+                .await;
             refresh_overlay_sessions(daemon).await;
             let daemon_balance = Arc::clone(daemon);
             tokio::spawn(async move {
@@ -4323,6 +7354,8 @@ async fn handle_overlay_event(
             if changed {
                 write_state(daemon).await?;
             }
+            emit_overlay_lifecycle_event(daemon, generation, "shown", DiagnosticOutcome::Succeeded)
+                .await;
         }
         OverlayEvent::Hidden => {
             let _transition = daemon.overlay_state_transitions.lock().await;
@@ -4343,6 +7376,13 @@ async fn handle_overlay_event(
             if changed {
                 write_state(daemon).await?;
             }
+            emit_overlay_lifecycle_event(
+                daemon,
+                generation,
+                "hidden",
+                DiagnosticOutcome::Succeeded,
+            )
+            .await;
         }
         OverlayEvent::OpacityUpdated { opacity } => {
             let _transition = daemon.overlay_state_transitions.lock().await;
@@ -4355,17 +7395,26 @@ async fn handle_overlay_event(
             };
             if changed {
                 write_state(daemon).await?;
+                emit_overlay_lifecycle_event(
+                    daemon,
+                    generation,
+                    "opacity_updated",
+                    DiagnosticOutcome::Succeeded,
+                )
+                .await;
             }
         }
         OverlayEvent::AskRequested {
             question,
+            interaction_id,
+            initiated_at_unix_ms: _,
             provider,
             model,
             mode,
             visible_context_ids,
             answer_current_transcript,
         } => {
-            let request = if answer_current_transcript {
+            let mut request = if answer_current_transcript {
                 answer_request_from_overlay_with_options(
                     &question,
                     provider,
@@ -4377,6 +7426,9 @@ async fn handle_overlay_event(
             } else {
                 answer_request_from_overlay(&question, provider, model, mode, visible_context_ids)
             };
+            request.metadata = request
+                .metadata
+                .with_interaction_id(interaction_id.unwrap_or_else(uuid::Uuid::new_v4));
             if !try_begin_overlay_answer(daemon).await {
                 tracing::info!(
                     request_id = %request.metadata.request_id,
@@ -4395,7 +7447,8 @@ async fn handle_overlay_event(
             let request_id = request.metadata.request_id;
             tokio::spawn(async move {
                 let result =
-                    answer_with_provider_runtime(&daemon_for_answer, request, "overlay ask").await;
+                    answer_with_provider_runtime(&daemon_for_answer, request, "overlay ask", None)
+                        .await;
                 if let Err(error) = result {
                     warn!(request_id = %request_id, "background overlay answer failed: {error:#}");
                 }
@@ -4426,7 +7479,7 @@ async fn handle_overlay_event(
                 &daemon.overlay_ui_state,
                 cue_core::overlay_ipc::OverlayUiState::InstructionsOpen,
             );
-            handle_instructions_requested(daemon).await?;
+            handle_instructions_requested(daemon, generation).await?;
         }
         OverlayEvent::InstructionsUpdated { text } => {
             let _ui_state = reset_overlay_ui_state_on_scope_exit(&daemon.overlay_ui_state);
@@ -4435,7 +7488,14 @@ async fn handle_overlay_event(
             } else {
                 Some(text.trim().to_string())
             };
-            let meeting_snapshot = set_answer_instructions(daemon, instructions).await?;
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            ensure!(
+                daemon.overlay_generation.load(Ordering::Acquire) == generation,
+                "stale overlay instruction mutation"
+            );
+            let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+            let meeting_snapshot =
+                set_answer_instructions(daemon, instructions, &account_context).await?;
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
             push_system_card(
                 daemon,
@@ -4466,13 +7526,31 @@ async fn handle_overlay_event(
             }
         }
         OverlayEvent::SessionOpenRequested { id } => {
-            open_meeting_session(daemon, id).await?;
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            ensure!(
+                daemon.overlay_generation.load(Ordering::Acquire) == generation,
+                "stale overlay session mutation"
+            );
+            let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+            open_meeting_session(daemon, id, &account_context).await?;
         }
         OverlayEvent::SessionRenameRequested { id, title } => {
-            rename_meeting_session(daemon, id, &title).await?;
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            ensure!(
+                daemon.overlay_generation.load(Ordering::Acquire) == generation,
+                "stale overlay session mutation"
+            );
+            let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+            rename_meeting_session(daemon, id, &title, &account_context).await?;
         }
         OverlayEvent::SessionDeleteRequested { id } => {
-            delete_meeting_session(daemon, id).await?;
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            ensure!(
+                daemon.overlay_generation.load(Ordering::Acquire) == generation,
+                "stale overlay session mutation"
+            );
+            let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+            delete_meeting_session(daemon, id, &account_context).await?;
         }
         OverlayEvent::SessionListRequested => {
             let active_session_id = daemon
@@ -4486,13 +7564,26 @@ async fn handle_overlay_event(
             refresh_overlay_sessions(daemon).await;
         }
         OverlayEvent::SessionContinueRequested => {
-            continue_session(daemon, "overlay session").await?;
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            ensure!(
+                daemon.overlay_generation.load(Ordering::Acquire) == generation,
+                "stale overlay session mutation"
+            );
+            let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+            continue_session(daemon, "overlay session", &account_context).await?;
         }
         OverlayEvent::SessionNewRequested => {
-            create_canonical_session(daemon, Some("Bluey session".to_string())).await?;
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            ensure!(
+                daemon.overlay_generation.load(Ordering::Acquire) == generation,
+                "stale overlay session mutation"
+            );
+            let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+            create_canonical_session(daemon, Some("Bluey session".to_string()), &account_context)
+                .await?;
         }
         OverlayEvent::ActivePageCaptureRequested => {
-            if let Err(error) = capture_active_page_context(daemon, "overlay page").await {
+            if let Err(error) = capture_active_page_context(daemon, "overlay page", None).await {
                 push_system_card(
                     daemon,
                     CardKind::Warning,
@@ -4520,7 +7611,7 @@ async fn handle_overlay_event(
             push_context_list_card(daemon).await?;
         }
         OverlayEvent::CaptureStartRequested => {
-            if let Err(error) = start_screen_capture(daemon, 12, "overlay eye").await {
+            if let Err(error) = start_screen_capture(daemon, 12, "overlay eye", None).await {
                 push_system_card(
                     daemon,
                     CardKind::Warning,
@@ -4610,16 +7701,26 @@ async fn handle_overlay_event(
                 apply_meeting_transition(daemon, transition).await;
             }
             let config = AudioCaptureConfig::dual_default();
-            if block_audio_start_if_not_signed_in(daemon, &config, "overlay listen", None)
-                .await
-                .is_some()
+            let _account_transition = daemon.account_answer_transition.lock().await;
+            let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+            if block_audio_start_if_not_signed_in(
+                daemon,
+                &config,
+                "overlay listen",
+                None,
+                &account_context,
+            )
+            .await
+            .is_some()
             {
                 return Ok(());
             }
+            account_context.ensure_current(&daemon.paths)?;
             set_overlay_listening_state(daemon, ListeningState::Connecting).await;
-            match start_audio_capture(daemon, config).await {
+            match start_audio_capture(daemon, config, &account_context).await {
                 Ok(status) if status.session_id.is_some() => {
                     set_overlay_listening_state(daemon, ListeningState::Listening).await;
+                    drop(_account_transition);
                     let balance = refresh_overlay_balance(daemon, None).await;
                     let balance_line = balance
                         .map(|label| format!("\nBalance: {label}."))
@@ -4702,6 +7803,62 @@ async fn handle_overlay_event(
                 schedule_overlay_restart(daemon);
             }
         }
+        OverlayEvent::AnswerRenderAcknowledged {
+            id,
+            interaction_id,
+            phase,
+            sequence,
+        } => {
+            let Some(pending) =
+                take_pending_answer_render_ack(daemon, id, interaction_id, phase, sequence).await
+            else {
+                debug!(
+                    card_id = %id,
+                    interaction_id = %interaction_id,
+                    sequence,
+                    ?phase,
+                    "ignored stale or unrequested answer render acknowledgement"
+                );
+                return Ok(());
+            };
+            let duration_ms = elapsed_ms(pending.pipeline_started_at);
+            if pending.final_is_first_visible_text {
+                emit_diagnostic_for_scope(
+                    daemon,
+                    pending.scope.clone(),
+                    DiagnosticEvent::new(
+                        DiagnosticEventKind::NativeFirstTextRendered,
+                        DiagnosticComponent::NativeOverlay,
+                        DiagnosticOutcome::Succeeded,
+                    )
+                    .interaction_id(Some(pending.interaction_id))
+                    .card_id(pending.card_id)
+                    .generation(pending.answer_generation)
+                    .sequence(pending.sequence)
+                    .duration_ms(Some(duration_ms)),
+                    DiagnosticPriority::Ordinary,
+                );
+            }
+            let event_kind = match pending.phase {
+                AnswerRenderAckPhase::FirstText => DiagnosticEventKind::NativeFirstTextRendered,
+                AnswerRenderAckPhase::Final => DiagnosticEventKind::NativeFinalRendered,
+            };
+            emit_diagnostic_for_scope(
+                daemon,
+                pending.scope,
+                DiagnosticEvent::new(
+                    event_kind,
+                    DiagnosticComponent::NativeOverlay,
+                    DiagnosticOutcome::Succeeded,
+                )
+                .interaction_id(Some(pending.interaction_id))
+                .card_id(pending.card_id)
+                .generation(pending.answer_generation)
+                .sequence(pending.sequence)
+                .duration_ms(Some(duration_ms)),
+                DiagnosticPriority::Terminal,
+            );
+        }
         OverlayEvent::Pong | OverlayEvent::CardRendered { .. } => {}
         OverlayEvent::Error { message } => {
             warn!(
@@ -4715,25 +7872,46 @@ async fn handle_overlay_event(
             detail,
         } => {
             let detail_chars = detail.as_deref().map(str::len).unwrap_or_default();
-            let safe_detail = detail
-                .as_deref()
-                .filter(|_| overlay_lifecycle_detail_is_safe(&stage))
-                .unwrap_or("");
+            let safe_stage = overlay_lifecycle_detail_is_safe(&stage);
+            let status_category = overlay_lifecycle_status_category(status.as_deref());
             if stage.starts_with("canvas_") {
                 warn!(
-                    overlay_stage = %stage,
-                    overlay_status = status.as_deref().unwrap_or(""),
+                    overlay_stage_chars = stage.chars().count(),
+                    overlay_status = status_category,
                     overlay_detail_chars = detail_chars,
                     "overlay canvas lifecycle"
                 );
             } else {
                 info!(
-                    overlay_stage = %stage,
-                    overlay_status = status.as_deref().unwrap_or(""),
+                    overlay_stage = if safe_stage {
+                        stage.as_str()
+                    } else {
+                        "unknown"
+                    },
+                    overlay_status = status_category,
                     overlay_detail_chars = detail_chars,
-                    overlay_safe_detail = safe_detail,
                     "overlay lifecycle"
                 );
+            }
+            if safe_stage {
+                let outcome = if status_category == "ok" {
+                    DiagnosticOutcome::Succeeded
+                } else {
+                    DiagnosticOutcome::Failed
+                };
+                emit_session_diagnostic(
+                    daemon,
+                    DiagnosticEvent::new(
+                        DiagnosticEventKind::OverlayLifecycle,
+                        DiagnosticComponent::NativeOverlay,
+                        outcome,
+                    )
+                    .generation(generation)
+                    .action(&stage)
+                    .error_category(status_category),
+                    DiagnosticPriority::Ordinary,
+                )
+                .await;
             }
         }
     }
@@ -4745,21 +7923,42 @@ async fn start_screen_capture(
     daemon: &Arc<Daemon>,
     interval_secs: u64,
     source: &str,
+    expected_fence: Option<DaemonMutationFence>,
 ) -> Result<()> {
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    let requires_capture_generation = expected_fence.is_some();
+    let mut fence = match expected_fence {
+        Some(fence) => {
+            validate_session_mutation_fence(daemon, &fence, false).await?;
+            fence
+        }
+        None => current_session_mutation_fence(daemon, false).await?,
+    };
     ensure_screen_capture_supported()?;
     let context_policy = load_settings(&daemon.paths)?.context_watch;
 
     let (stop_tx, stop_rx) = oneshot::channel();
-    {
+    let generation = {
         let mut capture = daemon.capture.lock().await;
+        if let Some(expected_generation) = fence.capture_generation {
+            ensure!(
+                capture.generation == expected_generation,
+                "context capture mutation authority changed"
+            );
+        } else if requires_capture_generation {
+            anyhow::bail!("context capture generation is required");
+        }
         if capture.stop.is_some() {
             return Ok(());
         }
+        capture.generation = capture.generation.wrapping_add(1);
         capture.interval_secs = interval_secs;
         capture.last_context_fingerprint = None;
         capture.stop = Some(stop_tx);
-    }
-    update_capture_state(daemon, true, Some(interval_secs)).await?;
+        capture.generation
+    };
+    fence.capture_generation = Some(generation);
+    update_capture_state(daemon, true, Some(interval_secs), generation).await?;
 
     push_system_card(
         daemon,
@@ -4778,21 +7977,43 @@ async fn start_screen_capture(
 
     let daemon_for_loop = daemon.clone();
     tokio::spawn(async move {
-        capture_loop(daemon_for_loop, interval_secs, stop_rx).await;
+        capture_loop(daemon_for_loop, interval_secs, stop_rx, fence).await;
     });
 
     Ok(())
 }
 
 async fn stop_screen_capture(daemon: &Arc<Daemon>, source: &str) -> Result<()> {
-    let stop = {
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    stop_screen_capture_under_transition(daemon, source, None).await
+}
+
+async fn stop_screen_capture_under_transition(
+    daemon: &Arc<Daemon>,
+    source: &str,
+    expected_fence: Option<&DaemonMutationFence>,
+) -> Result<()> {
+    let (stop, generation) = {
         let mut capture = daemon.capture.lock().await;
-        capture.stop.take()
+        if let Some(fence) = expected_fence {
+            let expected_generation = fence
+                .capture_generation
+                .context("context capture generation is required")?;
+            ensure!(
+                capture.generation == expected_generation,
+                "context capture mutation authority changed"
+            );
+        }
+        let stop = capture.stop.take();
+        if stop.is_some() {
+            capture.generation = capture.generation.wrapping_add(1);
+        }
+        (stop, capture.generation)
     };
 
     if let Some(stop) = stop {
         let _ = stop.send(());
-        update_capture_state(daemon, false, None).await?;
+        update_capture_state(daemon, false, None, generation).await?;
         push_system_card(
             daemon,
             CardKind::System,
@@ -4810,20 +8031,46 @@ async fn block_audio_start_if_not_signed_in(
     config: &AudioCaptureConfig,
     source: &'static str,
     trace_id: Option<&str>,
+    account_context: &AnswerAccountContext,
 ) -> Option<AudioPipelineStatus> {
-    if listen_account_verification_is_fresh(daemon).await {
+    if listen_account_verification_is_fresh(daemon, account_context).await {
         let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
         return None;
     }
 
     let block = match verify_cloud_account_for_listen(&daemon.paths, trace_id).await {
-        Ok(()) => {
-            mark_listen_account_verified(daemon).await;
+        Ok(credentials) => {
+            if account_context.ensure_current(&daemon.paths).is_err() {
+                return Some(current_audio_status(daemon).await);
+            }
+            if !credentials_match_answer_account_context(&credentials, account_context) {
+                return Some(current_audio_status(daemon).await);
+            }
+            mark_listen_account_verified(daemon, credentials).await;
             let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
-            let _ = refresh_overlay_balance(daemon, trace_id).await;
             return None;
         }
-        Err(block) => block,
+        Err(failure) => {
+            if account_context.ensure_current(&daemon.paths).is_err() {
+                return Some(current_audio_status(daemon).await);
+            }
+            if let Some((client, credentials)) = failure.revoked_credentials.as_deref() {
+                if let Err(error) = clear_revoked_client_credentials_under_transition(
+                    daemon,
+                    client,
+                    credentials,
+                    "listen_account_check",
+                )
+                .await
+                {
+                    warn!(
+                        error_category = %context_watch_safe_error_category(&error),
+                        "revoked Listen credentials could not be reconciled"
+                    );
+                }
+            }
+            failure.block
+        }
     };
     clear_listen_account_verification(daemon).await;
 
@@ -4867,53 +8114,110 @@ async fn block_audio_start_if_not_signed_in(
     Some(status)
 }
 
-async fn listen_account_verification_is_fresh(daemon: &Arc<Daemon>) -> bool {
-    daemon
-        .listen_account_verified_until
-        .lock()
-        .await
-        .is_some_and(|until| Instant::now() < until)
+fn credentials_match_answer_account_context(
+    credentials: &CredentialSnapshot,
+    account_context: &AnswerAccountContext,
+) -> bool {
+    let authority = credentials.authority();
+    account_context.owner_account_id.as_deref() == Some(authority.owner_account_id())
+        && account_context.credential_generation == Some(authority.credential_generation())
 }
 
-async fn mark_listen_account_verified(daemon: &Arc<Daemon>) {
-    *daemon.listen_account_verified_until.lock().await =
-        Some(Instant::now() + Duration::from_secs(LISTEN_ACCOUNT_VERIFICATION_TTL_SECS));
+async fn listen_account_verification_is_fresh(
+    daemon: &Arc<Daemon>,
+    account_context: &AnswerAccountContext,
+) -> bool {
+    let Some(cached) = daemon.listen_account_verification.lock().await.clone() else {
+        return false;
+    };
+    let is_fresh = Instant::now() < cached.expires_at
+        && credentials_match_answer_account_context(&cached.credentials, account_context)
+        && account_context.ensure_current(&daemon.paths).is_ok()
+        && credentials_are_current(&daemon.paths, &cached.credentials).unwrap_or(false);
+    if !is_fresh {
+        let mut guard = daemon.listen_account_verification.lock().await;
+        if guard.as_ref().is_some_and(|current| {
+            current.expires_at == cached.expires_at && current.credentials == cached.credentials
+        }) {
+            *guard = None;
+        }
+    }
+    is_fresh
+}
+
+async fn mark_listen_account_verified(daemon: &Arc<Daemon>, credentials: CredentialSnapshot) {
+    *daemon.listen_account_verification.lock().await = Some(ListenAccountVerification {
+        expires_at: Instant::now() + Duration::from_secs(LISTEN_ACCOUNT_VERIFICATION_TTL_SECS),
+        credentials,
+    });
 }
 
 async fn clear_listen_account_verification(daemon: &Arc<Daemon>) {
-    *daemon.listen_account_verified_until.lock().await = None;
+    *daemon.listen_account_verification.lock().await = None;
 }
 
 async fn verify_cloud_account_for_listen(
     paths: &AppPaths,
     trace_id: Option<&str>,
-) -> std::result::Result<(), ListenStartBlock> {
+) -> std::result::Result<CredentialSnapshot, ListenVerificationFailure> {
     let client = match build_cloud_client(paths, trace_id) {
         Ok(client) => client,
         Err(_) => {
-            return Err(ListenStartBlock::sign_in(
+            return Err(ListenVerificationFailure {
+                block: ListenStartBlock::sign_in(
+                    "Sign in to Bluey before using Listen. Audio capture, live transcription, and billing stay off until this desktop is linked."
+                        .to_string(),
+                ),
+                revoked_credentials: None,
+            });
+        }
+    };
+    let Some(credentials) = client.credential_snapshot() else {
+        return Err(ListenVerificationFailure {
+            block: ListenStartBlock::sign_in(
                 "Sign in to Bluey before using Listen. Audio capture, live transcription, and billing stay off until this desktop is linked."
                     .to_string(),
-            ));
-        }
+            ),
+            revoked_credentials: None,
+        });
     };
 
     match timeout(Duration::from_secs(4), async {
-        verify_stored_cloud_device_link(paths, &client).await?;
+        verify_cloud_device_link_for_credentials(&client, &credentials).await?;
         client
             .auth_get::<cue_cloud_client::AccountMe>("/account/me")
             .await
     })
     .await
     {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => {
-            if cloud_auth_error_should_clear_tokens(&error) {
-                if let Err(clear_error) = client.clear_tokens() {
-                    warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
+        Ok(Ok(_)) => {
+            let current_credentials = client.credential_snapshot().ok_or_else(|| {
+                ListenVerificationFailure {
+                    block: ListenStartBlock::wait(
+                        "Bluey sign-in changed while Listen was being verified. Try Listen again."
+                            .to_string(),
+                    ),
+                    revoked_credentials: None,
                 }
+            })?;
+            if !client
+                .credential_snapshot_is_current(&current_credentials)
+                .unwrap_or(false)
+            {
+                return Err(ListenVerificationFailure {
+                    block: ListenStartBlock::wait(
+                        "Bluey sign-in changed while Listen was being verified. Try Listen again."
+                            .to_string(),
+                    ),
+                    revoked_credentials: None,
+                });
             }
-            Err(match error {
+            Ok(current_credentials)
+        }
+        Ok(Err(error)) => {
+            let revoked_credentials = cloud_auth_error_should_clear_tokens(&error)
+                .then(|| Box::new((client.clone(), credentials)));
+            let block = match error {
                 cue_cloud_client::Error::Unauthorized => ListenStartBlock::sign_in(
                     "Your Bluey sign-in expired or the account is no longer active. Sign in again before using Listen.".to_string()
                 ),
@@ -4941,29 +8245,44 @@ async fn verify_cloud_account_for_listen(
                         "Bluey could not verify this desktop sign-in yet: {other}. Listen will stay off until sign-in is verified."
                     )
                 ),
+            };
+            Err(ListenVerificationFailure {
+                block,
+                revoked_credentials,
             })
         }
-        Err(_) => Err(ListenStartBlock::wait(
-            "Bluey could not verify sign-in quickly enough. Listen stayed off so audio is not captured or billed. Try again in a moment."
-                .to_string(),
-        )),
+        Err(_) => Err(ListenVerificationFailure {
+            block: ListenStartBlock::wait(
+                "Bluey could not verify sign-in quickly enough. Listen stayed off so audio is not captured or billed. Try again in a moment."
+                    .to_string(),
+            ),
+            revoked_credentials: None,
+        }),
     }
 }
 
 async fn ensure_active_meeting_for_session(
     daemon: &Arc<Daemon>,
     sync_reason: &'static str,
+    account_context: &AnswerAccountContext,
 ) -> Result<MeetingRecord> {
+    account_context.ensure_current(&daemon.paths)?;
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(new_owned_meeting(
-                &daemon.paths,
+            *meeting_guard = Some(new_meeting_for_account(
+                account_context,
                 Some("New recording".to_string()),
             ));
         }
         let meeting = meeting_guard.as_ref().expect("meeting exists").clone();
+        ensure!(
+            meeting_visible_for_owner(&meeting, account_context.owner_account_id.as_deref()),
+            "active audio session does not belong to the authorized account"
+        );
+        account_context.ensure_current(&daemon.paths)?;
         daemon.store.save_active(&meeting)?;
+        account_context.ensure_current(&daemon.paths)?;
         meeting
     };
 
@@ -4983,22 +8302,30 @@ async fn record_active_session_listen_start(
     daemon: &Arc<Daemon>,
     audio_session_id: &str,
     stt_provider: Option<&str>,
+    account_context: &AnswerAccountContext,
 ) -> Result<MeetingRecord> {
+    account_context.ensure_current(&daemon.paths)?;
     *daemon.last_live_transcript.lock().await = None;
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(new_owned_meeting(
-                &daemon.paths,
+            *meeting_guard = Some(new_meeting_for_account(
+                account_context,
                 Some("New recording".to_string()),
             ));
         }
         let meeting = meeting_guard.as_mut().expect("meeting exists");
+        ensure!(
+            meeting_visible_for_owner(meeting, account_context.owner_account_id.as_deref()),
+            "active audio session does not belong to the authorized account"
+        );
         meeting.diagnostics.record_listen_start(
             audio_session_id.to_string(),
             stt_provider.map(str::to_string),
         );
+        account_context.ensure_current(&daemon.paths)?;
         daemon.store.save_active(meeting)?;
+        account_context.ensure_current(&daemon.paths)?;
         meeting.clone()
     };
     info!(
@@ -5014,33 +8341,42 @@ async fn record_active_session_listen_start(
     Ok(meeting_snapshot)
 }
 
-async fn record_active_session_diagnostic(daemon: &Arc<Daemon>, kind: &'static str, message: &str) {
-    if let Err(error) = record_active_session_diagnostic_inner(daemon, kind, message).await {
-        warn!(
-            diagnostic_kind = kind,
-            error = %error,
-            "failed to record active session diagnostic"
-        );
-    }
+async fn record_active_session_diagnostic_for_context(
+    daemon: &Arc<Daemon>,
+    kind: &'static str,
+    message: &str,
+    account_context: &AnswerAccountContext,
+) -> Result<()> {
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    account_context.ensure_current(&daemon.paths)?;
+    record_active_session_diagnostic_inner(daemon, kind, message, account_context).await
 }
 
 async fn record_active_session_diagnostic_inner(
     daemon: &Arc<Daemon>,
     kind: &'static str,
     message: &str,
+    account_context: &AnswerAccountContext,
 ) -> Result<()> {
+    account_context.ensure_current(&daemon.paths)?;
     let clean = compact_snippet(message, 260);
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(new_owned_meeting(
-                &daemon.paths,
+            *meeting_guard = Some(new_meeting_for_account(
+                account_context,
                 Some("New recording".to_string()),
             ));
         }
         let meeting = meeting_guard.as_mut().expect("meeting exists");
+        ensure!(
+            meeting_visible_for_owner(meeting, account_context.owner_account_id.as_deref()),
+            "active diagnostic session does not belong to the authorized account"
+        );
         meeting.diagnostics.record_error(kind, clean.clone());
+        account_context.ensure_current(&daemon.paths)?;
         daemon.store.save_active(meeting)?;
+        account_context.ensure_current(&daemon.paths)?;
         meeting.clone()
     };
     info!(
@@ -5059,7 +8395,9 @@ async fn record_active_session_diagnostic_inner(
 async fn start_audio_capture(
     daemon: &Arc<Daemon>,
     config: AudioCaptureConfig,
+    account_context: &AnswerAccountContext,
 ) -> Result<AudioPipelineStatus> {
+    account_context.ensure_current(&daemon.paths)?;
     if daemon.meeting_end_in_progress.load(Ordering::Acquire) {
         return Err(anyhow!(
             "the current session is still finishing; wait a moment before starting Listen again"
@@ -5090,7 +8428,9 @@ async fn start_audio_capture(
 
     let session_id = format!("audio-{}", clock::now_epoch_ms_string());
     let audio_meeting =
-        match ensure_active_meeting_for_session(daemon, "audio_session_prepare").await {
+        match ensure_active_meeting_for_session(daemon, "audio_session_prepare", account_context)
+            .await
+        {
             Ok(meeting) => meeting,
             Err(error) => {
                 let mut runtime = daemon.audio_runtime.lock().await;
@@ -5100,6 +8440,11 @@ async fn start_audio_capture(
                 return Err(error);
             }
         };
+    begin_audio_diagnostics(
+        daemon,
+        SessionAuditScope::from_meeting(&audio_meeting),
+        &session_id,
+    );
     let (stop_tx, stop_rx) = oneshot::channel();
 
     let runtime = match build_real_audio_runtime_config(&daemon.paths, &config).await {
@@ -5109,12 +8454,22 @@ async fn start_audio_capture(
             if runtime.start_generation == start_generation {
                 runtime.starting = false;
             }
-            record_active_session_diagnostic(
+            let _ = record_active_session_diagnostic_for_context(
                 daemon,
                 "audio_start_error",
                 &format!("failed to build audio runtime: {error:#}"),
+                account_context,
             )
             .await;
+            emit_audio_capture_ready_diagnostic(
+                daemon,
+                &session_id,
+                "other",
+                0,
+                DiagnosticOutcome::Failed,
+                Some("runtime_setup"),
+            );
+            finish_audio_diagnostics(daemon, &session_id, DiagnosticOutcome::Failed);
             return Err(error);
         }
     };
@@ -5161,9 +8516,34 @@ async fn start_audio_capture(
         if still_current {
             *daemon.audio.lock().await = status;
         }
-        record_active_session_diagnostic(daemon, "audio_start_error", &message).await;
+        let _ = record_active_session_diagnostic_for_context(
+            daemon,
+            "audio_start_error",
+            &message,
+            account_context,
+        )
+        .await;
+        emit_audio_capture_ready_diagnostic(
+            daemon,
+            &session_id,
+            "other",
+            0,
+            DiagnosticOutcome::Failed,
+            Some("runtime_unavailable"),
+        );
+        finish_audio_diagnostics(daemon, &session_id, DiagnosticOutcome::Failed);
         return Err(anyhow!(message));
     };
+
+    if let Err(error) = account_context.ensure_current(&daemon.paths) {
+        let mut runtime = daemon.audio_runtime.lock().await;
+        if runtime.start_generation == start_generation {
+            runtime.starting = false;
+            runtime.start_generation = runtime.start_generation.wrapping_add(1);
+        }
+        finish_audio_diagnostics(daemon, &session_id, DiagnosticOutcome::Failed);
+        return Err(error);
+    }
 
     {
         let mut runtime = daemon.audio_runtime.lock().await;
@@ -5179,6 +8559,15 @@ async fn start_audio_capture(
                 session_id = %session_id,
                 "audio start canceled before capture runtime became active"
             );
+            emit_audio_capture_ready_diagnostic(
+                daemon,
+                &session_id,
+                "other",
+                0,
+                DiagnosticOutcome::Failed,
+                Some("start_canceled"),
+            );
+            finish_audio_diagnostics(daemon, &session_id, DiagnosticOutcome::Failed);
             return Err(anyhow!(
                 "the current session finished while Listen was starting; start Listen again"
             ));
@@ -5186,6 +8575,7 @@ async fn start_audio_capture(
         runtime.stop = Some(stop_tx);
         runtime.session_id = Some(session_id.clone());
         runtime.meeting_id = Some(audio_meeting.id);
+        runtime.account_context = Some(account_context.clone());
         runtime.finalizing_session = None;
         runtime.starting = false;
     }
@@ -5210,14 +8600,45 @@ async fn start_audio_capture(
             "listen STT mode selected"
         );
     }
-    let _ = record_active_session_listen_start(daemon, &session_id, status.stt_provider.as_deref())
-        .await;
+    if let Err(error) = record_active_session_listen_start(
+        daemon,
+        &session_id,
+        status.stt_provider.as_deref(),
+        account_context,
+    )
+    .await
+    {
+        let _ = stop_audio_capture(daemon).await;
+        finish_audio_diagnostics(daemon, &session_id, DiagnosticOutcome::Failed);
+        return Err(error);
+    }
+    emit_audio_capture_ready_diagnostic(
+        daemon,
+        &session_id,
+        selected_stt_provider,
+        status.devices.len(),
+        DiagnosticOutcome::Succeeded,
+        None,
+    );
 
     let daemon_for_loop = daemon.clone();
+    let audio_account_context = account_context.clone();
     match runtime {
         AudioRuntimeConfigResolution::Real(real_runtime) => {
             tokio::spawn(async move {
-                real_audio_loop(daemon_for_loop, session_id, real_runtime, stop_rx).await;
+                real_audio_loop(
+                    daemon_for_loop.clone(),
+                    session_id.clone(),
+                    real_runtime,
+                    stop_rx,
+                    audio_account_context,
+                )
+                .await;
+                finish_audio_diagnostics(
+                    &daemon_for_loop,
+                    &session_id,
+                    DiagnosticOutcome::Succeeded,
+                );
             });
         }
         AudioRuntimeConfigResolution::Unavailable(_) => {
@@ -5246,7 +8667,7 @@ async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::s
 
     crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::System)
         .await
-        .map_err(|e| anyhow::anyhow!("STT factory: {e}"))
+        .map_err(|error| closed_transport_error("system STT factory", &error.to_string()))
 }
 
 /// Build an STT provider for the microphone path via the factory chain.
@@ -5268,7 +8689,7 @@ pub async fn build_mic_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::S
 
     crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::Microphone)
         .await
-        .map_err(|e| anyhow::anyhow!("STT factory (mic): {e}"))
+        .map_err(|error| closed_transport_error("microphone STT factory", &error.to_string()))
 }
 
 async fn build_real_audio_runtime_config(
@@ -5624,12 +9045,14 @@ async fn wait_for_live_caption_answer_transcript_settle(
     };
 
     let wait_ms = live_stt_finalize_wait_ms();
+    let settle_started_at = Instant::now();
     let deadline = Instant::now() + Duration::from_millis(wait_ms);
     let quiet_after_change = Duration::from_millis(220);
     let mut last_snapshot = active_transcript_settle_snapshot(daemon, &audio_session_id).await;
     let initial_snapshot = last_snapshot.clone();
     let mut observed_current_session_text = last_snapshot.has_current_live_text;
     let mut last_change_at = Instant::now();
+    let mut settled_after_quiet_period = false;
 
     loop {
         if Instant::now() >= deadline {
@@ -5648,6 +9071,7 @@ async fn wait_for_live_caption_answer_transcript_settle(
             last_change_at = Instant::now();
         }
         if observed_current_session_text && last_change_at.elapsed() >= quiet_after_change {
+            settled_after_quiet_period = true;
             break;
         }
     }
@@ -5662,6 +9086,30 @@ async fn wait_for_live_caption_answer_transcript_settle(
         observed_current_session_text,
         "live caption answer waited for transcript settle before submit"
     );
+    if let Some(active) = daemon.audio_diagnostics.for_session(&audio_session_id) {
+        let outcome = if settled_after_quiet_period {
+            DiagnosticOutcome::Succeeded
+        } else {
+            DiagnosticOutcome::TimedOut
+        };
+        emit_diagnostic_for_scope(
+            daemon,
+            active.scope,
+            DiagnosticEvent::new(
+                DiagnosticEventKind::TranscriptSettled,
+                DiagnosticComponent::Stt,
+                outcome,
+            )
+            .audio_run_id(Some(active.run_id))
+            .duration_ms(Some(elapsed_ms(settle_started_at)))
+            .count(
+                last_snapshot
+                    .final_segments
+                    .saturating_sub(initial_snapshot.final_segments),
+            ),
+            DiagnosticPriority::Ordinary,
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6158,9 +9606,10 @@ async fn real_audio_loop(
     session_id: String,
     runtime: RealAudioRuntimeConfig,
     mut stop_rx: oneshot::Receiver<()>,
+    account_context: AnswerAccountContext,
 ) {
     if runtime.stt_transport == RealSttTransport::BlueyManagedRelay {
-        real_audio_relay_loop(daemon, session_id, runtime, stop_rx).await;
+        real_audio_relay_loop(daemon, session_id, runtime, stop_rx, account_context).await;
         return;
     }
 
@@ -6173,6 +9622,10 @@ async fn real_audio_loop(
     let mut idle_countdown_last_remaining = None;
 
     loop {
+        if account_context.ensure_current(&daemon.paths).is_err() {
+            stop_audio_capture_for_context_change(&daemon, &session_id, &account_context).await;
+            return;
+        }
         let mut source_jobs = FuturesUnordered::new();
         for source in &runtime.sources {
             let sequence = match source.source {
@@ -6206,6 +9659,10 @@ async fn real_audio_loop(
         }
 
         while let Some((source_kind, result)) = source_jobs.next().await {
+            if account_context.ensure_current(&daemon.paths).is_err() {
+                stop_audio_capture_for_context_change(&daemon, &session_id, &account_context).await;
+                return;
+            }
             match result {
                 Ok(captured) => {
                     if captured.audible || captured.segment.is_some() {
@@ -6218,20 +9675,40 @@ async fn real_audio_loop(
                             }
                             Ok(false) => {}
                             Err(error) => {
-                                warn!("real audio transcript emission failed: {error:#}");
+                                let raw_error = format!("{error:#}");
+                                warn!(
+                                    error_category = transport_error_category(&raw_error),
+                                    error_ref = %closed_diagnostic_ref("audio transcript persistence", &raw_error),
+                                    "real audio transcript emission failed"
+                                );
                             }
                         }
                     }
                 }
                 Err(error) => {
-                    let message = compact_snippet(&format!("{error:#}"), 260);
-                    record_active_session_diagnostic(&daemon, "audio_source_error", &message).await;
+                    let raw_error = format!("{error:#}");
                     let is_permission = crate::audio::capture::is_permission_denied_message(
-                        &message,
+                        &raw_error,
                     )
                         || crate::audio::system_capture::is_system_audio_permission_denied_message(
-                            &message,
+                            &raw_error,
                         );
+                    let category = if is_permission {
+                        "permission"
+                    } else {
+                        transport_error_category(&raw_error)
+                    };
+                    let message = format!(
+                        "Audio source failed: {category}; diagnostic_ref={}",
+                        closed_diagnostic_ref("audio source", &raw_error)
+                    );
+                    let _ = record_active_session_diagnostic_for_context(
+                        &daemon,
+                        "audio_source_error",
+                        &message,
+                        &account_context,
+                    )
+                    .await;
                     {
                         let mut audio = daemon.audio.lock().await;
                         if audio.session_id.as_deref() != Some(session_id.as_str()) {
@@ -6268,6 +9745,7 @@ async fn real_audio_loop(
                 last_audible_activity_at,
                 idle_timeout,
                 &mut idle_countdown_last_remaining,
+                &account_context,
             )
             .await
             {
@@ -6284,6 +9762,7 @@ async fn real_audio_loop(
                     last_audible_activity_at,
                     idle_timeout,
                     &mut idle_countdown_last_remaining,
+                    &account_context,
                 )
                 .await
                 {
@@ -6299,6 +9778,7 @@ async fn real_audio_relay_loop(
     session_id: String,
     runtime: RealAudioRuntimeConfig,
     mut stop_rx: oneshot::Receiver<()>,
+    account_context: AnswerAccountContext,
 ) {
     let source_count = runtime.sources.len();
     if source_count == 0 {
@@ -6311,24 +9791,55 @@ async fn real_audio_relay_loop(
     let last_audible_activity_at = Arc::new(Mutex::new(Instant::now()));
     let mut idle_countdown_last_remaining = None;
     let mut handles = Vec::with_capacity(source_count);
+    if account_context.ensure_current(&daemon.paths).is_err() {
+        stop_audio_capture_for_context_change(&daemon, &session_id, &account_context).await;
+        return;
+    }
     let relay_cloud = match build_cloud_client(&daemon.paths, None) {
         Ok(client) => {
+            let Some(credentials) = client.credential_snapshot() else {
+                stop_audio_capture_for_context_change(&daemon, &session_id, &account_context).await;
+                return;
+            };
+            if account_context.ensure_current(&daemon.paths).is_err() {
+                stop_audio_capture_for_context_change(&daemon, &session_id, &account_context).await;
+                return;
+            }
             let account_check = async {
-                verify_stored_cloud_device_link(&daemon.paths, &client).await?;
+                verify_cloud_device_link_for_credentials(&client, &credentials).await?;
                 client
                     .auth_get::<cue_cloud_client::AccountMe>("/account/me")
                     .await
             };
             if let Err(error) = account_check.await {
                 if cloud_auth_error_should_clear_tokens(&error) {
-                    if let Err(clear_error) = client.clear_tokens() {
-                        warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
+                    if let Err(clear_error) = clear_revoked_client_credentials(
+                        &daemon,
+                        &client,
+                        &credentials,
+                        "live_audio_account_check",
+                    )
+                    .await
+                    {
+                        warn!(
+                            error_category = %context_watch_safe_error_category(&clear_error),
+                            "revoked live-caption credentials could not be reconciled"
+                        );
                     }
-                    mark_cloud_account_signed_out(&daemon, "live_audio_account_check").await;
+                    stop_audio_capture_for_context_change(&daemon, &session_id, &account_context)
+                        .await;
+                    return;
                 }
-                let message = compact_snippet(
-                    &format!("Bluey account is not ready for live captions: {error:#}"),
-                    260,
+                if account_context.ensure_current(&daemon.paths).is_err() {
+                    stop_audio_capture_for_context_change(&daemon, &session_id, &account_context)
+                        .await;
+                    return;
+                }
+                let raw_error = format!("{error:#}");
+                let message = format!(
+                    "Bluey account is not ready for live captions: {}; diagnostic_ref={}",
+                    transport_error_category(&raw_error),
+                    closed_diagnostic_ref("live STT account check", &raw_error),
                 );
                 {
                     let mut audio = daemon.audio.lock().await;
@@ -6345,15 +9856,25 @@ async fn real_audio_relay_loop(
                     message,
                 )
                 .await;
-                let _ = stop_audio_capture(&daemon).await;
+                stop_audio_capture_for_context_change(&daemon, &session_id, &account_context).await;
+                return;
+            }
+            if account_context.ensure_current(&daemon.paths).is_err()
+                || !client
+                    .credential_snapshot_is_current(&credentials)
+                    .unwrap_or(false)
+            {
+                stop_audio_capture_for_context_change(&daemon, &session_id, &account_context).await;
                 return;
             }
             client
         }
         Err(error) => {
-            let message = compact_snippet(
-                &format!("failed to create Bluey cloud client for live captions: {error:#}"),
-                260,
+            let raw_error = format!("{error:#}");
+            let message = format!(
+                "Bluey could not prepare live captions: {}; diagnostic_ref={}",
+                transport_error_category(&raw_error),
+                closed_diagnostic_ref("live STT cloud client", &raw_error),
             );
             {
                 let mut audio = daemon.audio.lock().await;
@@ -6382,7 +9903,10 @@ async fn real_audio_relay_loop(
         let cloud_for_source = relay_cloud.clone();
         let mut source_stop_rx = relay_stop_rx.clone();
         let done_tx = done_tx.clone();
-        let last_audible_activity_at = Arc::clone(&last_audible_activity_at);
+        let authority = RelaySourceAuthority {
+            last_audible_activity_at: Arc::clone(&last_audible_activity_at),
+            account_context: account_context.clone(),
+        };
         let source_kind = source.source;
         handles.push(tokio::spawn(async move {
             let mut terminal_failure = false;
@@ -6393,16 +9917,17 @@ async fn real_audio_relay_loop(
                 source,
                 cloud_for_source,
                 &mut source_stop_rx,
-                last_audible_activity_at,
+                authority.clone(),
             )
             .await
             {
                 terminal_failure = true;
                 let message = compact_snippet(&format!("{error:#}"), 260);
-                record_active_session_diagnostic(
+                let _ = record_active_session_diagnostic_for_context(
                     &daemon_for_source,
                     "audio_source_error",
                     &message,
+                    &authority.account_context,
                 )
                 .await;
                 let is_permission = error.class == RelayFailureClass::Permission;
@@ -6446,6 +9971,10 @@ async fn real_audio_relay_loop(
                 }
             }
             _ = sleep(Duration::from_secs(1)) => {
+                if account_context.ensure_current(&daemon.paths).is_err() {
+                    let _ = relay_stop_tx.send(true);
+                    break;
+                }
                 if !active_audio_session_matches(&daemon, &session_id).await {
                     let _ = relay_stop_tx.send(true);
                     break;
@@ -6457,6 +9986,7 @@ async fn real_audio_relay_loop(
                     last_audible_activity_at,
                     idle_timeout,
                     &mut idle_countdown_last_remaining,
+                    &account_context,
                 )
                 .await
                 {
@@ -6664,13 +10194,20 @@ async fn run_relay_audio_source(
     source: RealAudioSource,
     cloud: cue_cloud_client::CloudClient,
     stop_rx: &mut watch::Receiver<bool>,
-    last_audible_activity_at: Arc<Mutex<Instant>>,
+    authority: RelaySourceAuthority,
 ) -> std::result::Result<(), RelaySourceFailure> {
     let mut progress = RelaySourceProgress::default();
     let mut deduper = RelayTranscriptDeduper::default();
     let max_attempts = LIVE_STT_MAX_RECONNECT_ATTEMPTS.saturating_add(1);
 
     for attempt in 1..=max_attempts {
+        if authority
+            .account_context
+            .ensure_current(&daemon.paths)
+            .is_err()
+        {
+            return Ok(());
+        }
         if *stop_rx.borrow() || !active_audio_session_matches(&daemon, &session_id).await {
             return Ok(());
         }
@@ -6683,7 +10220,7 @@ async fn run_relay_audio_source(
             cloud.clone(),
             RelayAttemptState {
                 stop_rx,
-                last_audible_activity_at: Arc::clone(&last_audible_activity_at),
+                authority: &authority,
                 progress: &mut progress,
                 deduper: &mut deduper,
             },
@@ -6693,7 +10230,9 @@ async fn run_relay_audio_source(
             Ok(()) => return Ok(()),
             Err(error) => {
                 let class = classify_relay_attempt_error(&error);
-                let detail = compact_snippet(&format!("{error:#}"), 220);
+                let raw_error = format!("{error:#}");
+                let error_ref = closed_diagnostic_ref("live STT relay", &raw_error);
+                let detail = format!("{} error; diagnostic_ref={error_ref}", class.as_str());
                 let Some(delay) = relay_retry_delay(source.source, class, attempt, &session_id)
                 else {
                     let message = if class == RelayFailureClass::Transient {
@@ -6734,7 +10273,8 @@ async fn run_relay_audio_source(
                     stream_id = %source.stream_id,
                     reconnect_attempt,
                     delay_ms = delay.as_millis() as u64,
-                    error = %detail,
+                    error_category = class.as_str(),
+                    error_ref = %error_ref,
                     "live STT relay connection failed; scheduling bounded reconnect"
                 );
                 tokio::select! {
@@ -6772,12 +10312,17 @@ async fn release_unclaimed_stt_reservation(
             reason,
             "released unclaimed live STT reservation"
         ),
-        Err(error) => warn!(
-            source = %source.source,
-            stream_id = %source.stream_id,
-            reason,
-            "failed to release unclaimed live STT reservation: {error:#}"
-        ),
+        Err(error) => {
+            let raw_error = format!("{error:#}");
+            warn!(
+                source = %source.source,
+                stream_id = %source.stream_id,
+                reason,
+                error_category = transport_error_category(&raw_error),
+                error_ref = %closed_diagnostic_ref("live STT reservation release", &raw_error),
+                "failed to release unclaimed live STT reservation"
+            );
+        }
     }
 }
 
@@ -6791,10 +10336,13 @@ async fn run_relay_audio_source_attempt(
 ) -> Result<()> {
     let RelayAttemptState {
         stop_rx,
-        last_audible_activity_at,
+        authority,
         progress,
         deduper,
     } = state;
+    let account_context = &authority.account_context;
+    let last_audible_activity_at = Arc::clone(&authority.last_audible_activity_at);
+    account_context.ensure_current(&daemon.paths)?;
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let (helper_path, source_arg) = match &source.ffmpeg_input {
         FfmpegAudioInput::NativeHelper {
@@ -6844,6 +10392,7 @@ async fn run_relay_audio_source_attempt(
     let startup_warmup_ms = live_stt_startup_warmup_ms();
     let mut silence_notice_sent = false;
     let (startup_ready_stats, startup_ready_reason) = loop {
+        account_context.ensure_current(&daemon.paths)?;
         tokio::select! {
             changed = stop_rx.changed() => {
                 if changed.is_err() || *stop_rx.borrow() {
@@ -6931,6 +10480,7 @@ async fn run_relay_audio_source_attempt(
     };
 
     let requested_seconds = managed_stt_relay_requested_seconds();
+    account_context.ensure_current(&daemon.paths)?;
     let stt_session = cloud
         .create_stt_session(&cue_cloud_client::SttSessionRequest {
             session_id: session_id.clone(),
@@ -6941,6 +10491,7 @@ async fn run_relay_audio_source_attempt(
         })
         .await
         .with_context(|| format!("failed to create live STT session for {}", source.source))?;
+    account_context.ensure_current(&daemon.paths)?;
     info!(
         source = %source.source,
         stream_id = %source.stream_id,
@@ -7023,6 +10574,7 @@ async fn run_relay_audio_source_attempt(
             tokio_tungstenite::connect_async(request),
         ) => result,
     };
+    account_context.ensure_current(&daemon.paths)?;
     let (socket, _) = match connect_result {
         Ok(Ok(socket)) => socket,
         Ok(Err(error)) => {
@@ -7055,9 +10607,11 @@ async fn run_relay_audio_source_attempt(
         }
     };
     set_overlay_listening_state(&daemon, ListeningState::Listening).await;
+    emit_stt_connected_diagnostic(&daemon, &session_id);
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     while let Some(preface) = preface_chunks.pop_front() {
+        account_context.ensure_current(&daemon.paths)?;
         progress.sequence = progress.sequence.saturating_add(1);
         let duration_ms = pcm16_16k_duration_ms(preface.len());
         let stats = pcm16_i16le_stats(&preface);
@@ -7084,6 +10638,7 @@ async fn run_relay_audio_source_attempt(
             let mut audio = daemon.audio.lock().await;
             audio.record_chunk(&chunk);
         }
+        emit_first_audio_chunk_diagnostic(&daemon, &session_id, preface.len(), progress.sequence);
         if progress.sequence == 1 || stats.is_audible_for_stt() {
             info!(
                 source = %source.source,
@@ -7124,6 +10679,7 @@ async fn run_relay_audio_source_attempt(
     let mut transport_ended = false;
     let mut stream_error: Option<anyhow::Error> = None;
     loop {
+        account_context.ensure_current(&daemon.paths)?;
         tokio::select! {
             changed = stop_rx.changed() => {
                 if changed.is_err() || *stop_rx.borrow() {
@@ -7158,6 +10714,12 @@ async fn run_relay_audio_source_attempt(
                     let mut audio = daemon.audio.lock().await;
                     audio.record_chunk(&chunk);
                 }
+                emit_first_audio_chunk_diagnostic(
+                    &daemon,
+                    &session_id,
+                    read,
+                    progress.sequence,
+                );
                 if progress.sequence == 1 || progress.sequence.is_multiple_of(50) {
                     info!(
                         source = %source.source,
@@ -7184,6 +10746,7 @@ async fn run_relay_audio_source_attempt(
                 .with_context(|| format!("failed to send live {} audio to Bluey STT relay", source.source))?;
             }
             message = ws_rx.next() => {
+                account_context.ensure_current(&daemon.paths)?;
                 match message {
                     Some(Ok(WebSocketMessage::Text(payload))) => {
                         emit_deepgram_relay_payload(
@@ -7191,7 +10754,7 @@ async fn run_relay_audio_source_attempt(
                             &session_id,
                             source.source,
                             &payload,
-                            Arc::clone(&last_audible_activity_at),
+                            authority,
                             progress,
                             deduper,
                         ).await?;
@@ -7203,7 +10766,7 @@ async fn run_relay_audio_source_attempt(
                                 &session_id,
                                 source.source,
                                 payload,
-                                Arc::clone(&last_audible_activity_at),
+                                authority,
                                 progress,
                                 deduper,
                             ).await?;
@@ -7243,9 +10806,11 @@ async fn run_relay_audio_source_attempt(
     tokio::pin!(finalize_deadline);
     let mut tail_frames = 0_u64;
     loop {
+        account_context.ensure_current(&daemon.paths)?;
         tokio::select! {
             _ = &mut finalize_deadline => break,
             message = ws_rx.next() => {
+                account_context.ensure_current(&daemon.paths)?;
                 match message {
                     Some(Ok(WebSocketMessage::Text(payload))) => {
                         tail_frames = tail_frames.saturating_add(1);
@@ -7254,7 +10819,7 @@ async fn run_relay_audio_source_attempt(
                             &session_id,
                             source.source,
                             &payload,
-                            Arc::clone(&last_audible_activity_at),
+                            authority,
                             progress,
                             deduper,
                         ).await?;
@@ -7267,7 +10832,7 @@ async fn run_relay_audio_source_attempt(
                                 &session_id,
                                 source.source,
                                 payload,
-                                Arc::clone(&last_audible_activity_at),
+                                authority,
                                 progress,
                                 deduper,
                             ).await?;
@@ -7276,10 +10841,13 @@ async fn run_relay_audio_source_attempt(
                     Some(Ok(WebSocketMessage::Close(_))) | None => break,
                     Some(Ok(WebSocketMessage::Ping(_))) | Some(Ok(WebSocketMessage::Pong(_))) | Some(Ok(WebSocketMessage::Frame(_))) => {}
                     Some(Err(error)) => {
+                        let raw_error = error.to_string();
                         warn!(
                             source = %source.source,
                             stream_id = %source.stream_id,
-                            "live STT websocket tail finalize failed: {error}"
+                            error_category = transport_error_category(&raw_error),
+                            error_ref = %closed_diagnostic_ref("live STT tail finalize", &raw_error),
+                            "live STT websocket tail finalize failed"
                         );
                         break;
                     }
@@ -7333,10 +10901,11 @@ async fn emit_deepgram_relay_payload(
     session_id: &str,
     source: AudioSourceKind,
     payload: &str,
-    last_audible_activity_at: Arc<Mutex<Instant>>,
+    authority: &RelaySourceAuthority,
     progress: &RelaySourceProgress,
     deduper: &mut RelayTranscriptDeduper,
 ) -> Result<()> {
+    authority.account_context.ensure_current(&daemon.paths)?;
     let sequence = progress.sequence;
     let attempt = progress.attempt;
     let pcm_source = pcm_source_for_audio_source(source);
@@ -7348,36 +10917,28 @@ async fn emit_deepgram_relay_payload(
             } else {
                 "stt_parse_error"
             };
-            let frame_type = serde_json::from_str::<serde_json::Value>(payload)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("type")
-                        .and_then(|ty| ty.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| "unknown".to_string());
+            let frame_type = closed_stt_frame_type(payload);
+            let error_ref = closed_diagnostic_ref("live STT relay frame", payload);
             let message = format!(
-                "Deepgram relay frame parse failed for {source} sequence {sequence} type {frame_type}: {error}"
+                "STT relay frame failed for {source} sequence {sequence} type {frame_type}: {}; diagnostic_ref={error_ref}",
+                stt_error_category(&error),
             );
-            record_active_session_diagnostic(daemon, kind, &message).await;
+            let _ = record_active_session_diagnostic_for_context(
+                daemon,
+                kind,
+                &message,
+                &authority.account_context,
+            )
+            .await;
             return Err(anyhow!(message));
         }
     };
     if events.is_empty() {
-        let frame_type = serde_json::from_str::<serde_json::Value>(payload)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("type")
-                    .and_then(|ty| ty.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+        let frame_type = closed_stt_frame_type(payload);
         debug!(
             source = %source,
             sequence,
-            frame_type = %frame_type,
+            frame_type,
             payload_bytes = payload.len(),
             "live STT relay provider frame without transcript"
         );
@@ -7408,7 +10969,7 @@ async fn emit_deepgram_relay_payload(
                 source.default_label()
             ))
             .with_source_sequence_range(sequence, sequence);
-        *last_audible_activity_at.lock().await = Instant::now();
+        *authority.last_audible_activity_at.lock().await = Instant::now();
         debug!(
             source = %source,
             sequence,
@@ -7430,7 +10991,12 @@ async fn emit_deepgram_relay_payload(
                 }
             }
             Err(error) => {
-                warn!("live relay transcript emission failed: {error:#}");
+                let raw_error = format!("{error:#}");
+                warn!(
+                    error_category = transport_error_category(&raw_error),
+                    error_ref = %closed_diagnostic_ref("live STT transcript persistence", &raw_error),
+                    "live relay transcript emission failed"
+                );
             }
         }
         if !audio_session_accepts_transcripts(daemon, session_id).await {
@@ -7438,6 +11004,26 @@ async fn emit_deepgram_relay_payload(
         }
     }
     Ok(())
+}
+
+fn closed_stt_frame_type(payload: &str) -> &'static str {
+    let frame_type = serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(|ty| ty.as_str())
+                .map(str::to_owned)
+        });
+    match frame_type.as_deref() {
+        Some("Results") => "results",
+        Some("Metadata") => "metadata",
+        Some("UtteranceEnd") => "utterance_end",
+        Some("SpeechStarted") => "speech_started",
+        Some("Error") => "error",
+        Some(_) => "other",
+        None => "unknown",
+    }
 }
 
 fn stt_relay_websocket_url(endpoint: &str) -> Result<String> {
@@ -7577,7 +11163,12 @@ async fn maybe_auto_stop_idle_audio(
     last_audible_activity_at: Instant,
     idle_timeout: Duration,
     countdown_last_remaining: &mut Option<u64>,
+    account_context: &AnswerAccountContext,
 ) -> bool {
+    if account_context.ensure_current(&daemon.paths).is_err() {
+        stop_audio_capture_for_context_change(daemon, session_id, account_context).await;
+        return true;
+    }
     let elapsed = last_audible_activity_at.elapsed();
     if elapsed < idle_timeout {
         maybe_emit_audio_idle_countdown(
@@ -7586,6 +11177,7 @@ async fn maybe_auto_stop_idle_audio(
             idle_timeout,
             idle_timeout.saturating_sub(elapsed),
             countdown_last_remaining,
+            account_context,
         )
         .await;
         return false;
@@ -7613,13 +11205,14 @@ async fn maybe_auto_stop_idle_audio(
         },
     )
     .await;
-    record_active_session_diagnostic(
+    let _ = record_active_session_diagnostic_for_context(
         daemon,
         "audio_auto_stopped",
         &format!(
             "Listen auto-stopped after {} without audible speech or a transcript update.",
             format_duration(idle_timeout)
         ),
+        account_context,
     )
     .await;
     {
@@ -7657,15 +11250,17 @@ async fn maybe_emit_audio_idle_countdown(
     idle_timeout: Duration,
     remaining: Duration,
     countdown_last_remaining: &mut Option<u64>,
+    account_context: &AnswerAccountContext,
 ) {
     let warning_window = audio_idle_stop_countdown_window();
     if remaining > warning_window {
         if countdown_last_remaining.take().is_some() {
             let _ = send_overlay(daemon, OverlayCommand::AudioAutoStopCountdownCleared).await;
-            record_active_session_diagnostic(
+            let _ = record_active_session_diagnostic_for_context(
                 daemon,
                 "audio_auto_stop_countdown_cleared",
                 "Audible input resumed before Listen auto-stop.",
+                account_context,
             )
             .await;
         }
@@ -7680,7 +11275,7 @@ async fn maybe_emit_audio_idle_countdown(
     *countdown_last_remaining = Some(remaining_secs);
 
     if first_countdown_notice {
-        record_active_session_diagnostic(
+        let _ = record_active_session_diagnostic_for_context(
             daemon,
             "audio_auto_stop_countdown_started",
             &format!(
@@ -7688,6 +11283,7 @@ async fn maybe_emit_audio_idle_countdown(
                 format_duration(remaining),
                 format_duration(idle_timeout)
             ),
+            account_context,
         )
         .await;
     }
@@ -7763,22 +11359,33 @@ fn format_duration(duration: Duration) -> String {
 }
 
 async fn refresh_overlay_balance(daemon: &Arc<Daemon>, trace_id: Option<&str>) -> Option<String> {
-    match fetch_current_balance_snapshot(trace_id).await {
-        BalanceLookup::Snapshot(snapshot) => {
-            let label = format_balance_snapshot_label(&snapshot);
-            daemon.balance_watch.publish(snapshot);
-            let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
-            let _ = send_overlay(
-                daemon,
-                OverlayCommand::SetBalance {
-                    label: label.clone(),
-                },
-            )
-            .await;
-            Some(label)
+    match fetch_current_balance_snapshot(&daemon.paths, trace_id).await {
+        BalanceLookup::Snapshot {
+            credentials,
+            snapshot,
+        } => {
+            daemon
+                .balance_watch
+                .publish_for_credentials(credentials.clone(), snapshot.clone());
+            push_overlay_balance_snapshot(daemon, &credentials, &snapshot)
+                .await
+                .ok()
+                .flatten()
         }
-        BalanceLookup::SignedOut => {
-            mark_cloud_account_signed_out(daemon, "balance_refresh").await;
+        BalanceLookup::Revoked {
+            client,
+            credentials,
+        } => {
+            daemon.balance_watch.publish_revoked(credentials.clone());
+            if let Err(error) =
+                clear_revoked_client_credentials(daemon, &client, &credentials, "balance_refresh")
+                    .await
+            {
+                warn!(
+                    error_category = %context_watch_safe_error_category(&error),
+                    "revoked balance credentials could not be reconciled"
+                );
+            }
             None
         }
         BalanceLookup::Unavailable => None,
@@ -7983,20 +11590,12 @@ fn meeting_visible_for_owner(meeting: &MeetingRecord, owner_account_id: Option<&
     }
 }
 
-fn tag_meeting_owner_from_paths(paths: &AppPaths, meeting: &mut MeetingRecord) {
-    if meeting
-        .owner_account_id
-        .as_deref()
-        .is_some_and(|owner| !owner.trim().is_empty())
-    {
-        return;
-    }
-    meeting.owner_account_id = current_owner_account_id(paths);
-}
-
-fn new_owned_meeting(paths: &AppPaths, title: Option<String>) -> MeetingRecord {
+fn new_meeting_for_account(
+    account_context: &AnswerAccountContext,
+    title: Option<String>,
+) -> MeetingRecord {
     let mut meeting = MeetingRecord::new(title);
-    tag_meeting_owner_from_paths(paths, &mut meeting);
+    meeting.owner_account_id = account_context.owner_account_id.clone();
     meeting
 }
 
@@ -8111,14 +11710,19 @@ fn latest_visible_meeting(
         .find(|meeting| meeting_visible_for_owner(meeting, owner_account_id)))
 }
 
-async fn move_unowned_local_sessions_to_current_account(daemon: &Arc<Daemon>) -> Result<String> {
-    let Some(owner_account_id) = current_owner_account_id(&daemon.paths) else {
-        return Err(anyhow!(
-            "Sign in to Bluey before moving local sessions to an account."
-        ));
-    };
+async fn move_unowned_local_sessions_to_current_account(
+    daemon: &Arc<Daemon>,
+    account_context: &AnswerAccountContext,
+) -> Result<String> {
+    let owner_account_id = account_context
+        .owner_account_id
+        .as_deref()
+        .context("Sign in to Bluey before moving local sessions to an account.")?
+        .to_string();
+    account_context.ensure_current(&daemon.paths)?;
 
     let active_id = daemon.store.load_active()?.map(|meeting| meeting.id);
+    account_context.ensure_current(&daemon.paths)?;
     let mut moved = 0usize;
     let mut skipped_empty = 0usize;
     let mut skipped_owned = 0usize;
@@ -8137,6 +11741,7 @@ async fn move_unowned_local_sessions_to_current_account(daemon: &Arc<Daemon>) ->
             continue;
         }
 
+        account_context.ensure_current(&daemon.paths)?;
         daemon.session_db.lock().reassign_session_owner(
             meeting.id,
             None,
@@ -8159,15 +11764,17 @@ async fn move_unowned_local_sessions_to_current_account(daemon: &Arc<Daemon>) ->
             daemon.store.save_archived(&meeting)?;
             project_meeting_session(daemon, &meeting, SessionStatus::Archived, false)?;
         }
+        account_context.ensure_current(&daemon.paths)?;
         moved += 1;
     }
 
+    account_context.ensure_current(&daemon.paths)?;
     refresh_overlay_sessions(daemon).await;
     if moved > 0 {
         schedule_auto_cloud_sync(daemon, "local_session_owner_migration", None).await;
     }
     info!(
-        owner_account_id = %owner_account_id,
+        account_id_hash = %cue_core::account_id_hash_prefix(&owner_account_id),
         moved,
         skipped_empty,
         skipped_owned,
@@ -8698,54 +12305,70 @@ fn should_show_overlay_context_item(item: &ContextArtifact) -> bool {
 }
 
 enum BalanceLookup {
-    Snapshot(crate::cloud::balance::BalanceSnapshot),
-    SignedOut,
+    Snapshot {
+        credentials: CredentialSnapshot,
+        snapshot: BalanceSnapshot,
+    },
+    Revoked {
+        client: cue_cloud_client::CloudClient,
+        credentials: CredentialSnapshot,
+    },
     Unavailable,
 }
 
-async fn fetch_current_balance_snapshot(trace_id: Option<&str>) -> BalanceLookup {
-    let paths = match AppPaths::discover() {
-        Ok(paths) => paths,
+async fn fetch_current_balance_snapshot(paths: &AppPaths, trace_id: Option<&str>) -> BalanceLookup {
+    let client = match build_cloud_client(paths, trace_id) {
+        Ok(client) => client,
         Err(error) => {
-            debug!("balance lookup skipped; app paths unavailable: {error}");
+            let raw_error = format!("{error:#}");
+            debug!(
+                error_category = transport_error_category(&raw_error),
+                "balance lookup skipped; account store unavailable"
+            );
             return BalanceLookup::Unavailable;
         }
     };
-    let client = match build_cloud_client(&paths, trace_id) {
-        Ok(client) => client,
-        Err(error) => {
-            debug!("balance lookup skipped; account store unavailable: {error}");
-            return BalanceLookup::Unavailable;
-        }
+    let Some(credentials) = client.credential_snapshot() else {
+        return BalanceLookup::Unavailable;
     };
 
     match tokio::time::timeout(Duration::from_secs(3), async {
-        verify_stored_cloud_device_link(&paths, &client).await?;
+        verify_cloud_device_link_for_credentials(&client, &credentials).await?;
         client
             .auth_get::<cue_cloud_client::AccountMe>("/account/me")
             .await
     })
     .await
     {
-        Ok(Ok(me)) => BalanceLookup::Snapshot(crate::cloud::balance::BalanceSnapshot {
-            balance_cents: me.balance_cents,
-            trial_seconds_remaining: me.trial_seconds_remaining,
-            auto_topup_enabled: me.auto_topup_enabled,
-            auto_topup_threshold_cents: me.auto_topup_threshold_cents,
-            auto_topup_amount_cents: me.auto_topup_amount_cents,
-            fetched_at_unix_ms: clock::now_epoch_ms_string().parse().unwrap_or_default(),
-            low_balance_warning: me.balance_cents < me.auto_topup_threshold_cents
-                && me.balance_cents > 0,
-        }),
+        Ok(Ok(me)) => BalanceLookup::Snapshot {
+            credentials: client.credential_snapshot().unwrap_or(credentials),
+            snapshot: BalanceSnapshot {
+                balance_cents: me.balance_cents,
+                trial_seconds_remaining: me.trial_seconds_remaining,
+                auto_topup_enabled: me.auto_topup_enabled,
+                auto_topup_threshold_cents: me.auto_topup_threshold_cents,
+                auto_topup_amount_cents: me.auto_topup_amount_cents,
+                fetched_at_unix_ms: clock::now_epoch_ms_string().parse().unwrap_or_default(),
+                low_balance_warning: me.balance_cents < me.auto_topup_threshold_cents
+                    && me.balance_cents > 0,
+            },
+        },
         Ok(Err(error)) => {
             if cloud_auth_error_should_clear_tokens(&error) {
-                warn!(error = %error, "balance lookup found revoked Bluey account; clearing local tokens");
-                if let Err(clear_error) = client.clear_tokens() {
-                    warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
+                warn!(
+                    error_category = "authorization",
+                    "balance lookup found revoked Bluey credentials"
+                );
+                BalanceLookup::Revoked {
+                    client,
+                    credentials,
                 }
-                BalanceLookup::SignedOut
             } else {
-                debug!("balance lookup skipped: {error}");
+                let raw_error = format!("{error:#}");
+                debug!(
+                    error_category = transport_error_category(&raw_error),
+                    "balance lookup skipped"
+                );
                 BalanceLookup::Unavailable
             }
         }
@@ -8845,6 +12468,10 @@ async fn start_background_cloud_login(
     source: &'static str,
     trace_id: Option<String>,
 ) -> Result<String> {
+    anyhow::ensure!(
+        load_pending_deleted_account_purge(&daemon.paths)?.is_none(),
+        "finish the pending account deletion cleanup before signing in"
+    );
     if cloud_account_linked(&daemon.paths) {
         refresh_signed_in_overlay_state(daemon, trace_id.as_deref()).await;
         return Ok("Bluey is already signed in.".to_string());
@@ -8957,12 +12584,15 @@ struct PreparedCloudLogin {
     flow: cue_cloud_client::DeviceFlow,
     login_url: String,
     device_request: cue_cloud_client::DeviceStartRequest,
+    expected_local_credential_generation: u64,
 }
 
 async fn prepare_background_cloud_login(
     paths: &AppPaths,
     trace_id: &str,
 ) -> Result<PreparedCloudLogin> {
+    let expected_local_credential_generation =
+        background_login_local_profile(paths)?.credential_generation;
     let api_url = resolve_background_login_api_url(paths);
     let config = cue_cloud_client::client::ClientConfig {
         base_url: api_url.clone(),
@@ -8986,7 +12616,54 @@ async fn prepare_background_cloud_login(
         flow,
         login_url,
         device_request,
+        expected_local_credential_generation,
     })
+}
+
+fn background_login_local_profile(paths: &AppPaths) -> Result<cue_core::AccountConfig> {
+    anyhow::ensure!(
+        load_pending_deleted_account_purge(paths)?.is_none(),
+        "finish the pending account deletion cleanup before signing in"
+    );
+    let account = load_account(paths)?.unwrap_or_else(cue_core::AccountConfig::local);
+    anyhow::ensure!(
+        account.owner_account_id().is_none() && !account.token_configured(),
+        "another Bluey account became active during sign-in"
+    );
+    Ok(account)
+}
+
+fn ensure_background_login_generation(
+    paths: &AppPaths,
+    expected_generation: u64,
+) -> Result<cue_core::AccountConfig> {
+    let account = background_login_local_profile(paths)?;
+    anyhow::ensure!(
+        account.credential_generation == expected_generation,
+        "another Bluey account changed during sign-in"
+    );
+    Ok(account)
+}
+
+fn commit_background_login_profile(
+    paths: &AppPaths,
+    expected_generation: u64,
+    account: &cue_core::AccountConfig,
+) -> Result<()> {
+    ensure_background_login_generation(paths, expected_generation)?;
+    anyhow::ensure!(
+        account.owner_account_id().is_some() && account.token_configured(),
+        "completed Bluey sign-in has no account credentials"
+    );
+    anyhow::ensure!(
+        cue_cloud_client::save_account_profile_and_tokens_if_generation(
+            paths,
+            expected_generation,
+            account,
+        )?,
+        "another Bluey account changed during sign-in"
+    );
+    Ok(())
 }
 
 fn build_cloud_device_start_request(
@@ -9042,25 +12719,19 @@ fn is_persisted_cloud_device_id(value: &str) -> bool {
     !value.is_empty() && value != "local-device"
 }
 
-fn stored_cloud_device_id(paths: &AppPaths) -> Option<String> {
-    load_account(paths)
-        .ok()
-        .flatten()
-        .map(|account| account.device_id)
-        .filter(|device_id| is_persisted_cloud_device_id(device_id))
-}
-
-async fn verify_stored_cloud_device_link(
-    paths: &AppPaths,
+async fn verify_cloud_device_link_for_credentials(
     client: &cue_cloud_client::CloudClient,
+    credentials: &CredentialSnapshot,
 ) -> std::result::Result<(), cue_cloud_client::Error> {
-    let Some(device_id) = stored_cloud_device_id(paths) else {
+    let Some(device_id) = credentials.authority().device_id() else {
         return Ok(());
     };
     let status: cue_cloud_client::DeviceStatusResponse = client
         .auth_post(
             "/account/devices/status",
-            &cue_cloud_client::DeviceStatusRequest { device_id },
+            &cue_cloud_client::DeviceStatusRequest {
+                device_id: device_id.to_string(),
+            },
         )
         .await?;
     if status.active {
@@ -9202,31 +12873,17 @@ async fn run_background_cloud_login(
     .await
     .context("Bluey desktop login timed out")??;
 
-    let existing = load_account(&daemon.paths).ok().flatten();
-    let mut account = existing.unwrap_or_else(cue_core::AccountConfig::local);
-    account.provider = "bluey".to_string();
-    account.api_url = login.api_url;
-    account.cloud_account_id = Some(auth.account.id.clone());
-    account.user_id = auth.account.email.clone();
-    if account.workspace_id.trim().is_empty() || account.workspace_id == "local-workspace" {
-        account.workspace_id = "default".to_string();
-    }
-    if let Some(device_id) = login
-        .device_request
-        .device_id
-        .as_deref()
-        .filter(|value| is_persisted_cloud_device_id(value))
     {
-        account.device_id = device_id.to_string();
-    } else if account.device_id.trim().is_empty() {
-        account.device_id = "local-device".to_string();
+        let _transition = daemon.account_answer_transition.lock().await;
+        ensure_background_login_generation(
+            &daemon.paths,
+            login.expected_local_credential_generation,
+        )?;
     }
-    account.linked_at = clock::now_epoch_ms_string();
+
     let access_token = auth.access_token.clone();
     let refresh_token = auth.refresh_token.clone();
     let account_email = auth.account.email.clone();
-    account.access_token = Some(auth.access_token);
-    account.refresh_token = Some(auth.refresh_token);
 
     // Keep the approved tokens in memory long enough to verify that the
     // desktop registration really exists. Do not persist or announce sign-in
@@ -9247,6 +12904,16 @@ async fn run_background_cloud_login(
         .as_deref()
         .filter(|value| is_persisted_cloud_device_id(value))
         .context("Bluey desktop login did not include a stable device identity")?;
+    {
+        let _transition = daemon.account_answer_transition.lock().await;
+        if let Err(error) = ensure_background_login_generation(
+            &daemon.paths,
+            login.expected_local_credential_generation,
+        ) {
+            let _ = login.client.logout();
+            return Err(error);
+        }
+    }
     let registration: std::result::Result<serde_json::Value, cue_cloud_client::Error> = login
         .client
         .auth_post("/account/devices/register", &login.device_request)
@@ -9276,27 +12943,63 @@ async fn run_background_cloud_login(
         anyhow::bail!("Bluey desktop registration was not active after sign-in");
     }
 
-    cue_cloud_client::save_account_profile_and_tokens(&daemon.paths, &account)
-        .context("failed to save Bluey account tokens")?;
-    if let Err(error) = crate::cloud::sync::reconcile_prepared_cloud_session_deletes(
-        &daemon.paths.data_dir,
-        &daemon.store,
-        Some(&auth.account.id),
-    ) {
-        warn!(
-            error = %error,
-            "could not reconcile interrupted local session deletions after sign-in"
-        );
+    {
+        let _transition = daemon.account_answer_transition.lock().await;
+        let existing = match ensure_background_login_generation(
+            &daemon.paths,
+            login.expected_local_credential_generation,
+        ) {
+            Ok(existing) => existing,
+            Err(error) => {
+                let _ = login.client.logout();
+                return Err(error);
+            }
+        };
+        let previous_answer_account_context = AnswerAccountContext::from_account(Some(&existing));
+        let mut account = existing;
+        account.provider = "bluey".to_string();
+        account.api_url = login.api_url.clone();
+        account.cloud_account_id = Some(auth.account.id.clone());
+        account.user_id = auth.account.email.clone();
+        if account.workspace_id.trim().is_empty() || account.workspace_id == "local-workspace" {
+            account.workspace_id = "default".to_string();
+        }
+        if let Some(device_id) = login
+            .device_request
+            .device_id
+            .as_deref()
+            .filter(|value| is_persisted_cloud_device_id(value))
+        {
+            account.device_id = device_id.to_string();
+        } else if account.device_id.trim().is_empty() {
+            account.device_id = "local-device".to_string();
+        }
+        account.linked_at = clock::now_epoch_ms_string();
+        account.access_token = Some(auth.access_token.clone());
+        account.refresh_token = Some(auth.refresh_token.clone());
+        if let Err(error) = commit_background_login_profile(
+            &daemon.paths,
+            login.expected_local_credential_generation,
+            &account,
+        ) {
+            let _ = login.client.logout();
+            return Err(error).context("failed to save Bluey account tokens");
+        }
+        let current_answer_account_context = AnswerAccountContext::capture(&daemon.paths)?;
+        invalidate_active_answer_if_owner_changed(
+            &daemon,
+            &previous_answer_account_context,
+            &current_answer_account_context,
+        )
+        .await;
     }
-    crate::cloud::sync::flush_pending_cloud_session_deletes(
-        &daemon.paths.data_dir,
-        &login.client,
-        Some(&auth.account.id),
-    )
-    .await;
+    spawn_cloud_delete_outbox_flush(&daemon, Some(trace_id.clone()));
 
     clear_active_session_if_not_current_owner(&daemon).await?;
-    mark_listen_account_verified(&daemon).await;
+    let credentials = SecureAccountStore::new(daemon.paths.clone())
+        .load_snapshot()?
+        .context("completed Bluey desktop login has no credential snapshot")?;
+    mark_listen_account_verified(&daemon, credentials).await;
     refresh_signed_in_overlay_state(&daemon, Some(&trace_id)).await;
     clear_background_cloud_login_if_current(&daemon, &login.flow.user_code).await;
     info!(
@@ -9328,6 +13031,7 @@ async fn clear_active_session_if_not_current_owner(daemon: &Arc<Daemon>) -> Resu
         daemon.store.archive(&archived)?;
         project_meeting_session(daemon, &archived, SessionStatus::Archived, false)?;
         update_state_from_meeting(daemon, None).await?;
+        let _ = send_overlay(daemon, OverlayCommand::Clear).await;
         let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
         refresh_overlay_sessions(daemon).await;
         write_state(daemon).await?;
@@ -9504,6 +13208,12 @@ async fn capture_transcribe_audio_chunk(
         let mut audio = daemon.audio.lock().await;
         audio.record_chunk(&chunk);
     }
+    emit_first_audio_chunk_diagnostic(
+        daemon,
+        session_id,
+        byte_len.min(usize::MAX as u64) as usize,
+        sequence,
+    );
 
     if daemon.audio.lock().await.session_id.as_deref() != Some(session_id) {
         let _ = tokio::fs::remove_file(&chunk_path).await;
@@ -9517,6 +13227,9 @@ async fn capture_transcribe_audio_chunk(
         transcribe_audio_file(runtime, source.source, sequence, &chunk_path, client)
             .await
             .with_context(|| format!("failed to transcribe {}", source.source));
+    if transcript_result.is_ok() {
+        emit_stt_connected_diagnostic(daemon, session_id);
+    }
     let _ = tokio::fs::remove_file(&chunk_path).await;
     Ok(CapturedAudioTranscription {
         segment: transcript_result?,
@@ -9738,7 +13451,7 @@ async fn transcribe_audio_file(
 ) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
     let audio = tokio::fs::read(chunk_path)
         .await
-        .with_context(|| format!("failed to read {}", chunk_path.display()))?;
+        .map_err(|error| closed_transport_error("STT audio read", &format!("{error:#}")))?;
     if audio.len() < 1_024 {
         return Ok(None);
     }
@@ -9796,21 +13509,22 @@ async fn transcribe_audio_file(
             ));
         }
     }
-    .with_context(|| format!("failed to call STT endpoint {}", runtime.stt_endpoint))?;
+    .map_err(|error| closed_transport_error("STT request", &format!("{error:#}")))?;
     let status = response.status();
     let body = response
         .text()
         .await
-        .context("failed to read STT response")?;
+        .map_err(|error| closed_transport_error("STT response read", &format!("{error:#}")))?;
     if !status.is_success() {
-        return Err(anyhow!(
-            "STT endpoint returned HTTP {status}: {}",
-            compact_snippet(&body, 320)
+        return Err(closed_http_response_error(
+            "STT provider",
+            status.as_u16(),
+            &body,
         ));
     }
 
-    let parsed: TranscriptionResponse =
-        serde_json::from_str(&body).context("STT response was not transcription JSON")?;
+    let parsed: TranscriptionResponse = serde_json::from_str(&body)
+        .map_err(|_| closed_invalid_response_error("STT provider", &body))?;
     let Some(text) = parsed.text.map(|text| text.trim().to_string()) else {
         return Ok(None);
     };
@@ -9860,11 +13574,16 @@ fn request_audio_stop_transition(
 
     let stopped_session_id = runtime.session_id.take();
     let stopped_meeting_id = runtime.meeting_id.take();
-    if let (Some(session_id), Some(meeting_id)) = (stopped_session_id.as_ref(), stopped_meeting_id)
-    {
+    let stopped_account_context = runtime.account_context.take();
+    if let (Some(session_id), Some(meeting_id), Some(account_context)) = (
+        stopped_session_id.as_ref(),
+        stopped_meeting_id,
+        stopped_account_context,
+    ) {
         runtime.finalizing_session = Some(AudioFinalizingSession {
             session_id: session_id.clone(),
             meeting_id,
+            account_context,
             expires_at: now + tail_window,
         });
     } else if let Some(finalizing) = runtime.finalizing_session.as_mut() {
@@ -9906,6 +13625,9 @@ async fn request_audio_stop(daemon: &Arc<Daemon>) -> (AudioPipelineStatus, Audio
     if let Some(stop) = transition.stop.take() {
         let _ = stop.send(());
     }
+    if let Some(session_id) = transition.stopped_session_id.as_deref() {
+        emit_audio_stop_requested_diagnostic(daemon, session_id);
+    }
     if let Some(session_id) = transition.stopped_session_id.as_ref() {
         info!(
             session_id = %session_id,
@@ -9921,8 +13643,34 @@ async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
     request_audio_stop(daemon).await.0
 }
 
-async fn settle_audio_before_meeting_end(daemon: &Arc<Daemon>) -> bool {
-    let (_, transition) = request_audio_stop(daemon).await;
+async fn stop_continuous_system_audio(daemon: &Arc<Daemon>) {
+    if let Some(capture) = daemon.system_audio.lock().await.take() {
+        capture.stop().await;
+    }
+}
+
+async fn stop_audio_capture_for_context_change(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    account_context: &AnswerAccountContext,
+) {
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    let should_stop = {
+        let runtime = daemon.audio_runtime.lock().await;
+        runtime.session_id.as_deref() == Some(session_id)
+            && runtime.account_context.as_ref() == Some(account_context)
+    };
+    if should_stop {
+        let _ = stop_audio_capture(daemon).await;
+        *daemon.last_live_transcript.lock().await = None;
+        set_overlay_listening_state(daemon, ListeningState::Paused).await;
+    }
+}
+
+async fn settle_audio_stop_transition(
+    daemon: &Arc<Daemon>,
+    transition: AudioStopTransition,
+) -> bool {
     let stopped_audio = transition.was_active_or_starting;
     let (Some(session_id), Some(deadline)) =
         (transition.finalizing_session_id, transition.tail_deadline)
@@ -9996,11 +13744,22 @@ fn select_audio_transcript_session(
     expected_session_id: Option<&str>,
     now: Instant,
 ) -> Option<AudioTranscriptSession> {
-    if let (Some(session_id), Some(meeting_id)) = (runtime.session_id.clone(), runtime.meeting_id) {
+    if runtime.session_id.is_some()
+        || runtime.meeting_id.is_some()
+        || runtime.account_context.is_some()
+    {
+        let (Some(session_id), Some(meeting_id), Some(account_context)) = (
+            runtime.session_id.clone(),
+            runtime.meeting_id,
+            runtime.account_context.clone(),
+        ) else {
+            return None;
+        };
         if expected_session_id.is_none_or(|expected| expected == session_id) {
             return Some(AudioTranscriptSession {
                 session_id,
                 meeting_id,
+                account_context,
                 finalizing: false,
             });
         }
@@ -10014,6 +13773,7 @@ fn select_audio_transcript_session(
         return Some(AudioTranscriptSession {
             session_id: finalizing.session_id.clone(),
             meeting_id: finalizing.meeting_id,
+            account_context: finalizing.account_context.clone(),
             finalizing: true,
         });
     }
@@ -10052,14 +13812,15 @@ async fn add_audio_transcript_segment(
     audio_session_id: &str,
     segment: &cue_core::audio::SttSegmentMetadata,
 ) -> Result<bool> {
-    add_audio_transcript_segment_inner(daemon, Some(audio_session_id), segment, false).await
+    add_audio_transcript_segment_inner(daemon, Some(audio_session_id), segment, false, None).await
 }
 
 async fn add_audio_transcript_segment_allowing_session_start(
     daemon: &Arc<Daemon>,
+    account_context: &AnswerAccountContext,
     segment: &cue_core::audio::SttSegmentMetadata,
 ) -> Result<bool> {
-    add_audio_transcript_segment_inner(daemon, None, segment, true).await
+    add_audio_transcript_segment_inner(daemon, None, segment, true, Some(account_context)).await
 }
 
 async fn add_audio_transcript_segment_inner(
@@ -10067,6 +13828,7 @@ async fn add_audio_transcript_segment_inner(
     expected_audio_session_id: Option<&str>,
     segment: &cue_core::audio::SttSegmentMetadata,
     allow_session_start: bool,
+    continuous_account_context: Option<&AnswerAccountContext>,
 ) -> Result<bool> {
     let audio_session =
         audio_transcript_session_for_segment(daemon, expected_audio_session_id).await;
@@ -10081,6 +13843,12 @@ async fn add_audio_transcript_segment_inner(
         .as_ref()
         .map(|session| session.session_id.clone())
         .unwrap_or_default();
+    let account_context = audio_session
+        .as_ref()
+        .map(|session| session.account_context.clone())
+        .or_else(|| continuous_account_context.cloned())
+        .ok_or_else(|| anyhow!(AnswerAccountContextChanged))?;
+    account_context.ensure_current(&daemon.paths)?;
     let meeting_id = if let Some(expected_meeting_id) =
         audio_session.as_ref().map(|session| session.meeting_id)
     {
@@ -10101,7 +13869,7 @@ async fn add_audio_transcript_segment_inner(
         }
         expected_meeting_id
     } else {
-        ensure_active_meeting_for_session(daemon, "continuous_audio_transcript")
+        ensure_active_meeting_for_session(daemon, "continuous_audio_transcript", &account_context)
             .await?
             .id
     };
@@ -10148,6 +13916,20 @@ async fn add_audio_transcript_segment_inner(
     }
 
     if !segment.is_final {
+        let _account_transition = daemon.account_answer_transition.lock().await;
+        account_context.ensure_current(&daemon.paths)?;
+        let meeting = daemon.meeting.lock().await.clone();
+        ensure!(
+            meeting.as_ref().is_some_and(|meeting| {
+                meeting.id == meeting_id
+                    && meeting_visible_for_owner(
+                        meeting,
+                        account_context.owner_account_id.as_deref(),
+                    )
+            }),
+            "live transcript session no longer belongs to the authorized account"
+        );
+        emit_first_stt_text_diagnostic(daemon, &audio_session_id, false, text.chars().count());
         let _ = send_overlay(
             daemon,
             OverlayCommand::TranscriptPartial {
@@ -10156,6 +13938,18 @@ async fn add_audio_transcript_segment_inner(
             },
         )
         .await;
+        if account_context.ensure_current(&daemon.paths).is_err() {
+            *daemon.last_live_transcript.lock().await = None;
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::TranscriptPartial {
+                    source: source_label.to_string(),
+                    text: String::new(),
+                },
+            )
+            .await;
+            return Err(anyhow!(AnswerAccountContextChanged));
+        }
         publish_live_transcript_event(
             daemon,
             LiveTranscriptEvent {
@@ -10169,9 +13963,16 @@ async fn add_audio_transcript_segment_inner(
             },
         )
         .await;
+        account_context.ensure_current(&daemon.paths)?;
         return Ok(false);
     }
 
+    // Use the same persistence barrier as hydration, answer publication, and
+    // account transitions. The durable tombstone sidecar is reapplied below
+    // so a stale in-memory live session cannot recreate content deleted on a
+    // different device.
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    account_context.ensure_current(&daemon.paths)?;
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         let Some(meeting) = meeting_guard
@@ -10185,6 +13986,18 @@ async fn add_audio_transcript_segment_inner(
             );
             return Ok(false);
         };
+        ensure!(
+            meeting_visible_for_owner(meeting, account_context.owner_account_id.as_deref()),
+            "active transcript session does not belong to the current account"
+        );
+        let owner_account_id = meeting.owner_account_id.clone();
+        if let Some(owner_account_id) = owner_account_id.as_deref() {
+            crate::cloud::sync::reapply_cloud_child_tombstones_before_save(
+                &daemon.paths.data_dir,
+                owner_account_id,
+                meeting,
+            )?;
+        }
         if is_near_duplicate_transcript(meeting, speaker, text, segment.is_final) {
             info!(
                 source = source_label,
@@ -10207,6 +14020,7 @@ async fn add_audio_transcript_segment_inner(
         meeting.action_items.extend(analysis.action_items);
         meeting.decisions.extend(analysis.decisions);
         daemon.store.save_active(meeting)?;
+        account_context.ensure_current(&daemon.paths)?;
         info!(
             meeting_id = %meeting.id,
             source = source_label,
@@ -10222,8 +14036,12 @@ async fn add_audio_transcript_segment_inner(
         meeting.clone()
     };
 
+    account_context.ensure_current(&daemon.paths)?;
+    emit_first_stt_text_diagnostic(daemon, &audio_session_id, true, text.chars().count());
+
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     schedule_auto_cloud_sync(daemon, "audio_transcript_final", None).await;
+    account_context.ensure_current(&daemon.paths)?;
     let _ = send_overlay(
         daemon,
         OverlayCommand::TranscriptFinal {
@@ -10232,6 +14050,7 @@ async fn add_audio_transcript_segment_inner(
         },
     )
     .await;
+    account_context.ensure_current(&daemon.paths)?;
 
     // Broadcast live transcript event for dashboard consumption.
     let ts_ms = meeting_snapshot
@@ -10252,6 +14071,7 @@ async fn add_audio_transcript_segment_inner(
         },
     )
     .await;
+    account_context.ensure_current(&daemon.paths)?;
 
     if segment.is_final {
         index_transcript_for_rag(daemon, meeting_snapshot.id.to_string(), text.to_string());
@@ -10420,7 +14240,10 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
         .cloned()
         .map(|artifact| ContextArtifactFileGuard::new(&daemon.paths, artifact))
         .collect::<Vec<_>>();
-    let meeting_snapshot = attach_context_artifacts(daemon, attached.clone()).await?;
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+    let meeting_snapshot =
+        attach_context_artifacts(daemon, attached.clone(), &account_context).await?;
     for guard in &mut artifact_files {
         guard.commit();
     }
@@ -10496,11 +14319,17 @@ async fn set_context_artifact_role(
     daemon: &Arc<Daemon>,
     id: uuid::Uuid,
     answer_context_role: AnswerContextRole,
+    account_context: &AnswerAccountContext,
 ) -> Result<(MeetingRecord, ContextArtifact)> {
+    account_context.ensure_current(&daemon.paths)?;
     let mut meeting_guard = daemon.meeting.lock().await;
     let current = meeting_guard
         .as_ref()
         .ok_or_else(|| anyhow!("no active session is available for context role assignment"))?;
+    ensure!(
+        meeting_visible_for_owner(current, account_context.owner_account_id.as_deref()),
+        "active session does not belong to the current account"
+    );
     let mut next = current.clone();
     let artifact = next
         .context
@@ -10516,12 +14345,14 @@ async fn set_context_artifact_role(
     }
     artifact.set_answer_context_role(answer_context_role);
     let updated = artifact.clone();
+    account_context.ensure_current(&daemon.paths)?;
     daemon.store.save_active(&next)?;
+    account_context.ensure_current(&daemon.paths)?;
     *meeting_guard = Some(next.clone());
     Ok((next, updated))
 }
 
-async fn handle_instructions_requested(daemon: &Arc<Daemon>) -> Result<()> {
+async fn handle_instructions_requested(daemon: &Arc<Daemon>, generation: u64) -> Result<()> {
     let current = daemon
         .meeting
         .lock()
@@ -10538,7 +14369,13 @@ async fn handle_instructions_requested(daemon: &Arc<Daemon>) -> Result<()> {
     } else {
         Some(text.trim().to_string())
     };
-    let meeting_snapshot = set_answer_instructions(daemon, instructions).await?;
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    ensure!(
+        daemon.overlay_generation.load(Ordering::Acquire) == generation,
+        "stale overlay instruction mutation"
+    );
+    let account_context = AnswerAccountContext::capture(&daemon.paths)?;
+    let meeting_snapshot = set_answer_instructions(daemon, instructions, &account_context).await?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     push_system_card(
         daemon,
@@ -10557,6 +14394,7 @@ async fn answer_question(
     daemon: &Arc<Daemon>,
     question: String,
     source: impl Into<String>,
+    expected_fence: Option<DaemonMutationFence>,
 ) -> Result<AnswerResponse> {
     let question = question.trim().to_string();
     if question.is_empty() {
@@ -10564,7 +14402,8 @@ async fn answer_question(
     }
 
     let request = default_answer_request(&question);
-    let (response, _events) = answer_with_provider_runtime(daemon, request, source).await?;
+    let (response, _events) =
+        answer_with_provider_runtime(daemon, request, source, expected_fence).await?;
     Ok(response)
 }
 
@@ -10572,8 +14411,14 @@ async fn answer_with_provider_runtime(
     daemon: &Arc<Daemon>,
     mut request: AnswerRequest,
     source: impl Into<String>,
+    expected_fence: Option<DaemonMutationFence>,
 ) -> Result<(AnswerResponse, Vec<AnswerStreamEvent>)> {
     let pipeline_started_at = Instant::now();
+    let interaction_id = request
+        .metadata
+        .interaction_id
+        .unwrap_or_else(uuid::Uuid::new_v4);
+    request.metadata.interaction_id = Some(interaction_id);
     let source = source.into();
     request.question = request.question.trim().to_string();
     if request.question.is_empty() {
@@ -10582,17 +14427,28 @@ async fn answer_with_provider_runtime(
     let live_caption_answer = request.metadata.answer_current_transcript
         || is_live_caption_answer_prompt(&request.question);
     wait_for_live_caption_answer_transcript_settle(daemon, live_caption_answer).await;
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    let answer_account_context = match expected_fence.as_ref() {
+        Some(fence) => validate_session_mutation_fence(daemon, fence, false).await?,
+        None => AnswerAccountContext::capture(&daemon.paths)?,
+    };
     let generation_id = next_answer_generation(daemon);
-
     let (meeting_snapshot, answer_meeting, live_transcript_high_water_mark) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            let meeting = new_owned_meeting(&daemon.paths, Some("New recording".to_string()));
+            answer_account_context.ensure_current(&daemon.paths)?;
+            let meeting =
+                new_meeting_for_account(&answer_account_context, Some("New recording".to_string()));
             daemon.store.save_active(&meeting)?;
+            answer_account_context.ensure_current(&daemon.paths)?;
             *meeting_guard = Some(meeting);
         }
 
         let meeting = meeting_guard.as_ref().expect("meeting exists");
+        ensure!(
+            meeting_visible_for_owner(meeting, answer_account_context.owner_account_id.as_deref(),),
+            "active answer session does not belong to the authorized account"
+        );
         if request.metadata.meeting_id.is_none() {
             request.metadata.meeting_id = Some(meeting.id);
         }
@@ -10621,6 +14477,13 @@ async fn answer_with_provider_runtime(
             live_transcript_high_water_mark,
         )
     };
+    drop(_account_transition);
+    if meeting_snapshot.owner_account_id.as_deref()
+        != answer_account_context.owner_account_id.as_deref()
+    {
+        return Err(anyhow!(AnswerAccountContextChanged));
+    }
+    let answer_audit_scope = SessionAuditScope::from_meeting(&meeting_snapshot);
     let live_interim_context = if live_caption_answer {
         recent_interim_live_transcript_context(daemon).await
     } else {
@@ -10630,10 +14493,11 @@ async fn answer_with_provider_runtime(
         && !meeting_snapshot.has_unanswered_live_transcript()
         && live_interim_context.is_none()
     {
-        record_active_session_diagnostic(
+        let _ = record_active_session_diagnostic_for_context(
             daemon,
             "answer_skipped_no_new_transcript",
             "Answer was requested before the current Listen run produced new transcript text.",
+            &answer_account_context,
         )
         .await;
         return Err(anyhow!(
@@ -10649,6 +14513,8 @@ async fn answer_with_provider_runtime(
             &meeting_snapshot,
             &request.question,
             &request.metadata.visible_context_ids,
+            interaction_id,
+            request.metadata.request_id,
         )
         .await;
     }
@@ -10666,6 +14532,27 @@ async fn answer_with_provider_runtime(
     let question_display_context =
         visible_question_context_for_ids(&meeting_snapshot, &question_attachment_ids);
     let final_context_shape = answer_context_shape(&request.context);
+    emit_diagnostic_for_scope(
+        daemon,
+        answer_audit_scope.clone(),
+        DiagnosticEvent::new(
+            DiagnosticEventKind::AnswerContextPrepared,
+            DiagnosticComponent::Rag,
+            DiagnosticOutcome::Succeeded,
+        )
+        .interaction_id(Some(interaction_id))
+        .trace_id(request.metadata.correlation_id.as_deref())
+        .request_id(request.metadata.request_id)
+        .duration_ms(Some(context_prepare_ms))
+        .context_count(final_context_shape.total)
+        .context_shape(
+            final_context_shape.documents,
+            final_context_shape.screenshots,
+            final_context_shape.transcripts,
+            final_context_shape.memory,
+        ),
+        DiagnosticPriority::Ordinary,
+    );
     log_answer_request_diagnostics(&request, &source, question_display_context.len());
     let (visible_question_title, visible_question) =
         visible_question_for_source(&request.question, &source, &question_display_context);
@@ -10684,25 +14571,29 @@ async fn answer_with_provider_runtime(
         },
     )
     .await;
-    record_visible_audit_event(
+    emit_diagnostic_for_scope(
         daemon,
-        "ui_question_card",
-        json!({
-            "request_id": request.metadata.request_id.to_string(),
-            "source": source.clone(),
-            "route": format!("{:?}", request.route),
-            "title": visible_question_title.clone(),
-            "text": compact_snippet(&visible_question, 16_000),
-            "visible_context_count": question_display_context.len(),
-            "attachment_ids": question_attachment_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-            "answer_context_total": final_context_shape.total,
-            "answer_context_documents": final_context_shape.documents,
-            "answer_context_memory": final_context_shape.memory,
-            "answer_context_screenshots": final_context_shape.screenshots,
-            "answer_context_transcripts": final_context_shape.transcripts,
-        }),
-    )
-    .await;
+        answer_audit_scope.clone(),
+        DiagnosticEvent::new(
+            DiagnosticEventKind::AnswerRequestAccepted,
+            DiagnosticComponent::Daemon,
+            DiagnosticOutcome::Started,
+        )
+        .interaction_id(Some(interaction_id))
+        .request_id(request.metadata.request_id)
+        .provider(&request.route.primary.provider.display_label())
+        .streaming(request.metadata.stream)
+        .input_chars(request.question.chars().count())
+        .question_intent(question_intent_label(&request.question))
+        .context_count(final_context_shape.total)
+        .context_shape(
+            final_context_shape.documents,
+            final_context_shape.screenshots,
+            final_context_shape.transcripts,
+            final_context_shape.memory,
+        ),
+        DiagnosticPriority::Ordinary,
+    );
     write_state(daemon).await?;
 
     let answer_card_started_at = Instant::now();
@@ -10712,22 +14603,48 @@ async fn answer_with_provider_runtime(
     let answer_card_id = answer_card.id;
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card: answer_card }).await;
     register_active_answer_card(daemon, generation_id, answer_card_id).await;
-    let mut overlay_stream =
-        OverlayAnswerStream::new(Arc::clone(daemon), answer_card_id, generation_id);
-    overlay_stream.push_status(initial_progress).await?;
-    record_visible_audit_event(
+    let mut overlay_stream = OverlayAnswerStream::new(
+        Arc::clone(daemon),
+        OverlayAnswerStreamConfig {
+            card_id: answer_card_id,
+            generation_id,
+            interaction_id,
+            request_id: request.metadata.request_id,
+            audit_scope: answer_audit_scope.clone(),
+            started_at: pipeline_started_at,
+            answer_account_context: answer_account_context.clone(),
+        },
+    );
+    if let Err(error) = overlay_stream.push_status(initial_progress).await {
+        if answer_account_context_changed(&error) {
+            let error = discard_answer_after_account_context_change(
+                daemon,
+                generation_id,
+                answer_card_id,
+                request.metadata.request_id,
+            )
+            .await;
+            return Err(error);
+        }
+        clear_active_answer_card(daemon, generation_id, answer_card_id).await;
+        return Err(error);
+    }
+    emit_diagnostic_for_scope(
         daemon,
-        "ui_answer_started",
-        json!({
-            "request_id": request.metadata.request_id.to_string(),
-            "card_id": answer_card_id.to_string(),
-            "generation_id": generation_id,
-            "progress": initial_progress,
-            "route": format!("{:?}", request.route),
-            "streaming": request.metadata.stream,
-        }),
-    )
-    .await;
+        answer_audit_scope.clone(),
+        DiagnosticEvent::new(
+            DiagnosticEventKind::AnswerCardCreated,
+            DiagnosticComponent::Daemon,
+            DiagnosticOutcome::Succeeded,
+        )
+        .interaction_id(Some(interaction_id))
+        .request_id(request.metadata.request_id)
+        .card_id(answer_card_id)
+        .generation(generation_id)
+        .streaming(request.metadata.stream)
+        .duration_ms(Some(elapsed_ms(answer_card_started_at))),
+        DiagnosticPriority::Ordinary,
+    );
     info!(
         request_id = %request.metadata.request_id,
         card_id = %answer_card_id,
@@ -10745,7 +14662,6 @@ async fn answer_with_provider_runtime(
         generation_id,
         route_primary = %request.route.primary.provider.display_label(),
         route_fallbacks = request.route.fallbacks.len(),
-        question_hash = %stable_text_hash_prefix(&request.question),
         question_chars = request.question.chars().count(),
         question_words = word_count(&request.question),
         question_intent = question_intent_label(&request.question),
@@ -10769,11 +14685,26 @@ async fn answer_with_provider_runtime(
         &request,
         &answer_meeting,
         Some(&mut overlay_stream),
+        &answer_account_context,
     )
     .await
     {
         Ok(outcome) => outcome,
         Err(error) => {
+            if answer_account_context_changed(&error)
+                || answer_account_context
+                    .ensure_owner_current(&daemon.paths)
+                    .is_err()
+            {
+                let error = discard_answer_after_account_context_change(
+                    daemon,
+                    generation_id,
+                    answer_card_id,
+                    request.metadata.request_id,
+                )
+                .await;
+                return Err(error);
+            }
             if is_answer_generation_current(daemon, generation_id) {
                 let user_message = user_facing_answer_error(&error);
                 let error_message = if let Some(partial) =
@@ -10795,26 +14726,52 @@ async fn answer_with_provider_runtime(
                     question_display_context.len(),
                     &error,
                 );
-                record_active_session_diagnostic(daemon, "answer_error", &error_message).await;
-                let _ = overlay_stream.finish(&error_message).await;
-                record_visible_audit_event(
+                let _ = record_active_session_diagnostic_for_context(
                     daemon,
-                    "ui_answer_error",
-                    json!({
-                        "request_id": request.metadata.request_id.to_string(),
-                        "card_id": answer_card_id.to_string(),
-                        "generation_id": generation_id,
-                        "visible_message": error_message.clone(),
-                        "raw_error": compact_snippet(&format!("{error:#}"), 4_000),
-                    }),
+                    "answer_error",
+                    &error_message,
+                    &answer_account_context,
                 )
                 .await;
+                let _ = overlay_stream.finish(&error_message).await;
+                emit_diagnostic_for_scope(
+                    daemon,
+                    answer_audit_scope.clone(),
+                    DiagnosticEvent::new(
+                        DiagnosticEventKind::AnswerFailed,
+                        DiagnosticComponent::Daemon,
+                        DiagnosticOutcome::Failed,
+                    )
+                    .interaction_id(Some(interaction_id))
+                    .request_id(request.metadata.request_id)
+                    .card_id(answer_card_id)
+                    .generation(generation_id)
+                    .error_category(answer_diagnostic_error_category(&error))
+                    .duration_ms(Some(elapsed_ms(pipeline_started_at))),
+                    DiagnosticPriority::Terminal,
+                );
+                let _account_transition = daemon.account_answer_transition.lock().await;
+                if answer_account_context
+                    .ensure_owner_current(&daemon.paths)
+                    .is_err()
+                {
+                    clear_active_answer_card(daemon, generation_id, answer_card_id).await;
+                    return Err(anyhow!(AnswerAccountContextChanged));
+                }
                 let failed_meeting_snapshot = {
                     let mut meeting_guard = daemon.meeting.lock().await;
                     if let Some(meeting) = meeting_guard
                         .as_mut()
                         .filter(|meeting| meeting.id == meeting_snapshot.id)
                     {
+                        let owner_account_id = meeting.owner_account_id.clone();
+                        if let Some(owner_account_id) = owner_account_id.as_deref() {
+                            crate::cloud::sync::reapply_cloud_child_tombstones_before_save(
+                                &daemon.paths.data_dir,
+                                owner_account_id,
+                                meeting,
+                            )?;
+                        }
                         let failed_turn = ConversationTurn::new(
                             visible_question.clone(),
                             error_message.clone(),
@@ -10864,6 +14821,22 @@ async fn answer_with_provider_runtime(
             return Err(error);
         }
     };
+    if ensure_answer_account_context_for_provider(
+        &answer_account_context,
+        &daemon.paths,
+        &outcome.provider,
+    )
+    .is_err()
+    {
+        let error = discard_answer_after_account_context_change(
+            daemon,
+            generation_id,
+            answer_card_id,
+            request.metadata.request_id,
+        )
+        .await;
+        return Err(error);
+    }
     let route_total_ms = elapsed_ms(route_started_at);
     let safety = outcome.safety.clone();
     let answer_start_latency_ms = overlay_stream.answer_start_latency_ms();
@@ -10904,33 +14877,31 @@ async fn answer_with_provider_runtime(
             context_transcripts = final_context_shape.transcripts,
             "answer first visible text was slow"
         );
-        record_visible_audit_event(
+        emit_diagnostic_for_scope(
             daemon,
-            "ui_answer_slow_start",
-            json!({
-                "request_id": request.metadata.request_id.to_string(),
-                "request_ref": short_request_ref(request.metadata.request_id),
-                "card_id": answer_card_id.to_string(),
-                "generation_id": generation_id,
-                "provider": outcome.provider.display_label(),
-                "route_primary": request.route.primary.provider.display_label(),
-                "answer_start_latency_ms": start_latency_ms,
-                "route_total_ms": route_total_ms,
-                "context_prepare_ms": context_prepare_ms,
-                "overlay_card_ms": overlay_card_ms,
-                "pipeline_total_ms": elapsed_ms(pipeline_started_at),
-                "question_words": word_count(&request.question),
-                "question_intent": question_intent_label(&request.question),
-                "context_was_empty": context_was_empty,
-                "visible_context_count": question_display_context.len(),
-                "answer_context_total": final_context_shape.total,
-                "answer_context_documents": final_context_shape.documents,
-                "answer_context_memory": final_context_shape.memory,
-                "answer_context_screenshots": final_context_shape.screenshots,
-                "answer_context_transcripts": final_context_shape.transcripts,
-            }),
-        )
-        .await;
+            answer_audit_scope.clone(),
+            DiagnosticEvent::new(
+                DiagnosticEventKind::AnswerSlowStart,
+                DiagnosticComponent::Daemon,
+                DiagnosticOutcome::TimedOut,
+            )
+            .interaction_id(Some(interaction_id))
+            .request_id(request.metadata.request_id)
+            .card_id(answer_card_id)
+            .generation(generation_id)
+            .provider(&outcome.provider.display_label())
+            .route(&request.route.primary.provider.display_label())
+            .duration_ms(Some(start_latency_ms))
+            .question_intent(question_intent_label(&request.question))
+            .context_count(final_context_shape.total)
+            .context_shape(
+                final_context_shape.documents,
+                final_context_shape.screenshots,
+                final_context_shape.transcripts,
+                final_context_shape.memory,
+            ),
+            DiagnosticPriority::Terminal,
+        );
     }
     log_answer_completion_diagnostics(
         &request,
@@ -10942,6 +14913,7 @@ async fn answer_with_provider_runtime(
     );
     let metadata =
         AnswerResponseMetadata::new(request.metadata.request_id, outcome.provider.clone())
+            .with_interaction_id(interaction_id)
             .with_requested_route(request.route.clone())
             .with_latency(outcome.latency_ms)
             .with_usage(
@@ -10997,40 +14969,101 @@ async fn answer_with_provider_runtime(
     });
     events.push(AnswerStreamEvent::completed(response.clone()));
 
+    // This lock is shared with account publication and sign-out. Once the
+    // final account/generation checks pass, no owner transition can interleave
+    // with final presentation or either local persistence surface.
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    if let Some(fence) = expected_fence.as_ref() {
+        validate_session_mutation_fence(daemon, fence, false).await?;
+    }
     if !is_answer_generation_current(daemon, generation_id) {
         clear_active_answer_card(daemon, generation_id, answer_card_id).await;
+        if ensure_answer_account_context_for_provider(
+            &answer_account_context,
+            &daemon.paths,
+            &outcome.provider,
+        )
+        .is_err()
+        {
+            return Err(anyhow!(AnswerAccountContextChanged));
+        }
         return Ok((response, events));
     }
 
-    if !overlay_stream.has_text() {
-        overlay_stream.replay_text(&response.answer).await?;
-    }
     let persisted_cost_label =
         answer_overlay_cost_label(&response.metadata, answer_start_latency_ms);
-    overlay_stream
-        .finish_with_cost_label(&response.answer, persisted_cost_label.clone())
-        .await?;
-    record_visible_audit_event(
-        daemon,
-        "ui_answer_finished",
-        json!({
-            "request_id": request.metadata.request_id.to_string(),
-            "card_id": answer_card_id.to_string(),
-            "generation_id": generation_id,
-            "provider": outcome.provider.display_label(),
-            "latency_ms": outcome.latency_ms,
-            "answer_start_latency_ms": answer_start_latency_ms,
-            "visible_answer": compact_snippet(&response.answer, 64_000),
-            "cost_label": persisted_cost_label.clone(),
-            "sources": outcome.sources.len(),
-        }),
-    )
+    let overlay_result = async {
+        if !overlay_stream.has_text() {
+            overlay_stream.replay_text(&response.answer).await?;
+        }
+        overlay_stream
+            .finish_with_cost_label(&response.answer, persisted_cost_label.clone())
+            .await
+    }
     .await;
-    let still_current = is_answer_generation_current(daemon, generation_id);
-    clear_active_answer_card(daemon, generation_id, answer_card_id).await;
-    if !still_current {
+    if let Err(error) = overlay_result {
+        if answer_account_context_changed(&error) {
+            let error = discard_answer_after_account_context_change(
+                daemon,
+                generation_id,
+                answer_card_id,
+                request.metadata.request_id,
+            )
+            .await;
+            return Err(error);
+        }
+        clear_active_answer_card(daemon, generation_id, answer_card_id).await;
+        return Err(error);
+    }
+    emit_diagnostic_for_scope(
+        daemon,
+        answer_audit_scope.clone(),
+        DiagnosticEvent::new(
+            DiagnosticEventKind::AnswerRouteCompleted,
+            DiagnosticComponent::Model,
+            DiagnosticOutcome::Succeeded,
+        )
+        .interaction_id(Some(interaction_id))
+        .request_id(request.metadata.request_id)
+        .card_id(answer_card_id)
+        .generation(generation_id)
+        .provider(&outcome.provider.display_label())
+        .duration_ms(Some(outcome.latency_ms))
+        .output_chars(response.answer.chars().count())
+        .source_count(outcome.sources.len())
+        .count(outcome.attempts.len()),
+        DiagnosticPriority::Terminal,
+    );
+    if !is_answer_generation_current(daemon, generation_id) {
+        clear_active_answer_card(daemon, generation_id, answer_card_id).await;
+        if ensure_answer_account_context_for_provider(
+            &answer_account_context,
+            &daemon.paths,
+            &outcome.provider,
+        )
+        .is_err()
+        {
+            return Err(anyhow!(AnswerAccountContextChanged));
+        }
         return Ok((response, events));
     }
+    if ensure_answer_account_context_for_provider(
+        &answer_account_context,
+        &daemon.paths,
+        &outcome.provider,
+    )
+    .is_err()
+    {
+        let error = discard_answer_after_account_context_change(
+            daemon,
+            generation_id,
+            answer_card_id,
+            request.metadata.request_id,
+        )
+        .await;
+        return Err(error);
+    }
+    clear_active_answer_card(daemon, generation_id, answer_card_id).await;
     if let Some(source_card) = source_card_for_managed_sources(&outcome.sources) {
         let _ = send_overlay(daemon, OverlayCommand::PushCard { card: source_card }).await;
     }
@@ -11049,6 +15082,21 @@ async fn answer_with_provider_runtime(
             "answer completed after the active session changed; skipping stale persistence"
         );
         return Ok((response, events));
+    }
+
+    if ensure_answer_account_context_for_provider(
+        &answer_account_context,
+        &daemon.paths,
+        &outcome.provider,
+    )
+    .is_err()
+    {
+        warn!(
+            request_id = %request.metadata.request_id,
+            generation_id,
+            "discarded answer before persistence after the signed-in account context changed"
+        );
+        return Err(anyhow!(AnswerAccountContextChanged));
     }
 
     let persisted_artifact = outcome
@@ -11084,9 +15132,27 @@ async fn answer_with_provider_runtime(
         "conversation answer persistence diagnostics"
     );
 
+    let persistence_started_at = Instant::now();
+    let mut response_db_persisted = true;
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if let Some(meeting) = meeting_guard.as_mut() {
+            ensure!(
+                meeting.id == meeting_snapshot.id
+                    && meeting_visible_for_owner(
+                        meeting,
+                        answer_account_context.owner_account_id.as_deref(),
+                    ),
+                "active answer session changed before persistence"
+            );
+            let owner_account_id = meeting.owner_account_id.clone();
+            if let Some(owner_account_id) = owner_account_id.as_deref() {
+                crate::cloud::sync::reapply_cloud_child_tombstones_before_save(
+                    &daemon.paths.data_dir,
+                    owner_account_id,
+                    meeting,
+                )?;
+            }
             let conversation_turn = ConversationTurn::new(
                 visible_question.clone(),
                 persisted_answer.clone(),
@@ -11107,6 +15173,11 @@ async fn answer_with_provider_runtime(
                 &persisted_answer,
             );
             maybe_autoname_meeting(meeting, &request.question);
+            ensure_answer_account_context_for_provider(
+                &answer_account_context,
+                &daemon.paths,
+                &outcome.provider,
+            )?;
             daemon.store.save_active(meeting)?;
             if let Err(error) = persist_conversation_turn_response(
                 &daemon.paths,
@@ -11115,6 +15186,7 @@ async fn answer_with_provider_runtime(
                 &response.metadata,
                 persisted_cost_label.as_deref(),
             ) {
+                response_db_persisted = false;
                 warn!(
                     error = %error,
                     meeting_id = %meeting.id,
@@ -11137,25 +15209,48 @@ async fn answer_with_provider_runtime(
     };
     if live_caption_answer {
         *daemon.last_live_transcript.lock().await = None;
-        record_visible_audit_event(
+        emit_diagnostic_for_scope(
             daemon,
-            "transcript_buffer_consumed",
-            json!({
-                "meeting_id": meeting_snapshot.id.to_string(),
-                "consumed_segments": live_transcript_high_water_mark,
-                "remaining_segments": meeting_snapshot
-                    .transcript
-                    .len()
-                    .saturating_sub(meeting_snapshot.live_answer_transcript_cursor),
-                "request_id": request.metadata.request_id.to_string(),
-            }),
-        )
-        .await;
+            answer_audit_scope.clone(),
+            DiagnosticEvent::new(
+                DiagnosticEventKind::TranscriptBufferConsumed,
+                DiagnosticComponent::Stt,
+                DiagnosticOutcome::Succeeded,
+            )
+            .interaction_id(Some(interaction_id))
+            .request_id(request.metadata.request_id)
+            .count(live_transcript_high_water_mark),
+            DiagnosticPriority::Ordinary,
+        );
     }
 
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     refresh_overlay_context_items(daemon, &meeting_snapshot).await;
     write_state(daemon).await?;
+    let persistence_outcome = if response_db_persisted {
+        DiagnosticOutcome::Succeeded
+    } else {
+        DiagnosticOutcome::Failed
+    };
+    emit_diagnostic_for_scope(
+        daemon,
+        SessionAuditScope::from_meeting(&meeting_snapshot),
+        DiagnosticEvent::new(
+            DiagnosticEventKind::PersistenceCompleted,
+            DiagnosticComponent::Persistence,
+            persistence_outcome,
+        )
+        .interaction_id(Some(interaction_id))
+        .request_id(request.metadata.request_id)
+        .duration_ms(Some(elapsed_ms(persistence_started_at)))
+        .count(1)
+        .error_category(if response_db_persisted {
+            "none"
+        } else {
+            "response_db_write_failed"
+        }),
+        DiagnosticPriority::Terminal,
+    );
     schedule_auto_cloud_sync(daemon, "answer_saved", None).await;
     Ok((response, events))
 }
@@ -11201,24 +15296,27 @@ fn persist_conversation_turn_response(
     let model = metadata.provider.model.as_ref().map(|model| model.as_str());
     let session_id = meeting.id.to_string();
 
-    db.insert_cue_response(crate::db::NewCueResponse {
-        id: &response_id,
-        session_id: &session_id,
-        kind: "answer",
-        text: &turn.answer,
-        source_text: Some(&turn.question),
-        ts_ms: turn_created_at,
-        cost_cents,
-        balance_cents_after: None,
-        provider: Some(provider_id.as_str()),
-        model,
-        input_tokens: usage.map(|usage| usage.input_tokens as i64),
-        output_tokens: usage.map(|usage| usage.output_tokens as i64),
-        cost_label,
-        artifact_type,
-        artifact_body,
-        artifact_confidence,
-    })?;
+    db.insert_cue_response_for_owner(
+        meeting.owner_account_id.as_deref(),
+        crate::db::NewCueResponse {
+            id: &response_id,
+            session_id: &session_id,
+            kind: "answer",
+            text: &turn.answer,
+            source_text: Some(&turn.question),
+            ts_ms: turn_created_at,
+            cost_cents,
+            balance_cents_after: None,
+            provider: Some(provider_id.as_str()),
+            model,
+            input_tokens: usage.map(|usage| usage.input_tokens as i64),
+            output_tokens: usage.map(|usage| usage.output_tokens as i64),
+            cost_label,
+            artifact_type,
+            artifact_body,
+            artifact_confidence,
+        },
+    )?;
     Ok(())
 }
 
@@ -13184,6 +17282,7 @@ async fn resolve_answer_route(
     request: &AnswerRequest,
     meeting: &MeetingRecord,
     mut stream: Option<&mut OverlayAnswerStream>,
+    answer_account_context: &AnswerAccountContext,
 ) -> Result<AnswerRouteOutcome> {
     if let Some(refusal) = internal_disclosure_refusal_for_question(&request.question) {
         let started_at = Instant::now();
@@ -13210,6 +17309,7 @@ async fn resolve_answer_route(
     let mut failures = Vec::new();
 
     for (fallback_depth, step) in request.route.steps().enumerate() {
+        answer_account_context.ensure_owner_current(paths)?;
         let config = provider_client_config(&step.provider);
         let required_capabilities = if step.required_capabilities.is_empty() {
             vec![cue_core::AiCapability::Chat]
@@ -13275,8 +17375,15 @@ async fn resolve_answer_route(
         if matches!(step.provider.provider_kind, AiProviderKind::CueManaged) {
             payload.context = compact_managed_answer_context(&payload.context);
             let stream_ref = stream.as_mut().map(|stream| &mut **stream);
-            match call_bluey_managed_provider(paths, request, &step.provider, &payload, stream_ref)
-                .await
+            match call_bluey_managed_provider(
+                paths,
+                request,
+                &step.provider,
+                &payload,
+                stream_ref,
+                answer_account_context,
+            )
+            .await
             {
                 Ok(answer) => {
                     attempts.push(
@@ -13299,6 +17406,10 @@ async fn resolve_answer_route(
                     });
                 }
                 Err(error) => {
+                    if answer_account_context_changed(&error) {
+                        return Err(error);
+                    }
+                    answer_account_context.ensure_current(paths)?;
                     let message = format!(
                         "{} request failed: {error:#}",
                         step.provider.display_label()
@@ -13345,6 +17456,7 @@ async fn resolve_answer_route(
                 });
             }
             Err(error) => {
+                answer_account_context.ensure_owner_current(paths)?;
                 let message = format!(
                     "{} request failed: {error:#}",
                     step.provider.display_label()
@@ -13371,8 +17483,24 @@ async fn call_bluey_managed_provider(
     provider: &ProviderSelector,
     payload: &ProviderRequestPayload,
     mut stream: Option<&mut OverlayAnswerStream>,
+    answer_account_context: &AnswerAccountContext,
 ) -> Result<LiveProviderAnswer> {
-    let client = build_cloud_client(paths, request.metadata.correlation_id.as_deref())?;
+    let account_context =
+        AccountCloudContext::snapshot(paths, request.metadata.correlation_id.as_deref())?;
+    account_context.ensure_answer_context(answer_account_context)?;
+    if let Some(stream) = stream.as_deref_mut() {
+        stream.require_managed_account_context();
+    }
+    let client = account_context.client.clone();
+    let client = request
+        .metadata
+        .interaction_id
+        .map(|interaction_id| {
+            client
+                .clone()
+                .with_interaction_id(interaction_id.to_string())
+        })
+        .unwrap_or(client);
     let lane = managed_lane_for_provider(provider, payload);
     let managed = BlueyManagedProvider::new(client, lane);
     let prompt = managed_provider_prompt_parts(payload)?;
@@ -13394,6 +17522,29 @@ async fn call_bluey_managed_provider(
     let started_at = Instant::now();
 
     if payload.stream {
+        if let Some(stream) = stream.as_deref_mut() {
+            stream
+                .emit_diagnostic(
+                    DiagnosticEvent::new(
+                        DiagnosticEventKind::ModelAttemptStarted,
+                        DiagnosticComponent::Model,
+                        DiagnosticOutcome::Started,
+                    )
+                    .interaction_id(request.metadata.interaction_id)
+                    .request_id(request.metadata.request_id)
+                    .provider(&provider.display_label())
+                    .model(
+                        provider
+                            .model
+                            .as_ref()
+                            .map(|model| model.as_str())
+                            .unwrap_or("bluey-managed"),
+                    )
+                    .attempt(1),
+                    DiagnosticPriority::Ordinary,
+                )
+                .await;
+        }
         if let Some(stream) = stream.as_mut() {
             let status = if !llm_request.image_data_urls.is_empty() {
                 "Reading screen context"
@@ -13416,13 +17567,12 @@ async fn call_bluey_managed_provider(
             image_count = llm_request.image_data_urls.len(),
             system_chars = llm_request.system.chars().count(),
             user_chars = llm_request.user.chars().count(),
-            user_hash = %stable_text_hash_prefix(&llm_request.user),
             "managed provider stream starting"
         );
-        let mut chunks = managed
-            .complete_stream(&llm_request)
-            .await
-            .map_err(managed_llm_error)?;
+        account_context.ensure_answer_context(answer_account_context)?;
+        let chunks_result = managed.complete_stream(&llm_request).await;
+        account_context.ensure_answer_context(answer_account_context)?;
+        let mut chunks = chunks_result.map_err(managed_llm_error)?;
         info!(
             provider = %provider.display_label(),
             request_id = %request.metadata.request_id,
@@ -13431,6 +17581,22 @@ async fn call_bluey_managed_provider(
             stream_connect_ms = elapsed_ms(started_at),
             "managed provider stream connected"
         );
+        if let Some(stream) = stream.as_deref_mut() {
+            stream
+                .emit_diagnostic(
+                    DiagnosticEvent::new(
+                        DiagnosticEventKind::ModelConnected,
+                        DiagnosticComponent::Model,
+                        DiagnosticOutcome::Succeeded,
+                    )
+                    .interaction_id(request.metadata.interaction_id)
+                    .request_id(request.metadata.request_id)
+                    .provider(&provider.display_label())
+                    .duration_ms(Some(elapsed_ms(started_at))),
+                    DiagnosticPriority::Ordinary,
+                )
+                .await;
+        }
         let mut answer = String::new();
         let mut token_usage = None;
         let mut cost_label = None;
@@ -13441,6 +17607,7 @@ async fn call_bluey_managed_provider(
         let mut first_event_logged = false;
         let mut first_text_logged = false;
         while let Some(chunk) = chunks.next().await {
+            account_context.ensure_answer_context(answer_account_context)?;
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -13452,6 +17619,8 @@ async fn call_bluey_managed_provider(
                             &llm_request,
                             &mut stream,
                             &answer,
+                            &account_context,
+                            answer_account_context,
                             provider,
                             request.metadata.request_id,
                             started_at,
@@ -13462,15 +17631,24 @@ async fn call_bluey_managed_provider(
                             Ok(Some(recovered)) => return Ok(recovered),
                             Ok(None) => {}
                             Err(recovery_error) => {
+                                if answer_account_context_changed(&recovery_error) {
+                                    return Err(recovery_error);
+                                }
+                                let raw_recovery_error = format!("{recovery_error:#}");
                                 warn!(
                                     provider = %provider.display_label(),
                                     request_id = %request.metadata.request_id,
-                                    recovery_error = %recovery_error,
+                                    recovery_error_category = answer_diagnostic_error_category(&recovery_error),
+                                    recovery_error_ref = %closed_diagnostic_ref(
+                                        "managed stream recovery",
+                                        &raw_recovery_error,
+                                    ),
                                     "managed provider stream cache recovery failed"
                                 );
                             }
                         }
                     }
+                    account_context.ensure_answer_context(answer_account_context)?;
                     if !answer.trim().is_empty()
                         && is_missing_terminal_stream_metadata_error(&lower)
                         && incomplete_answer_reason(&answer).is_none()
@@ -13500,6 +17678,22 @@ async fn call_bluey_managed_provider(
                     sources_count = chunk.sources.len(),
                     "managed provider stream first event"
                 );
+                if let Some(stream) = stream.as_deref_mut() {
+                    stream
+                        .emit_diagnostic(
+                            DiagnosticEvent::new(
+                                DiagnosticEventKind::ModelFirstEvent,
+                                DiagnosticComponent::Model,
+                                DiagnosticOutcome::Succeeded,
+                            )
+                            .interaction_id(request.metadata.interaction_id)
+                            .request_id(request.metadata.request_id)
+                            .provider(&provider.display_label())
+                            .duration_ms(Some(first_event_ms)),
+                            DiagnosticPriority::Ordinary,
+                        )
+                        .await;
+                }
                 if first_event_ms >= 2_000 {
                     warn!(
                         provider = %provider.display_label(),
@@ -13541,6 +17735,23 @@ async fn call_bluey_managed_provider(
                         first_text_chars = chunk.text.chars().count(),
                         "managed provider stream first text"
                     );
+                    if let Some(stream) = stream.as_deref_mut() {
+                        stream
+                            .emit_diagnostic(
+                                DiagnosticEvent::new(
+                                    DiagnosticEventKind::ModelFirstText,
+                                    DiagnosticComponent::Model,
+                                    DiagnosticOutcome::Succeeded,
+                                )
+                                .interaction_id(request.metadata.interaction_id)
+                                .request_id(request.metadata.request_id)
+                                .provider(&provider.display_label())
+                                .duration_ms(Some(first_text_ms))
+                                .output_chars(chunk.text.chars().count()),
+                                DiagnosticPriority::Ordinary,
+                            )
+                            .await;
+                    }
                     if first_text_ms >= 2_500 {
                         warn!(
                             provider = %provider.display_label(),
@@ -13585,6 +17796,7 @@ async fn call_bluey_managed_provider(
                 saw_finished = true;
             }
         }
+        account_context.ensure_answer_context(answer_account_context)?;
         info!(
             provider = %provider.display_label(),
             request_id = %request.metadata.request_id,
@@ -13600,6 +17812,24 @@ async fn call_bluey_managed_provider(
             token_total = token_usage.map(|usage| usage.total_tokens),
             "managed provider stream finished reading"
         );
+        if let Some(stream) = stream.as_deref_mut() {
+            stream
+                .emit_diagnostic(
+                    DiagnosticEvent::new(
+                        DiagnosticEventKind::ModelAttemptCompleted,
+                        DiagnosticComponent::Model,
+                        DiagnosticOutcome::Succeeded,
+                    )
+                    .interaction_id(request.metadata.interaction_id)
+                    .request_id(request.metadata.request_id)
+                    .provider(&provider.display_label())
+                    .duration_ms(Some(elapsed_ms(started_at)))
+                    .output_chars(answer.chars().count())
+                    .source_count(sources.len()),
+                    DiagnosticPriority::Terminal,
+                )
+                .await;
+        }
 
         let answer = answer.trim().to_string();
         if answer.is_empty() {
@@ -13692,6 +17922,8 @@ async fn call_bluey_managed_provider(
                 &llm_request,
                 &mut stream,
                 &answer,
+                &account_context,
+                answer_account_context,
                 provider,
                 request.metadata.request_id,
                 started_at,
@@ -13709,10 +17941,18 @@ async fn call_bluey_managed_provider(
                     );
                 }
                 Err(recovery_error) => {
+                    if answer_account_context_changed(&recovery_error) {
+                        return Err(recovery_error);
+                    }
+                    let raw_recovery_error = format!("{recovery_error:#}");
                     warn!(
                         provider = %provider.display_label(),
                         request_id = %request.metadata.request_id,
-                        recovery_error = %recovery_error,
+                        recovery_error_category = answer_diagnostic_error_category(&recovery_error),
+                        recovery_error_ref = %closed_diagnostic_ref(
+                            "managed stream recovery",
+                            &raw_recovery_error,
+                        ),
                         "managed provider stream cache recovery failed after missing final metadata"
                     );
                 }
@@ -13738,10 +17978,10 @@ async fn call_bluey_managed_provider(
         });
     }
 
-    let response = managed
-        .complete(&llm_request)
-        .await
-        .map_err(managed_llm_error)?;
+    account_context.ensure_answer_context(answer_account_context)?;
+    let response_result = managed.complete(&llm_request).await;
+    account_context.ensure_answer_context(answer_account_context)?;
+    let response = response_result.map_err(managed_llm_error)?;
     let answer = sanitize_answer_text(response.text.trim())
         .trim()
         .to_string();
@@ -13875,21 +18115,34 @@ async fn recover_managed_stream_from_cached_answer(
     llm_request: &LlmRequest,
     stream: &mut Option<&mut OverlayAnswerStream>,
     partial_answer: &str,
+    account_context: &AccountCloudContext,
+    answer_account_context: &AnswerAccountContext,
     provider: &ProviderSelector,
     request_id: uuid::Uuid,
     started_at: Instant,
     stream_failure: &str,
 ) -> Result<Option<LiveProviderAnswer>> {
     let partial_chars = partial_answer.trim().chars().count();
-    let response = match managed.complete(llm_request).await {
+    let stream_failure_category = transport_error_category(stream_failure);
+    let stream_failure_ref = closed_diagnostic_ref("managed stream", stream_failure);
+    account_context.ensure_answer_context(answer_account_context)?;
+    let response_result = managed.complete(llm_request).await;
+    account_context.ensure_answer_context(answer_account_context)?;
+    let response = match response_result {
         Ok(response) => response,
         Err(error) => {
+            let raw_recovery_error = error.to_string();
             warn!(
                 provider = %provider.display_label(),
                 request_id = %request_id,
                 partial_answer_chars = partial_chars,
-                stream_failure = %stream_failure,
-                recovery_error = %error,
+                stream_failure_category,
+                stream_failure_ref = %stream_failure_ref,
+                recovery_error_category = llm_error_category(&error),
+                recovery_error_ref = %closed_diagnostic_ref(
+                    "managed cached-answer recovery",
+                    &raw_recovery_error,
+                ),
                 "managed provider stream cached-answer recovery unavailable"
             );
             return Ok(None);
@@ -13903,7 +18156,8 @@ async fn recover_managed_stream_from_cached_answer(
             provider = %provider.display_label(),
             request_id = %request_id,
             partial_answer_chars = partial_chars,
-            stream_failure = %stream_failure,
+            stream_failure_category,
+            stream_failure_ref = %stream_failure_ref,
             "managed provider stream cached-answer recovery returned empty answer"
         );
         return Ok(None);
@@ -13915,7 +18169,8 @@ async fn recover_managed_stream_from_cached_answer(
             partial_answer_chars = partial_chars,
             recovered_answer_chars = answer.chars().count(),
             answer_incomplete_reason = reason,
-            stream_failure = %stream_failure,
+            stream_failure_category,
+            stream_failure_ref = %stream_failure_ref,
             "managed provider stream cached-answer recovery returned incomplete answer"
         );
         return Ok(None);
@@ -13927,7 +18182,8 @@ async fn recover_managed_stream_from_cached_answer(
             request_id = %request_id,
             partial_answer_chars = partial_chars,
             recovered_answer_chars = recovered_chars,
-            stream_failure = %stream_failure,
+            stream_failure_category,
+            stream_failure_ref = %stream_failure_ref,
             "managed provider stream cached-answer recovery was shorter than partial stream"
         );
         return Ok(None);
@@ -13953,7 +18209,8 @@ async fn recover_managed_stream_from_cached_answer(
         request_id = %request_id,
         partial_answer_chars = partial_chars,
         recovered_answer_chars = recovered_chars,
-        stream_failure = %stream_failure,
+        stream_failure_category,
+        stream_failure_ref = %stream_failure_ref,
         "managed provider stream recovered from cached final answer"
     );
     let token_usage = response.cost.as_ref().map(token_usage_from_llm_cost);
@@ -13993,7 +18250,51 @@ fn token_usage_from_llm_cost(cost: &cue_llm::LlmCostMetadata) -> TokenUsage {
 }
 
 fn managed_llm_error(error: cue_llm::LlmError) -> anyhow::Error {
-    anyhow!("{error}")
+    let raw = error.to_string();
+    let error_ref = closed_diagnostic_ref("managed provider", &raw);
+    match error {
+        cue_llm::LlmError::Auth => {
+            anyhow!("managed provider authentication failed; diagnostic_ref={error_ref}")
+        }
+        cue_llm::LlmError::Quota(_) => {
+            anyhow!("managed provider quota exceeded; diagnostic_ref={error_ref}")
+        }
+        cue_llm::LlmError::Network(detail) => {
+            let lower = detail.to_ascii_lowercase();
+            if is_missing_terminal_stream_metadata_error(&lower) {
+                anyhow!(
+                    "managed provider stream ended without final metadata; diagnostic_ref={error_ref}"
+                )
+            } else {
+                anyhow!("managed provider network error; diagnostic_ref={error_ref}")
+            }
+        }
+        cue_llm::LlmError::Provider(detail) if detail == "internal_disclosure_blocked" => {
+            anyhow!("internal_disclosure_blocked; diagnostic_ref={error_ref}")
+        }
+        cue_llm::LlmError::Provider(_) => {
+            anyhow!("managed provider error; diagnostic_ref={error_ref}")
+        }
+        cue_llm::LlmError::CapacityBusy {
+            retry_after_secs, ..
+        } => anyhow!(
+            "managed provider capacity busy: retry after {retry_after_secs}s; diagnostic_ref={error_ref}"
+        ),
+        cue_llm::LlmError::Billing(_) => {
+            anyhow!("managed provider billing failure; diagnostic_ref={error_ref}")
+        }
+    }
+}
+
+fn llm_error_category(error: &cue_llm::LlmError) -> &'static str {
+    match error {
+        cue_llm::LlmError::Auth => "authentication",
+        cue_llm::LlmError::Quota(_) => "quota",
+        cue_llm::LlmError::Network(_) => "network",
+        cue_llm::LlmError::Provider(_) => "provider",
+        cue_llm::LlmError::CapacityBusy { .. } => "capacity",
+        cue_llm::LlmError::Billing(_) => "billing",
+    }
 }
 
 async fn call_chat_provider(
@@ -14050,16 +18351,16 @@ async fn call_chat_provider(
         .json(&request_body)
         .send()
         .await
-        .with_context(|| format!("failed to call {endpoint}"))?;
+        .map_err(|error| closed_transport_error("provider request", &format!("{error:#}")))?;
     let status = response.status();
     if !status.is_success() {
-        let body = response
-            .text()
-            .await
-            .context("failed to read provider error response")?;
-        return Err(anyhow!(
-            "provider returned HTTP {status}: {}",
-            compact_snippet(&body, 320)
+        let body = response.text().await.map_err(|error| {
+            closed_transport_error("provider error response read", &format!("{error:#}"))
+        })?;
+        return Err(closed_http_response_error(
+            "provider",
+            status.as_u16(),
+            &body,
         ));
     }
 
@@ -14070,10 +18371,10 @@ async fn call_chat_provider(
     let body = response
         .text()
         .await
-        .context("failed to read provider response")?;
+        .map_err(|error| closed_transport_error("provider response read", &format!("{error:#}")))?;
 
-    let parsed: ChatCompletionResponse =
-        serde_json::from_str(&body).context("provider response was not chat-completions JSON")?;
+    let parsed: ChatCompletionResponse = serde_json::from_str(&body)
+        .map_err(|_| closed_invalid_response_error("provider", &body))?;
     let answer = parsed
         .choices
         .into_iter()
@@ -14153,7 +18454,7 @@ async fn read_streaming_chat_response(
     while let Some(chunk) = response
         .chunk()
         .await
-        .context("failed to read provider stream chunk")?
+        .map_err(|error| closed_transport_error("provider stream read", &format!("{error:#}")))?
     {
         pending.push_str(&String::from_utf8_lossy(&chunk));
         while let Some((frame_end, delimiter_len)) = next_sse_frame(&pending) {
@@ -14169,9 +18470,7 @@ async fn read_streaming_chat_response(
                     continue;
                 }
                 let parsed: ChatCompletionStreamResponse = serde_json::from_str(data)
-                    .with_context(|| {
-                        format!("provider stream event was not chat-completions JSON: {data}")
-                    })?;
+                    .map_err(|_| closed_invalid_response_error("provider stream event", data))?;
                 if let Some(usage) = parsed.usage {
                     let input = usage.prompt_tokens.unwrap_or_default();
                     let output = usage.completion_tokens.unwrap_or_default();
@@ -14226,7 +18525,9 @@ async fn read_streaming_chat_response(
                 continue;
             }
             let parsed: ChatCompletionStreamResponse =
-                serde_json::from_str(data).context("trailing provider stream event was invalid")?;
+                serde_json::from_str(data).map_err(|_| {
+                    closed_invalid_response_error("provider trailing stream event", data)
+                })?;
             for choice in parsed.choices {
                 if let Some(reason) = choice
                     .finish_reason
@@ -15802,6 +20103,8 @@ async fn answer_context_for_question(
     meeting: &MeetingRecord,
     question: &str,
     visible_context_ids: &[uuid::Uuid],
+    interaction_id: uuid::Uuid,
+    request_id: uuid::Uuid,
 ) -> Vec<AnswerContext> {
     let minimize_session_context =
         should_minimize_session_context_for_fast_answer(question, visible_context_ids);
@@ -15810,7 +20113,6 @@ async fn answer_context_for_question(
     let mut context = if minimize_session_context || prioritize_saved_attachments {
         debug!(
             session_id = %meeting.id,
-            question_hash = %stable_text_hash_prefix(question),
             question_words = word_count(question),
             question_intent = question_intent_label(question),
             prioritize_saved_attachments,
@@ -15838,18 +20140,50 @@ async fn answer_context_for_question(
         && should_lookup_answer_memory(question, visible_context_ids)
         && !memory_timeout.is_zero()
     {
+        let rag_started_at = Instant::now();
         match timeout(
             memory_timeout,
             retrieved_memory_contexts(daemon, meeting, question),
         )
         .await
         {
-            Ok(memory_context) => context.extend(memory_context),
+            Ok(memory_context) => {
+                let hit_count = memory_context.len();
+                context.extend(memory_context);
+                emit_diagnostic_for_scope(
+                    daemon,
+                    SessionAuditScope::from_meeting(meeting),
+                    DiagnosticEvent::new(
+                        DiagnosticEventKind::RagQueryCompleted,
+                        DiagnosticComponent::Rag,
+                        DiagnosticOutcome::Succeeded,
+                    )
+                    .interaction_id(Some(interaction_id))
+                    .request_id(request_id)
+                    .duration_ms(Some(elapsed_ms(rag_started_at)))
+                    .source_count(hit_count),
+                    DiagnosticPriority::Ordinary,
+                );
+            }
             Err(_) => {
                 debug!(
-                    session_id = %meeting.id,
+                    session_id_hash = %cue_core::account_id_hash_prefix(&meeting.id.to_string()),
                     timeout_ms = memory_timeout.as_millis(),
                     "skipping RAG memory lookup to keep answer startup fast"
+                );
+                emit_diagnostic_for_scope(
+                    daemon,
+                    SessionAuditScope::from_meeting(meeting),
+                    DiagnosticEvent::new(
+                        DiagnosticEventKind::RagQueryCompleted,
+                        DiagnosticComponent::Rag,
+                        DiagnosticOutcome::TimedOut,
+                    )
+                    .interaction_id(Some(interaction_id))
+                    .request_id(request_id)
+                    .duration_ms(Some(elapsed_ms(rag_started_at)))
+                    .source_count(0),
+                    DiagnosticPriority::Ordinary,
                 );
             }
         }
@@ -16241,9 +20575,11 @@ async fn retrieved_memory_contexts(
             }
         }
         Err(error) => {
+            let raw_error = format!("{error:#}");
             debug!(
-                session_id = %current_session_id,
-                error = %error,
+                session_id_hash = %cue_core::account_id_hash_prefix(&current_session_id),
+                error_category = transport_error_category(&raw_error),
+                error_ref = %closed_diagnostic_ref("RAG query", &raw_error),
                 "conversation context query failed"
             );
         }
@@ -17497,12 +21833,17 @@ fn estimate_tokens_from_words(words: usize) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
-async fn capture_loop(daemon: Arc<Daemon>, interval_secs: u64, mut stop_rx: oneshot::Receiver<()>) {
+async fn capture_loop(
+    daemon: Arc<Daemon>,
+    interval_secs: u64,
+    mut stop_rx: oneshot::Receiver<()>,
+    fence: DaemonMutationFence,
+) {
     let mut consecutive_failures = 0_u32;
     loop {
         let wait = tokio::select! {
             _ = &mut stop_rx => break,
-            result = capture_context_watch_once(&daemon) => {
+            result = capture_context_watch_once(&daemon, &fence) => {
                 match result {
                     Ok(_) => {
                         consecutive_failures = 0;
@@ -17511,20 +21852,41 @@ async fn capture_loop(daemon: Arc<Daemon>, interval_secs: u64, mut stop_rx: ones
                     Err(error) if context_watch_error_is_fatal(&error) => {
                         let category = context_watch_safe_error_category(&error);
                         warn!(error_category = category, "context mode stopped after a fatal capture error");
-                        {
+                        let (stopped_current_generation, still_authorized) = {
+                            let _account_transition =
+                                daemon.account_answer_transition.lock().await;
+                            let still_authorized = validate_session_mutation_fence(
+                                &daemon,
+                                &fence,
+                                false,
+                            )
+                            .await
+                            .is_ok();
                             let mut capture = daemon.capture.lock().await;
-                            capture.stop.take();
+                            let stopped = fence.capture_generation == Some(capture.generation)
+                                && capture.stop.take().is_some();
+                            if stopped {
+                                capture.generation = capture.generation.wrapping_add(1);
+                            }
+                            let generation = capture.generation;
+                            drop(capture);
+                            if stopped {
+                                let _ =
+                                    update_capture_state(&daemon, false, None, generation).await;
+                            }
+                            (stopped, still_authorized)
+                        };
+                        if stopped_current_generation && still_authorized {
+                            push_system_card(
+                                &daemon,
+                                CardKind::Warning,
+                                "Context mode stopped",
+                                format!(
+                                    "Bluey stopped Context mode because {category}. Review Data controls and OS permissions, then start it again."
+                                ),
+                            )
+                            .await;
                         }
-                        let _ = update_capture_state(&daemon, false, None).await;
-                        push_system_card(
-                            &daemon,
-                            CardKind::Warning,
-                            "Context mode stopped",
-                            format!(
-                                "Bluey stopped Context mode because {category}. Review Data controls and OS permissions, then start it again."
-                            ),
-                        )
-                        .await;
                         break;
                     }
                     Err(error) => {
@@ -17605,6 +21967,20 @@ fn context_watch_safe_error_category(error: &anyhow::Error) -> &'static str {
     }
 }
 
+fn cloud_sync_safe_error_category(error: &anyhow::Error) -> &'static str {
+    let lower = format!("{error:#}").to_ascii_lowercase();
+    if lower.contains("repeated cursor")
+        || lower.contains("pagination cursor")
+        || lower.contains("hydration cursor")
+    {
+        "corrupt_cursor"
+    } else if lower.contains("deletion provenance is corrupt") {
+        "corrupt_deletion_provenance"
+    } else {
+        context_watch_safe_error_category(error)
+    }
+}
+
 fn context_watch_retry_delay(consecutive_failures: u32) -> Duration {
     let shift = consecutive_failures.saturating_sub(1).min(5);
     Duration::from_secs(1_u64 << shift)
@@ -17618,7 +21994,16 @@ enum ContextWatchOutcome {
     NoReadableContext,
 }
 
-async fn capture_context_watch_once(daemon: &Arc<Daemon>) -> Result<ContextWatchOutcome> {
+async fn capture_context_watch_once(
+    daemon: &Arc<Daemon>,
+    fence: &DaemonMutationFence,
+) -> Result<ContextWatchOutcome> {
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    let account_context = validate_session_mutation_fence(daemon, fence, false)
+        .await
+        .map_err(|_| FatalContextWatchError {
+            category: "the signed-in account or active session changed",
+        })?;
     let policy = load_settings(&daemon.paths)
         .map_err(|_| FatalContextWatchError {
             category: "Data controls could not be read safely",
@@ -17669,6 +22054,7 @@ async fn capture_context_watch_once(daemon: &Arc<Daemon>) -> Result<ContextWatch
                     &mut owned_file,
                     &mut owned_artifact,
                     fingerprint,
+                    &account_context,
                 )
                 .await?;
                 return Ok(ContextWatchOutcome::Attached);
@@ -17728,6 +22114,7 @@ async fn capture_context_watch_once(daemon: &Arc<Daemon>) -> Result<ContextWatch
         &mut owned_file,
         &mut owned_artifact,
         fingerprint,
+        &account_context,
     )
     .await?;
     Ok(ContextWatchOutcome::Attached)
@@ -17740,14 +22127,17 @@ async fn attach_context_watch_artifact(
     owned_file: &mut ContextWatchFileGuard,
     owned_artifact: &mut ContextArtifactFileGuard,
     fingerprint: String,
+    account_context: &AnswerAccountContext,
 ) -> Result<()> {
-    let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact]).await?;
+    let meeting_snapshot =
+        attach_context_artifacts(daemon, vec![artifact], account_context).await?;
     owned_file.commit();
     owned_artifact.commit();
     commit_context_watch_fingerprint(daemon, fingerprint).await;
     let meeting_snapshot = match prune_context_watch_history(
         daemon,
         policy.max_local_items.clamp(10, 500),
+        account_context,
     )
     .await
     {
@@ -17790,18 +22180,15 @@ async fn attach_context_watch_artifact(
         )
         .await;
     }
-    record_visible_audit_event(
+    emit_session_diagnostic(
         daemon,
-        "ui_context_watch_observation",
-        json!({
-            "session_id": meeting_snapshot.id.to_string(),
-            "context_items": meeting_snapshot.context.len(),
-            "capture_kind": meeting_snapshot
-                .context
-                .last()
-                .map(|item| item.kind.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-        }),
+        DiagnosticEvent::new(
+            DiagnosticEventKind::ContextWatchObserved,
+            DiagnosticComponent::Daemon,
+            DiagnosticOutcome::Succeeded,
+        )
+        .context_count(meeting_snapshot.context.len()),
+        DiagnosticPriority::Ordinary,
     )
     .await;
     if let Err(error) = write_state(daemon).await {
@@ -17940,12 +22327,18 @@ fn context_watch_screenshot_fallback_allowed(
 async fn prune_context_watch_history(
     daemon: &Arc<Daemon>,
     max_local_items: usize,
+    account_context: &AnswerAccountContext,
 ) -> Result<Option<MeetingRecord>> {
+    account_context.ensure_current(&daemon.paths)?;
     let (removed, snapshot) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         let Some(current) = meeting_guard.as_ref() else {
             return Ok(None);
         };
+        ensure!(
+            meeting_visible_for_owner(current, account_context.owner_account_id.as_deref()),
+            "active context session does not belong to the authorized account"
+        );
         let watch_ids = current
             .context
             .iter()
@@ -17970,7 +22363,9 @@ async fn prune_context_watch_history(
                 true
             }
         });
+        account_context.ensure_current(&daemon.paths)?;
         daemon.store.save_active(&next)?;
+        account_context.ensure_current(&daemon.paths)?;
         *meeting_guard = Some(next.clone());
         (removed, next)
     };
@@ -18010,7 +22405,16 @@ fn remove_bluey_owned_context_watch_file(paths: &AppPaths, path: &Path) {
 async fn capture_active_page_context(
     daemon: &Arc<Daemon>,
     source: impl Into<String>,
+    expected_fence: Option<&DaemonMutationFence>,
 ) -> Result<ContextArtifact> {
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    let account_context = match expected_fence {
+        Some(fence) => validate_session_mutation_fence(daemon, fence, false).await?,
+        None => {
+            let fence = current_session_mutation_fence(daemon, false).await?;
+            validate_session_mutation_fence(daemon, &fence, false).await?
+        }
+    };
     let source = source.into();
     let page = capture_active_page().await?;
     let policy = load_settings(&daemon.paths)?.context_watch;
@@ -18037,7 +22441,8 @@ async fn capture_active_page_context(
     )?;
 
     let mut owned_artifact = ContextArtifactFileGuard::new(&daemon.paths, artifact.clone());
-    let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
+    let meeting_snapshot =
+        attach_context_artifacts(daemon, vec![artifact.clone()], &account_context).await?;
     owned_source.commit();
     owned_artifact.commit();
     if let Err(error) = update_state_from_meeting(daemon, Some(&meeting_snapshot)).await {
@@ -18065,7 +22470,7 @@ async fn analyze_active_page_context(
     daemon: &Arc<Daemon>,
     question_context: Option<&str>,
 ) -> Result<()> {
-    match capture_active_page_context(daemon, "overlay analyse").await {
+    match capture_active_page_context(daemon, "overlay analyse", None).await {
         Ok(artifact) => {
             let context_hint = if question_context
                 .map(str::trim)
@@ -18098,6 +22503,8 @@ async fn analyze_screen_with_screenshot_fallback(
     page_error: anyhow::Error,
     question_context: Option<&str>,
 ) -> Result<()> {
+    let _account_transition = daemon.account_answer_transition.lock().await;
+    let account_context = AnswerAccountContext::capture(&daemon.paths)?;
     let page_error_text = format!("{page_error:#}");
     let policy = load_settings(&daemon.paths)?.context_watch;
     if !policy.screenshot_fallback {
@@ -18122,7 +22529,8 @@ async fn analyze_screen_with_screenshot_fallback(
         Some("Captured screenshot context for this answer.".to_string()),
     )?;
     let mut owned_artifact = ContextArtifactFileGuard::new(&daemon.paths, artifact.clone());
-    let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
+    let meeting_snapshot =
+        attach_context_artifacts(daemon, vec![artifact.clone()], &account_context).await?;
     owned_source.commit();
     owned_artifact.commit();
     if let Err(error) = update_state_from_meeting(daemon, Some(&meeting_snapshot)).await {
@@ -18830,13 +23238,19 @@ fn capture_active_page_platform() -> Result<ActivePageCapture> {
 async fn attach_context_artifacts(
     daemon: &Arc<Daemon>,
     artifacts: Vec<ContextArtifact>,
+    account_context: &AnswerAccountContext,
 ) -> Result<MeetingRecord> {
+    account_context.ensure_current(&daemon.paths)?;
     let indexed_artifacts = artifacts.clone();
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
-        let mut next_meeting = meeting_guard
-            .clone()
-            .unwrap_or_else(|| new_owned_meeting(&daemon.paths, Some("New recording".to_string())));
+        let mut next_meeting = meeting_guard.clone().unwrap_or_else(|| {
+            new_meeting_for_account(account_context, Some("New recording".to_string()))
+        });
+        ensure!(
+            meeting_visible_for_owner(&next_meeting, account_context.owner_account_id.as_deref(),),
+            "active context session does not belong to the authorized account"
+        );
         let title_seed = artifacts
             .iter()
             .map(|artifact| artifact.title.as_str())
@@ -18844,12 +23258,15 @@ async fn attach_context_artifacts(
             .join(" ");
         next_meeting.context.extend(artifacts);
         maybe_autoname_meeting(&mut next_meeting, &title_seed);
+        account_context.ensure_current(&daemon.paths)?;
         daemon.store.save_active(&next_meeting)?;
+        account_context.ensure_current(&daemon.paths)?;
         *meeting_guard = Some(next_meeting.clone());
         next_meeting
     };
 
     index_context_artifacts_for_rag(daemon, meeting_snapshot.id.to_string(), indexed_artifacts);
+    account_context.ensure_current(&daemon.paths)?;
     schedule_auto_cloud_sync(daemon, "context_attach", None).await;
     Ok(meeting_snapshot)
 }
@@ -19015,25 +23432,30 @@ async fn canonical_session_lifecycle(
 async fn create_canonical_session(
     daemon: &Arc<Daemon>,
     title: Option<String>,
+    account_context: &AnswerAccountContext,
 ) -> Result<DaemonSessionLifecycle> {
-    let owner_account_id = current_owner_account_id(&daemon.paths);
+    account_context.ensure_current(&daemon.paths)?;
+    let owner_account_id = account_context.owner_account_id.as_deref();
     let current = daemon.meeting.lock().await.clone();
     if current
         .as_ref()
-        .is_some_and(|meeting| !meeting_visible_for_owner(meeting, owner_account_id.as_deref()))
+        .is_some_and(|meeting| !meeting_visible_for_owner(meeting, owner_account_id))
     {
         anyhow::bail!("the active session belongs to a different account");
     }
     if current.is_some() {
         prepare_runtime_for_session_change(daemon, "session_create").await;
+        account_context.ensure_current(&daemon.paths)?;
     }
 
     let replaced = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if let Some(current) = meeting_guard.take() {
+            account_context.ensure_current(&daemon.paths)?;
             let archived = finalize_meeting_for_archive(current);
             daemon.store.archive(&archived)?;
             project_meeting_session(daemon, &archived, SessionStatus::Archived, false)?;
+            account_context.ensure_current(&daemon.paths)?;
             Some(archived)
         } else {
             None
@@ -19042,20 +23464,24 @@ async fn create_canonical_session(
 
     let meeting = {
         let mut meeting_guard = daemon.meeting.lock().await;
-        let meeting = new_owned_meeting(
-            &daemon.paths,
+        account_context.ensure_current(&daemon.paths)?;
+        let meeting = new_meeting_for_account(
+            account_context,
             title.or_else(|| Some("Bluey session".to_string())),
         );
         daemon.store.save_active(&meeting)?;
+        account_context.ensure_current(&daemon.paths)?;
         *meeting_guard = Some(meeting.clone());
         meeting
     };
 
+    account_context.ensure_current(&daemon.paths)?;
     update_state_from_meeting(daemon, Some(&meeting)).await?;
     let _ = send_overlay(daemon, OverlayCommand::Clear).await;
     refresh_overlay_context_items(daemon, &meeting).await;
     refresh_overlay_sessions(daemon).await;
     write_state(daemon).await?;
+    account_context.ensure_current(&daemon.paths)?;
     schedule_auto_cloud_sync(daemon, "session_create", None).await;
     Ok(canonical_session_lifecycle(daemon, Some(meeting), replaced, None).await)
 }
@@ -19063,17 +23489,20 @@ async fn create_canonical_session(
 async fn continue_session(
     daemon: &Arc<Daemon>,
     source: impl Into<String>,
+    account_context: &AnswerAccountContext,
 ) -> Result<MeetingRecord> {
     let source = source.into();
-    let owner_account_id = current_owner_account_id(&daemon.paths);
+    account_context.ensure_current(&daemon.paths)?;
+    let owner_account_id = account_context.owner_account_id.as_deref();
     let has_visible_active_session = daemon
         .meeting
         .lock()
         .await
         .as_ref()
-        .is_some_and(|meeting| meeting_visible_for_owner(meeting, owner_account_id.as_deref()));
+        .is_some_and(|meeting| meeting_visible_for_owner(meeting, owner_account_id));
     if !has_visible_active_session {
         prepare_runtime_for_session_change(daemon, "session_continue").await;
+        account_context.ensure_current(&daemon.paths)?;
     }
     enum ContinueOutcome {
         Active(MeetingRecord),
@@ -19085,27 +23514,30 @@ async fn continue_session(
         let mut meeting_guard = daemon.meeting.lock().await;
         if let Some(meeting) = meeting_guard
             .as_ref()
-            .filter(|meeting| meeting_visible_for_owner(meeting, owner_account_id.as_deref()))
+            .filter(|meeting| meeting_visible_for_owner(meeting, owner_account_id))
         {
             ContinueOutcome::Active(meeting.clone())
         } else {
             if meeting_guard.is_some() {
                 *meeting_guard = None;
             }
-            if let Some(mut meeting) =
-                latest_visible_meeting(&daemon.store, owner_account_id.as_deref())?
-            {
+            account_context.ensure_current(&daemon.paths)?;
+            if let Some(mut meeting) = latest_visible_meeting(&daemon.store, owner_account_id)? {
                 maybe_autoname_meeting_from_existing(&mut meeting);
                 // Restored transcript is history for conversational context,
                 // not a fresh live-caption question to submit again.
                 meeting.mark_live_transcript_answered();
                 meeting.ended_at = None;
                 daemon.store.save_active(&meeting)?;
+                account_context.ensure_current(&daemon.paths)?;
                 *meeting_guard = Some(meeting.clone());
                 ContinueOutcome::Restored(meeting)
             } else {
-                let meeting = new_owned_meeting(&daemon.paths, Some("Bluey session".to_string()));
+                account_context.ensure_current(&daemon.paths)?;
+                let meeting =
+                    new_meeting_for_account(account_context, Some("Bluey session".to_string()));
                 daemon.store.save_active(&meeting)?;
+                account_context.ensure_current(&daemon.paths)?;
                 *meeting_guard = Some(meeting.clone());
                 ContinueOutcome::Created(meeting)
             }
@@ -19142,6 +23574,7 @@ async fn continue_session(
     if should_warm_memory {
         reindex_meeting_for_rag(daemon, meeting.clone());
     }
+    account_context.ensure_current(&daemon.paths)?;
     update_state_from_meeting(daemon, Some(&meeting)).await?;
     if should_hydrate_history {
         hydrate_overlay_meeting_history(daemon, &meeting).await;
@@ -19150,6 +23583,7 @@ async fn continue_session(
     refresh_overlay_sessions(daemon).await;
     push_system_card(daemon, CardKind::System, title, body).await;
     write_state(daemon).await?;
+    account_context.ensure_current(&daemon.paths)?;
     schedule_auto_cloud_sync(daemon, "session_continue", None).await;
     Ok(meeting)
 }
@@ -19157,23 +23591,27 @@ async fn continue_session(
 async fn switch_to_meeting_session(
     daemon: &Arc<Daemon>,
     id: uuid::Uuid,
+    account_context: &AnswerAccountContext,
 ) -> Result<CanonicalSessionSwitch> {
+    account_context.ensure_current(&daemon.paths)?;
     let selected = daemon
         .store
         .load_by_id(id)?
         .with_context(|| format!("session {id} not found"))?;
-    let owner_account_id = current_owner_account_id(&daemon.paths);
-    if !meeting_visible_for_owner(&selected, owner_account_id.as_deref()) {
+    let owner_account_id = account_context.owner_account_id.as_deref();
+    if !meeting_visible_for_owner(&selected, owner_account_id) {
         anyhow::bail!("session {id} does not belong to the current account");
     }
     let active_snapshot = daemon.meeting.lock().await.clone();
     if active_snapshot.as_ref().is_some_and(|meeting| {
-        meeting.id != id && !meeting_visible_for_owner(meeting, owner_account_id.as_deref())
+        meeting.id != id && !meeting_visible_for_owner(meeting, owner_account_id)
     }) {
         anyhow::bail!("the active session belongs to a different account");
     }
     if let Some(active) = active_snapshot.filter(|meeting| meeting.id == id) {
+        account_context.ensure_current(&daemon.paths)?;
         project_meeting_session(daemon, &active, SessionStatus::Active, true)?;
+        account_context.ensure_current(&daemon.paths)?;
         return Ok(CanonicalSessionSwitch {
             current: active,
             replaced: None,
@@ -19187,14 +23625,17 @@ async fn switch_to_meeting_session(
         .is_none_or(|meeting| meeting.id != id);
     if replacing_active_session {
         prepare_runtime_for_session_change(daemon, "session_open").await;
+        account_context.ensure_current(&daemon.paths)?;
     }
 
     let replaced = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if let Some(current) = meeting_guard.take().filter(|current| current.id != id) {
+            account_context.ensure_current(&daemon.paths)?;
             let archived = finalize_meeting_for_archive(current);
             daemon.store.archive(&archived)?;
             project_meeting_session(daemon, &archived, SessionStatus::Archived, false)?;
+            account_context.ensure_current(&daemon.paths)?;
             Some(archived)
         } else {
             None
@@ -19207,7 +23648,9 @@ async fn switch_to_meeting_session(
     // new live-caption answer request.
     selected.mark_live_transcript_answered();
     selected.ended_at = None;
+    account_context.ensure_current(&daemon.paths)?;
     daemon.store.save_active(&selected)?;
+    account_context.ensure_current(&daemon.paths)?;
     {
         let mut meeting_guard = daemon.meeting.lock().await;
         *meeting_guard = Some(selected.clone());
@@ -19226,6 +23669,7 @@ async fn switch_to_meeting_session(
         );
     }
     write_state(daemon).await?;
+    account_context.ensure_current(&daemon.paths)?;
     schedule_auto_cloud_sync(daemon, "session_open", None).await;
     Ok(CanonicalSessionSwitch {
         current: selected,
@@ -19233,15 +23677,22 @@ async fn switch_to_meeting_session(
     })
 }
 
-async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<MeetingRecord> {
-    Ok(switch_to_meeting_session(daemon, id).await?.current)
+async fn open_meeting_session(
+    daemon: &Arc<Daemon>,
+    id: uuid::Uuid,
+    account_context: &AnswerAccountContext,
+) -> Result<MeetingRecord> {
+    Ok(switch_to_meeting_session(daemon, id, account_context)
+        .await?
+        .current)
 }
 
 async fn activate_canonical_session(
     daemon: &Arc<Daemon>,
     id: uuid::Uuid,
+    account_context: &AnswerAccountContext,
 ) -> Result<DaemonSessionLifecycle> {
-    let switched = switch_to_meeting_session(daemon, id).await?;
+    let switched = switch_to_meeting_session(daemon, id, account_context).await?;
     Ok(canonical_session_lifecycle(daemon, Some(switched.current), switched.replaced, None).await)
 }
 
@@ -19249,16 +23700,19 @@ async fn rename_meeting_session(
     daemon: &Arc<Daemon>,
     id: uuid::Uuid,
     title: &str,
+    account_context: &AnswerAccountContext,
 ) -> Result<MeetingRecord> {
+    account_context.ensure_current(&daemon.paths)?;
     let existing = daemon
         .store
         .load_by_id(id)?
         .with_context(|| format!("session {id} not found"))?;
-    let owner_account_id = current_owner_account_id(&daemon.paths);
-    if !meeting_visible_for_owner(&existing, owner_account_id.as_deref()) {
+    if !meeting_visible_for_owner(&existing, account_context.owner_account_id.as_deref()) {
         anyhow::bail!("session {id} does not belong to the current account");
     }
+    account_context.ensure_current(&daemon.paths)?;
     let renamed = daemon.store.rename(id, title)?;
+    account_context.ensure_current(&daemon.paths)?;
     let stored_active = daemon
         .store
         .load_active()?
@@ -19267,7 +23721,9 @@ async fn rename_meeting_session(
         let mut meeting_guard = daemon.meeting.lock().await;
         if let Some(active) = meeting_guard.as_mut().filter(|active| active.id == id) {
             active.title = renamed.title.clone();
+            account_context.ensure_current(&daemon.paths)?;
             daemon.store.save_active(active)?;
+            account_context.ensure_current(&daemon.paths)?;
             true
         } else if stored_active && meeting_guard.is_none() {
             *meeting_guard = Some(renamed.clone());
@@ -19290,17 +23746,23 @@ async fn rename_meeting_session(
     )
     .await;
     write_state(daemon).await?;
+    account_context.ensure_current(&daemon.paths)?;
     schedule_auto_cloud_sync(daemon, "session_rename", None).await;
     Ok(renamed)
 }
 
-async fn archive_canonical_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<MeetingRecord> {
-    let owner_account_id = current_owner_account_id(&daemon.paths);
+async fn archive_canonical_session(
+    daemon: &Arc<Daemon>,
+    id: uuid::Uuid,
+    account_context: &AnswerAccountContext,
+) -> Result<MeetingRecord> {
+    account_context.ensure_current(&daemon.paths)?;
+    let owner_account_id = account_context.owner_account_id.as_deref();
     let selected = daemon
         .store
         .load_by_id(id)?
         .with_context(|| format!("session {id} not found"))?;
-    if !meeting_visible_for_owner(&selected, owner_account_id.as_deref()) {
+    if !meeting_visible_for_owner(&selected, owner_account_id) {
         anyhow::bail!("session {id} does not belong to the current account");
     }
     let is_active_in_memory = {
@@ -19316,6 +23778,7 @@ async fn archive_canonical_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Resu
             .is_some_and(|meeting| meeting.id == id);
     if is_active {
         prepare_runtime_for_session_change(daemon, "session_archive").await;
+        account_context.ensure_current(&daemon.paths)?;
     }
 
     let archived = finalize_meeting_for_archive(selected);
@@ -19331,20 +23794,27 @@ async fn archive_canonical_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Resu
         }
         daemon.store.archive(&archived)?;
         project_meeting_session(daemon, &archived, SessionStatus::Archived, false)?;
+        account_context.ensure_current(&daemon.paths)?;
         update_state_from_meeting(daemon, None).await?;
         let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
         set_overlay_listening_state(daemon, ListeningState::Idle).await;
     } else {
         daemon.store.save_archived(&archived)?;
         project_meeting_session(daemon, &archived, SessionStatus::Archived, false)?;
+        account_context.ensure_current(&daemon.paths)?;
     }
     refresh_overlay_sessions(daemon).await;
     write_state(daemon).await?;
+    account_context.ensure_current(&daemon.paths)?;
     schedule_auto_cloud_sync(daemon, "session_archive", None).await;
     Ok(archived)
 }
 
-async fn deactivate_canonical_session(daemon: &Arc<Daemon>) -> Result<DaemonSessionLifecycle> {
+async fn deactivate_canonical_session(
+    daemon: &Arc<Daemon>,
+    account_context: &AnswerAccountContext,
+) -> Result<DaemonSessionLifecycle> {
+    account_context.ensure_current(&daemon.paths)?;
     let active_in_memory = daemon
         .meeting
         .lock()
@@ -19354,24 +23824,29 @@ async fn deactivate_canonical_session(daemon: &Arc<Daemon>) -> Result<DaemonSess
     let active_id = match active_in_memory {
         Some(id) => Some(id),
         None => daemon.store.load_active()?.and_then(|meeting| {
-            let owner_account_id = current_owner_account_id(&daemon.paths);
-            meeting_visible_for_owner(&meeting, owner_account_id.as_deref()).then_some(meeting.id)
+            meeting_visible_for_owner(&meeting, account_context.owner_account_id.as_deref())
+                .then_some(meeting.id)
         }),
     };
     let Some(active_id) = active_id else {
         return Ok(canonical_session_lifecycle(daemon, None, None, None).await);
     };
-    let archived = archive_canonical_session(daemon, active_id).await?;
+    let archived = archive_canonical_session(daemon, active_id, account_context).await?;
     Ok(canonical_session_lifecycle(daemon, Some(archived), None, None).await)
 }
 
-async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<MeetingRecord> {
+async fn delete_meeting_session(
+    daemon: &Arc<Daemon>,
+    id: uuid::Uuid,
+    account_context: &AnswerAccountContext,
+) -> Result<MeetingRecord> {
+    account_context.ensure_current(&daemon.paths)?;
     let meeting_for_cleanup = daemon
         .store
         .load_by_id(id)?
         .with_context(|| format!("session {id} not found"))?;
-    let owner_account_id = current_owner_account_id(&daemon.paths);
-    if !meeting_visible_for_owner(&meeting_for_cleanup, owner_account_id.as_deref()) {
+    let owner_account_id = account_context.owner_account_id.as_deref();
+    if !meeting_visible_for_owner(&meeting_for_cleanup, owner_account_id) {
         anyhow::bail!("session {id} does not belong to the current account");
     }
     let is_active_in_memory = {
@@ -19387,15 +23862,16 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
             .is_some_and(|meeting| meeting.id == id);
     if is_active {
         prepare_runtime_for_session_change(daemon, "session_deleted").await;
+        account_context.ensure_current(&daemon.paths)?;
     }
 
     let mut cloud_delete = {
         // Reconciliation must not observe the Prepared state until this
         // synchronous local transaction has either committed or aborted.
-        let _cloud_delete_transaction = owner_account_id
-            .as_ref()
-            .map(|_| crate::cloud::sync::lock_cloud_session_delete_transaction());
-        let mut cloud_delete = if let Some(owner_account_id) = owner_account_id.as_deref() {
+        account_context.ensure_current(&daemon.paths)?;
+        let _cloud_delete_transaction =
+            owner_account_id.map(|_| crate::cloud::sync::lock_cloud_session_delete_transaction());
+        let mut cloud_delete = if let Some(owner_account_id) = owner_account_id {
             crate::cloud::sync::prepare_cloud_session_delete(
                 &daemon.paths.data_dir,
                 id,
@@ -19405,7 +23881,7 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
             crate::cloud::sync::CloudSessionDeleteDisposition::NotPreviouslyUploaded
         };
         let abort_prepared_cloud_delete = || {
-            let Some(owner_account_id) = owner_account_id.as_deref() else {
+            let Some(owner_account_id) = owner_account_id else {
                 return;
             };
             if let Err(cleanup_error) = crate::cloud::sync::abort_prepared_cloud_session_delete(
@@ -19421,9 +23897,11 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
             }
         };
 
-        if let Err(error) =
-            crate::cloud::sync::purge_session_audit_state(&daemon.paths.data_dir, id)
-        {
+        if let Err(error) = crate::cloud::sync::purge_session_audit_state(
+            &daemon.paths.data_dir,
+            owner_account_id,
+            id,
+        ) {
             abort_prepared_cloud_delete();
             return Err(error).context("failed to purge local session diagnostics");
         }
@@ -19466,7 +23944,7 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
             );
             anyhow::bail!("session {id} not found");
         }
-        if let Some(owner_account_id) = owner_account_id.as_deref() {
+        if let Some(owner_account_id) = owner_account_id {
             cloud_delete = match crate::cloud::sync::commit_prepared_cloud_session_delete(
                 &daemon.paths.data_dir,
                 id,
@@ -19486,6 +23964,7 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
                 }
             };
         }
+        account_context.ensure_current(&daemon.paths)?;
         cloud_delete
     };
     {
@@ -19502,15 +23981,19 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
     daemon
         .rag_indexer
         .delete_session(id.to_string(), meeting_for_cleanup.owner_account_id.clone());
-    if let Some(owner_account_id) = owner_account_id.as_deref() {
-        if let Ok(client) = build_cloud_client(&daemon.paths, None) {
-            cloud_delete = crate::cloud::sync::flush_queued_cloud_session_delete(
-                &daemon.paths.data_dir,
-                id,
-                &client,
-                owner_account_id,
-            )
-            .await;
+    if let Some(owner_account_id) = owner_account_id {
+        if let Ok(account_context) = AccountCloudContext::snapshot(&daemon.paths, None) {
+            if account_context.owner_account_id == owner_account_id {
+                cloud_delete = crate::cloud::sync::flush_queued_cloud_session_delete(
+                    &daemon.paths.data_dir,
+                    id,
+                    &account_context.client,
+                    owner_account_id,
+                    &|| account_context.ensure_current(),
+                )
+                .await
+                .unwrap_or(crate::cloud::sync::CloudSessionDeleteDisposition::Queued);
+            }
         }
     }
 
@@ -19538,24 +24021,33 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
     )
     .await;
     write_state(daemon).await?;
+    account_context.ensure_current(&daemon.paths)?;
     Ok(meeting_for_cleanup)
 }
 
 async fn set_answer_instructions(
     daemon: &Arc<Daemon>,
     instructions: Option<String>,
+    account_context: &AnswerAccountContext,
 ) -> Result<MeetingRecord> {
+    account_context.ensure_current(&daemon.paths)?;
     let mut meeting_guard = daemon.meeting.lock().await;
     if meeting_guard.is_none() {
-        *meeting_guard = Some(new_owned_meeting(
-            &daemon.paths,
+        *meeting_guard = Some(new_meeting_for_account(
+            account_context,
             Some("New recording".to_string()),
         ));
     }
 
     let meeting = meeting_guard.as_mut().expect("meeting exists");
+    ensure!(
+        meeting_visible_for_owner(meeting, account_context.owner_account_id.as_deref()),
+        "active instruction session does not belong to the authorized account"
+    );
     meeting.answer_instructions = instructions;
+    account_context.ensure_current(&daemon.paths)?;
     daemon.store.save_active(meeting)?;
+    account_context.ensure_current(&daemon.paths)?;
     Ok(meeting.clone())
 }
 
@@ -19563,11 +24055,13 @@ async fn update_capture_state(
     daemon: &Arc<Daemon>,
     active: bool,
     interval_secs: Option<u64>,
+    generation: u64,
 ) -> Result<()> {
     {
         let mut state = daemon.state.lock().await;
         state.screen_capture_active = active;
         state.screen_capture_interval_secs = interval_secs;
+        state.screen_capture_generation = generation;
     }
     write_state(daemon).await
 }
@@ -19583,11 +24077,14 @@ async fn push_system_card(
 }
 
 async fn current_or_last_meeting(daemon: &Arc<Daemon>) -> Result<Option<MeetingRecord>> {
+    let _account_transition = daemon.account_answer_transition.lock().await;
     let owner_account_id = current_owner_account_id(&daemon.paths);
     if let Some(active) = daemon.meeting.lock().await.as_ref() {
-        if meeting_visible_for_owner(active, owner_account_id.as_deref()) {
-            return Ok(Some(active.clone()));
-        }
+        ensure!(
+            meeting_visible_for_owner(active, owner_account_id.as_deref()),
+            "active session does not belong to the current account"
+        );
+        return Ok(Some(active.clone()));
     }
     latest_visible_meeting(&daemon.store, owner_account_id.as_deref())
 }
@@ -20108,18 +24605,19 @@ async fn shutdown_daemon(daemon: &Arc<Daemon>) {
     if let Some(handle) = daemon.auto_cloud_sync_debounce.lock().await.take() {
         handle.abort();
     }
-    if let Some(capture) = daemon.system_audio.lock().await.take() {
-        capture.stop().await;
-    }
+    let _ = stop_balance_polling(daemon).await;
+    stop_continuous_system_audio(daemon).await;
     let _ = stop_audio_capture(daemon).await;
     if let Some(meeting) = daemon.meeting.lock().await.as_ref() {
         let _ = daemon.store.save_active(meeting);
     }
-    if let Some(mut overlay) = daemon.overlay.lock().await.take() {
-        let _ = overlay.send(&OverlayCommand::Shutdown);
-        let _ = overlay.child.kill();
-        let _ = overlay.child.wait();
+    if let Some(overlay) = daemon.overlay.lock().await.take() {
+        if let Ok(completion) = overlay.send_confirmed(OverlayCommand::Shutdown) {
+            let _ = timeout(Duration::from_millis(500), completion).await;
+        }
+        let _ = tokio::task::spawn_blocking(move || dispose_overlay_process(Some(overlay))).await;
     }
+    daemon.diagnostics.shutdown().await;
     let _ = tokio::fs::remove_file(&daemon.paths.state_file).await;
 }
 
@@ -20140,9 +24638,10 @@ fn spawn_overlay(
     // by overlay::resolve_overlay_path.
     let resolved = if let Some(path) = explicit {
         path.to_path_buf()
+    } else if let Some(path) = crate::overlay::dev_overlay_override_path() {
+        path
     } else {
-        let default = discover_overlay_bin()?;
-        crate::overlay::resolve_overlay_path(&default)
+        discover_overlay_bin()?
     };
 
     // Step 2: verify the binary path is canonical + inside the install dir.
@@ -20151,7 +24650,7 @@ fn spawn_overlay(
     let has_overlay_override = explicit.is_some()
         || env::var_os("BLUEY_OVERLAY_BIN").is_some()
         || env::var_os("CUE_OVERLAY_BIN").is_some();
-    let install_dir = if cfg!(debug_assertions)
+    let default_install_dir = if cfg!(debug_assertions)
         || (crate::overlay::is_dev_overlay_enabled() && has_overlay_override)
     {
         env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -20162,7 +24661,15 @@ fn spawn_overlay(
             .and_then(|p| p.parent().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("/"))
     };
-    if let Err(e) = crate::overlay::verify_overlay_binary(&resolved, &install_dir) {
+    #[cfg(debug_assertions)]
+    let test_install_dir = marked_test_workspace_root_for(
+        &resolved,
+        env::var_os("BLUEY_TEST_WORKSPACE_ROOT").as_deref(),
+    );
+    #[cfg(not(debug_assertions))]
+    let test_install_dir: Option<PathBuf> = None;
+    let install_dir = test_install_dir.as_deref().unwrap_or(&default_install_dir);
+    if let Err(e) = crate::overlay::verify_overlay_binary(&resolved, install_dir) {
         warn!(
             error = %e,
             binary = %resolved.display(),
@@ -20181,6 +24688,24 @@ fn spawn_overlay(
     }
 
     spawn_stdio_overlay(resolved, events, expected_token, ui_state, generation)
+}
+
+#[cfg(any(debug_assertions, test))]
+fn marked_test_workspace_root_for(
+    binary: &Path,
+    configured_root: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let root = PathBuf::from(configured_root?);
+    if !root
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("bluey-tests."))
+        || !root.join(".bluey-test-workspace").is_file()
+    {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let binary = binary.canonicalize().ok()?;
+    binary.starts_with(&root).then_some(root)
 }
 
 fn spawn_stdio_overlay(
@@ -20229,11 +24754,11 @@ fn spawn_stdio_overlay(
             .with_context(|| format!("overlay {} startup failed", resolved.display()));
     }
 
-    Ok(OverlayProcess {
+    Ok(OverlayProcess::new(
         child,
-        transport: OverlayTransport::Stdio(stdin),
+        OverlayTransport::Stdio(stdin),
         generation,
-    })
+    ))
 }
 
 fn apply_minimal_overlay_environment(command: &mut Command) {
@@ -20412,11 +24937,11 @@ fn spawn_macos_socket_overlay(
             .with_context(|| format!("overlay {} startup failed", resolved.display()));
     }
 
-    Ok(OverlayProcess {
+    Ok(OverlayProcess::new(
         child,
-        transport: OverlayTransport::Socket(stream),
+        OverlayTransport::Socket(stream),
         generation,
-    })
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -21619,6 +26144,7 @@ async fn update_state_from_meeting(
     daemon: &Arc<Daemon>,
     meeting: Option<&MeetingRecord>,
 ) -> Result<()> {
+    *daemon.diagnostic_scope.write() = meeting.map(SessionAuditScope::from_meeting);
     if let Some(meeting) = meeting {
         project_meeting_session(daemon, meeting, SessionStatus::Active, true)?;
     }
@@ -21663,7 +26189,17 @@ fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
         return;
     }
     let session_id = meeting.id.to_string();
-    let db_dir = daemon.paths.data_dir.clone();
+    let owner_account_id = meeting.owner_account_id.clone();
+    let account_context = match AnswerAccountContext::capture(&daemon.paths) {
+        Ok(context) if meeting_visible_for_owner(meeting, context.owner_account_id.as_deref()) => {
+            context
+        }
+        _ => {
+            warn!("auto-recap skipped: session owner is no longer current");
+            return;
+        }
+    };
+    let daemon = Arc::clone(daemon);
     tokio::spawn(async move {
         let llm = match build_recap_llm_from_env() {
             Some(p) => p,
@@ -21677,27 +26213,35 @@ fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
             .await;
         match result {
             Ok(resp) => {
-                let db_path = db_dir.join("sessions.db");
+                let _account_transition = daemon.account_answer_transition.lock().await;
+                if account_context.ensure_current(&daemon.paths).is_err() {
+                    warn!("auto-recap discarded after account transition");
+                    return;
+                }
+                let db_path = daemon.paths.data_dir.join("sessions.db");
                 if let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db"))
                 {
-                    if let Err(e) = db.insert_cue_response(crate::db::NewCueResponse {
-                        id: &resp.id,
-                        session_id: &resp.source_session_id,
-                        kind: &resp.kind,
-                        text: &resp.text,
-                        source_text: resp.source_text.as_deref(),
-                        ts_ms: resp.ts_ms as i64,
-                        cost_cents: resp.cost_cents,
-                        balance_cents_after: resp.balance_cents_after,
-                        provider: resp.provider.as_deref(),
-                        model: resp.model.as_deref(),
-                        input_tokens: resp.input_tokens,
-                        output_tokens: resp.output_tokens,
-                        cost_label: resp.cost_label.as_deref(),
-                        artifact_type: resp.artifact_type.as_deref(),
-                        artifact_body: resp.artifact_body.as_deref(),
-                        artifact_confidence: resp.artifact_confidence,
-                    }) {
+                    if let Err(e) = db.insert_cue_response_for_owner(
+                        owner_account_id.as_deref(),
+                        crate::db::NewCueResponse {
+                            id: &resp.id,
+                            session_id: &resp.source_session_id,
+                            kind: &resp.kind,
+                            text: &resp.text,
+                            source_text: resp.source_text.as_deref(),
+                            ts_ms: resp.ts_ms as i64,
+                            cost_cents: resp.cost_cents,
+                            balance_cents_after: resp.balance_cents_after,
+                            provider: resp.provider.as_deref(),
+                            model: resp.model.as_deref(),
+                            input_tokens: resp.input_tokens,
+                            output_tokens: resp.output_tokens,
+                            cost_label: resp.cost_label.as_deref(),
+                            artifact_type: resp.artifact_type.as_deref(),
+                            artifact_body: resp.artifact_body.as_deref(),
+                            artifact_confidence: resp.artifact_confidence,
+                        },
+                    ) {
                         warn!(error = %e, "auto-recap: failed to persist");
                     } else {
                         info!(session_id = %session_id, "auto-recap persisted");
@@ -21705,7 +26249,10 @@ fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 }
             }
             Err(e) => {
-                warn!(error = %e, "auto-recap LLM call failed");
+                warn!(
+                    error_category = e.diagnostic_category(),
+                    "auto-recap LLM call failed"
+                );
             }
         }
     });
@@ -21765,6 +26312,54 @@ mod tests {
         (base, paths)
     }
 
+    fn signed_in_test_account(
+        owner_account_id: &str,
+        access_token: &str,
+    ) -> cue_core::AccountConfig {
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.api_url = "http://127.0.0.1:9".to_string();
+        account.cloud_account_id = Some(owner_account_id.to_string());
+        account.user_id = format!("{owner_account_id}@example.test");
+        account.device_id = "bluey-test-device".to_string();
+        account.access_token = Some(access_token.to_string());
+        account.refresh_token = Some(format!("refresh-{access_token}"));
+        account
+    }
+
+    fn stored_test_credentials(paths: &AppPaths) -> CredentialSnapshot {
+        stored_test_credentials_if_any(paths).expect("test account should contain credentials")
+    }
+
+    fn stored_test_credentials_if_any(paths: &AppPaths) -> Option<CredentialSnapshot> {
+        SecureAccountStore::new(paths.clone())
+            .load_snapshot()
+            .expect("load test credential snapshot")
+    }
+
+    fn assert_account_credentials_unchanged(
+        actual: &cue_core::AccountConfig,
+        expected: &cue_core::AccountConfig,
+    ) {
+        assert_eq!(actual.cloud_account_id, expected.cloud_account_id);
+        assert_eq!(actual.user_id, expected.user_id);
+        assert_eq!(actual.access_token, expected.access_token);
+        assert_eq!(actual.refresh_token, expected.refresh_token);
+        assert_eq!(actual.credential_generation, expected.credential_generation);
+    }
+
+    fn test_balance_snapshot(balance_cents: i64) -> BalanceSnapshot {
+        BalanceSnapshot {
+            balance_cents,
+            trial_seconds_remaining: 0,
+            auto_topup_enabled: false,
+            auto_topup_threshold_cents: 0,
+            auto_topup_amount_cents: 0,
+            fetched_at_unix_ms: 1,
+            low_balance_warning: false,
+        }
+    }
+
     fn recv_overlay_event_with_timeout(
         receiver: &mut mpsc::Receiver<OverlayProcessEvent>,
         label: &str,
@@ -21787,11 +26382,94 @@ mod tests {
     }
 
     #[test]
+    fn cloud_session_sync_retry_backoff_is_bounded() {
+        assert_eq!(next_cloud_session_sync_backoff(0), 120);
+        assert_eq!(next_cloud_session_sync_backoff(60), 120);
+        assert_eq!(next_cloud_session_sync_backoff(120), 240);
+        assert_eq!(next_cloud_session_sync_backoff(600), 900);
+        assert_eq!(next_cloud_session_sync_backoff(900), 900);
+    }
+
+    #[test]
+    fn cloud_sync_cursor_errors_use_a_closed_category() {
+        let cursor = anyhow!("cloud session pagination returned a repeated cursor: opaque-secret");
+        assert_eq!(cloud_sync_safe_error_category(&cursor), "corrupt_cursor");
+        let provenance = anyhow!("cloud deletion provenance is corrupt at /private/path");
+        assert_eq!(
+            cloud_sync_safe_error_category(&provenance),
+            "corrupt_deletion_provenance"
+        );
+    }
+
+    #[test]
+    fn provider_and_stt_failures_expose_only_closed_diagnostic_references() {
+        let endpoint = "https://private.example.test/v1/chat?token=secret-token";
+        let body = r#"{"error":"private provider body","token":"secret-token"}"#;
+        let transport = closed_transport_error(
+            "provider request",
+            &format!("request failed for URL {endpoint}"),
+        )
+        .to_string();
+        let response = closed_http_response_error("provider", 502, body).to_string();
+        let invalid = closed_invalid_response_error("STT provider", body).to_string();
+        let managed = managed_llm_error(cue_llm::LlmError::Provider(body.to_string())).to_string();
+
+        for closed in [&transport, &response, &invalid, &managed] {
+            assert!(!closed.contains(endpoint));
+            assert!(!closed.contains("private provider body"));
+            assert!(!closed.contains("secret-token"));
+            assert!(closed.contains("ref="));
+        }
+        assert_eq!(
+            closed_diagnostic_ref("provider", body),
+            closed_diagnostic_ref("provider", body)
+        );
+        assert_ne!(
+            closed_diagnostic_ref("provider", body),
+            closed_diagnostic_ref("STT provider", body)
+        );
+    }
+
+    #[test]
+    fn sign_out_commit_rejects_a_racing_account_generation() {
+        let (base, paths) = isolated_test_paths("sign-out-generation-cas");
+        let mut account_a = cue_core::AccountConfig::local();
+        account_a.provider = "bluey".to_string();
+        account_a.cloud_account_id = Some("account-a".to_string());
+        account_a.access_token = Some("access-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+
+        let prepared = PreparedCloudAccountSignOut::capture(&paths).unwrap();
+        let mut account_b = account_a;
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.access_token = Some("access-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+
+        assert!(prepared.commit(&paths).is_err());
+        assert_eq!(
+            load_account(&paths)
+                .unwrap()
+                .as_ref()
+                .and_then(cue_core::AccountConfig::owner_account_id),
+            Some("account-b")
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn auto_cloud_sync_env_is_disable_only_and_cannot_bypass_persisted_consent() {
         let _lock = AUTO_CLOUD_SYNC_ENV_LOCK.lock().unwrap();
         let _bluey_env = TestEnvSnapshot::clear("BLUEY_AUTO_CLOUD_SYNC");
         let _cue_env = TestEnvSnapshot::clear("CUE_AUTO_CLOUD_SYNC");
         let (base, paths) = isolated_test_paths("auto-sync-consent");
+
+        let mut account_a = cue_core::AccountConfig::local();
+        account_a.provider = "bluey".to_string();
+        account_a.cloud_account_id = Some("account-a".to_string());
+        account_a.user_id = "a@example.com".to_string();
+        account_a.access_token = Some("access-a".to_string());
+        account_a.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
 
         cue_core::save_settings(&paths, &cue_core::CueSettings::default()).unwrap();
         std::env::set_var("BLUEY_AUTO_CLOUD_SYNC", "true");
@@ -21802,11 +26480,22 @@ mod tests {
             &cue_core::CueSettings {
                 cloud_sync_enabled: true,
                 cloud_sync_consent_granted: true,
+                cloud_sync_consent_account_id: Some("account-a".to_string()),
                 ..cue_core::CueSettings::default()
             },
         )
         .unwrap();
         assert!(auto_cloud_sync_enabled(&paths));
+
+        let mut account_b = account_a.clone();
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+        assert!(!auto_cloud_sync_enabled(&paths));
+
+        cue_core::save_account(&paths, &account_a).unwrap();
 
         std::env::set_var("BLUEY_AUTO_CLOUD_SYNC", "off");
         assert!(!auto_cloud_sync_enabled(&paths));
@@ -21820,12 +26509,393 @@ mod tests {
             &cue_core::CueSettings {
                 cloud_sync_enabled: true,
                 cloud_sync_consent_granted: false,
+                cloud_sync_consent_account_id: Some("account-a".to_string()),
                 ..cue_core::CueSettings::default()
             },
         )
         .unwrap();
         assert!(!auto_cloud_sync_enabled(&paths));
 
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn account_cloud_context_fails_closed_after_account_or_credential_change() {
+        let (base, paths) = isolated_test_paths("account-cloud-context");
+        let mut account_a = cue_core::AccountConfig::local();
+        account_a.provider = "bluey".to_string();
+        account_a.cloud_account_id = Some("account-a".to_string());
+        account_a.user_id = "a@example.com".to_string();
+        account_a.access_token = Some("access-a".to_string());
+        account_a.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+
+        let context = AccountCloudContext::snapshot(&paths, Some("scope-test")).unwrap();
+        assert_eq!(context.owner_account_id, "account-a");
+        context.ensure_current().unwrap();
+
+        account_a.access_token = Some("rotated-access-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+        assert!(context.ensure_current().is_err());
+
+        let rotated = AccountCloudContext::snapshot(&paths, None).unwrap();
+        let mut account_b = account_a;
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+        assert!(rotated.ensure_current().is_err());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn background_device_login_never_overwrites_a_newer_external_account() {
+        let (base, paths) = isolated_test_paths("background-login-account-cas");
+        let local = cue_core::AccountConfig::local();
+        cue_core::save_account(&paths, &local).unwrap();
+        let expected = background_login_local_profile(&paths).unwrap();
+
+        let mut stale_account_c = expected.clone();
+        stale_account_c.provider = "bluey".to_string();
+        stale_account_c.cloud_account_id = Some("account-c".to_string());
+        stale_account_c.user_id = "c@example.com".to_string();
+        stale_account_c.access_token = Some("access-c".to_string());
+        stale_account_c.refresh_token = Some("refresh-c".to_string());
+
+        let mut newer_account_b = expected.clone();
+        newer_account_b.provider = "bluey".to_string();
+        newer_account_b.cloud_account_id = Some("account-b".to_string());
+        newer_account_b.user_id = "b@example.com".to_string();
+        newer_account_b.access_token = Some("access-b".to_string());
+        newer_account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &newer_account_b).unwrap();
+
+        assert!(commit_background_login_profile(
+            &paths,
+            expected.credential_generation,
+            &stale_account_c,
+        )
+        .is_err());
+        let persisted = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(persisted.cloud_account_id.as_deref(), Some("account-b"));
+        assert_eq!(persisted.access_token.as_deref(), Some("access-b"));
+        assert_eq!(persisted.refresh_token.as_deref(), Some("refresh-b"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn incomplete_cloud_hydration_never_allows_upload() {
+        let complete = crate::cloud::sync::CloudHydrationSummary::default();
+        assert!(!cloud_hydration_blocks_upload(&complete));
+
+        let attachments_pending = crate::cloud::sync::CloudHydrationSummary {
+            attachment_retry_count: 1,
+            ..Default::default()
+        };
+        assert!(cloud_hydration_blocks_upload(&attachments_pending));
+
+        let cleanup_pending = crate::cloud::sync::CloudHydrationSummary {
+            local_cleanup_retry_count: 1,
+            ..Default::default()
+        };
+        assert!(cloud_hydration_blocks_upload(&cleanup_pending));
+    }
+
+    #[tokio::test]
+    async fn cloud_hydration_reloads_the_owned_active_runtime_before_future_writes() {
+        let (base, paths) = isolated_test_paths("hydration-active-runtime-reload");
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.cloud_account_id = Some("account-a".to_string());
+        account.user_id = "a@example.com".to_string();
+        account.access_token = Some("access-a".to_string());
+        account.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account).unwrap();
+
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting = MeetingRecord::new(Some("Before hydration".to_string()));
+        meeting.owner_account_id = Some("account-a".to_string());
+        store.save_active(&meeting).unwrap();
+        let daemon = test_daemon(&paths);
+
+        let mut reconciled = meeting.clone();
+        reconciled.title = "Cloud reconciled".to_string();
+        daemon.store.save_active(&reconciled).unwrap();
+        daemon
+            .meeting
+            .lock()
+            .await
+            .as_mut()
+            .expect("active runtime")
+            .title = "Stale runtime".to_string();
+
+        let context = AccountCloudContext::snapshot(&paths, None).unwrap();
+        reload_active_meeting_after_cloud_hydration(&daemon, &context, &[meeting.id], false)
+            .await
+            .unwrap();
+        assert_eq!(
+            daemon
+                .meeting
+                .lock()
+                .await
+                .as_ref()
+                .map(|meeting| meeting.title.as_str()),
+            Some("Cloud reconciled")
+        );
+
+        daemon.diagnostics.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn deleted_account_purge_removes_only_current_owner_local_state() {
+        let (base, paths) = isolated_test_paths("deleted-account-local-purge");
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.cloud_account_id = Some("account-a".to_string());
+        account.user_id = "a@example.com".to_string();
+        account.access_token = Some("access-a".to_string());
+        account.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account).unwrap();
+        cue_core::save_settings(
+            &paths,
+            &cue_core::CueSettings {
+                cloud_sync_enabled: true,
+                cloud_sync_consent_granted: true,
+                cloud_sync_consent_account_id: Some("account-a".to_string()),
+                support_diagnostics_upload_enabled: true,
+                support_diagnostics_upload_consent_granted: true,
+                support_diagnostics_upload_consent_account_id: Some("account-a".to_string()),
+                ..cue_core::CueSettings::default()
+            },
+        )
+        .unwrap();
+
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut owner_a = MeetingRecord::new(Some("Owner A".to_string()));
+        owner_a.owner_account_id = Some("account-a".to_string());
+        let owner_a_id = owner_a.id;
+        store.save_active(&owner_a).unwrap();
+        let mut owner_b = MeetingRecord::new(Some("Owner B".to_string()));
+        owner_b.owner_account_id = Some("account-b".to_string());
+        let owner_b_id = owner_b.id;
+        store.save_archived(&owner_b).unwrap();
+
+        let daemon = test_daemon(&paths);
+        assert!(purge_deleted_account_local_data(&daemon, "account-a")
+            .await
+            .is_err());
+        assert!(daemon.store.load_by_id(owner_a_id).unwrap().is_some());
+        prepare_deleted_account_local_purge(
+            &daemon,
+            "account-a",
+            "550e8400-e29b-41d4-a716-446655440101",
+            "550e8400-e29b-41d4-a716-446655440102",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            purge_deleted_account_local_data(&daemon, "account-a")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(daemon.store.load_by_id(owner_a_id).unwrap().is_none());
+        assert!(daemon.store.load_by_id(owner_b_id).unwrap().is_some());
+        assert!(daemon
+            .session_db
+            .lock()
+            .get_session_for_owner(Some("account-a"), owner_a_id)
+            .unwrap()
+            .is_none());
+        assert!(daemon
+            .session_db
+            .lock()
+            .get_session_for_owner(Some("account-b"), owner_b_id)
+            .unwrap()
+            .is_some());
+        let settings = cue_core::load_settings(&paths).unwrap();
+        assert!(!settings.cloud_sync_enabled);
+        assert!(!settings.support_diagnostics_upload_enabled);
+        let pending = load_pending_deleted_account_purge(&paths)
+            .unwrap()
+            .expect("cleanup marker remains through profile and onboarding cleanup");
+        assert_eq!(pending.state, DeletedAccountPurgeState::OnboardingReset);
+        assert!(load_account(&paths)
+            .unwrap()
+            .as_ref()
+            .and_then(cue_core::AccountConfig::owner_account_id)
+            .is_none());
+        assert_eq!(
+            daemon
+                .session_db
+                .lock()
+                .load_setting("onboarding_complete")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+        acknowledge_deleted_account_local_purge(
+            &paths,
+            "account-a",
+            "550e8400-e29b-41d4-a716-446655440101",
+            "550e8400-e29b-41d4-a716-446655440102",
+        )
+        .unwrap();
+        assert!(load_pending_deleted_account_purge(&paths)
+            .unwrap()
+            .is_none());
+
+        daemon.diagnostics.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn prepared_account_deletion_stops_capture_and_fences_content_without_server_ack() {
+        let (base, paths) = isolated_test_paths("prepared-account-deletion");
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.cloud_account_id = Some("account-a".to_string());
+        account.user_id = "a@example.com".to_string();
+        account.access_token = Some("access-a".to_string());
+        account.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account).unwrap();
+
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting = MeetingRecord::new(Some("Deletion-fenced meeting".to_string()));
+        meeting.owner_account_id = Some("account-a".to_string());
+        let meeting_id = meeting.id;
+        store.save_active(&meeting).unwrap();
+        let daemon = test_daemon(&paths);
+        let audio_account_context = AnswerAccountContext::capture(&paths).unwrap();
+        let (audio_stop_tx, audio_stop_rx) = oneshot::channel();
+        {
+            let mut runtime = daemon.audio_runtime.lock().await;
+            runtime.stop = Some(audio_stop_tx);
+            runtime.session_id = Some("deletion-audio-session".to_string());
+            runtime.meeting_id = Some(meeting_id);
+            runtime.account_context = Some(audio_account_context.clone());
+        }
+        let (capture_stop_tx, capture_stop_rx) = oneshot::channel();
+        {
+            let mut capture = daemon.capture.lock().await;
+            capture.stop = Some(capture_stop_tx);
+            capture.generation = 7;
+        }
+        let running_cloud_operation = AccountCloudContext::snapshot(&paths, None).unwrap();
+
+        let prepared = prepare_deleted_account_local_purge(
+            &daemon,
+            "account-a",
+            "550e8400-e29b-41d4-a716-446655440201",
+            "550e8400-e29b-41d4-a716-446655440202",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared.operation_id,
+            "550e8400-e29b-41d4-a716-446655440201"
+        );
+        let pending = load_pending_deleted_account_purge(&paths)
+            .unwrap()
+            .expect("prepared deletion marker");
+        assert_eq!(pending.owner_account_id, "account-a");
+        assert_eq!(pending.state, DeletedAccountPurgeState::Prepared);
+        assert!(running_cloud_operation.ensure_current().is_err());
+        assert!(audio_stop_rx.await.is_ok());
+        assert!(capture_stop_rx.await.is_ok());
+        {
+            let runtime = daemon.audio_runtime.lock().await;
+            assert!(runtime.stop.is_none());
+            assert!(runtime.session_id.is_none());
+            assert!(runtime.finalizing_session.is_none());
+        }
+        assert!(daemon.capture.lock().await.stop.is_none());
+
+        let tail = cue_core::audio::SttSegmentMetadata::new(
+            "this final transcript must not survive deletion preparation",
+            0,
+            500,
+            true,
+        )
+        .with_source(AudioSourceKind::Microphone);
+        let error = add_audio_transcript_segment_allowing_session_start(
+            &daemon,
+            &audio_account_context,
+            &tail,
+        )
+        .await
+        .expect_err("pending deletion must reject a final STT write");
+        assert!(answer_account_context_changed(&error));
+        assert!(daemon
+            .meeting
+            .lock()
+            .await
+            .as_ref()
+            .expect("active meeting")
+            .transcript
+            .is_empty());
+        assert!(daemon
+            .store
+            .load_by_id(meeting_id)
+            .unwrap()
+            .expect("stored meeting")
+            .transcript
+            .is_empty());
+
+        let replay = prepare_deleted_account_local_purge(
+            &daemon,
+            "account-a",
+            "550e8400-e29b-41d4-a716-446655440203",
+            "550e8400-e29b-41d4-a716-446655440204",
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.operation_id, pending.operation_id);
+        assert_eq!(replay.recovery_token, pending.recovery_token);
+        assert!(AnswerAccountContext::capture(&paths).is_err());
+        assert_eq!(
+            resume_pending_deleted_account_purge(&daemon).await.unwrap(),
+            None
+        );
+
+        abort_deleted_account_local_purge(&daemon, "account-a")
+            .await
+            .unwrap();
+        AnswerAccountContext::capture(&paths).unwrap();
+        assert!(load_pending_deleted_account_purge(&paths)
+            .unwrap()
+            .is_none());
+
+        daemon.diagnostics.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn restart_acknowledges_only_a_durable_completed_account_purge() {
+        let (base, paths) = isolated_test_paths("completed-account-deletion-restart");
+        cue_core::save_account(&paths, &cue_core::AccountConfig::local()).unwrap();
+        let daemon = test_daemon(&paths);
+        persist_pending_deleted_account_purge(
+            &paths,
+            "account-a",
+            "550e8400-e29b-41d4-a716-446655440301",
+            "550e8400-e29b-41d4-a716-446655440302",
+            DeletedAccountPurgeState::OnboardingReset,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resume_pending_deleted_account_purge(&daemon).await.unwrap(),
+            Some(0)
+        );
+        assert!(load_pending_deleted_account_purge(&paths)
+            .unwrap()
+            .is_none());
+
+        daemon.diagnostics.shutdown().await;
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -21842,6 +26912,7 @@ mod tests {
         .expect("session db");
         reconcile_session_projection(&session_db, &store, active_meeting.as_ref(), paths)
             .expect("reconcile session projection");
+        let diagnostic_scope = active_meeting.as_ref().map(SessionAuditScope::from_meeting);
         let rag_indexer =
             RagIndexCoordinator::from_paths(paths, store.clone()).expect("RAG index coordinator");
         let (overlay_events_tx, _overlay_events_rx) = mpsc::channel(4);
@@ -21869,6 +26940,7 @@ mod tests {
                 stop: None,
                 interval_secs: 12,
                 last_context_fingerprint: None,
+                generation: 0,
             }),
             meeting_watch: MeetingWatch::default(),
             audio: Mutex::new(AudioPipelineStatus::idle()),
@@ -21876,28 +26948,847 @@ mod tests {
                 stop: None,
                 session_id: None,
                 meeting_id: None,
+                account_context: None,
                 finalizing_session: None,
                 start_generation: 0,
                 starting: false,
             }),
+            audio_diagnostics: AudioDiagnosticRuntime::default(),
             meeting_end_in_progress: AtomicBool::new(false),
             cloud: Mutex::new(cloud_status_from_env(paths)),
             cloud_login: Mutex::new(None),
-            listen_account_verified_until: Mutex::new(None),
+            listen_account_verification: Mutex::new(None),
             auto_cloud_sync_debounce: Mutex::new(None),
-            balance_poll_shutdown: Mutex::new(None),
+            account_answer_transition: Mutex::new(()),
+            cloud_delete_flush: Mutex::new(()),
+            cloud_sync_flight: Mutex::new(()),
+            balance_poll_task: Mutex::new(None),
             balance_watch: crate::cloud::balance::BalanceWatch::default(),
             overlay_answer_active: Mutex::new(false),
             answer_generation: AtomicU64::new(0),
             active_answer_card: Mutex::new(None),
             active_answer_snapshot: Mutex::new(None),
+            pending_answer_render_acks: Mutex::new(VecDeque::new()),
             system_audio: Mutex::new(None),
             live_transcript_tx: broadcast::channel(64).0,
             last_live_transcript: Mutex::new(None),
             rag_indexer,
             overlay_session_token: "test-token".to_string(),
             overlay_ui_state: new_shared_overlay_ui_state(),
+            diagnostic_scope: parking_lot::RwLock::new(diagnostic_scope),
+            diagnostics: DiagnosticRuntime::disabled(),
         })
+    }
+
+    #[tokio::test]
+    async fn late_balance_success_and_401_never_cross_owner_or_credential_generation() {
+        let (base, paths) = isolated_test_paths("balance-authority-transition");
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a1")).unwrap();
+        let daemon = test_daemon(&paths);
+
+        let client_a = build_cloud_client(&paths, None).unwrap();
+        let credentials_a = client_a.credential_snapshot().unwrap();
+        cue_core::save_account(&paths, &signed_in_test_account("account-b", "access-b")).unwrap();
+        let account_b = load_account(&paths).unwrap().unwrap();
+
+        assert!(
+            push_overlay_balance_snapshot(&daemon, &credentials_a, &test_balance_snapshot(101))
+                .await
+                .unwrap()
+                .is_none(),
+            "late A success must not render after B replaces it"
+        );
+        assert!(
+            !clear_revoked_client_credentials(
+                &daemon,
+                &client_a,
+                &credentials_a,
+                "test_late_owner_401",
+            )
+            .await
+            .unwrap(),
+            "late A 401 must not clear B"
+        );
+        assert_account_credentials_unchanged(&load_account(&paths).unwrap().unwrap(), &account_b);
+
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a1")).unwrap();
+        let client_a1 = build_cloud_client(&paths, None).unwrap();
+        let credentials_a1 = client_a1.credential_snapshot().unwrap();
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a2")).unwrap();
+        let account_a2 = load_account(&paths).unwrap().unwrap();
+
+        assert!(
+            push_overlay_balance_snapshot(&daemon, &credentials_a1, &test_balance_snapshot(102))
+                .await
+                .unwrap()
+                .is_none(),
+            "late A1 success must not render after A2 refreshes it"
+        );
+        assert!(
+            !clear_revoked_client_credentials(
+                &daemon,
+                &client_a1,
+                &credentials_a1,
+                "test_late_generation_401",
+            )
+            .await
+            .unwrap(),
+            "late A1 401 must not clear A2"
+        );
+        assert_account_credentials_unchanged(&load_account(&paths).unwrap().unwrap(), &account_a2);
+
+        daemon.diagnostics.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn listen_verification_cache_never_crosses_owner_or_credential_generation() {
+        let (base, paths) = isolated_test_paths("listen-verification-authority-transition");
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a1")).unwrap();
+        let daemon = test_daemon(&paths);
+
+        let credentials_a1 = stored_test_credentials(&paths);
+        let account_a1 = AnswerAccountContext::capture(&paths).unwrap();
+        mark_listen_account_verified(&daemon, credentials_a1.clone()).await;
+        assert!(listen_account_verification_is_fresh(&daemon, &account_a1).await);
+
+        cue_core::save_account(&paths, &signed_in_test_account("account-b", "access-b")).unwrap();
+        let account_b = AnswerAccountContext::capture(&paths).unwrap();
+        assert!(
+            !listen_account_verification_is_fresh(&daemon, &account_b).await,
+            "a cached verification for A must not authorize B"
+        );
+        assert!(daemon.listen_account_verification.lock().await.is_none());
+
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a1")).unwrap();
+        let credentials_a1 = stored_test_credentials(&paths);
+        let account_a1 = AnswerAccountContext::capture(&paths).unwrap();
+        mark_listen_account_verified(&daemon, credentials_a1).await;
+        assert!(listen_account_verification_is_fresh(&daemon, &account_a1).await);
+
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a2")).unwrap();
+        let account_a2 = AnswerAccountContext::capture(&paths).unwrap();
+        assert!(
+            !listen_account_verification_is_fresh(&daemon, &account_a2).await,
+            "a cached verification for A1 must not authorize refreshed A2 credentials"
+        );
+        assert!(daemon.listen_account_verification.lock().await.is_none());
+
+        daemon.diagnostics.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn exact_revoked_balance_event_clears_only_its_credential_successor() {
+        let (base, paths) = isolated_test_paths("balance-exact-revocation");
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a")).unwrap();
+        let credentials = stored_test_credentials(&paths);
+        let daemon = test_daemon(&paths);
+
+        assert!(
+            clear_revoked_credentials(&daemon, &credentials, "test_exact_revocation")
+                .await
+                .unwrap()
+        );
+        let account = load_account(&paths).unwrap().unwrap();
+        assert_eq!(
+            account.owner_account_id_with_token_state(true),
+            Some("account-a")
+        );
+        assert!(account.access_token.is_none());
+        assert!(account.refresh_token.is_none());
+        assert!(stored_test_credentials_if_any(&paths).is_none());
+        assert!(matches!(
+            daemon.balance_watch.current_event(),
+            BalanceEvent::Cleared { credentials: cleared } if cleared == credentials
+        ));
+
+        daemon.diagnostics.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn balance_poll_task_shutdown_is_owned_and_awaited() {
+        let (base, paths) = isolated_test_paths("balance-owned-shutdown");
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a")).unwrap();
+        let daemon = test_daemon(&paths);
+        let client = build_cloud_client(&paths, None).unwrap();
+        let task =
+            crate::cloud::balance::spawn_authority_loop(client, daemon.balance_watch.clone())
+                .unwrap();
+        *daemon.balance_poll_task.lock().await = Some(task);
+
+        assert!(
+            timeout(Duration::from_secs(3), stop_balance_polling(&daemon))
+                .await
+                .expect("owned balance poll shutdown should complete")
+        );
+        assert!(daemon.balance_poll_task.lock().await.is_none());
+
+        daemon.diagnostics.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn continuous_audio_rechecks_account_after_dequeue_before_provider_dispatch() {
+        let (base, paths) = isolated_test_paths("continuous-audio-dispatch-fence");
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a")).unwrap();
+        let account_context = AnswerAccountContext::capture(&paths).unwrap();
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<()>(1);
+        let (dequeued_tx, dequeued_rx) = oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+        let task_paths = paths.clone();
+        let dispatch = tokio::spawn(async move {
+            chunk_rx.recv().await.expect("test chunk");
+            let _ = dequeued_tx.send(());
+            let _ = resume_rx.await;
+            continuous_audio_account_is_current(&task_paths, &account_context)
+        });
+
+        chunk_tx.send(()).await.unwrap();
+        dequeued_rx.await.unwrap();
+        cue_core::save_account(&paths, &signed_in_test_account("account-b", "access-b")).unwrap();
+        let _ = resume_tx.send(());
+        assert!(
+            !dispatch.await.unwrap(),
+            "A chunk dequeued before the switch must be rejected at dispatch after B wins"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn queued_account_a_mutations_cannot_touch_replacement_account_b() {
+        let (base, paths) = isolated_test_paths("queued-owner-bound-mutations");
+        let mut account_a = cue_core::AccountConfig::local();
+        account_a.provider = "bluey".to_string();
+        account_a.cloud_account_id = Some("account-a".to_string());
+        account_a.user_id = "a@example.com".to_string();
+        account_a.access_token = Some("access-a".to_string());
+        account_a.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting_a = MeetingRecord::new(Some("Owner A".to_string()));
+        meeting_a.owner_account_id = Some("account-a".to_string());
+        store.save_active(&meeting_a).unwrap();
+        let mut local_meeting = MeetingRecord::new(Some("Local meeting".to_string()));
+        local_meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "saved local content",
+            true,
+        ));
+        let local_meeting_id = local_meeting.id;
+        store.save_archived(&local_meeting).unwrap();
+        let daemon = test_daemon(&paths);
+        let stale_fence = current_session_mutation_fence(&daemon, true).await.unwrap();
+
+        // Queue A's logout behind the same transition barrier used by login.
+        // Install B while the barrier is held, then prove the stale request
+        // validates only after it acquires the barrier and therefore fails.
+        let transition = daemon.account_answer_transition.lock().await;
+        let queued_daemon = daemon.clone();
+        let queued_fence = stale_fence.clone();
+        let queued_logout = tokio::spawn(async move {
+            handle_request(
+                &queued_daemon,
+                DaemonRequest::CloudLogoutBound {
+                    fence: queued_fence,
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!queued_logout.is_finished());
+
+        let mut account_b = account_a;
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+        let mut meeting_b = MeetingRecord::new(Some("Owner B".to_string()));
+        meeting_b.owner_account_id = Some("account-b".to_string());
+        daemon.store.save_active(&meeting_b).unwrap();
+        *daemon.meeting.lock().await = Some(meeting_b.clone());
+        project_meeting_session(&daemon, &meeting_b, SessionStatus::Active, true).unwrap();
+        update_state_from_meeting(&daemon, Some(&meeting_b))
+            .await
+            .unwrap();
+        drop(transition);
+
+        assert!(matches!(
+            queued_logout.await.unwrap(),
+            DaemonResponse::Error { .. }
+        ));
+        assert_eq!(
+            cue_core::load_account(&paths)
+                .unwrap()
+                .and_then(|account| account.cloud_account_id),
+            Some("account-b".to_string())
+        );
+
+        let owner_b_session_count = daemon
+            .session_db
+            .lock()
+            .list_sessions_for_owner(Some("account-b"), None, 100)
+            .unwrap()
+            .len();
+        for request in [
+            DaemonRequest::MeetingEndBound {
+                fence: stale_fence.clone(),
+            },
+            DaemonRequest::SessionCreateBound {
+                title: Some("Stale A creation".to_string()),
+                fence: stale_fence.clone(),
+            },
+            DaemonRequest::SessionDeactivateBound {
+                fence: stale_fence.clone(),
+            },
+            DaemonRequest::SessionsMoveLocalToCurrentAccountBound {
+                confirmed: true,
+                fence: stale_fence.clone(),
+            },
+        ] {
+            assert!(matches!(
+                handle_request(&daemon, request).await,
+                DaemonResponse::Error { .. }
+            ));
+        }
+        assert!(daemon
+            .meeting
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|meeting| meeting.id == meeting_b.id));
+        assert_eq!(
+            daemon
+                .session_db
+                .lock()
+                .list_sessions_for_owner(Some("account-b"), None, 100)
+                .unwrap()
+                .len(),
+            owner_b_session_count
+        );
+        assert!(daemon
+            .store
+            .load_by_id(local_meeting_id)
+            .unwrap()
+            .is_some_and(|meeting| meeting.owner_account_id.is_none()));
+
+        daemon.diagnostics.shutdown().await;
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn validated_account_a_helpers_never_derive_replacement_account_b_owner() {
+        let (base, paths) = isolated_test_paths("validated-owner-helper-account-switch");
+        let mut account_a = cue_core::AccountConfig::local();
+        account_a.provider = "bluey".to_string();
+        account_a.cloud_account_id = Some("account-a".to_string());
+        account_a.user_id = "a@example.com".to_string();
+        account_a.access_token = Some("access-a".to_string());
+        account_a.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting_a = MeetingRecord::new(Some("Owner A".to_string()));
+        meeting_a.owner_account_id = Some("account-a".to_string());
+        let artifact = ContextArtifact::new(
+            ContextKind::Text,
+            "/tmp/owner-a-context.txt",
+            "Owner A context",
+            None,
+            Some(12),
+        );
+        let artifact_id = artifact.id;
+        meeting_a.context.push(artifact);
+        meeting_a.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "owner A content",
+            true,
+        ));
+        let meeting_a_id = meeting_a.id;
+        store.save_active(&meeting_a).unwrap();
+
+        let mut local = MeetingRecord::new(Some("Local import".to_string()));
+        local
+            .transcript
+            .push(TranscriptSegment::new(Speaker::User, "local content", true));
+        let local_id = local.id;
+        store.save_archived(&local).unwrap();
+
+        let daemon = test_daemon(&paths);
+        let validated_a = AnswerAccountContext::capture(&paths).unwrap();
+
+        let mut account_b = account_a;
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+
+        assert!(create_canonical_session(
+            &daemon,
+            Some("Must not create for B".to_string()),
+            &validated_a,
+        )
+        .await
+        .is_err());
+        assert!(continue_session(&daemon, "stale A", &validated_a)
+            .await
+            .is_err());
+        assert!(
+            activate_canonical_session(&daemon, meeting_a_id, &validated_a)
+                .await
+                .is_err()
+        );
+        assert!(
+            rename_meeting_session(&daemon, meeting_a_id, "Hijacked", &validated_a)
+                .await
+                .is_err()
+        );
+        assert!(
+            archive_canonical_session(&daemon, meeting_a_id, &validated_a)
+                .await
+                .is_err()
+        );
+        assert!(deactivate_canonical_session(&daemon, &validated_a)
+            .await
+            .is_err());
+        assert!(delete_meeting_session(&daemon, meeting_a_id, &validated_a)
+            .await
+            .is_err());
+        assert!(
+            move_unowned_local_sessions_to_current_account(&daemon, &validated_a)
+                .await
+                .is_err()
+        );
+        assert!(attach_context_artifacts(
+            &daemon,
+            vec![ContextArtifact::new(
+                ContextKind::Text,
+                "/tmp/stale-a.txt",
+                "Stale A",
+                None,
+                Some(7),
+            )],
+            &validated_a,
+        )
+        .await
+        .is_err());
+        assert!(set_answer_instructions(
+            &daemon,
+            Some("Stale A instructions".to_string()),
+            &validated_a,
+        )
+        .await
+        .is_err());
+        assert!(set_context_artifact_role(
+            &daemon,
+            artifact_id,
+            AnswerContextRole::CandidateResume,
+            &validated_a,
+        )
+        .await
+        .is_err());
+
+        let unchanged_a = daemon.store.load_by_id(meeting_a_id).unwrap().unwrap();
+        assert_eq!(unchanged_a.title, "Owner A");
+        assert_eq!(unchanged_a.owner_account_id.as_deref(), Some("account-a"));
+        assert!(daemon
+            .store
+            .load_by_id(local_id)
+            .unwrap()
+            .is_some_and(|meeting| meeting.owner_account_id.is_none()));
+        assert!(daemon
+            .session_db
+            .lock()
+            .list_sessions_for_owner(Some("account-b"), None, 100)
+            .unwrap()
+            .is_empty());
+
+        daemon.diagnostics.shutdown().await;
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn audio_runtime_drops_stale_account_a_partial_and_final_after_external_switch() {
+        let (base, paths) = isolated_test_paths("audio-owner-generation-switch");
+        let mut account_a = cue_core::AccountConfig::local();
+        account_a.provider = "bluey".to_string();
+        account_a.cloud_account_id = Some("account-a".to_string());
+        account_a.user_id = "a@example.com".to_string();
+        account_a.access_token = Some("access-a".to_string());
+        account_a.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting_a = MeetingRecord::new(Some("Owner A recording".to_string()));
+        meeting_a.owner_account_id = Some("account-a".to_string());
+        let meeting_a_id = meeting_a.id;
+        store.save_active(&meeting_a).unwrap();
+        let daemon = test_daemon(&paths);
+        let captured_a = AnswerAccountContext::capture(&paths).unwrap();
+        {
+            let mut runtime = daemon.audio_runtime.lock().await;
+            runtime.session_id = Some("audio-account-a".to_string());
+            runtime.meeting_id = Some(meeting_a_id);
+            runtime.account_context = Some(captured_a);
+        }
+        let mut live_events = daemon.live_transcript_tx.subscribe();
+
+        let mut account_b = account_a;
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+
+        for is_final in [false, true] {
+            let segment = cue_core::audio::SttSegmentMetadata::new(
+                if is_final {
+                    "stale final"
+                } else {
+                    "stale partial"
+                },
+                0,
+                200,
+                is_final,
+            )
+            .with_source(AudioSourceKind::Microphone);
+            let error = add_audio_transcript_segment(&daemon, "audio-account-a", &segment)
+                .await
+                .expect_err("stale audio authority must fail closed");
+            assert!(answer_account_context_changed(&error));
+        }
+
+        assert!(live_events.try_recv().is_err());
+        assert!(daemon.last_live_transcript.lock().await.is_none());
+        assert!(daemon
+            .meeting
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|meeting| meeting.transcript.is_empty()));
+        assert!(daemon
+            .store
+            .load_by_id(meeting_a_id)
+            .unwrap()
+            .is_some_and(|meeting| meeting.transcript.is_empty()));
+
+        daemon.diagnostics.shutdown().await;
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn meeting_end_rejects_external_owner_switch_after_audio_settlement() {
+        let (base, paths) = isolated_test_paths("meeting-end-owner-switch-during-settle");
+        let mut account_a = cue_core::AccountConfig::local();
+        account_a.provider = "bluey".to_string();
+        account_a.cloud_account_id = Some("account-a".to_string());
+        account_a.user_id = "a@example.com".to_string();
+        account_a.access_token = Some("access-a".to_string());
+        account_a.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut meeting_a = MeetingRecord::new(Some("Owner A ending".to_string()));
+        meeting_a.owner_account_id = Some("account-a".to_string());
+        meeting_a.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "preserve owner A",
+            true,
+        ));
+        let meeting_a_id = meeting_a.id;
+        store.save_active(&meeting_a).unwrap();
+        let daemon = test_daemon(&paths);
+        let captured_a = AnswerAccountContext::capture(&paths).unwrap();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        {
+            let mut runtime = daemon.audio_runtime.lock().await;
+            runtime.stop = Some(stop_tx);
+            runtime.session_id = Some("meeting-end-audio-a".to_string());
+            runtime.meeting_id = Some(meeting_a_id);
+            runtime.account_context = Some(captured_a);
+        }
+        let fence = current_session_mutation_fence(&daemon, true).await.unwrap();
+        let daemon_for_end = Arc::clone(&daemon);
+        let ending = tokio::spawn(async move {
+            handle_request(&daemon_for_end, DaemonRequest::MeetingEndBound { fence }).await
+        });
+        stop_rx.await.expect("meeting end requests audio stop");
+
+        let mut account_b = account_a;
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+
+        assert!(matches!(
+            ending.await.unwrap(),
+            DaemonResponse::Error { .. }
+        ));
+        assert!(daemon
+            .meeting
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|meeting| meeting.id == meeting_a_id));
+        assert!(daemon
+            .store
+            .load_by_id(meeting_a_id)
+            .unwrap()
+            .is_some_and(|meeting| meeting.ended_at.is_none()));
+
+        daemon.diagnostics.shutdown().await;
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn browser_login_owner_switch_invalidates_active_answer_but_token_refresh_does_not() {
+        let (base, paths) = isolated_test_paths("answer-account-switch");
+        let mut account_a = cue_core::AccountConfig::local();
+        account_a.provider = "bluey".to_string();
+        account_a.cloud_account_id = Some("account-a".to_string());
+        account_a.user_id = "a@example.com".to_string();
+        account_a.access_token = Some("access-a".to_string());
+        account_a.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+
+        let daemon = test_daemon(&paths);
+        let generation_id = next_answer_generation(&daemon);
+        let card_id = uuid::Uuid::new_v4();
+        *daemon.active_answer_card.lock().await = Some((generation_id, card_id));
+        let original_context = AnswerAccountContext::capture(&paths).unwrap();
+
+        account_a.access_token = Some("rotated-access-a".to_string());
+        cue_core::save_account(&paths, &account_a).unwrap();
+        let refreshed_context = AnswerAccountContext::capture(&paths).unwrap();
+        assert!(
+            !invalidate_active_answer_if_owner_changed(
+                &daemon,
+                &original_context,
+                &refreshed_context,
+            )
+            .await
+        );
+        assert!(is_answer_generation_current(&daemon, generation_id));
+        assert_eq!(
+            *daemon.active_answer_card.lock().await,
+            Some((generation_id, card_id))
+        );
+        original_context.ensure_owner_current(&paths).unwrap();
+        assert!(original_context.ensure_current(&paths).is_err());
+
+        let mut account_b = account_a;
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+        let switched_context = AnswerAccountContext::capture(&paths).unwrap();
+        assert!(
+            invalidate_active_answer_if_owner_changed(
+                &daemon,
+                &refreshed_context,
+                &switched_context,
+            )
+            .await
+        );
+        assert!(!is_answer_generation_current(&daemon, generation_id));
+        assert!(daemon.active_answer_card.lock().await.is_none());
+        assert!(refreshed_context.ensure_owner_current(&paths).is_err());
+        assert!(refreshed_context.ensure_current(&paths).is_err());
+
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn cloud_tombstone_clears_active_session_and_purges_only_the_named_owner() {
+        let (base, paths) = isolated_test_paths("cloud-tombstone-lifecycle");
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.cloud_account_id = Some("account-a".to_string());
+        account.user_id = "a@example.com".to_string();
+        account.access_token = Some("access-a".to_string());
+        account.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account).unwrap();
+
+        let store = MeetingStore::new(&paths).unwrap();
+        let mut active = MeetingRecord::new(Some("Cloud deleted".to_string()));
+        active.owner_account_id = Some("account-a".to_string());
+        let active_id = active.id;
+        store.save_active(&active).unwrap();
+        let mut other_owner = MeetingRecord::new(Some("Keep owner B".to_string()));
+        other_owner.owner_account_id = Some("account-b".to_string());
+        let other_owner_id = other_owner.id;
+        store.save_archived(&other_owner).unwrap();
+        for meeting in [&active, &other_owner] {
+            crate::cloud::sync::append_privacy_safe_diagnostic_events_for_scope(
+                &paths.data_dir,
+                &SessionAuditScope::from_meeting(meeting),
+                &[("existing".to_string(), serde_json::json!({"count": 1}))],
+            )
+            .unwrap();
+        }
+        let active_diagnostics = crate::cloud::sync::session_audit_event_log_path_for_test(
+            &paths.data_dir,
+            &SessionAuditScope::from_meeting(&active),
+        );
+        let other_owner_diagnostics = crate::cloud::sync::session_audit_event_log_path_for_test(
+            &paths.data_dir,
+            &SessionAuditScope::from_meeting(&other_owner),
+        );
+        assert!(active_diagnostics.is_file());
+        assert!(other_owner_diagnostics.is_file());
+
+        let mut daemon = test_daemon(&paths);
+        Arc::get_mut(&mut daemon).unwrap().diagnostics =
+            DiagnosticRuntime::start(paths.data_dir.clone());
+        let response_session_id = active_id.to_string();
+        daemon
+            .session_db
+            .lock()
+            .insert_cue_response(crate::db::NewCueResponse {
+                id: "cloud-deleted-response",
+                session_id: &response_session_id,
+                kind: "answer",
+                text: "private answer",
+                source_text: Some("private question"),
+                ts_ms: 100,
+                cost_cents: None,
+                balance_cents_after: None,
+                provider: Some("test"),
+                model: Some("test"),
+                input_tokens: None,
+                output_tokens: None,
+                cost_label: None,
+                artifact_type: None,
+                artifact_body: None,
+                artifact_confidence: None,
+            })
+            .unwrap();
+        let answer_generation = next_answer_generation(&daemon);
+        *daemon.active_answer_card.lock().await = Some((answer_generation, uuid::Uuid::new_v4()));
+
+        // Hydration removes the canonical file before app-level cleanup sees
+        // the returned tombstone IDs. The in-memory active session and SQL
+        // response projection deliberately remain at this point.
+        assert!(daemon.store.delete(active_id).unwrap());
+        assert!(daemon
+            .meeting
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|meeting| meeting.id == active_id));
+        assert_eq!(
+            daemon
+                .session_db
+                .lock()
+                .list_cue_responses(&response_session_id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let account_context = AccountCloudContext::snapshot(&paths, None).unwrap();
+        assert!(purge_cloud_tombstoned_sessions_for_owner(
+            &daemon,
+            &account_context,
+            &[active_id, other_owner_id],
+        )
+        .await
+        .unwrap());
+
+        assert!(daemon.meeting.lock().await.is_none());
+        assert!(!is_answer_generation_current(&daemon, answer_generation));
+        assert!(daemon.active_answer_card.lock().await.is_none());
+        assert!(daemon.store.load_by_id(active_id).unwrap().is_none());
+        assert!(daemon.store.load_by_id(other_owner_id).unwrap().is_some());
+        assert!(!active_diagnostics.exists());
+        assert!(other_owner_diagnostics.is_file());
+        assert!(matches!(
+            daemon.state.lock().await.meeting,
+            MeetingState::Idle
+        ));
+        {
+            let db = daemon.session_db.lock();
+            assert!(db
+                .is_cloud_session_tombstoned_for_owner("account-a", active_id)
+                .unwrap());
+            assert!(db
+                .get_session_for_owner(Some("account-a"), active_id)
+                .unwrap()
+                .is_none());
+            assert!(db
+                .list_cue_responses(&response_session_id, 10)
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .ensure_session_record_for_owner(
+                    Some("account-a"),
+                    active_id,
+                    "Late stale write",
+                    100,
+                    200,
+                )
+                .is_err());
+            assert!(db
+                .get_session_for_owner(Some("account-b"), other_owner_id)
+                .unwrap()
+                .is_some());
+        }
+
+        assert!(!purge_cloud_tombstoned_sessions_for_owner(
+            &daemon,
+            &account_context,
+            &[active_id],
+        )
+        .await
+        .unwrap());
+
+        daemon.store.save_active(&other_owner).unwrap();
+        *daemon.meeting.lock().await = Some(other_owner.clone());
+        update_state_from_meeting(&daemon, Some(&other_owner))
+            .await
+            .unwrap();
+        let mut account_b = account;
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+        assert!(purge_cloud_tombstoned_sessions_for_owner(
+            &daemon,
+            &account_context,
+            &[other_owner_id],
+        )
+        .await
+        .is_err());
+        assert!(daemon
+            .meeting
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|meeting| meeting.id == other_owner_id));
+        assert!(daemon.store.load_by_id(other_owner_id).unwrap().is_some());
+        assert!(daemon
+            .session_db
+            .lock()
+            .get_session_for_owner(Some("account-b"), other_owner_id)
+            .unwrap()
+            .is_some());
+
+        daemon.diagnostics.shutdown().await;
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
@@ -21924,11 +27815,11 @@ mod tests {
         daemon
             .overlay_hydration
             .send_if_modified(|state| state.begin(generation));
-        *daemon.overlay.lock().await = Some(OverlayProcess {
+        *daemon.overlay.lock().await = Some(OverlayProcess::new(
             child,
-            transport: OverlayTransport::Stdio(stdin),
+            OverlayTransport::Stdio(stdin),
             generation,
-        });
+        ));
 
         let command_daemon = Arc::clone(&daemon);
         let command = tokio::spawn(async move {
@@ -21966,7 +27857,7 @@ mod tests {
             .await
             .take()
             .expect("test overlay process");
-        drop(process.transport);
+        process.writer.shutdown_blocking();
         process.child.wait().expect("drain overlay test pipe");
         daemon
             .overlay_hydration
@@ -21988,6 +27879,162 @@ mod tests {
             Some("push_card")
         );
 
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    async fn install_overlay_command_capture(
+        daemon: &Arc<Daemon>,
+        output_path: &Path,
+        generation: u64,
+    ) {
+        let output_file = std::fs::File::create(output_path).expect("overlay test output");
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(output_file))
+            .spawn()
+            .expect("spawn deterministic overlay pipe");
+        let stdin = child.stdin.take().expect("overlay test stdin");
+        daemon
+            .overlay_generation
+            .store(generation, Ordering::Release);
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.begin(generation));
+        *daemon.overlay.lock().await = Some(OverlayProcess::new(
+            child,
+            OverlayTransport::Stdio(stdin),
+            generation,
+        ));
+    }
+
+    #[cfg(unix)]
+    async fn finish_overlay_command_capture(
+        daemon: &Arc<Daemon>,
+        output_path: &Path,
+        generation: u64,
+    ) -> Vec<serde_json::Value> {
+        let mut process = daemon
+            .overlay
+            .lock()
+            .await
+            .take()
+            .expect("test overlay process");
+        process.writer.shutdown_blocking();
+        process.child.wait().expect("drain overlay test pipe");
+        daemon
+            .overlay_hydration
+            .send_if_modified(|state| state.fail(generation));
+        std::fs::read_to_string(output_path)
+            .expect("read overlay command log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse overlay command"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlay_account_hydration_revalidates_a_to_b_before_completing() {
+        let (base, paths) = isolated_test_paths("overlay-account-hydration-a-to-b");
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a")).unwrap();
+        let daemon = test_daemon(&paths);
+        daemon
+            .balance_watch
+            .publish_for_credentials(stored_test_credentials(&paths), test_balance_snapshot(111));
+
+        let generation = 71;
+        let output_path = base.join("overlay-commands.ndjson");
+        install_overlay_command_capture(&daemon, &output_path, generation).await;
+        let switch_paths = paths.clone();
+        let switch_balance = daemon.balance_watch.clone();
+        hydrate_overlay_account_state_with_attempt_hook(&daemon, generation, move |attempt| {
+            if attempt == 1 {
+                cue_core::save_account(
+                    &switch_paths,
+                    &signed_in_test_account("account-b", "access-b"),
+                )
+                .expect("replace account during hydration");
+                switch_balance.publish_for_credentials(
+                    stored_test_credentials(&switch_paths),
+                    test_balance_snapshot(222),
+                );
+            }
+        })
+        .await
+        .expect("A to B hydration should stabilize");
+
+        let commands = finish_overlay_command_capture(&daemon, &output_path, generation).await;
+        assert_eq!(
+            commands.len(),
+            4,
+            "account switch should require two attempts"
+        );
+        assert_eq!(
+            commands[1].get("label").and_then(serde_json::Value::as_str),
+            Some(format_balance_snapshot_label(&test_balance_snapshot(111)).as_str())
+        );
+        assert_eq!(
+            commands[2]
+                .get("signed_in")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let final_balance = format_balance_snapshot_label(&test_balance_snapshot(222));
+        assert_eq!(
+            commands[3].get("label").and_then(serde_json::Value::as_str),
+            Some(final_balance.as_str()),
+            "stale account A balance must not remain after account B wins"
+        );
+        assert_eq!(
+            stored_test_credentials(&paths)
+                .authority()
+                .owner_account_id(),
+            "account-b"
+        );
+
+        daemon.diagnostics.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn overlay_account_hydration_revalidates_a_to_signed_out_before_completing() {
+        let (base, paths) = isolated_test_paths("overlay-account-hydration-a-to-signed-out");
+        cue_core::save_account(&paths, &signed_in_test_account("account-a", "access-a")).unwrap();
+        let daemon = test_daemon(&paths);
+        daemon
+            .balance_watch
+            .publish_for_credentials(stored_test_credentials(&paths), test_balance_snapshot(333));
+
+        let generation = 72;
+        let output_path = base.join("overlay-commands.ndjson");
+        install_overlay_command_capture(&daemon, &output_path, generation).await;
+        let sign_out_paths = paths.clone();
+        hydrate_overlay_account_state_with_attempt_hook(&daemon, generation, move |attempt| {
+            if attempt == 1 {
+                cue_core::save_account(&sign_out_paths, &cue_core::AccountConfig::local())
+                    .expect("sign out during hydration");
+            }
+        })
+        .await
+        .expect("A to signed-out hydration should stabilize");
+
+        let commands = finish_overlay_command_capture(&daemon, &output_path, generation).await;
+        assert_eq!(commands.len(), 4, "sign-out should require two attempts");
+        assert_eq!(
+            commands[2]
+                .get("signed_in")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            commands[3].get("label").and_then(serde_json::Value::as_str),
+            Some("Sign in"),
+            "stale account A balance must be cleared after sign-out wins"
+        );
+        assert!(stored_test_credentials_if_any(&paths).is_none());
+
+        daemon.diagnostics.shutdown().await;
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -22140,11 +28187,11 @@ mod tests {
         daemon
             .overlay_hydration
             .send_if_modified(|state| state.begin(generation));
-        *daemon.overlay.lock().await = Some(OverlayProcess {
+        *daemon.overlay.lock().await = Some(OverlayProcess::new(
             child,
-            transport: OverlayTransport::Stdio(stdin),
+            OverlayTransport::Stdio(stdin),
             generation,
-        });
+        ));
 
         let restart_daemon = Arc::clone(&daemon);
         let restart = tokio::spawn(async move { restart_overlay_once(&restart_daemon).await });
@@ -22189,16 +28236,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn debug_overlay_allowance_requires_marked_owned_test_workspace() {
+        let root =
+            env::temp_dir().join(format!("bluey-tests.overlay-root-{}", uuid::Uuid::new_v4()));
+        let inside = root.join("helper");
+        let outside =
+            env::temp_dir().join(format!("bluey-overlay-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create test workspace");
+        std::fs::write(&inside, b"test helper").expect("write inside helper");
+        std::fs::write(&outside, b"outside helper").expect("write outside helper");
+
+        assert!(marked_test_workspace_root_for(&inside, Some(root.as_os_str())).is_none());
+        std::fs::write(root.join(".bluey-test-workspace"), b"").expect("mark owned test workspace");
+        assert_eq!(
+            marked_test_workspace_root_for(&inside, Some(root.as_os_str())),
+            root.canonicalize().ok()
+        );
+        assert!(marked_test_workspace_root_for(&outside, Some(root.as_os_str())).is_none());
+
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn replacement_ready_hydrates_while_exited_event_waits_for_command() {
         use std::os::unix::fs::PermissionsExt;
 
         let (base, paths) = isolated_test_paths("overlay-ready-reentrant");
-        let helper_dir = env::current_dir()
-            .expect("test current directory")
-            .join("target")
-            .join(format!("overlay-ready-test-{}", uuid::Uuid::new_v4()));
+        // Keep generated helpers inside the test-owned temporary tree. A
+        // failed or interrupted test must never leave repository-local target
+        // residue behind.
+        let helper_dir = base.join(format!("overlay-ready-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&helper_dir).expect("create overlay helper directory");
         let helper = helper_dir.join("overlay-ready-test.sh");
         std::fs::write(
@@ -22302,11 +28372,16 @@ cat
         meeting.context.push(artifact);
         store.save_active(&meeting).expect("save active meeting");
         let daemon = test_daemon(&paths);
+        let account_context = AnswerAccountContext::capture(&paths).unwrap();
 
-        let (snapshot, updated) =
-            set_context_artifact_role(&daemon, artifact_id, AnswerContextRole::CandidateResume)
-                .await
-                .expect("set explicit context role");
+        let (snapshot, updated) = set_context_artifact_role(
+            &daemon,
+            artifact_id,
+            AnswerContextRole::CandidateResume,
+            &account_context,
+        )
+        .await
+        .expect("set explicit context role");
 
         assert_eq!(
             updated.answer_context_role,
@@ -22351,12 +28426,13 @@ cat
         meeting.context.push(artifact);
         store.save_active(&meeting).expect("save active meeting");
         let daemon = test_daemon(&paths);
+        let account_context = AnswerAccountContext::capture(&paths).unwrap();
 
         for role in [
             AnswerContextRole::UserConfirmedStory,
             AnswerContextRole::CandidateResume,
         ] {
-            let error = set_context_artifact_role(&daemon, artifact_id, role)
+            let error = set_context_artifact_role(&daemon, artifact_id, role, &account_context)
                 .await
                 .expect_err("derived model summary must not gain a trusted role");
             assert!(error.to_string().contains("can only remain General"));
@@ -24191,9 +30267,10 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         )
         .expect("client");
 
-        let traced = cloud_client_with_optional_trace(client, Some("trace-123"));
+        let trace_id = "550e8400-e29b-41d4-a716-446655440001";
+        let traced = cloud_client_with_optional_trace(client, Some(trace_id));
 
-        assert_eq!(traced.config.trace_id.as_deref(), Some("trace-123"));
+        assert_eq!(traced.config.trace_id.as_deref(), Some(trace_id));
     }
 
     #[test]
@@ -24204,7 +30281,7 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         )
         .expect("client");
 
-        let traced = cloud_client_with_optional_trace(client, Some("bad\ntrace"));
+        let traced = cloud_client_with_optional_trace(client, Some("user@example.com"));
 
         assert_eq!(traced.config.trace_id, None);
     }
@@ -25092,9 +31169,14 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             stop: None,
             session_id: None,
             meeting_id: None,
+            account_context: None,
             finalizing_session: Some(AudioFinalizingSession {
                 session_id: "old-run".to_string(),
                 meeting_id,
+                account_context: AnswerAccountContext {
+                    owner_account_id: None,
+                    credential_generation: None,
+                },
                 expires_at: now + Duration::from_secs(1),
             }),
             start_generation: 1,
@@ -25104,6 +31186,10 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
 
         runtime.session_id = Some("new-run".to_string());
         runtime.meeting_id = Some(meeting_id);
+        runtime.account_context = Some(AnswerAccountContext {
+            owner_account_id: None,
+            credential_generation: None,
+        });
         assert!(select_audio_transcript_session(&mut runtime, Some("old-run"), now).is_none());
         assert_eq!(
             select_audio_transcript_session(&mut runtime, Some("new-run"), now)
@@ -25119,9 +31205,14 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             stop: None,
             session_id: None,
             meeting_id: None,
+            account_context: None,
             finalizing_session: Some(AudioFinalizingSession {
                 session_id: "finished-run".to_string(),
                 meeting_id: uuid::Uuid::new_v4(),
+                account_context: AnswerAccountContext {
+                    owner_account_id: None,
+                    credential_generation: None,
+                },
                 expires_at: now + Duration::from_millis(10),
             }),
             start_generation: 1,
@@ -25147,6 +31238,10 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             stop: Some(stop_tx),
             session_id: Some("active-run".to_string()),
             meeting_id: Some(meeting_id),
+            account_context: Some(AnswerAccountContext {
+                owner_account_id: None,
+                credential_generation: None,
+            }),
             finalizing_session: None,
             start_generation: 7,
             starting: true,
@@ -25185,9 +31280,14 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             stop: None,
             session_id: None,
             meeting_id: None,
+            account_context: None,
             finalizing_session: Some(AudioFinalizingSession {
                 session_id: "finishing-run".to_string(),
                 meeting_id,
+                account_context: AnswerAccountContext {
+                    owner_account_id: None,
+                    credential_generation: None,
+                },
                 expires_at: original_deadline,
             }),
             start_generation: 2,
@@ -26241,6 +32341,8 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         assert!(overlay_event_is_user_interaction(
             &OverlayEvent::AskRequested {
                 question: "private question".to_string(),
+                interaction_id: None,
+                initiated_at_unix_ms: None,
                 provider: None,
                 model: None,
                 mode: None,
@@ -26259,6 +32361,132 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
 
         assert!(overlay_lifecycle_detail_is_safe("theme_changed"));
         assert!(!overlay_lifecycle_detail_is_safe("unknown_stage"));
+    }
+
+    #[test]
+    fn native_dispatch_latency_rejects_future_and_stale_timestamps() {
+        assert_eq!(bounded_native_dispatch_ms(Some(10_000), 10_125), Some(125));
+        assert_eq!(bounded_native_dispatch_ms(Some(10_001), 10_000), None);
+        assert_eq!(
+            bounded_native_dispatch_ms(Some(10_000), 10_000 + 5 * 60 * 1_000 + 1),
+            None
+        );
+        assert_eq!(bounded_native_dispatch_ms(None, 10_000), None);
+    }
+
+    #[test]
+    fn overlapping_audio_runs_keep_diagnostic_attribution_isolated() {
+        let runtime = AudioDiagnosticRuntime::default();
+        let scope_a = SessionAuditScope {
+            session_id: uuid::Uuid::new_v4(),
+            owner_account_id: Some("account-a".to_string()),
+        };
+        let scope_b = SessionAuditScope {
+            session_id: uuid::Uuid::new_v4(),
+            owner_account_id: Some("account-a".to_string()),
+        };
+        let run_a = runtime.start(scope_a, "audio-a".to_string());
+        let run_b = runtime.start(scope_b, "audio-b".to_string());
+
+        assert_eq!(
+            runtime.for_session("audio-a").map(|run| run.run_id),
+            Some(run_a.run_id)
+        );
+        assert_eq!(
+            runtime.for_session("audio-b").map(|run| run.run_id),
+            Some(run_b.run_id)
+        );
+        assert_eq!(
+            runtime.finish("audio-a").map(|run| run.run_id),
+            Some(run_a.run_id)
+        );
+        assert_eq!(
+            runtime.for_session("audio-b").map(|run| run.run_id),
+            Some(run_b.run_id)
+        );
+        assert!(runtime.for_session("audio-a").is_none());
+    }
+
+    #[test]
+    fn overlay_writer_enforces_record_and_aggregate_byte_budgets() {
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let request = build_overlay_write_request(
+            OverlayCommand::SetOpacity { opacity: 0.5 },
+            None,
+            Arc::clone(&queued_bytes),
+            1_024,
+            1_024,
+        )
+        .expect("small command should fit");
+        let reserved = request.line.len();
+        assert_eq!(queued_bytes.load(Ordering::Acquire), reserved);
+
+        let aggregate_error = build_overlay_write_request(
+            OverlayCommand::SetOpacity { opacity: 0.6 },
+            None,
+            Arc::clone(&queued_bytes),
+            1_024,
+            reserved,
+        )
+        .expect_err("aggregate budget must be enforced");
+        assert_eq!(aggregate_error, OverlayWriteFailure::ByteBudgetExceeded);
+
+        let record_error = build_overlay_write_request(
+            OverlayCommand::SetOpacity { opacity: 0.7 },
+            None,
+            Arc::clone(&queued_bytes),
+            1,
+            1_024,
+        )
+        .expect_err("record budget must be enforced");
+        assert_eq!(record_error, OverlayWriteFailure::RecordTooLarge);
+
+        drop(request);
+        assert_eq!(queued_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn final_and_paint_ack_updates_require_confirmed_transport_write() {
+        let card_id = uuid::Uuid::new_v4();
+        let interaction_id = uuid::Uuid::new_v4();
+        let streaming = OverlayCommand::UpdateCard {
+            id: card_id,
+            interaction_id: Some(interaction_id),
+            body: "partial".to_string(),
+            done: false,
+            sequence: 1,
+            snapshot: false,
+            cost_label: None,
+            artifact: None,
+            render_ack: None,
+        };
+        assert!(!overlay_command_requires_write_confirmation(&streaming));
+
+        let first_text = OverlayCommand::UpdateCard {
+            id: card_id,
+            interaction_id: Some(interaction_id),
+            body: "partial".to_string(),
+            done: false,
+            sequence: 1,
+            snapshot: false,
+            cost_label: None,
+            artifact: None,
+            render_ack: Some(AnswerRenderAckPhase::FirstText),
+        };
+        assert!(overlay_command_requires_write_confirmation(&first_text));
+
+        let final_update = OverlayCommand::UpdateCard {
+            id: card_id,
+            interaction_id: Some(interaction_id),
+            body: "done".to_string(),
+            done: true,
+            sequence: 2,
+            snapshot: false,
+            cost_label: None,
+            artifact: None,
+            render_ack: Some(AnswerRenderAckPhase::Final),
+        };
+        assert!(overlay_command_requires_write_confirmation(&final_update));
     }
 
     #[test]
@@ -26551,8 +32779,11 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             .await
             .expect_err("unsigned profile should not start Listen");
 
-        assert!(err.message.contains("Sign in to Bluey before using Listen"));
-        assert!(err.open_login);
+        assert!(err
+            .block
+            .message
+            .contains("Sign in to Bluey before using Listen"));
+        assert!(err.block.open_login);
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -26608,6 +32839,7 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
                 stop: None,
                 interval_secs: 12,
                 last_context_fingerprint: None,
+                generation: 0,
             }),
             meeting_watch: MeetingWatch::default(),
             audio: Mutex::new(AudioPipelineStatus::idle()),
@@ -26615,39 +32847,50 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
                 stop: None,
                 session_id: Some("audio-test".to_string()),
                 meeting_id: None,
+                account_context: Some(AnswerAccountContext {
+                    owner_account_id: None,
+                    credential_generation: None,
+                }),
                 finalizing_session: None,
                 start_generation: 0,
                 starting: false,
             }),
+            audio_diagnostics: AudioDiagnosticRuntime::default(),
             meeting_end_in_progress: AtomicBool::new(false),
             cloud: Mutex::new(cloud_status_from_env(&paths)),
             cloud_login: Mutex::new(None),
-            listen_account_verified_until: Mutex::new(Some(
-                Instant::now() + Duration::from_secs(LISTEN_ACCOUNT_VERIFICATION_TTL_SECS),
-            )),
+            listen_account_verification: Mutex::new(None),
             auto_cloud_sync_debounce: Mutex::new(None),
-            balance_poll_shutdown: Mutex::new(None),
+            account_answer_transition: Mutex::new(()),
+            cloud_delete_flush: Mutex::new(()),
+            cloud_sync_flight: Mutex::new(()),
+            balance_poll_task: Mutex::new(None),
             balance_watch: crate::cloud::balance::BalanceWatch::default(),
             overlay_answer_active: Mutex::new(false),
             answer_generation: AtomicU64::new(0),
             active_answer_card: Mutex::new(None),
             active_answer_snapshot: Mutex::new(None),
+            pending_answer_render_acks: Mutex::new(VecDeque::new()),
             system_audio: Mutex::new(None),
             live_transcript_tx: broadcast::channel(64).0,
             last_live_transcript: Mutex::new(None),
             rag_indexer,
             overlay_session_token: "test-token".to_string(),
             overlay_ui_state: new_shared_overlay_ui_state(),
+            diagnostic_scope: parking_lot::RwLock::new(None),
+            diagnostics: DiagnosticRuntime::disabled(),
         });
 
         *daemon.audio.lock().await =
             AudioPipelineStatus::simulated("audio-test", AudioCaptureConfig::dual_default());
 
-        apply_cloud_account_signed_out(&daemon, "test_signed_out", false).await;
+        let _transition = daemon.account_answer_transition.lock().await;
+        apply_cloud_account_runtime_signed_out_under_transition(&daemon, "test_signed_out", false)
+            .await;
 
         assert!(daemon.audio.lock().await.session_id.is_none());
         assert!(daemon.audio_runtime.lock().await.session_id.is_none());
-        assert!(daemon.listen_account_verified_until.lock().await.is_none());
+        assert!(daemon.listen_account_verification.lock().await.is_none());
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -26655,13 +32898,17 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
     async fn transcript_only_session_is_projected_for_dashboard_visibility() {
         let (base, paths) = isolated_test_paths("transcript-session-projection-test");
         let daemon = test_daemon(&paths);
+        let fence = current_session_mutation_fence(&daemon, false)
+            .await
+            .unwrap();
 
         let response = handle_request(
             &daemon,
-            DaemonRequest::TranscriptAdd {
+            DaemonRequest::TranscriptAddBound {
                 speaker: Speaker::Other,
                 text: "A transcript-only meeting should still be visible.".to_string(),
                 is_final: true,
+                fence,
             },
         )
         .await;
@@ -26917,7 +33164,8 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
     async fn canonical_session_switch_archives_previous_and_stops_audio() {
         let (base, paths) = isolated_test_paths("canonical-session-switch-test");
         let daemon = test_daemon(&paths);
-        let first = create_canonical_session(&daemon, Some("First".to_string()))
+        let account_context = AnswerAccountContext::capture(&paths).unwrap();
+        let first = create_canonical_session(&daemon, Some("First".to_string()), &account_context)
             .await
             .unwrap()
             .changed
@@ -26931,9 +33179,10 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             runtime.meeting_id = Some(first.id);
         }
 
-        let second_lifecycle = create_canonical_session(&daemon, Some("Second".to_string()))
-            .await
-            .unwrap();
+        let second_lifecycle =
+            create_canonical_session(&daemon, Some("Second".to_string()), &account_context)
+                .await
+                .unwrap();
         let second = second_lifecycle.changed.expect("second session");
         let replaced = second_lifecycle.replaced.expect("replaced session");
 
@@ -26970,11 +33219,13 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
     async fn reactivating_current_session_is_idempotent_and_keeps_live_transcript() {
         let (base, paths) = isolated_test_paths("canonical-session-idempotency-test");
         let daemon = test_daemon(&paths);
-        let session = create_canonical_session(&daemon, Some("Current".to_string()))
-            .await
-            .unwrap()
-            .changed
-            .expect("created session");
+        let account_context = AnswerAccountContext::capture(&paths).unwrap();
+        let session =
+            create_canonical_session(&daemon, Some("Current".to_string()), &account_context)
+                .await
+                .unwrap()
+                .changed
+                .expect("created session");
         {
             let mut meeting_guard = daemon.meeting.lock().await;
             let meeting = meeting_guard.as_mut().expect("active meeting");
@@ -26994,7 +33245,7 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             runtime.meeting_id = Some(session.id);
         }
 
-        let lifecycle = activate_canonical_session(&daemon, session.id)
+        let lifecycle = activate_canonical_session(&daemon, session.id, &account_context)
             .await
             .unwrap();
 
@@ -27026,9 +33277,11 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
     async fn overlay_delete_cleans_store_dashboard_history_context_and_rag() {
         let (base, paths) = isolated_test_paths("canonical-session-delete-test");
         let daemon = test_daemon(&paths);
-        let lifecycle = create_canonical_session(&daemon, Some("Delete me".to_string()))
-            .await
-            .unwrap();
+        let account_context = AnswerAccountContext::capture(&paths).unwrap();
+        let lifecycle =
+            create_canonical_session(&daemon, Some("Delete me".to_string()), &account_context)
+                .await
+                .unwrap();
         let session_id = lifecycle.changed.expect("created session").id;
 
         let markdown_dir = paths.data_dir.join("context-markdown");
@@ -27123,7 +33376,9 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             );
         }
 
-        delete_meeting_session(&daemon, session_id).await.unwrap();
+        delete_meeting_session(&daemon, session_id, &account_context)
+            .await
+            .unwrap();
 
         assert!(daemon.store.load_by_id(session_id).unwrap().is_none());
         assert!(!markdown_path.exists());
@@ -27730,7 +33985,8 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
     async fn failed_context_save_does_not_mutate_in_memory_meeting() {
         let (base, paths) = isolated_test_paths("context-save-rollback");
         let daemon = test_daemon(&paths);
-        let existing = new_owned_meeting(&paths, Some("Existing".to_string()));
+        let account_context = AnswerAccountContext::capture(&paths).unwrap();
+        let existing = new_meeting_for_account(&account_context, Some("Existing".to_string()));
         *daemon.meeting.lock().await = Some(existing.clone());
         std::fs::create_dir(paths.data_dir.join("active-meeting.json"))
             .expect("block active meeting replacement");
@@ -27744,7 +34000,7 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             None,
             Some(14),
         );
-        let error = attach_context_artifacts(&daemon, vec![artifact])
+        let error = attach_context_artifacts(&daemon, vec![artifact], &account_context)
             .await
             .expect_err("save must fail");
         assert!(!format!("{error:#}").is_empty());

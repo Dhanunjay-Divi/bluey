@@ -37,6 +37,7 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -105,6 +106,27 @@ static wchar_t g_kind[64] = L"system";
 static wchar_t g_source[256] = L"";
 static wchar_t g_card_id[80] = L"";
 static ULONGLONG g_card_update_sequence = 0;
+typedef enum BlueyRenderAckPhase {
+    BLUEY_RENDER_ACK_NONE = 0,
+    BLUEY_RENDER_ACK_FIRST_TEXT = 1,
+    BLUEY_RENDER_ACK_FINAL = 2,
+} BlueyRenderAckPhase;
+
+typedef struct BlueyPendingRenderAck {
+    bool active;
+    wchar_t card_id[80];
+    char interaction_id[37];
+    BlueyRenderAckPhase phase;
+    ULONGLONG requested_sequence;
+    ULONGLONG paint_sequence;
+    ULONGLONG presentation_revision;
+    unsigned retry_count;
+} BlueyPendingRenderAck;
+
+static SRWLOCK g_render_ack_lock = SRWLOCK_INIT;
+static BlueyPendingRenderAck g_pending_first_text_ack;
+static BlueyPendingRenderAck g_pending_final_ack;
+static ULONGLONG g_presentation_revision = 0;
 static wchar_t g_last_question[2048] = L"";
 static int g_recovery_mode = 0; /* 0 none, 1 continue partial, 2 retry */
 static bool g_visible = true;
@@ -203,8 +225,24 @@ typedef struct MeetingEvidencePayload {
     LONGLONG observed_at_unix_ms;
 } MeetingEvidencePayload;
 
+static void clear_pending_render_ack(void) {
+    AcquireSRWLockExclusive(&g_render_ack_lock);
+    ZeroMemory(&g_pending_first_text_ack, sizeof(g_pending_first_text_ack));
+    ZeroMemory(&g_pending_final_ack, sizeof(g_pending_final_ack));
+    ReleaseSRWLockExclusive(&g_render_ack_lock);
+}
+
+static void advance_presentation_revision(void) {
+    AcquireSRWLockExclusive(&g_render_ack_lock);
+    g_presentation_revision = g_presentation_revision == ULLONG_MAX
+        ? 1
+        : g_presentation_revision + 1;
+    ReleaseSRWLockExclusive(&g_render_ack_lock);
+}
+
 static void reset_card_update_sequence(void) {
     g_card_update_sequence = 0;
+    clear_pending_render_ack();
 }
 
 static bool json_read_optional_bool(
@@ -262,7 +300,10 @@ static bool json_read_optional_u64(
 static bool should_apply_card_update(
     const char *json,
     size_t json_len,
-    bool snapshot
+    bool snapshot,
+    bool snapshot_recovery,
+    ULONGLONG *applied_sequence,
+    bool *sequence_present_out
 ) {
     ULONGLONG sequence = 0;
     bool sequence_present = false;
@@ -274,11 +315,15 @@ static bool should_apply_card_update(
             &sequence_present)) {
         return false;
     }
+    if (applied_sequence) *applied_sequence = sequence;
+    if (sequence_present_out) *sequence_present_out = sequence_present;
 
     if (snapshot) {
-        if (sequence_present && sequence > g_card_update_sequence) {
-            g_card_update_sequence = sequence;
+        if (!sequence_present) {
+            return snapshot_recovery && g_card_update_sequence == 0;
         }
+        if (!snapshot_recovery && sequence <= g_card_update_sequence) return false;
+        g_card_update_sequence = sequence;
         return true;
     }
     if (!sequence_present) {
@@ -326,6 +371,7 @@ static bool replace_body_owned(wchar_t *body) {
     g_body = body;
     ReleaseSRWLockExclusive(&g_body_lock);
     if (previous != g_initial_body) free(previous);
+    advance_presentation_revision();
     return true;
 }
 
@@ -454,6 +500,7 @@ static void update_recovery_action_from_current_card(void) {
 #define ID_AUTOSEND_TIMER 3001
 #define ID_MANUAL_SEND_TIMER 3002
 #define ID_MEETING_BANNER_TIMER 3003
+#define ID_RENDER_ACK_RETRY_TIMER 3004
 #define WM_BLUEY_MEETING_EVIDENCE (WM_APP + 41)
 #define WM_BLUEY_MEETING_DETECTION_DISABLED (WM_APP + 42)
 #define AUTOSEND_CAPTION_SETTLE_DELAY_MS 300
@@ -489,6 +536,393 @@ static void load_session_token(void) {
     if (n == 0 || n >= sizeof(g_session_token)) {
         g_session_token[0] = '\0';
     }
+}
+
+#define BLUEY_OUTPUT_QUEUE_CAPACITY 256u
+#define BLUEY_OUTPUT_QUEUE_MAX_BYTES (12u * 1024u * 1024u)
+#define BLUEY_OUTPUT_RECORD_MAX_BYTES JSON_MAX_LINE_LEN
+#define BLUEY_UI_METADATA_EVENT_MAX_BYTES (16u * 1024u)
+#define BLUEY_UI_ASK_EVENT_MAX_BYTES (32u * 1024u)
+#define BLUEY_UI_BULK_EVENT_MAX_BYTES (256u * 1024u)
+
+typedef struct BlueyOutputRecord {
+    char *data;
+    size_t length;
+    bool droppable;
+} BlueyOutputRecord;
+
+typedef struct BlueyJsonBuffer {
+    char *data;
+    size_t length;
+    size_t capacity;
+    size_t max_length;
+    bool failed;
+} BlueyJsonBuffer;
+
+static CRITICAL_SECTION g_output_lock;
+static bool g_output_lock_initialized = false;
+static HANDLE g_output_wake = NULL;
+static HANDLE g_output_thread = NULL;
+static BlueyOutputRecord g_output_queue[BLUEY_OUTPUT_QUEUE_CAPACITY];
+static size_t g_output_head = 0;
+static size_t g_output_count = 0;
+static size_t g_output_bytes = 0;
+static bool g_output_stopping = false;
+static volatile LONG g_output_failed = 0;
+static volatile LONG g_output_dropped_records = 0;
+
+static bool output_write_loss_summary(HANDLE output, LONG dropped_records);
+
+static bool output_write_all(HANDLE output, const char *data, size_t length) {
+    if (!data || length == 0 || output == INVALID_HANDLE_VALUE || output == NULL) {
+        return false;
+    }
+
+    size_t offset = 0;
+    while (offset < length) {
+        size_t remaining = length - offset;
+        DWORD chunk = remaining > (size_t)MAXDWORD ? MAXDWORD : (DWORD)remaining;
+        DWORD written = 0;
+        if (!WriteFile(output, data + offset, chunk, &written, NULL) || written == 0) {
+            return false;
+        }
+        offset += (size_t)written;
+    }
+    return true;
+}
+
+static bool output_pop_locked(BlueyOutputRecord *record) {
+    if (!record || g_output_count == 0) return false;
+    *record = g_output_queue[g_output_head];
+    ZeroMemory(&g_output_queue[g_output_head], sizeof(g_output_queue[g_output_head]));
+    g_output_head = (g_output_head + 1u) % BLUEY_OUTPUT_QUEUE_CAPACITY;
+    g_output_count--;
+    if (record->length <= g_output_bytes) g_output_bytes -= record->length;
+    else g_output_bytes = 0;
+    return true;
+}
+
+static void output_remove_relative_locked(size_t relative_index) {
+    if (relative_index >= g_output_count) return;
+    size_t index = (g_output_head + relative_index) % BLUEY_OUTPUT_QUEUE_CAPACITY;
+    BlueyOutputRecord removed = g_output_queue[index];
+
+    for (size_t offset = relative_index; offset + 1u < g_output_count; offset++) {
+        size_t current = (g_output_head + offset) % BLUEY_OUTPUT_QUEUE_CAPACITY;
+        size_t next = (g_output_head + offset + 1u) % BLUEY_OUTPUT_QUEUE_CAPACITY;
+        g_output_queue[current] = g_output_queue[next];
+    }
+
+    size_t tail = (g_output_head + g_output_count - 1u) % BLUEY_OUTPUT_QUEUE_CAPACITY;
+    ZeroMemory(&g_output_queue[tail], sizeof(g_output_queue[tail]));
+    g_output_count--;
+    if (removed.length <= g_output_bytes) g_output_bytes -= removed.length;
+    else g_output_bytes = 0;
+    free(removed.data);
+}
+
+static DWORD WINAPI output_writer_thread(LPVOID unused) {
+    (void)unused;
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output == INVALID_HANDLE_VALUE || output == NULL) {
+        InterlockedExchange(&g_output_failed, 1);
+    }
+
+    for (;;) {
+        BlueyOutputRecord record;
+        ZeroMemory(&record, sizeof(record));
+        bool stopping = false;
+
+        EnterCriticalSection(&g_output_lock);
+        bool has_record = output_pop_locked(&record);
+        stopping = g_output_stopping;
+        LeaveCriticalSection(&g_output_lock);
+
+        if (has_record) {
+            if (InterlockedCompareExchange(&g_output_failed, 0, 0) == 0
+                && !output_write_all(output, record.data, record.length)) {
+                InterlockedExchange(&g_output_failed, 1);
+            }
+            free(record.data);
+            LONG dropped_records = InterlockedExchange(&g_output_dropped_records, 0);
+            if (dropped_records > 0
+                && InterlockedCompareExchange(&g_output_failed, 0, 0) == 0
+                && !output_write_loss_summary(output, dropped_records)) {
+                InterlockedExchange(&g_output_failed, 1);
+            }
+            continue;
+        }
+        if (stopping || InterlockedCompareExchange(&g_output_failed, 0, 0) != 0) {
+            break;
+        }
+        WaitForSingleObject(g_output_wake, INFINITE);
+    }
+
+    return 0;
+}
+
+static bool start_output_writer(void) {
+    if (g_output_lock_initialized) return true;
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output == INVALID_HANDLE_VALUE || output == NULL) return false;
+    if (!InitializeCriticalSectionAndSpinCount(&g_output_lock, 256)) return false;
+    g_output_lock_initialized = true;
+    g_output_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_output_wake) {
+        DeleteCriticalSection(&g_output_lock);
+        g_output_lock_initialized = false;
+        return false;
+    }
+    g_output_thread = CreateThread(NULL, 0, output_writer_thread, NULL, 0, NULL);
+    if (!g_output_thread) {
+        CloseHandle(g_output_wake);
+        g_output_wake = NULL;
+        DeleteCriticalSection(&g_output_lock);
+        g_output_lock_initialized = false;
+        return false;
+    }
+    return true;
+}
+
+static void stop_output_writer(void) {
+    if (!g_output_lock_initialized) return;
+
+    EnterCriticalSection(&g_output_lock);
+    g_output_stopping = true;
+    LeaveCriticalSection(&g_output_lock);
+    SetEvent(g_output_wake);
+
+    DWORD wait_result = g_output_thread
+        ? WaitForSingleObject(g_output_thread, 2000)
+        : WAIT_OBJECT_0;
+    if (wait_result == WAIT_TIMEOUT && g_output_thread) {
+        CancelSynchronousIo(g_output_thread);
+        SetEvent(g_output_wake);
+        wait_result = WaitForSingleObject(g_output_thread, 500);
+    }
+
+    if (wait_result != WAIT_OBJECT_0) {
+        /* The process is exiting. Keep shared state alive rather than racing a
+         * writer still unwinding from a blocked pipe operation. */
+        return;
+    }
+
+    if (g_output_thread) {
+        CloseHandle(g_output_thread);
+        g_output_thread = NULL;
+    }
+    if (g_output_wake) {
+        CloseHandle(g_output_wake);
+        g_output_wake = NULL;
+    }
+
+    EnterCriticalSection(&g_output_lock);
+    BlueyOutputRecord record;
+    while (output_pop_locked(&record)) free(record.data);
+    LeaveCriticalSection(&g_output_lock);
+    /* Input and detector workers are process-lifetime threads. Leave the
+     * stopped lock available so late producers fail closed without racing a
+     * deleted synchronization primitive during shutdown. */
+}
+
+static bool enqueue_output_record(char *data, size_t length, bool droppable) {
+    if (!data || length == 0 || length > BLUEY_OUTPUT_RECORD_MAX_BYTES
+        || !g_output_lock_initialized) {
+        free(data);
+        return false;
+    }
+
+    EnterCriticalSection(&g_output_lock);
+    if (g_output_stopping
+        || InterlockedCompareExchange(&g_output_failed, 0, 0) != 0) {
+        LeaveCriticalSection(&g_output_lock);
+        free(data);
+        return false;
+    }
+
+    while (g_output_count >= BLUEY_OUTPUT_QUEUE_CAPACITY
+           || length > BLUEY_OUTPUT_QUEUE_MAX_BYTES - g_output_bytes) {
+        if (droppable) {
+            InterlockedIncrement(&g_output_dropped_records);
+            LeaveCriticalSection(&g_output_lock);
+            free(data);
+            return false;
+        }
+
+        size_t droppable_index = g_output_count;
+        for (size_t index = 0; index < g_output_count; index++) {
+            size_t slot = (g_output_head + index) % BLUEY_OUTPUT_QUEUE_CAPACITY;
+            if (g_output_queue[slot].droppable) {
+                droppable_index = index;
+                break;
+            }
+        }
+        if (droppable_index == g_output_count) {
+            LeaveCriticalSection(&g_output_lock);
+            free(data);
+            return false;
+        }
+        output_remove_relative_locked(droppable_index);
+        InterlockedIncrement(&g_output_dropped_records);
+    }
+
+    size_t tail = (g_output_head + g_output_count) % BLUEY_OUTPUT_QUEUE_CAPACITY;
+    g_output_queue[tail].data = data;
+    g_output_queue[tail].length = length;
+    g_output_queue[tail].droppable = droppable;
+    g_output_count++;
+    g_output_bytes += length;
+    LeaveCriticalSection(&g_output_lock);
+    SetEvent(g_output_wake);
+    return true;
+}
+
+static void json_buffer_init_limited(
+    BlueyJsonBuffer *buffer,
+    size_t initial_capacity,
+    size_t max_length
+) {
+    if (!buffer) return;
+    ZeroMemory(buffer, sizeof(*buffer));
+    if (max_length == 0 || max_length > BLUEY_OUTPUT_RECORD_MAX_BYTES) {
+        max_length = BLUEY_OUTPUT_RECORD_MAX_BYTES;
+    }
+    if (initial_capacity < 256u) initial_capacity = 256u;
+    if (initial_capacity > max_length) initial_capacity = max_length;
+    buffer->data = (char *)malloc(initial_capacity);
+    if (!buffer->data) {
+        buffer->failed = true;
+        return;
+    }
+    buffer->capacity = initial_capacity;
+    buffer->max_length = max_length;
+    buffer->data[0] = '\0';
+}
+
+static bool json_buffer_reserve(BlueyJsonBuffer *buffer, size_t additional) {
+    if (!buffer || buffer->failed || !buffer->data) return false;
+    if (buffer->length >= buffer->max_length
+        || additional > buffer->max_length - buffer->length - 1u) {
+        buffer->failed = true;
+        return false;
+    }
+    size_t required = buffer->length + additional + 1u;
+    if (required <= buffer->capacity) return true;
+
+    size_t capacity = buffer->capacity;
+    while (capacity < required) {
+        size_t next = capacity > buffer->max_length / 2u
+            ? buffer->max_length
+            : capacity * 2u;
+        if (next <= capacity) {
+            buffer->failed = true;
+            return false;
+        }
+        capacity = next;
+    }
+    char *grown = (char *)realloc(buffer->data, capacity);
+    if (!grown) {
+        buffer->failed = true;
+        return false;
+    }
+    buffer->data = grown;
+    buffer->capacity = capacity;
+    return true;
+}
+
+static bool json_buffer_append_bytes(
+    BlueyJsonBuffer *buffer,
+    const char *text,
+    size_t text_len
+) {
+    if (!text || !json_buffer_reserve(buffer, text_len)) return false;
+    memcpy(buffer->data + buffer->length, text, text_len);
+    buffer->length += text_len;
+    buffer->data[buffer->length] = '\0';
+    return true;
+}
+
+static bool json_buffer_append(BlueyJsonBuffer *buffer, const char *text) {
+    return text && json_buffer_append_bytes(buffer, text, strlen(text));
+}
+
+static bool json_buffer_append_char(BlueyJsonBuffer *buffer, char value) {
+    return json_buffer_append_bytes(buffer, &value, 1u);
+}
+
+static bool json_buffer_append_format(BlueyJsonBuffer *buffer, const char *format, ...) {
+    if (!buffer || !format || buffer->failed) return false;
+    va_list args;
+    va_start(args, format);
+    va_list measure_args;
+    va_copy(measure_args, args);
+    int needed = vsnprintf(NULL, 0, format, measure_args);
+    va_end(measure_args);
+    if (needed < 0 || !json_buffer_reserve(buffer, (size_t)needed)) {
+        va_end(args);
+        if (buffer) buffer->failed = true;
+        return false;
+    }
+    int written = vsnprintf(
+        buffer->data + buffer->length,
+        buffer->capacity - buffer->length,
+        format,
+        args);
+    va_end(args);
+    if (written != needed) {
+        buffer->failed = true;
+        return false;
+    }
+    buffer->length += (size_t)written;
+    return true;
+}
+
+static bool json_buffer_append_escaped(BlueyJsonBuffer *buffer, const char *text) {
+    if (!buffer || !text) return false;
+    for (const unsigned char *cursor = (const unsigned char *)text; *cursor; cursor++) {
+        switch (*cursor) {
+        case '\\':
+            if (!json_buffer_append(buffer, "\\\\")) return false;
+            break;
+        case '"':
+            if (!json_buffer_append(buffer, "\\\"")) return false;
+            break;
+        case '\n':
+            if (!json_buffer_append(buffer, "\\n")) return false;
+            break;
+        case '\r':
+            if (!json_buffer_append(buffer, "\\r")) return false;
+            break;
+        case '\t':
+            if (!json_buffer_append(buffer, "\\t")) return false;
+            break;
+        default:
+            if (*cursor < 0x20) {
+                if (!json_buffer_append_format(buffer, "\\u%04x", *cursor)) return false;
+            } else if (!json_buffer_append_char(buffer, (char)*cursor)) {
+                return false;
+            }
+            break;
+        }
+    }
+    return true;
+}
+
+static void json_buffer_dispose(BlueyJsonBuffer *buffer) {
+    if (!buffer) return;
+    free(buffer->data);
+    ZeroMemory(buffer, sizeof(*buffer));
+}
+
+static bool json_buffer_enqueue(BlueyJsonBuffer *buffer, bool droppable) {
+    if (!buffer || buffer->failed || !buffer->data || buffer->length == 0) {
+        json_buffer_dispose(buffer);
+        return false;
+    }
+    char *data = buffer->data;
+    size_t length = buffer->length;
+    ZeroMemory(buffer, sizeof(*buffer));
+    return enqueue_output_record(data, length, droppable);
 }
 
 static void ensure_tooltip_window(void) {
@@ -560,37 +994,47 @@ static void configure_tooltips(void) {
     add_control_tooltip(g_close_button, L"Turn Bluey off");
 }
 
-// Print `,"token":"..."` if a token is set, else nothing.
+// Append `,"token":"..."` if a token is set, else nothing.
 // Caller must have already opened the JSON object and emitted >= 1 field.
-static void emit_token_field(void) {
+static bool append_token_field(BlueyJsonBuffer *buffer) {
     if (g_session_token[0] != '\0') {
-        printf(",\"token\":\"%s\"", g_session_token);
+        return json_buffer_append(buffer, ",\"token\":\"")
+            && json_buffer_append_escaped(buffer, g_session_token)
+            && json_buffer_append_char(buffer, '"');
     }
+    return true;
 }
 
-static void emit_ready(void) {
-    printf("{\"type\":\"ready\",\"platform\":\"windows\",\"capture_excluded\":true");
-    emit_token_field();
-    printf("}\n");
-    fflush(stdout);
+static bool output_write_loss_summary(HANDLE output, LONG dropped_records) {
+    if (dropped_records <= 0) return true;
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 384u, BLUEY_UI_METADATA_EVENT_MAX_BYTES);
+    json_buffer_append(
+        &buffer,
+        "{\"type\":\"lifecycle\","
+        "\"stage\":\"native_output_records_dropped\","
+        "\"status\":\"degraded\",\"detail\":\"");
+    json_buffer_append_format(&buffer, "count=%ld", (long)dropped_records);
+    json_buffer_append_char(&buffer, '"');
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    bool written = !buffer.failed
+        && output_write_all(output, buffer.data, buffer.length);
+    json_buffer_dispose(&buffer);
+    return written;
 }
 
-static void json_print_escaped(const char *text) {
-    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
-        switch (*p) {
-        case '\\': fputs("\\\\", stdout); break;
-        case '"': fputs("\\\"", stdout); break;
-        case '\n': fputs("\\n", stdout); break;
-        case '\r': fputs("\\r", stdout); break;
-        case '\t': fputs("\\t", stdout); break;
-        default:
-            if (*p < 0x20) {
-                printf("\\u%04x", *p);
-            } else {
-                fputc(*p, stdout);
-            }
-        }
-    }
+static bool emit_ready(void) {
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 256u, BLUEY_UI_METADATA_EVENT_MAX_BYTES);
+    json_buffer_append(
+        &buffer,
+        "{\"type\":\"ready\",\"platform\":\"windows\",\"capture_excluded\":true");
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    return json_buffer_enqueue(&buffer, false);
 }
 
 static char *wide_to_utf8_alloc(const wchar_t *text) {
@@ -632,6 +1076,20 @@ static wchar_t *utf8_to_wide_alloc(const char *text, size_t text_len) {
     }
     wide[wchars] = L'\0';
     return wide;
+}
+
+static bool json_buffer_append_wide_escaped(
+    BlueyJsonBuffer *buffer,
+    const wchar_t *text
+) {
+    char *utf8 = wide_to_utf8_alloc(text ? text : L"");
+    if (!utf8) {
+        if (buffer) buffer->failed = true;
+        return false;
+    }
+    bool appended = json_buffer_append_escaped(buffer, utf8);
+    free(utf8);
+    return appended;
 }
 
 static void normalize_answer_display_text(wchar_t *text) {
@@ -707,27 +1165,39 @@ static void normalize_answer_display_text(wchar_t *text) {
     text[write] = L'\0';
 }
 
-static void emit_simple_event(const char *type) {
-    printf("{\"type\":\"%s\"", type);
-    emit_token_field();
-    printf("}\n");
-    fflush(stdout);
+static bool emit_simple_event(const char *type) {
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 256u, BLUEY_UI_METADATA_EVENT_MAX_BYTES);
+    json_buffer_append(&buffer, "{\"type\":\"");
+    json_buffer_append_escaped(&buffer, type ? type : "");
+    json_buffer_append_char(&buffer, '"');
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    return json_buffer_enqueue(&buffer, false);
 }
 
-static void emit_lifecycle_event(const char *stage, const char *status, const char *detail) {
-    printf("{\"type\":\"lifecycle\",\"stage\":\"");
-    json_print_escaped(stage ? stage : "");
-    printf("\",\"status\":\"");
-    json_print_escaped(status ? status : "ok");
-    printf("\"");
+static bool emit_lifecycle_event(
+    const char *stage,
+    const char *status,
+    const char *detail
+) {
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 512u, BLUEY_UI_METADATA_EVENT_MAX_BYTES);
+    json_buffer_append(&buffer, "{\"type\":\"lifecycle\",\"stage\":\"");
+    json_buffer_append_escaped(&buffer, stage ? stage : "");
+    json_buffer_append(&buffer, "\",\"status\":\"");
+    json_buffer_append_escaped(&buffer, status ? status : "ok");
+    json_buffer_append_char(&buffer, '"');
     if (detail && detail[0] != '\0') {
-        printf(",\"detail\":\"");
-        json_print_escaped(detail);
-        printf("\"");
+        json_buffer_append(&buffer, ",\"detail\":\"");
+        json_buffer_append_escaped(&buffer, detail);
+        json_buffer_append_char(&buffer, '"');
     }
-    emit_token_field();
-    printf("}\n");
-    fflush(stdout);
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    return json_buffer_enqueue(&buffer, true);
 }
 
 static bool register_bluey_hotkey(int id, UINT key, const char *name, char *failures, size_t failures_len) {
@@ -749,89 +1219,331 @@ static bool register_bluey_hotkey(int id, UINT key, const char *name, char *fail
     return false;
 }
 
-static void emit_ask_event(const wchar_t *question, bool answer_current_transcript) {
-    char *utf8 = wide_to_utf8_alloc(question);
-    if (!utf8) return;
+static bool generate_interaction_id(char destination[37]) {
+    if (!destination) return false;
+    GUID id;
+    if (FAILED(CoCreateGuid(&id))) {
+        destination[0] = '\0';
+        return false;
+    }
+    int written = snprintf(
+        destination,
+        37,
+        "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        (unsigned long)id.Data1,
+        (unsigned)id.Data2,
+        (unsigned)id.Data3,
+        (unsigned)id.Data4[0],
+        (unsigned)id.Data4[1],
+        (unsigned)id.Data4[2],
+        (unsigned)id.Data4[3],
+        (unsigned)id.Data4[4],
+        (unsigned)id.Data4[5],
+        (unsigned)id.Data4[6],
+        (unsigned)id.Data4[7]);
+    return written == 36;
+}
 
-    fputs("{\"type\":\"ask_requested\",\"question\":\"", stdout);
-    json_print_escaped(utf8);
-    free(utf8);
-    // Close `question`, emit fixed fields, append `,"token":"..."` if set,
-    // then close the JSON object.
-    if (g_answer_detail_mode == 1) {
-        fputs("\",\"provider\":\"managed\",\"model\":\"instant\",\"mode\":\"instant\"", stdout);
-    } else if (g_answer_detail_mode == 2) {
-        fputs("\",\"provider\":\"managed\",\"model\":\"deep\",\"mode\":\"deep\"", stdout);
+static ULONGLONG current_unix_time_ms(void) {
+    static const ULONGLONG WINDOWS_TO_UNIX_EPOCH_TICKS = 116444736000000000ULL;
+    FILETIME file_time;
+    ULARGE_INTEGER ticks;
+    GetSystemTimeAsFileTime(&file_time);
+    ticks.LowPart = file_time.dwLowDateTime;
+    ticks.HighPart = file_time.dwHighDateTime;
+    if (ticks.QuadPart <= WINDOWS_TO_UNIX_EPOCH_TICKS) return 0;
+    return (ticks.QuadPart - WINDOWS_TO_UNIX_EPOCH_TICKS) / 10000ULL;
+}
+
+static bool canonical_uuid(const char *value) {
+    if (!value || strlen(value) != 36u) return false;
+    bool has_nonzero_digit = false;
+    for (size_t index = 0; index < 36u; index++) {
+        if (index == 8u || index == 13u || index == 18u || index == 23u) {
+            if (value[index] != '-') return false;
+            continue;
+        }
+        if (!json_is_hex(value[index])) return false;
+        if (value[index] != '0') has_nonzero_digit = true;
+    }
+    return has_nonzero_digit;
+}
+
+static bool canonical_wide_uuid(const wchar_t *value) {
+    if (!value || wcslen(value) != 36u) return false;
+    bool has_nonzero_digit = false;
+    for (size_t index = 0; index < 36u; index++) {
+        if (index == 8u || index == 13u || index == 18u || index == 23u) {
+            if (value[index] != L'-') return false;
+            continue;
+        }
+        wchar_t digit = value[index];
+        bool valid = (digit >= L'0' && digit <= L'9')
+            || (digit >= L'a' && digit <= L'f')
+            || (digit >= L'A' && digit <= L'F');
+        if (!valid) return false;
+        if (digit != L'0') has_nonzero_digit = true;
+    }
+    return has_nonzero_digit;
+}
+
+static BlueyRenderAckPhase parse_render_ack_phase(
+    const char *json,
+    size_t json_len
+) {
+    char phase[24];
+    if (!json_extract_string(json, json_len, "render_ack", phase, sizeof(phase))) {
+        return BLUEY_RENDER_ACK_NONE;
+    }
+    if (strcmp(phase, "first_text") == 0) return BLUEY_RENDER_ACK_FIRST_TEXT;
+    if (strcmp(phase, "final") == 0) return BLUEY_RENDER_ACK_FINAL;
+    return BLUEY_RENDER_ACK_NONE;
+}
+
+static void update_pending_render_acks(
+    const wchar_t *card_id,
+    const char *interaction_id,
+    BlueyRenderAckPhase phase,
+    ULONGLONG sequence,
+    bool sequence_present,
+    bool body_updated
+) {
+    AcquireSRWLockExclusive(&g_render_ack_lock);
+    bool valid_update = body_updated
+        && card_id
+        && canonical_wide_uuid(card_id)
+        && sequence_present
+        && sequence == g_card_update_sequence;
+    bool has_interaction = interaction_id && canonical_uuid(interaction_id);
+    BlueyPendingRenderAck *slots[] = {
+        &g_pending_first_text_ack,
+        &g_pending_final_ack,
+    };
+
+    if (!valid_update) {
+        ReleaseSRWLockExclusive(&g_render_ack_lock);
+        return;
+    }
+
+    for (size_t index = 0; index < sizeof(slots) / sizeof(slots[0]); index++) {
+        BlueyPendingRenderAck *pending = slots[index];
+        if (!pending->active) continue;
+        if (wcscmp(pending->card_id, card_id) != 0
+            || (has_interaction
+                && strcmp(pending->interaction_id, interaction_id) != 0)
+            || sequence < pending->requested_sequence) {
+            ZeroMemory(pending, sizeof(*pending));
+            continue;
+        }
+        pending->paint_sequence = sequence;
+        pending->presentation_revision = g_presentation_revision;
+    }
+
+    if (phase != BLUEY_RENDER_ACK_NONE && has_interaction) {
+        BlueyPendingRenderAck *pending = phase == BLUEY_RENDER_ACK_FIRST_TEXT
+            ? &g_pending_first_text_ack
+            : &g_pending_final_ack;
+        ZeroMemory(pending, sizeof(*pending));
+        pending->active = true;
+        wcsncpy_s(pending->card_id, 80, card_id, _TRUNCATE);
+        strncpy_s(
+            pending->interaction_id,
+            sizeof(pending->interaction_id),
+            interaction_id,
+            _TRUNCATE);
+        pending->phase = phase;
+        pending->requested_sequence = sequence;
+        pending->paint_sequence = sequence;
+        pending->presentation_revision = g_presentation_revision;
+    }
+    ReleaseSRWLockExclusive(&g_render_ack_lock);
+}
+
+static ULONGLONG current_presentation_revision(void) {
+    AcquireSRWLockShared(&g_render_ack_lock);
+    ULONGLONG revision = g_presentation_revision;
+    ReleaseSRWLockShared(&g_render_ack_lock);
+    return revision;
+}
+
+static bool emit_pending_render_ack_locked(
+    BlueyPendingRenderAck *pending,
+    ULONGLONG painted_revision
+) {
+    if (!pending || !pending->active) return false;
+    if (wcscmp(pending->card_id, g_card_id) != 0
+        || !canonical_wide_uuid(pending->card_id)
+        || pending->paint_sequence != g_card_update_sequence
+        || pending->paint_sequence < pending->requested_sequence
+        || !canonical_uuid(pending->interaction_id)
+        || pending->presentation_revision != painted_revision) {
+        ZeroMemory(pending, sizeof(*pending));
+        return false;
+    }
+
+    const char *phase = pending->phase == BLUEY_RENDER_ACK_FIRST_TEXT
+        ? "first_text"
+        : (pending->phase == BLUEY_RENDER_ACK_FINAL ? "final" : NULL);
+    if (!phase) {
+        ZeroMemory(pending, sizeof(*pending));
+        return false;
+    }
+
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 512u, BLUEY_UI_METADATA_EVENT_MAX_BYTES);
+    json_buffer_append(
+        &buffer,
+        "{\"type\":\"answer_render_acknowledged\",\"id\":\"");
+    json_buffer_append_wide_escaped(&buffer, pending->card_id);
+    json_buffer_append(&buffer, "\",\"interaction_id\":\"");
+    json_buffer_append(&buffer, pending->interaction_id);
+    json_buffer_append(&buffer, "\",\"phase\":\"");
+    json_buffer_append(&buffer, phase);
+    json_buffer_append_format(
+        &buffer,
+        "\",\"sequence\":%llu",
+        (unsigned long long)pending->paint_sequence);
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    bool queued = json_buffer_enqueue(&buffer, false);
+    bool retry = false;
+    if (queued) {
+        ZeroMemory(pending, sizeof(*pending));
+    } else if (pending->retry_count < 3u) {
+        pending->retry_count++;
+        retry = true;
     } else {
-        fputs("\",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"general\"", stdout);
+        ZeroMemory(pending, sizeof(*pending));
+    }
+    return retry;
+}
+
+static void emit_pending_render_ack_after_paint(ULONGLONG painted_revision) {
+    if (!g_visible || g_collapsed) return;
+
+    AcquireSRWLockExclusive(&g_render_ack_lock);
+    if (g_presentation_revision != painted_revision) {
+        ReleaseSRWLockExclusive(&g_render_ack_lock);
+        InvalidateRect(g_hwnd, NULL, FALSE);
+        return;
+    }
+    bool retry = emit_pending_render_ack_locked(
+        &g_pending_first_text_ack, painted_revision);
+    retry = emit_pending_render_ack_locked(
+        &g_pending_final_ack, painted_revision) || retry;
+    bool pending = g_pending_first_text_ack.active || g_pending_final_ack.active;
+    ReleaseSRWLockExclusive(&g_render_ack_lock);
+    if (retry && g_hwnd) SetTimer(g_hwnd, ID_RENDER_ACK_RETRY_TIMER, 25, NULL);
+    else if (!pending && g_hwnd) KillTimer(g_hwnd, ID_RENDER_ACK_RETRY_TIMER);
+}
+
+static bool emit_ask_event(const wchar_t *question, bool answer_current_transcript) {
+    ULONGLONG initiated_at_unix_ms = current_unix_time_ms();
+    char *utf8 = wide_to_utf8_alloc(question);
+    if (!utf8) return false;
+    char interaction_id[37];
+    if (!generate_interaction_id(interaction_id)) {
+        free(utf8);
+        return false;
+    }
+
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 4096u, BLUEY_UI_ASK_EVENT_MAX_BYTES);
+    json_buffer_append(&buffer, "{\"type\":\"ask_requested\",\"question\":\"");
+    json_buffer_append_escaped(&buffer, utf8);
+    free(utf8);
+    json_buffer_append(&buffer, "\",\"interaction_id\":\"");
+    json_buffer_append(&buffer, interaction_id);
+    json_buffer_append_format(
+        &buffer,
+        "\",\"initiated_at_unix_ms\":%llu",
+        (unsigned long long)initiated_at_unix_ms);
+    if (g_answer_detail_mode == 1) {
+        json_buffer_append(
+            &buffer,
+            ",\"provider\":\"managed\",\"model\":\"instant\",\"mode\":\"instant\"");
+    } else if (g_answer_detail_mode == 2) {
+        json_buffer_append(
+            &buffer,
+            ",\"provider\":\"managed\",\"model\":\"deep\",\"mode\":\"deep\"");
+    } else {
+        json_buffer_append(
+            &buffer,
+            ",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"general\"");
     }
     bool wrote_context_id = false;
     for (int i = 0; i < g_context_chip_count; i++) {
         if (!g_context_chips[i].pending || g_context_chips[i].id[0] == L'\0') continue;
         char *context_id = wide_to_utf8_alloc(g_context_chips[i].id);
         if (!context_id) continue;
-        fputs(wrote_context_id ? ",\"" : ",\"visible_context_ids\":[\"", stdout);
-        json_print_escaped(context_id);
-        fputc('"', stdout);
+        json_buffer_append(
+            &buffer,
+            wrote_context_id ? ",\"" : ",\"visible_context_ids\":[\"");
+        json_buffer_append_escaped(&buffer, context_id);
+        json_buffer_append_char(&buffer, '"');
         free(context_id);
         wrote_context_id = true;
     }
-    if (wrote_context_id) fputc(']', stdout);
-    fputs(ask_event_current_transcript_json_field(answer_current_transcript), stdout);
-    emit_token_field();
-    fputs("}\n", stdout);
-    fflush(stdout);
+    if (wrote_context_id) json_buffer_append_char(&buffer, ']');
+    json_buffer_append(
+        &buffer,
+        ask_event_current_transcript_json_field(answer_current_transcript));
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    return json_buffer_enqueue(&buffer, false);
 }
 
-static void emit_paste_text_event(const wchar_t *text) {
-    char *utf8 = wide_to_utf8_alloc(text);
-    if (!utf8) return;
-
-    fputs("{\"type\":\"paste_text_requested\",\"text\":\"", stdout);
-    json_print_escaped(utf8);
-    free(utf8);
-    fputc('"', stdout);
-    emit_token_field();
-    fputs("}\n", stdout);
-    fflush(stdout);
+static bool emit_paste_text_event(const wchar_t *text) {
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 4096u, BLUEY_UI_BULK_EVENT_MAX_BYTES);
+    json_buffer_append(&buffer, "{\"type\":\"paste_text_requested\",\"text\":\"");
+    json_buffer_append_wide_escaped(&buffer, text);
+    json_buffer_append_char(&buffer, '"');
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    return json_buffer_enqueue(&buffer, false);
 }
 
-static void json_print_wide_escaped(const wchar_t *text) {
-    char *utf8 = wide_to_utf8_alloc(text ? text : L"");
-    if (!utf8) return;
-    json_print_escaped(utf8);
-    free(utf8);
-}
-
-static void emit_meeting_banner_action(const char *action) {
-    fputs("{\"type\":\"meeting_banner_action\",\"candidate_id\":\"", stdout);
-    json_print_wide_escaped(g_meeting_candidate_id);
-    fputs("\",\"action\":\"", stdout);
-    json_print_escaped(action ? action : "dismiss");
-    fputs("\",\"app_id\":\"", stdout);
-    json_print_wide_escaped(g_meeting_candidate_app_id);
-    fputc('"', stdout);
+static bool emit_meeting_banner_action(const char *action) {
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 1024u, BLUEY_UI_METADATA_EVENT_MAX_BYTES);
+    json_buffer_append(
+        &buffer,
+        "{\"type\":\"meeting_banner_action\",\"candidate_id\":\"");
+    json_buffer_append_wide_escaped(&buffer, g_meeting_candidate_id);
+    json_buffer_append(&buffer, "\",\"action\":\"");
+    json_buffer_append_escaped(&buffer, action ? action : "dismiss");
+    json_buffer_append(&buffer, "\",\"app_id\":\"");
+    json_buffer_append_wide_escaped(&buffer, g_meeting_candidate_app_id);
+    json_buffer_append_char(&buffer, '"');
     if (g_meeting_candidate_provider[0] != L'\0') {
-        fputs(",\"provider\":\"", stdout);
-        json_print_wide_escaped(g_meeting_candidate_provider);
-        fputc('"', stdout);
+        json_buffer_append(&buffer, ",\"provider\":\"");
+        json_buffer_append_wide_escaped(&buffer, g_meeting_candidate_provider);
+        json_buffer_append_char(&buffer, '"');
     }
-    emit_token_field();
-    fputs("}\n", stdout);
-    fflush(stdout);
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    return json_buffer_enqueue(&buffer, false);
 }
 
-static void emit_meeting_evidence_event(const MeetingEvidencePayload *evidence) {
-    if (!evidence || evidence->app_id[0] == L'\0') return;
-    fputs(
+static bool emit_meeting_evidence_event(const MeetingEvidencePayload *evidence) {
+    if (!evidence || evidence->app_id[0] == L'\0') return false;
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 2048u, BLUEY_UI_METADATA_EVENT_MAX_BYTES);
+    json_buffer_append(
+        &buffer,
         "{\"type\":\"meeting_evidence_observed\",\"evidence\":{"
-        "\"source\":\"wasapi_session\",\"app_name\":\"",
-        stdout);
-    json_print_wide_escaped(evidence->app_name);
-    fputs("\",\"app_id\":\"", stdout);
-    json_print_wide_escaped(evidence->app_id);
-    fprintf(
-        stdout,
+        "\"source\":\"wasapi_session\",\"app_name\":\"");
+    json_buffer_append_wide_escaped(&buffer, evidence->app_name);
+    json_buffer_append(&buffer, "\",\"app_id\":\"");
+    json_buffer_append_wide_escaped(&buffer, evidence->app_id);
+    json_buffer_append_format(
+        &buffer,
         "\",\"process_id\":%lu,\"audio_input_active\":%s,"
         "\"audio_output_active\":%s,\"app_foreground\":%s,"
         "\"browser\":%s,\"dedicated_meeting_app\":%s,"
@@ -844,19 +1556,19 @@ static void emit_meeting_evidence_event(const MeetingEvidencePayload *evidence) 
         evidence->dedicated_meeting_app ? "true" : "false",
         evidence->observed_at_unix_ms);
     if (evidence->provider[0] != L'\0') {
-        fputs(",\"provider\":\"", stdout);
-        json_print_wide_escaped(evidence->provider);
-        fputc('"', stdout);
+        json_buffer_append(&buffer, ",\"provider\":\"");
+        json_buffer_append_wide_escaped(&buffer, evidence->provider);
+        json_buffer_append_char(&buffer, '"');
     }
     if (evidence->window_title[0] != L'\0') {
-        fputs(",\"window_title\":\"", stdout);
-        json_print_wide_escaped(evidence->window_title);
-        fputc('"', stdout);
+        json_buffer_append(&buffer, ",\"window_title\":\"");
+        json_buffer_append_wide_escaped(&buffer, evidence->window_title);
+        json_buffer_append_char(&buffer, '"');
     }
-    fputc('}', stdout);
-    emit_token_field();
-    fputs("}\n", stdout);
-    fflush(stdout);
+    json_buffer_append_char(&buffer, '}');
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    return json_buffer_enqueue(&buffer, true);
 }
 
 typedef struct MeetingAppIdentity {
@@ -1454,9 +2166,9 @@ static int pending_context_chip_count(void) {
     return count;
 }
 
-static void emit_attach_files_event_from_drop(HDROP drop) {
+static bool emit_attach_files_event_from_drop(HDROP drop) {
     UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, NULL, 0);
-    if (count == 0) return;
+    if (count == 0) return false;
     if (count > 64) count = 64;
 
     UINT supported_count = 0;
@@ -1470,13 +2182,12 @@ static void emit_attach_files_event_from_drop(HDROP drop) {
     }
 
     if (skipped_count > 0) show_unsupported_drop_message(skipped_count, supported_count + skipped_count);
-    if (supported_count == 0) return;
-    if (skipped_count == 0) show_supported_drop_loading(supported_count);
-    g_show_context_chips = false;
-    g_pending_context_chips = false;
-    expect_pending_context_chips();
+    if (supported_count == 0) return false;
 
-    fputs("{\"type\":\"attach_files_requested\",\"paths\":[", stdout);
+    BlueyJsonBuffer buffer;
+    json_buffer_init_limited(
+        &buffer, 4096u, BLUEY_UI_BULK_EVENT_MAX_BYTES);
+    json_buffer_append(&buffer, "{\"type\":\"attach_files_requested\",\"paths\":[");
     bool emitted = false;
     for (UINT i = 0; i < count; i++) {
         wchar_t *path = drag_query_path_alloc(drop, i);
@@ -1490,17 +2201,27 @@ static void emit_attach_files_event_from_drop(HDROP drop) {
         free(path);
         if (!utf8) continue;
 
-        if (emitted) fputc(',', stdout);
-        fputc('"', stdout);
-        json_print_escaped(utf8);
-        fputc('"', stdout);
+        if (emitted) json_buffer_append_char(&buffer, ',');
+        json_buffer_append_char(&buffer, '"');
+        json_buffer_append_escaped(&buffer, utf8);
+        json_buffer_append_char(&buffer, '"');
         free(utf8);
         emitted = true;
     }
-    fputc(']', stdout);
-    emit_token_field();
-    fputs("}\n", stdout);
-    fflush(stdout);
+    json_buffer_append_char(&buffer, ']');
+    append_token_field(&buffer);
+    json_buffer_append(&buffer, "}\n");
+    if (!emitted) {
+        json_buffer_dispose(&buffer);
+        return false;
+    }
+    if (!json_buffer_enqueue(&buffer, false)) return false;
+
+    if (skipped_count == 0) show_supported_drop_loading(supported_count);
+    g_show_context_chips = false;
+    g_pending_context_chips = false;
+    expect_pending_context_chips();
+    return true;
 }
 
 static void update_record_button(void) {
@@ -2885,17 +3606,22 @@ static void send_current_question(void) {
 static void send_current_question_now(bool listen_triggered) {
     int length = GetWindowTextLengthW(g_ask_edit);
     if (length <= 0 && g_recovery_mode != 0) {
+        int recovery_mode = g_recovery_mode;
         const wchar_t *question = g_recovery_mode == 1
             ? L"Continue the previous answer from where it stopped. Do not repeat completed content. Finish any missing code, explanation, complexity, or conclusion."
             : (g_last_question[0]
                 ? g_last_question
                 : L"Retry the previous question and return a complete answer.");
+        if (!emit_ask_event(question, false)) {
+            MessageBeep(MB_ICONWARNING);
+            SetFocus(g_ask_edit);
+            return;
+        }
         emit_lifecycle_event(
             "answer_recovery_requested",
             "ok",
-            g_recovery_mode == 1 ? "action=continue platform=windows" : "action=retry platform=windows");
+            recovery_mode == 1 ? "action=continue platform=windows" : "action=retry platform=windows");
         set_recovery_mode(0);
-        emit_ask_event(question, false);
         InvalidateRect(g_hwnd, NULL, TRUE);
         SetFocus(g_ask_edit);
         return;
@@ -2931,17 +3657,23 @@ static void send_current_question_now(bool listen_triggered) {
         is_live_transcript_answer_prompt(fallback_question) ? "true" : "false",
         pending_context_chip_count()
     );
-    emit_lifecycle_event("ask_answer_sent", "ok", detail);
+    bool emitted = false;
     if (length <= 0) {
-        emit_ask_event(fallback_question, answer_current_transcript);
+        emitted = emit_ask_event(fallback_question, answer_current_transcript);
     } else {
         wchar_t *question = (wchar_t *)calloc((size_t)length + 1, sizeof(wchar_t));
         if (!question) return;
         GetWindowTextW(g_ask_edit, question, length + 1);
-        wcsncpy_s(g_last_question, 2048, question, _TRUNCATE);
-        emit_ask_event(question, answer_current_transcript);
+        emitted = emit_ask_event(question, answer_current_transcript);
+        if (emitted) wcsncpy_s(g_last_question, 2048, question, _TRUNCATE);
         free(question);
     }
+    if (!emitted) {
+        MessageBeep(MB_ICONWARNING);
+        SetFocus(g_ask_edit);
+        return;
+    }
+    emit_lifecycle_event("ask_answer_sent", "ok", detail);
     set_recovery_mode(0);
     SetWindowTextW(g_ask_edit, L"");
     clear_local_transcript_context();
@@ -3364,6 +4096,14 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
     } else if (strcmp(msg_type, "update_card") == 0) {
         wchar_t id[80] = L"";
         safe_extract_json_to_wide(line, line_len, "id", id, 80);
+        char interaction_id[40] = "";
+        json_extract_string(
+            line,
+            line_len,
+            "interaction_id",
+            interaction_id,
+            sizeof(interaction_id));
+        BlueyRenderAckPhase render_ack = parse_render_ack_phase(line, line_len);
         bool snapshot = false;
         bool valid_snapshot = json_read_optional_bool(
             line,
@@ -3373,9 +4113,17 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
         bool card_matches = wcscmp(id, g_card_id) == 0 && id[0] != L'\0';
         bool snapshot_recovery =
             snapshot && g_card_id[0] == L'\0' && id[0] != L'\0';
+        ULONGLONG applied_sequence = 0;
+        bool sequence_present = false;
         if (valid_snapshot
             && (card_matches || snapshot_recovery)
-            && should_apply_card_update(line, line_len, snapshot)) {
+            && should_apply_card_update(
+                line,
+                line_len,
+                snapshot,
+                snapshot_recovery,
+                &applied_sequence,
+                &sequence_present)) {
             if (snapshot_recovery) {
                 /*
                  * A restarted overlay has no preceding push_card frame. Rebuild
@@ -3406,6 +4154,13 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
                     line, line_len, "artifact", &artifact, &artifact_len)) {
                 updated = set_body_from_json(artifact, artifact_len, "body", is_answer);
             }
+            update_pending_render_acks(
+                id,
+                interaction_id,
+                render_ack,
+                applied_sequence,
+                sequence_present,
+                updated);
             if (updated) {
                 update_recovery_action_from_current_card();
                 update_paste_answer_button();
@@ -4010,8 +4765,9 @@ static void draw_resize_affordance_d2d(RECT rect) {
     }
 }
 
-static bool paint_with_d2d(HWND hwnd) {
+static bool paint_with_d2d(HWND hwnd, ULONGLONG *painted_revision) {
     if (!ensure_d2d_target(hwnd)) return false;
+    if (painted_revision) *painted_revision = 0;
 
     RECT rect;
     GetClientRect(hwnd, &rect);
@@ -4107,6 +4863,9 @@ static bool paint_with_d2d(HWND hwnd) {
         float context_reserved = context_chips_visible() ? 34.0f : 0.0f;
         float sent_reserved = sent_chips_visible_for_current_card() ? 34.0f : 0.0f;
         AcquireSRWLockShared(&g_body_lock);
+        if (painted_revision) {
+            *painted_revision = current_presentation_revision();
+        }
         d2d_text(g_body, g_fmt_body, d2d_rectf(18.0f, (float)body_top, (float)rect.right - 18.0f, (float)rect.bottom - 124.0f - context_reserved - sent_reserved), g_light_theme ? 22 : 230, g_light_theme ? 43 : 240, g_light_theme ? 56 : 245, 1.0f);
         ReleaseSRWLockShared(&g_body_lock);
         draw_sent_chips_d2d(rect, context_reserved);
@@ -4194,6 +4953,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         hide_meeting_banner(NULL);
         return 0;
     case WM_TIMER:
+        if (wparam == ID_RENDER_ACK_RETRY_TIMER) {
+            KillTimer(hwnd, ID_RENDER_ACK_RETRY_TIMER);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
         if (wparam == ID_AUTOSEND_TIMER) {
             KillTimer(hwnd, ID_AUTOSEND_TIMER);
             g_auto_send_timer_armed = false;
@@ -4273,22 +5037,32 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             if (!g_recording && g_record_restart_after_ms != 0 && (LONG)(now_ms - g_record_restart_after_ms) < 0) {
                 return 0;
             }
-            g_last_record_toggle_ms = now_ms;
             bool was_recording = g_recording;
-            g_recording = !g_recording;
+            bool next_recording = !g_recording;
+            if (!emit_simple_event(
+                    next_recording
+                        ? "recording_start_requested"
+                        : "recording_stop_requested")) {
+                MessageBeep(MB_ICONWARNING);
+                return 0;
+            }
+            g_last_record_toggle_ms = now_ms;
+            g_recording = next_recording;
             g_record_restart_after_ms = was_recording ? now_ms + 1200 : 0;
             update_record_button();
             InvalidateRect(hwnd, NULL, TRUE);
-            emit_simple_event(g_recording ? "recording_start_requested" : "recording_stop_requested");
             if (was_recording) {
                 cancel_auto_send_timer("record_button");
             }
             return 0;
         }
         if (id == ID_TRANSCRIPT_CLEAR_BUTTON) {
+            if (!emit_simple_event("transcript_clear_requested")) {
+                MessageBeep(MB_ICONWARNING);
+                return 0;
+            }
             clear_local_transcript_context();
             InvalidateRect(hwnd, NULL, TRUE);
-            emit_simple_event("transcript_clear_requested");
             return 0;
         }
         if (id == ID_PASTE_ANSWER_BUTTON) {
@@ -4618,8 +5392,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         return 0;
     }
     case WM_PAINT: {
-        if (paint_with_d2d(hwnd)) {
+        ULONGLONG painted_revision = 0;
+        if (paint_with_d2d(hwnd, &painted_revision)) {
             ValidateRect(hwnd, NULL);
+            emit_pending_render_ack_after_paint(painted_revision);
             return 0;
         }
 
@@ -4759,6 +5535,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         SelectObject(hdc, body_font);
         SetTextColor(hdc, g_light_theme ? RGB(22, 43, 56) : RGB(230, 240, 245));
         AcquireSRWLockShared(&g_body_lock);
+        painted_revision = current_presentation_revision();
         DrawTextW(hdc, g_body, -1, &body_rect, DT_LEFT | DT_TOP | DT_WORDBREAK);
         ReleaseSRWLockShared(&g_body_lock);
         draw_sent_chips_gdi(hdc, rect, context_reserved);
@@ -4768,6 +5545,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         DeleteObject(title_font);
         DeleteObject(body_font);
         EndPaint(hwnd, &ps);
+        emit_pending_render_ack_after_paint(painted_revision);
         return 0;
     }
     case WM_CLOSE:
@@ -4812,6 +5590,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassW(&wc);
 
+    load_session_token();
+    if (!start_output_writer()) return 1;
+
     load_overlay_placement();
 
     /* Stealth: WS_EX_TOOLWINDOW removes the window from Alt+Tab and the
@@ -4844,6 +5625,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         instance,
         NULL
     );
+    if (!g_hwnd) {
+        stop_output_writer();
+        return 1;
+    }
 
     create_controls(g_hwnd);
     create_meeting_banner(instance);
@@ -4851,8 +5636,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     set_window_opacity(g_opacity);
     apply_capture_exclusion(g_hwnd);
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-    load_session_token();
-    emit_ready();
+    if (!emit_ready()) {
+        DestroyWindow(g_hwnd);
+        stop_output_writer();
+        return 1;
+    }
     int hotkeys_registered = 0;
     char hotkey_failures[192] = "";
     hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_TOGGLE_OVERLAY, 'B', "B", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
@@ -4879,5 +5667,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
         DispatchMessage(&msg);
     }
     stop_meeting_detector();
+    stop_output_writer();
     return 0;
 }

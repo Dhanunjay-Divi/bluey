@@ -66,7 +66,8 @@ pub enum SpeculativeChunk {
     Error {
         /// Lane that failed ("draft" or "deep").
         lane: &'static str,
-        /// Underlying error message.
+        /// Closed, content-free error category. Raw provider messages must not
+        /// cross this boundary because callers may log the chunk.
         message: String,
     },
 }
@@ -154,7 +155,7 @@ impl SpeculativeRouter {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        error = %e,
+                        error_category = e.diagnostic_category(),
                         "speculative router: instant lane unavailable; running deep-only",
                     );
                     // Surface a non-fatal Error chunk so the UI can show a
@@ -162,7 +163,7 @@ impl SpeculativeRouter {
                     let _ = tx
                         .send(SpeculativeChunk::Error {
                             lane: "draft",
-                            message: format!("instant lane unavailable: {e}"),
+                            message: e.diagnostic_category().to_string(),
                         })
                         .await;
                 }
@@ -301,7 +302,7 @@ fn spawn_lane(
                                 let _ = tx
                                     .send(SpeculativeChunk::Error {
                                         lane: role.label(),
-                                        message: e.to_string(),
+                                        message: e.diagnostic_category().to_string(),
                                     })
                                     .await;
                                 return;
@@ -312,7 +313,7 @@ fn spawn_lane(
                         let _ = tx
                             .send(SpeculativeChunk::Error {
                                 lane: role.label(),
-                                message: "provider stream ended before a terminal chunk".into(),
+                                message: "stream_incomplete".into(),
                             })
                             .await;
                     }
@@ -321,7 +322,7 @@ fn spawn_lane(
                     let _ = tx
                         .send(SpeculativeChunk::Error {
                             lane: role.label(),
-                            message: e.to_string(),
+                            message: e.diagnostic_category().to_string(),
                         })
                         .await;
                 }
@@ -355,7 +356,7 @@ fn spawn_lane(
                     let _ = tx
                         .send(SpeculativeChunk::Error {
                             lane: role.label(),
-                            message: e.to_string(),
+                            message: e.diagnostic_category().to_string(),
                         })
                         .await;
                 }
@@ -571,7 +572,7 @@ mod tests {
         assert!(matches!(
             rx.recv().await,
             Some(SpeculativeChunk::Error { lane: "draft", message })
-                if message.contains("before a terminal chunk")
+                if message == "stream_incomplete"
         ));
     }
 
@@ -885,7 +886,11 @@ mod tests {
         while let Some(chunk) = stream.next().await {
             match chunk {
                 SpeculativeChunk::Draft { .. } | SpeculativeChunk::Final { .. } => texts += 1,
-                SpeculativeChunk::Error { .. } => errors += 1,
+                SpeculativeChunk::Error { message, .. } => {
+                    assert_eq!(message, "provider");
+                    assert!(!message.contains("upstream blocked for test"));
+                    errors += 1;
+                }
             }
         }
         assert!(errors >= 1, "expected at least one Error chunk");

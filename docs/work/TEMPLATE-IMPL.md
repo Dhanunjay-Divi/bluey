@@ -20,7 +20,7 @@
 ```bash
 # Commands run and their output summary
 cargo build        # ✅ success
-cargo test         # ✅ X tests passed
+bash scripts/run-bluey-tests.sh all  # ✅ X tests passed; temp workspace cleaned
 cargo clippy       # ✅ no warnings
 ```
 

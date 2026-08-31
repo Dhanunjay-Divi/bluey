@@ -7,13 +7,28 @@
 #   - cue-cli crate produces: "cue" and "bluey"
 # We package the "bluey" / "bluey-daemon" variants.
 
-.PHONY: require-update-pubkey build-daemon-release build-dashboard-release build-helpers-release \
+.PHONY: require-update-pubkey test-rust test-rust-workspace test-rust-server \
+        test-rust-launcher build-daemon-release build-dashboard-release build-helpers-release \
         build-darwin-arm64 build-darwin-x86_64 build-darwin-universal \
         build-windows-x86_64 build-all package-darwin-arm64 \
         package-darwin-x86_64 package-darwin-universal \
         package-windows-x86_64 package-windows-x86_64-gnu
 
 VERSION ?= $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+# Local Rust tests intentionally do not reuse the release/build target. The
+# launcher owns a fresh bounded workspace and removes it on every exit path.
+test-rust:
+	bash scripts/run-bluey-tests.sh all
+
+test-rust-workspace:
+	bash scripts/run-bluey-tests.sh workspace
+
+test-rust-server:
+	bash scripts/run-bluey-tests.sh server
+
+test-rust-launcher:
+	bash scripts/run-bluey-tests.sh --self-test
 
 require-update-pubkey:
 	@test -n "$(BLUEY_UPDATE_PUBKEY)" || (echo "BLUEY_UPDATE_PUBKEY is required for release packages; set it from the release public key before packaging." >&2; exit 1)
