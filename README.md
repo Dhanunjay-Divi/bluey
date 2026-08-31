@@ -117,6 +117,36 @@ Run the isolated smoke test:
 scripts/smoke-test.sh
 ```
 
+Run local test and check commands through the disposable test launcher so Rust
+artifacts and temporary SQLite files do not accumulate in the checkout:
+
+```bash
+scripts/run-bluey-tests.sh all
+scripts/run-bluey-tests.sh -- cargo test --manifest-path server/Cargo.toml --lib jobs
+```
+
+Each invocation uses a unique private directory under local `/tmp`, isolates
+Cargo, temporary, primary SQLite, data, config, runtime, and log state, forces
+the SQLite backend, and removes inherited production/test PostgreSQL URLs. A
+distinct process group contains ordinary compiler/test descendants. Verified
+cleanup runs after success, failure, HUP, INT, or TERM; cleanup failure turns a
+successful command into an error without hiding an existing failure or signal
+status. Both modes execute from the physical repository root even when invoked
+elsewhere. Before marker establishment, an early owned root is safely cleaned;
+after establishment, a missing or malformed marker retains the root and reports
+cleanup failure for audit. An uncatchable SIGKILL or host crash is handled
+conservatively only on a later launcher invocation, and uncertain process
+inspection is treated as active. A zombie-only process group is treated as
+inactive because it cannot execute or retain files; the self-test creates that
+state deterministically to prevent intermittent cleanup failures. The launcher
+rejects repositories, worktrees, Downloads siblings, broad temporary roots,
+and `/Volumes`, and never chmods an existing parent. Verify the safety contract
+without compiling Rust:
+
+```bash
+scripts/run-bluey-tests.sh --self-test
+```
+
 For a local debug session:
 
 ```bash
