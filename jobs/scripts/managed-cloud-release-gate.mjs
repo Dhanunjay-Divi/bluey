@@ -1865,10 +1865,17 @@ function requireClosedRuntimeContent(componentId, entries) {
     ) {
       fail(componentId + " runtime contains development content: " + path);
     }
-    if (
-      /original[-_]source[-_]verifier|source-verifier/i.test(path)
-    ) {
-      fail("Phase 611 must not claim a source-verifier runtime entrypoint");
+    if (/original[-_]?source[-_]?verifier|source[-_]?verifier/i.test(path)) {
+      const entry = byPath.get(path);
+      if (
+        componentId !== "jobs-workflows" ||
+        path !== "app/workflows/dist/original-source-verifier.js"
+      ) {
+        fail(componentId + " runtime contains unexpected source-verifier path: " + path);
+      }
+      if (!entry || entry.type !== "file" || entry.sizeBytes < 1) {
+        fail("jobs-workflows source-verifier entrypoint must be a nonempty regular file");
+      }
     }
   }
   if (componentId === "jobs-runner") {
@@ -1903,6 +1910,21 @@ function requireClosedRuntimeContent(componentId, entries) {
     ) {
       fail("Managed runner image may not contain unused Firefox or WebKit");
     }
+  }
+}
+
+function requireWorkflowVerifierEntrypointAuthority(
+  componentId,
+  entries,
+  requiredPaths,
+) {
+  if (componentId !== "jobs-workflows") return;
+  const path = "app/workflows/dist/original-source-verifier.js";
+  const expected = requiredPaths.includes(path);
+  const entry = entries.find((item) => item.path === path);
+  const present = entry?.type === "file" && entry.sizeBytes > 0;
+  if (present !== expected) {
+    fail("jobs-workflows source-verifier entrypoint does not match release authority");
   }
 }
 
@@ -3463,18 +3485,11 @@ async function descriptorBuildToComponent(
     );
   }
   requiredPaths.sort();
-  if (
-    componentId === "jobs-workflows" &&
-    requiredPaths.includes("app/workflows/dist/original-source-verifier.js") &&
-    !inventory.entries.some(
-      (entry) =>
-        entry.path === "app/workflows/dist/original-source-verifier.js" &&
-        entry.type === "file" &&
-        entry.sizeBytes > 0,
-    )
-  ) {
-    fail("jobs-workflows successor runtime is missing original-source verifier entrypoint");
-  }
+  requireWorkflowVerifierEntrypointAuthority(
+    componentId,
+    inventory.entries,
+    requiredPaths,
+  );
   const runtimeRoles = expectedRuntimeRolesForComponent(
     componentId,
     capabilities,
@@ -4140,18 +4155,11 @@ export async function validateManagedCloudCandidate(candidateDirectory) {
       component.artifactKind,
     );
     const { value: inventory } = await readCanonicalJson(inventoryPath);
-    if (
-      component.componentId === "jobs-workflows" &&
-      baseRequiredPaths.includes("app/workflows/dist/original-source-verifier.js") &&
-      !inventory.entries.some(
-        (entry) =>
-          entry.path === "app/workflows/dist/original-source-verifier.js" &&
-          entry.type === "file" &&
-          entry.sizeBytes > 0,
-      )
-    ) {
-      fail("jobs-workflows successor runtime is missing original-source verifier entrypoint");
-    }
+    requireWorkflowVerifierEntrypointAuthority(
+      component.componentId,
+      inventory.entries,
+      baseRequiredPaths,
+    );
     const attachedInventory = validatedAttachments.decoded.get(
       component.componentId,
     );
@@ -6321,13 +6329,14 @@ function markedSection(text, marker) {
 
 export async function validateManagedCloudWorkflowContract(workflowFile) {
   const text = await readFile(workflowFile, "utf8");
-  for (const marker of [
+  const releaseSections = [
     "CANDIDATE-BUILD",
     "VERIFY-NO-REBUILD",
     "AUTHORIZE-NO-REBUILD",
     "PROMOTE-NO-REBUILD",
     "ROLLBACK-NO-REBUILD",
-  ]) {
+  ];
+  for (const marker of releaseSections) {
     markedSection(text, marker);
   }
   const forbiddenCommands = [
@@ -6351,12 +6360,7 @@ export async function validateManagedCloudWorkflowContract(workflowFile) {
   ) {
     fail("Candidate build must audit the read-only exact Jobs dependency graph before artifacts");
   }
-  for (const marker of [
-    "VERIFY-NO-REBUILD",
-    "AUTHORIZE-NO-REBUILD",
-    "PROMOTE-NO-REBUILD",
-    "ROLLBACK-NO-REBUILD",
-  ]) {
+  for (const marker of releaseSections.slice(1)) {
     if (containsForbiddenCommand(markedSection(text, marker))) {
       fail(marker + " must not install dependencies or rebuild artifacts");
     }
@@ -6364,23 +6368,80 @@ export async function validateManagedCloudWorkflowContract(workflowFile) {
   if (/\$\{\{\s*secrets\./.test(markedSection(text, "CANDIDATE-BUILD"))) {
     fail("Candidate build section must not receive repository secrets");
   }
+  const allowedActions = new Set([
+    "actions/checkout",
+    "actions/download-artifact",
+    "actions/setup-node",
+    "actions/upload-artifact",
+  ]);
   for (const match of text.matchAll(/uses:\s*([^\s#]+)/g)) {
+    const [action, revision, extra] = match[1].split("@");
     if (
-      !/^(?:actions\/checkout|actions\/download-artifact|actions\/upload-artifact)@[0-9a-f]{40}$/.test(
-        match[1],
-      )
+      extra !== undefined ||
+      !allowedActions.has(action) ||
+      !/^[0-9a-f]{40}$/.test(revision ?? "")
     ) {
       fail("Every GitHub Action must be pinned by full commit SHA");
     }
   }
+  const setupNodeAction =
+    "uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
+  const exactNodeVersion = "node-version: 22.23.2";
+  const exactNodeAssertion = 'test "$(node --version)" = "v22.23.2"';
+  const defaultBranchType = "github.ref_type == 'branch'";
+  const defaultBranchName =
+    "github.ref_name == github.event.repository.default_branch";
+  const protectedNodeCommand =
+    /(?:^|\n)\s*(?:run:\s*)?node\s+(?:jobs\/scripts\/managed-cloud-release-gate\.mjs|--test|-e|--input-type=module)/m;
+  for (const marker of releaseSections) {
+    const section = markedSection(text, marker);
+    const setupIndex = section.indexOf(setupNodeAction);
+    const assertionIndex = section.indexOf(exactNodeAssertion);
+    const commandIndex = section.search(protectedNodeCommand);
+    const stepsIndex = section.indexOf("steps:");
+    if (
+      section.split(defaultBranchType).length - 1 !== 1 ||
+      section.split(defaultBranchName).length - 1 !== 1 ||
+      section.indexOf(defaultBranchType) > stepsIndex ||
+      section.indexOf(defaultBranchName) > stepsIndex ||
+      section.split(setupNodeAction).length - 1 !== 1 ||
+      section.split(exactNodeVersion).length - 1 !== 1 ||
+      section.split(exactNodeAssertion).length - 1 !== 1 ||
+      setupIndex < 0 ||
+      assertionIndex <= setupIndex ||
+      commandIndex <= assertionIndex
+    ) {
+      fail(
+        marker +
+          " must be default-branch-only and pin Node 22.23.2 before release evidence",
+      );
+    }
+  }
   if (
-    !text.includes("directDiscovery: false") ||
-    !text.includes("globalDiscovery: false") ||
-    !text.includes("sourceVerification: false") ||
-    text.includes("original-source-verifier.js") ||
-    text.includes("original_source_verifier.js")
+    !candidateBuildSection.includes("directDiscovery: false") ||
+    !candidateBuildSection.includes("globalDiscovery: false") ||
+    !candidateBuildSection.includes("--version 2") ||
+    !candidateBuildSection.includes(
+      "bluey-jobs-managed-cloud-release-gate-tests-v2",
+    ) ||
+    !candidateBuildSection.includes(
+      "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=" +
+        "original_source_verifier,workflow_gateway,workflow_worker",
+    ) ||
+    !candidateBuildSection.includes(
+      'audience: "bluey-jobs-managed-cloud-release-descriptor-v2"',
+    ) ||
+    !candidateBuildSection.includes("sourceVerification: true") ||
+    !candidateBuildSection.includes("version: 2") ||
+    candidateBuildSection.includes("sourceVerification: false") ||
+    candidateBuildSection.includes(
+      'audience: "bluey-jobs-managed-cloud-release-descriptor-v1"',
+    )
   ) {
-    fail("Workflow must reserve, but never claim, conditional Phase 612 workers");
+    fail(
+      "Workflow must build the exact source-verification v2 candidate " +
+        "while direct and global discovery remain disabled",
+    );
   }
   if (
     !text.includes("vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256") ||

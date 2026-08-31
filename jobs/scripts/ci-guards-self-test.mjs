@@ -245,6 +245,98 @@ function testDependencySecurityWorkflowGuard() {
       managedRelease.includes("major===22&&minor<13"),
     "Managed-cloud candidate must prove Node compatibility and audit before building artifacts",
   );
+  const managedSetupNode =
+    "uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
+  const managedNodeVersion = "node-version: 22.23.2";
+  const managedNodeAssertion = 'test "$(node --version)" = "v22.23.2"';
+  const managedDefaultBranchType = "github.ref_type == 'branch'";
+  const managedDefaultBranchName =
+    "github.ref_name == github.event.repository.default_branch";
+  const managedNodeCommand =
+    /(?:^|\n)\s*(?:run:\s*)?node\s+(?:jobs\/scripts\/managed-cloud-release-gate\.mjs|--test|-e|--input-type=module)/m;
+  for (const marker of [
+    "CANDIDATE-BUILD",
+    "VERIFY-NO-REBUILD",
+    "AUTHORIZE-NO-REBUILD",
+    "PROMOTE-NO-REBUILD",
+    "ROLLBACK-NO-REBUILD",
+  ]) {
+    const begin = `# RELEASE-GATE: ${marker}-BEGIN`;
+    const end = `# RELEASE-GATE: ${marker}-END`;
+    const section = managedRelease.slice(
+      managedRelease.indexOf(begin) + begin.length,
+      managedRelease.indexOf(end),
+    );
+    const setupIndex = section.indexOf(managedSetupNode);
+    const assertionIndex = section.indexOf(managedNodeAssertion);
+    const commandIndex = section.search(managedNodeCommand);
+    const stepsIndex = section.indexOf("steps:");
+    assert.equal(
+      section.split(managedDefaultBranchType).length - 1,
+      1,
+      `${marker} must require a branch ref`,
+    );
+    assert.equal(
+      section.split(managedDefaultBranchName).length - 1,
+      1,
+      `${marker} must require the repository default branch`,
+    );
+    assert.equal(
+      section.split(managedSetupNode).length - 1,
+      1,
+      `${marker} must contain one pinned setup-node action`,
+    );
+    assert.equal(
+      section.split(managedNodeVersion).length - 1,
+      1,
+      `${marker} must contain one exact Node patch`,
+    );
+    assert.equal(
+      section.split(managedNodeAssertion).length - 1,
+      1,
+      `${marker} must assert the exact Node patch`,
+    );
+    assert(
+      section.indexOf(managedDefaultBranchType) < stepsIndex &&
+        section.indexOf(managedDefaultBranchName) < stepsIndex &&
+        setupIndex >= 0 &&
+        assertionIndex > setupIndex &&
+        commandIndex > assertionIndex,
+      `${marker} must bind the default branch and Node before release evidence`,
+    );
+  }
+  for (const required of [
+    "--version 2",
+    "bluey-jobs-managed-cloud-release-gate-tests-v2",
+    "bluey-jobs-managed-cloud-release-descriptor-v2",
+    "sourceVerification: true",
+    "directDiscovery: false",
+    "globalDiscovery: false",
+    "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=" +
+      "original_source_verifier,workflow_gateway,workflow_worker",
+  ]) {
+    assert(
+      managedRelease.includes(required),
+      `Managed-cloud candidate is missing the release-v2 source-verifier binding: ${required}`,
+    );
+  }
+  assert(
+    !managedRelease.includes("sourceVerification: false") &&
+      !managedRelease.includes("bluey-jobs-managed-cloud-release-descriptor-v1"),
+    "Managed-cloud candidate must not silently fall back to release v1",
+  );
+  const workflowsDockerfile = fs.readFileSync(
+    path.join(repoRoot, "jobs/workflows/Dockerfile"),
+    "utf8",
+  );
+  assert.equal(
+    workflowsDockerfile.split(
+      "ARG BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=" +
+        "original_source_verifier,workflow_gateway,workflow_worker",
+    ).length - 1,
+    2,
+    "The workflows build and runtime stages must default to the exact release-v2 role set",
+  );
 }
 
 function testBuiltPortalPublicBetaTruth() {

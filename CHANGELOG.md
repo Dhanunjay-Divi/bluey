@@ -7,6 +7,16 @@ under `docs/release/`.
 
 ### Added
 
+- Prepared the Bluey Jobs managed-cloud candidate path for the existing release-v2 original-source
+  verifier authority. New candidates explicitly bind the source-verification protocol, compiled
+  verifier entrypoint, exact three-role workflows image measurement, distinct runtime grant and
+  heartbeat authority, and required `original-source-verifier-readiness` activation evidence.
+  Every release-evidence job pins and asserts Node 22.23.2 before processing, dispatch is limited
+  to the repository default branch, OCI inspection admits only the exact nonempty regular verifier
+  entrypoint, and release-v1 assembly rejects those verifier bytes and roles.
+  Direct and global discovery remain false; every checked-in production/provider-write flag stays
+  off. This source change does not dispatch a release workflow, sign or activate a candidate,
+  contact a provider, open a cohort, deploy, or create an employer-facing effect.
 - Added a durable, public, first-come Bluey Jobs cohort with an atomic hard cap,
   sticky admissions, revisioned administrative suspension and denial,
   privacy-safe aggregate telemetry, and a fail-closed master kill switch. The
