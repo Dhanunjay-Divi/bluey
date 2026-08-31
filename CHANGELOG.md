@@ -316,6 +316,19 @@ under `docs/release/`.
 
 ### Fixed
 
+- Added a marker-bound local test launcher after repeated Bluey Rust suites were reported to
+  recreate roughly 7–20 GiB per hour. Cargo targets, ordinary temporary/SQLite paths, and Bluey
+  data/config/runtime/log paths now live under one unique private `/tmp` run root with incremental
+  and debug bloat disabled. The canonical `run-bluey-tests.sh` also overrides poisoned primary DB
+  and log values, forces SQLite, removes inherited PostgreSQL URLs, and supervises a distinct
+  command process group. Every mode starts from the physical repository root; signals are deferred
+  through root ownership; and once marker establishment begins, a missing or malformed marker
+  retains the root and fails cleanup explicitly. Verified exact-root cleanup preserves
+  nonzero/signal status and fails a successful command when deletion fails; the next-launch reaper
+  skips live groups, process-inspection ambiguity, and linked or invalid markers. Fake-command
+  self-tests and a Jobs CI guard cover parent rejection, mkdir-window signals, caller CWD,
+  descendants, stale recovery, marker corruption, and cleanup failure. No SSD, existing repository
+  target, database, production service, or release flag is touched.
 - Corrected the hosted Jobs runner plan-matrix fixture to establish and read back verified,
   durable public-beta admission before testing Free/Pro/Cloud and application-integrity
   boundaries. The regression now proves it crossed the valid outer beta gate before the
