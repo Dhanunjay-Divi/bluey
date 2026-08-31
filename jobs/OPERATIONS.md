@@ -1508,6 +1508,57 @@ source-only wording is:
 > Signed ATS certification authority is source-ready; every provider remains
 > Review first pending authorized tenant and runner evidence.
 
+## Managed original-source verifier release-v2 authority
+
+The managed-cloud candidate workflow emits only the version-2 source-verification
+contract. It keeps direct and global discovery false and measures the exact
+`jobs-workflows` image for these sorted roles:
+
+```text
+original_source_verifier
+workflow_gateway
+workflow_worker
+```
+
+Run the verifier as a separate rootless process from those same stored image
+bytes with the immutable command:
+
+```text
+/usr/local/bin/node workflows/dist/original-source-verifier.js
+```
+
+Do not rebuild or retag the image for that role. The protected deployment must
+issue a distinct one-time runtime grant, token, instance ID, and worker ID for
+`original_source_verifier`; inject the generic managed-runtime settings only
+into that process; and keep its API origin HTTPS in production. The measured
+runtime identity is derived inside the container and must never be configured.
+
+The process claims its exact grant, remeasures the image, publishes one fresh
+runtime heartbeat, and performs a successful lease poll before it may continue
+reporting ready. Every assignment remains bound to the exact activation,
+manifest, protocol, runtime instance/epoch, worker, generation, and fence. A
+final lease heartbeat immediately precedes terminal publication. Runtime,
+release, source, subject, operational-hold, or fence drift denies publication;
+byte-identical terminal replay remains lookup-only and changed bytes quarantine
+the assignment.
+
+Promotion evidence must include `original-source-verifier-readiness` in the
+exact canary set alongside the workflow image-digest and read-only-rootfs
+attestations. Treat a missing/stale verifier heartbeat, failed dependency poll,
+wrong runtime role, v1 manifest, missing source-verification protocol, missing
+entrypoint, enabled direct/global discovery, or mismatched stored-byte readback
+as a stop-the-line failure. Disable new authority through the signed head or
+runtime grant; preserve immutable observations, receipts, and response-loss
+replay. Rollback is a higher-sequence transition to previously verified stored
+bytes, never a rebuild or pointer rewind.
+
+The checked-in production switches stay off. This source contract does not
+activate a release, contact a provider, create a customer cohort, or authorize
+an application, message, mailbox action, or discovery worker. Anonymous live
+provider canaries, rights/rate approval, hosted PostgreSQL/Temporal behavior,
+runtime capacity, monitoring, kill-switch exercise, and rollback rehearsal are
+separate release gates.
+
 ## Reviewed communication release authority
 
 Recruiter replies and interview-calendar actions use an authority boundary that
