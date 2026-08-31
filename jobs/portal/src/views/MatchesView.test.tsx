@@ -105,7 +105,7 @@ function match(canPrepare: boolean, capability: NonNullable<JobPosting["eligibil
 
 const runners = (available: boolean): RunnerAvailability => ({
   local: {
-    status: "invited_beta",
+    status: "limited_beta",
     available: false,
     plan_included: false,
     distribution_enabled: false,
@@ -113,17 +113,17 @@ const runners = (available: boolean): RunnerAvailability => ({
     next_action: "Use cloud automation or Review.",
   },
   cloud: {
-    status: available ? "available" : "invited_beta",
+    status: available ? "available" : "limited_beta",
     available,
     plan_included: true,
     distribution_enabled: available,
-    reason: available ? "Available." : "Cloud automation is still in invited beta.",
+    reason: available ? "Available." : "Cloud automation is temporarily unavailable in this limited public beta.",
     next_action: available ? "Queue in the cloud." : "Use Review first.",
   },
   auto_submit_available: available,
   auto_submit_reason: available
     ? "Auto-submit is available."
-    : "Cloud automation is still in invited beta.",
+    : "Cloud automation is temporarily unavailable in this limited public beta.",
 });
 
 const authorization = (status: AutoSubmitAuthorization["status"] = "active"): AutoSubmitAuthorization => ({
@@ -291,7 +291,7 @@ describe("Career Track filtering and submission truth", () => {
     const certified = match(true, "certified");
 
     expect(canAutoSubmit(certified, runners(false), [authorization()])).toBe(false);
-    expect(autoSubmitUnavailableReason(certified, runners(false), [authorization()])).toContain("invited beta");
+    expect(autoSubmitUnavailableReason(certified, runners(false), [authorization()])).toContain("limited public beta");
     expect(canAutoSubmit(certified, runners(true), [])).toBe(false);
     expect(autoSubmitUnavailableReason(certified, runners(true), [])).toContain("Career Track");
     expect(canAutoSubmit(certified, runners(true), [authorization("needs_review")])).toBe(false);
@@ -349,6 +349,6 @@ describe("Career Track filtering and submission truth", () => {
       match(true, "certified"),
       localOnly,
       [authorization()],
-    )).toContain("invited beta");
+    )).toContain("limited public beta");
   });
 });

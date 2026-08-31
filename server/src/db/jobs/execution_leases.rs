@@ -1513,6 +1513,11 @@ fn claim_execution_lease_inner(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_sqlite_tx(
+                &tx, account_id,
+            )? {
+                return Err(ExecutionLeaseError::Conflict);
+            }
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
@@ -1855,6 +1860,11 @@ fn claim_execution_lease_inner(
                     .map_err(execution_lease_from_managed_cloud_error)?;
                 lock_postgres_ats_certification(&mut tx)
                     .map_err(execution_lease_from_ats_certification_error)?;
+            }
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_postgres_tx(
+                &mut tx, account_id,
+            )? {
+                return Err(ExecutionLeaseError::Conflict);
             }
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             let discovered_application =
@@ -2723,6 +2733,11 @@ pub fn authorize_managed_execution_effect(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_sqlite_tx(
+                &tx, account_id,
+            )? {
+                return Err(ExecutionLeaseError::Conflict);
+            }
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
@@ -2814,6 +2829,11 @@ pub fn authorize_managed_execution_effect(
                     .scope,
             )
             .map_err(execution_lease_from_managed_cloud_error)?;
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_postgres_tx(
+                &mut tx, account_id,
+            )? {
+                return Err(ExecutionLeaseError::Conflict);
+            }
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             let volume_worker_id = discover_managed_execution_volume_worker_postgres_tx(
                 &mut tx,
@@ -2968,6 +2988,7 @@ fn managed_execution_effect_rechecks_composed_authority_after_canonical_prelock(
     let mut previous = 0;
     for operation in [
         "lock_managed_cloud_workflow_admission_postgres_tx",
+        "public_beta_effect_authorized_postgres_tx",
         "lock_discovery_account_shared_postgres",
         "resolve_managed_cloud_execution_effect_postgres_tx_after_prelock",
     ] {
@@ -3010,18 +3031,35 @@ fn managed_execution_effect_rechecks_composed_authority_after_canonical_prelock(
 #[test]
 fn fix_728_cloud_claim_and_submit_hold_checks_precede_effect_mutation_without_relocks() {
     let source = include_str!("execution_leases.rs");
-    let claim = source
+    let claim_all = source
         .split("fn claim_execution_lease_inner(")
         .nth(1)
         .expect("cloud claim implementation")
         .split("\nfn execution_lease_from_runner_volume_error(")
         .next()
-        .expect("bounded cloud claim implementation")
+        .expect("bounded cloud claim implementation");
+    let sqlite_claim = claim_all
+        .split("DbPool::Sqlite(_) =>")
+        .nth(1)
+        .expect("SQLite cloud claim implementation")
+        .split("DbPool::Postgres(_) =>")
+        .next()
+        .expect("bounded SQLite cloud claim implementation");
+    let sqlite_public_beta = sqlite_claim
+        .find("public_beta_effect_authorized_sqlite_tx")
+        .expect("SQLite cloud claim public-beta effect fence");
+    let sqlite_first_mutation = sqlite_claim
+        .find("require_active_account_write_fence_sqlite_tx")
+        .expect("SQLite cloud claim first account mutation fence");
+    assert!(sqlite_public_beta < sqlite_first_mutation);
+
+    let claim = claim_all
         .split("DbPool::Postgres(_) =>")
         .nth(1)
         .expect("PostgreSQL cloud claim implementation");
     let mut previous = 0;
     for operation in [
+        "public_beta_effect_authorized_postgres_tx",
         "lock_discovery_account_shared_postgres",
         "postgres_execution_target",
         "operational_hold_context_for_application_postgres_tx_after_authority_prelock",
@@ -3608,6 +3646,11 @@ fn start_irreversible_submission_inner(
                     managed_cloud,
                 });
             }
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_sqlite_tx(
+                &tx, account_id,
+            )? {
+                return Err(ExecutionLeaseError::Conflict);
+            }
             if managed_cloud_context
                 .and_then(|(input, _)| input)
                 .is_none()
@@ -3844,6 +3887,11 @@ fn start_irreversible_submission_inner(
                     .map_err(execution_lease_from_managed_cloud_error)?;
                 lock_postgres_ats_certification(&mut tx)
                     .map_err(execution_lease_from_ats_certification_error)?;
+            }
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_postgres_tx(
+                &mut tx, account_id,
+            )? {
+                return Err(ExecutionLeaseError::Conflict);
             }
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             if managed_cloud_context

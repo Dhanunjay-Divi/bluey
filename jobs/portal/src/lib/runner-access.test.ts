@@ -19,7 +19,7 @@ const runner = (
   reason: available
     ? "Runner is available."
     : planIncluded
-      ? "Runner is included but still in invited beta."
+      ? "Runner is included but temporarily unavailable in this limited public beta."
       : "Runner is not included in this plan.",
   next_action: planIncluded ? "Review applications." : "View plans.",
 });
@@ -28,7 +28,10 @@ describe("cloud automation access copy", () => {
   it("keeps public plans web-first and cloud beta truthful", () => {
     const copy = Object.values(runnerLandingCopy).join(" ");
 
-    expect(copy).toContain("invited beta");
+    expect(copy).toContain("limited public beta");
+    expect(copy).toContain("not cloud automation");
+    expect(copy).toContain("available runner");
+    expect(copy).not.toMatch(/automation then runs|admission (grants|authorizes)/i);
     expect(copy).toContain("web portal");
     expect(copy).toContain("job-site handoff");
     expect(copy).not.toMatch(/install|local browser|run locally/i);
@@ -36,9 +39,9 @@ describe("cloud automation access copy", () => {
     expect(copy).not.toContain("local + cloud");
   });
 
-  it("describes unavailable cloud automation as invited beta", () => {
-    expect(cloudRunnerAccessCopy(runner("invited_beta", false, true))).toMatchObject({
-      badge: "Invited beta",
+  it("describes unavailable cloud automation as limited public beta", () => {
+    expect(cloudRunnerAccessCopy(runner("limited_beta", false, true))).toMatchObject({
+      badge: "Limited public beta",
       action: "Review applications",
     });
   });

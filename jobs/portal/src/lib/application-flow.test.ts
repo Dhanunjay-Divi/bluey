@@ -21,7 +21,7 @@ import {
 
 const runners = (available: boolean): RunnerAvailability => ({
   local: {
-    status: "invited_beta",
+    status: "limited_beta",
     available: false,
     plan_included: false,
     distribution_enabled: false,
@@ -29,15 +29,15 @@ const runners = (available: boolean): RunnerAvailability => ({
     next_action: "Use cloud automation or Review.",
   },
   cloud: {
-    status: available ? "available" : "invited_beta",
+    status: available ? "available" : "limited_beta",
     available,
     plan_included: true,
     distribution_enabled: available,
-    reason: available ? "Available." : "Invited beta.",
+    reason: available ? "Available." : "Limited public beta.",
     next_action: available ? "Queue in the cloud." : "Review first.",
   },
   auto_submit_available: available,
-  auto_submit_reason: available ? "Auto-submit is available." : "Auto-submit is still in invited beta.",
+  auto_submit_reason: available ? "Auto-submit is available." : "Auto-submit is temporarily unavailable in this limited public beta.",
 });
 
 const application = (state: JobApplication["state"]): JobApplication => ({

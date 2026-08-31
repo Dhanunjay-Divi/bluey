@@ -1,7 +1,14 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { AlertCircle, LoaderCircle } from "lucide-react";
-import { accessToken, ApiError, jobsApi } from "./api";
+import {
+  accessToken,
+  ApiError,
+  jobsApi,
+  loadJobsPortal,
+  signOutOfBluey,
+  type JobsBetaAccess,
+} from "./api";
 import { previewWorkspace, previewWorkspaceForScenario } from "./data/preview";
 import type {
   AccountSummary,
@@ -33,6 +40,7 @@ import { AppShell } from "./components/AppShell";
 import { AuthGate } from "./components/AuthGate";
 import { Onboarding } from "./components/Onboarding";
 import { LoadError, LoadingScreen } from "./components/PageState";
+import { PublicBetaGate } from "./components/PublicBetaGate";
 import { previewPosting, previewResume } from "./lib/preview-application";
 import { runnerAvailabilityOrLocked } from "./lib/runner-access";
 import { automationRoute, portalPreviewState } from "./lib/portal-navigation";
@@ -539,6 +547,9 @@ export default function App() {
   const [account, setAccount] = useState<AccountSummary | null>(
     isPreview ? { email: "taylor@example.com", balance_cents: 2450 } : null,
   );
+  const [betaAccess, setBetaAccess] = useState<JobsBetaAccess | null>(
+    isPreview ? { schemaVersion: 1, access: "admitted", reason: "admitted" } : null,
+  );
   const [resumeVersions, setResumeVersions] = useState<Record<string, ResumeVersion>>({});
   const [loading, setLoading] = useState(!isPreview && Boolean(accessToken()));
   const [error, setError] = useState("");
@@ -555,17 +566,29 @@ export default function App() {
     setLoading(true);
     setError("");
     try {
-      const [nextWorkspace, nextAccount] = await Promise.all([jobsApi.workspace(), jobsApi.account()]);
-      if (installWorkspaceAtAuthorityEpoch(
+      const loaded = await loadJobsPortal();
+      if (!workspaceAuthorityEpoch.current.canInstall(refreshToken)) return;
+      setBetaAccess(loaded.betaAccess);
+      if (loaded.betaAccess.access !== "admitted") {
+        setWorkspace(null);
+        setAccount(null);
+        setResumeVersions({});
+      } else if (loaded.workspace && loaded.account && installWorkspaceAtAuthorityEpoch(
         setWorkspace,
         workspaceAuthorityEpoch.current,
         refreshToken,
-        nextWorkspace,
-      )) setAccount(nextAccount);
+        loaded.workspace,
+      )) {
+        setAccount(loaded.account);
+      }
     } catch (requestError) {
       if (workspaceAuthorityEpoch.current.canInstall(refreshToken)) {
         const message = requestError instanceof Error ? requestError.message : "Bluey Jobs could not load.";
         setError(message);
+        setBetaAccess({ schemaVersion: 1, access: "not_admitted", reason: "unavailable" });
+        setWorkspace(null);
+        setAccount(null);
+        setResumeVersions({});
       }
     } finally {
       if (refreshGeneration === workspaceRefreshGeneration.current) {
@@ -1331,6 +1354,17 @@ export default function App() {
   }, []);
 
   if (!isPreview && !accessToken()) return <AuthGate />;
+  if (loading && !betaAccess) return <LoadingScreen />;
+  if (!betaAccess) return <LoadError message={error} onRetry={refresh} />;
+  if (betaAccess.access !== "admitted") {
+    return (
+      <PublicBetaGate
+        betaAccess={betaAccess}
+        onRetry={refresh}
+        onSignOut={signOutOfBluey}
+      />
+    );
+  }
   if (loading && !workspace) return <LoadingScreen />;
   if (!workspace) return <LoadError message={error} onRetry={refresh} />;
   if (!workspace.profile.onboarding_complete) {

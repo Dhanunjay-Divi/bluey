@@ -2144,6 +2144,12 @@ pub fn claim_communication_action(
                 if mailbox.provider != candidate.6 {
                     anyhow::bail!("communication mailbox authority changed")
                 }
+                if !crate::db::jobs_beta_access::public_beta_effect_authorized_sqlite_tx(
+                    &tx,
+                    &candidate.1,
+                )? {
+                    continue;
+                }
                 if communication_dispatch_is_held_sqlite_tx(
                     &tx,
                     &candidate.1,
@@ -2450,6 +2456,12 @@ pub fn claim_communication_action(
                 }
                 scan_cursor = Some(candidate_cursor.clone());
                 scanned += 1;
+                if !crate::db::jobs_beta_access::public_beta_effect_authorized_postgres_tx(
+                    &mut tx,
+                    &candidate_account_id,
+                )? {
+                    continue;
+                }
                 lock_discovery_account_shared_postgres(&mut tx, &candidate_account_id)?;
                 if communication_dispatch_is_held_postgres_tx_after_authority_prelock(
                     &mut tx,
@@ -2930,7 +2942,7 @@ fn validate_communication_reconciliation_evidence(
 pub fn mark_communication_action_request_started(
     pool: &DbPool,
     lease: &JobsCommunicationLeaseAccess,
-) -> Result<JobsCommunicationAction> {
+) -> Result<Option<JobsCommunicationAction>> {
     if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
         anyhow::bail!("communication execution is not enabled")
     }
@@ -2943,10 +2955,15 @@ pub fn mark_communication_action_request_started(
     });
     let evidence_sha256 = communication_evidence_sha256(&evidence)?;
     let evidence_json = to_json(&evidence, "Jobs communication request-start evidence")?;
-    let action = crate::db::run_blocking_db(|| match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let public_beta_effect_authorized =
+                crate::db::jobs_beta_access::public_beta_effect_authorized_sqlite_tx(
+                    &tx,
+                    &lease.account_id,
+                )?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx,
                 &lease.account_id,
@@ -3047,13 +3064,15 @@ pub fn mark_communication_action_request_started(
                 tx.commit()?;
                 return Ok(Some(action));
             }
-            if communication_dispatch_is_held_sqlite_tx_after_authority(
-                &tx,
-                &lease.account_id,
-                &action.application_id,
-                &mailbox_provider,
-                &employer_domain,
-            )? {
+            if !public_beta_effect_authorized
+                || communication_dispatch_is_held_sqlite_tx_after_authority(
+                    &tx,
+                    &lease.account_id,
+                    &action.application_id,
+                    &mailbox_provider,
+                    &employer_domain,
+                )?
+            {
                 let changed = tx.execute(
                     "UPDATE jobs_communication_actions
                         SET status = 'needs_input', lease_owner = NULL, lease_kind = NULL,
@@ -3121,6 +3140,11 @@ pub fn mark_communication_action_request_started(
             lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
             lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)?;
             lock_postgres_ats_certification(&mut tx)?;
+            let public_beta_effect_authorized =
+                crate::db::jobs_beta_access::public_beta_effect_authorized_postgres_tx(
+                    &mut tx,
+                    &lease.account_id,
+                )?;
             lock_discovery_account_shared_postgres(&mut tx, &lease.account_id)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx,
@@ -3242,7 +3266,7 @@ pub fn mark_communication_action_request_started(
                 )?;
             let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)?;
             require_communication_lease_current_at_ms(&action, effect_now_ms)?;
-            if dispatch_held {
+            if !public_beta_effect_authorized || dispatch_held {
                 let changed = tx.execute(
                     "UPDATE jobs_communication_actions
                         SET status = 'needs_input', lease_owner = NULL, lease_kind = NULL,
@@ -3306,8 +3330,7 @@ pub fn mark_communication_action_request_started(
             tx.commit()?;
             Ok(Some(action))
         }
-    })?;
-    action.ok_or_else(|| anyhow::anyhow!("communication dispatch is unavailable"))
+    })
 }
 
 pub fn finish_communication_action(
@@ -4335,6 +4358,7 @@ fn fix_728_communication_dispatch_uses_submitted_domain_after_one_canonical_prel
     assert_ordered(
         fresh,
         &[
+            "public_beta_effect_authorized_postgres_tx",
             "lock_discovery_account_shared_postgres",
             "communication_dispatch_is_held_postgres_tx_after_authority_prelock",
             "require_active_account_write_fence_postgres_tx",
@@ -4362,6 +4386,7 @@ fn fix_728_communication_dispatch_uses_submitted_domain_after_one_canonical_prel
         "lock_operational_hold_shared_postgres_tx",
         "lock_managed_cloud_release_registry_shared_postgres_tx",
         "lock_postgres_ats_certification",
+        "public_beta_effect_authorized_postgres_tx",
         "lock_discovery_account_shared_postgres",
         "communication_employer_domain_postgres_tx_after_authority_prelock",
         "SELECT evidence_sha256",
@@ -4407,6 +4432,7 @@ fn fix_728_communication_dispatch_uses_submitted_domain_after_one_canonical_prel
         "communication_dispatch_is_held_postgres_tx_with_domain_after_authority_prelock",
         "communication_post_lock_db_now_postgres_tx",
         "require_communication_lease_current_at_ms",
+        "!public_beta_effect_authorized",
         "INSERT INTO jobs_communication_action_attempt_evidence",
     ] {
         let position = fresh

@@ -73,11 +73,11 @@ const runners = (cloudAvailable: boolean): RunnerAvailability => ({
     next_action: "Use a legacy local client.",
   },
   cloud: {
-    status: cloudAvailable ? "available" : "invited_beta",
+    status: cloudAvailable ? "available" : "limited_beta",
     available: cloudAvailable,
     plan_included: true,
     distribution_enabled: cloudAvailable,
-    reason: cloudAvailable ? "Cloud automation is available." : "Cloud automation is still in invited beta.",
+    reason: cloudAvailable ? "Cloud automation is available." : "Cloud automation is temporarily unavailable in this limited public beta.",
     next_action: cloudAvailable ? "Start cloud automation." : "Use Review first.",
   },
   auto_submit_available: cloudAvailable,
@@ -97,7 +97,7 @@ describe("reviewed application runner availability", () => {
     const certified = eligibility("certified", true);
 
     expect(hasAvailableRunner(certified, runners(false))).toBe(false);
-    expect(runnerUnavailableReason(certified, runners(false))).toContain("invited beta");
+    expect(runnerUnavailableReason(certified, runners(false))).toContain("limited public beta");
     expect(hasAvailableRunner(certified, runners(true))).toBe(true);
   });
 

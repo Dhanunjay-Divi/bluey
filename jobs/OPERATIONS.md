@@ -18,7 +18,9 @@ On a Bluey production host, install `ops/bluey-jobs.env.example` as
 `/etc/bluey-api/bluey-jobs.env`, replace every placeholder with an independent
 secret, and set mode `0640` with owner `root:bluey`. The Jobs systemd unit also
 loads the shared API, Valkey, and Postgres environment files. Keep
-`BLUEY_JOBS_BETA_ENABLED=0` until the restricted beta is intentionally opened.
+`BLUEY_JOBS_BETA_ENABLED=0` until the public cohort migration, closed-state
+read-back, backup/restore, exact-artifact smoke, suspension, and rollback are
+proved. This variable is the master kill switch, not a cohort-size control.
 The launch product is the browser-delivered Jobs portal at `/jobs/automation`
 with the managed cloud Background runner. Customers install nothing. The
 legacy `/jobs/browser` route is compatibility navigation only and must not be

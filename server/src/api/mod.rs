@@ -19,6 +19,7 @@ pub mod auth_routes;
 pub mod billing;
 pub mod jobs;
 pub mod jobs_ats_certifications;
+pub mod jobs_beta_access;
 pub mod jobs_browser_releases;
 mod jobs_communication_actions;
 mod jobs_import;
@@ -254,7 +255,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route("/account/usage", get(account::usage))
         .merge(
-            jobs::router().route_layer(axum::middleware::from_fn_with_state(
+            jobs::router(state.clone()).route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 crate::rate_limit::limit_jobs_api,
             )),
@@ -419,7 +420,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
 
     let protected = Router::new()
         .merge(
-            jobs::router().route_layer(axum::middleware::from_fn_with_state(
+            jobs::router(state.clone()).route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 crate::rate_limit::limit_jobs_api,
             )),

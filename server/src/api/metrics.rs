@@ -199,8 +199,81 @@ fn render_metrics(
         provider_health.redis_errors_total
     )?;
 
+    append_jobs_public_beta_metrics(&mut body, metrics)?;
     append_jobs_operational_metrics(&mut body, metrics)?;
     Ok(body)
+}
+
+fn append_jobs_public_beta_metrics(body: &mut String, metrics: &MetricsSnapshot) -> Result<()> {
+    if !["draft", "open", "closed_to_new", "suspended"].contains(&metrics.jobs_public_beta_state)
+        || !(0..=10_000).contains(&metrics.jobs_public_beta_hard_cap)
+        || !(0..=metrics.jobs_public_beta_hard_cap).contains(&metrics.jobs_public_beta_assigned)
+        || !(0..=metrics.jobs_public_beta_assigned)
+            .contains(&metrics.jobs_public_beta_live_enrollments)
+        || metrics.jobs_public_beta_public_enrollments < 0
+        || metrics.jobs_public_beta_admin_enrollments < 0
+        || metrics.jobs_public_beta_active_denials < 0
+        || metrics
+            .jobs_public_beta_public_enrollments
+            .checked_add(metrics.jobs_public_beta_admin_enrollments)
+            != Some(metrics.jobs_public_beta_live_enrollments)
+    {
+        bail!("invalid public beta metric authority")
+    }
+
+    writeln!(
+        body,
+        "# HELP bluey_jobs_public_beta_state Current durable public beta cohort state."
+    )?;
+    writeln!(body, "# TYPE bluey_jobs_public_beta_state gauge")?;
+    writeln!(
+        body,
+        "bluey_jobs_public_beta_state{{state=\"{}\"}} 1",
+        metrics.jobs_public_beta_state
+    )?;
+    for (name, help, metric_type, value) in [
+        (
+            "bluey_jobs_public_beta_hard_cap",
+            "Current durable public beta hard cap.",
+            "gauge",
+            metrics.jobs_public_beta_hard_cap,
+        ),
+        (
+            "bluey_jobs_public_beta_slots_assigned_total",
+            "Cumulative public beta slots assigned.",
+            "counter",
+            metrics.jobs_public_beta_assigned,
+        ),
+        (
+            "bluey_jobs_public_beta_live_enrollments",
+            "Current retained enrollment rows.",
+            "gauge",
+            metrics.jobs_public_beta_live_enrollments,
+        ),
+        (
+            "bluey_jobs_public_beta_public_enrollments",
+            "Current public-window enrollment rows.",
+            "gauge",
+            metrics.jobs_public_beta_public_enrollments,
+        ),
+        (
+            "bluey_jobs_public_beta_admin_enrollments",
+            "Current administrative enrollment rows.",
+            "gauge",
+            metrics.jobs_public_beta_admin_enrollments,
+        ),
+        (
+            "bluey_jobs_public_beta_active_denials",
+            "Current active account denial overrides.",
+            "gauge",
+            metrics.jobs_public_beta_active_denials,
+        ),
+    ] {
+        writeln!(body, "# HELP {name} {help}")?;
+        writeln!(body, "# TYPE {name} {metric_type}")?;
+        writeln!(body, "{name} {value}")?;
+    }
+    Ok(())
 }
 
 fn append_jobs_operational_metrics(body: &mut String, metrics: &MetricsSnapshot) -> Result<()> {
@@ -348,6 +421,13 @@ mod tests {
     #[test]
     fn jobs_metrics_use_only_closed_labels_and_omit_private_sentinels() {
         let snapshot = MetricsSnapshot {
+            jobs_public_beta_state: "open",
+            jobs_public_beta_hard_cap: 25,
+            jobs_public_beta_assigned: 7,
+            jobs_public_beta_live_enrollments: 6,
+            jobs_public_beta_public_enrollments: 5,
+            jobs_public_beta_admin_enrollments: 1,
+            jobs_public_beta_active_denials: 2,
             operational_holds: vec![OperationalHoldMetric {
                 capability: "generation".to_string(),
                 scope_kind: "account".to_string(),
@@ -362,6 +442,10 @@ mod tests {
         ));
         assert!(body.contains("bluey_jobs_capability_ready{capability=\"generation\"} 0"));
         assert!(body.contains("bluey_jobs_capability_ready{capability=\"discovery\"} 1"));
+        assert!(body.contains("bluey_jobs_public_beta_state{state=\"open\"} 1"));
+        assert!(body.contains("bluey_jobs_public_beta_hard_cap 25"));
+        assert!(body.contains("bluey_jobs_public_beta_slots_assigned_total 7"));
+        assert!(body.contains("bluey_jobs_public_beta_active_denials 2"));
         for forbidden in [
             "private-account-id",
             "private.example",
@@ -386,6 +470,21 @@ mod tests {
             ..MetricsSnapshot::default()
         };
         assert!(render(&snapshot).is_err());
+
+        let invalid_public_beta = MetricsSnapshot {
+            jobs_public_beta_state: "private-account-id",
+            ..MetricsSnapshot::default()
+        };
+        assert!(render(&invalid_public_beta).is_err());
+
+        let impossible_public_beta_counts = MetricsSnapshot {
+            jobs_public_beta_hard_cap: 1,
+            jobs_public_beta_assigned: 1,
+            jobs_public_beta_live_enrollments: 2,
+            jobs_public_beta_public_enrollments: 2,
+            ..MetricsSnapshot::default()
+        };
+        assert!(render(&impossible_public_beta_counts).is_err());
     }
 
     #[test]

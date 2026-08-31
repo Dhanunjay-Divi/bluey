@@ -1806,7 +1806,7 @@ pub struct RunnerChannelAvailability {
 impl Default for RunnerChannelAvailability {
     fn default() -> Self {
         Self {
-            status: "invited_beta".to_string(),
+            status: "limited_beta".to_string(),
             available: false,
             plan_included: false,
             distribution_enabled: false,
@@ -1984,7 +1984,7 @@ pub struct JobsWorkspace {
 /// already represented by the workspace and resume versions.
 #[derive(Debug, Clone, Serialize)]
 pub struct JobsAccountExport {
-    pub workspace: JobsWorkspace,
+    pub workspace: Option<JobsWorkspace>,
     pub canonical_track_policy_ledger: CanonicalTrackPolicyLedgerExport,
     pub resume_versions: Vec<ResumeVersion>,
     pub attempt_reservations: Vec<AttemptReservation>,
@@ -1993,6 +1993,10 @@ pub struct JobsAccountExport {
     pub communication_actions: Vec<JobsCommunicationActionExport>,
     pub communication_evidence: Vec<JobsCommunicationEvidenceExport>,
     pub communication_reconciliations: Vec<JobsCommunicationReconciliationExport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub public_beta_enrollments: Vec<super::jobs_beta_access::PublicBetaEnrollmentExport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub public_beta_overrides: Vec<super::jobs_beta_access::PublicBetaOverrideExport>,
 }
 
 #[derive(Debug, Clone, Serialize)]

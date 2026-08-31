@@ -6,8 +6,7 @@
 use axum::{
     body::Body,
     extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
-    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
-    middleware::Next,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
     Extension, Json, Router,
@@ -19,7 +18,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    api::{jobs_import, jobs_resume_generation, jobs_worker_auth::JobsWorkerIdentity, AppState},
+    api::{
+        jobs_beta_access, jobs_import, jobs_resume_generation,
+        jobs_worker_auth::JobsWorkerIdentity, AppState,
+    },
     auth::AuthedAccount,
     db::{
         jobs::{
@@ -108,8 +110,8 @@ const LEVER_SUBMISSION_ADAPTER_VERSION: &str = "2026.07.0-beta.1";
 const SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRY_MS: i64 = i64::MAX;
 const MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS: usize = 250;
 
-pub fn router() -> Router<AppState> {
-    Router::new()
+pub fn router(state: AppState) -> Router<AppState> {
+    let customer = Router::new()
         .route("/api/jobs/workspace", get(workspace))
         .route("/api/jobs/taxonomy", get(taxonomy))
         .route("/api/jobs/onboarding/complete", post(complete_onboarding))
@@ -284,7 +286,14 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/jobs/entitlements", get(entitlements))
         .route("/api/jobs/runs/:run_id/events", get(run_events))
-        .route_layer(axum::middleware::from_fn(require_jobs_beta))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            jobs_beta_access::require_customer_access,
+        ));
+
+    Router::new()
+        .merge(jobs_beta_access::access_router())
+        .merge(customer)
 }
 
 #[derive(Debug, Serialize)]
@@ -447,14 +456,15 @@ pub fn local_runner_router() -> Router<AppState> {
         )
         .route(
             "/api/jobs/local-runs/:run_id/resume",
-            post(consume_local_run_resume),
+            post(consume_local_run_resume).route_layer(axum::middleware::from_fn(
+                jobs_beta_access::require_jobs_master,
+            )),
         )
         .route(
             "/api/jobs/local-runs/:run_id/result",
             post(save_local_run_result)
                 .route_layer(DefaultBodyLimit::max(RECEIPT_BODY_LIMIT_BYTES)),
         )
-        .route_layer(axum::middleware::from_fn(require_jobs_beta))
 }
 
 pub fn admin_router() -> Router<AppState> {
@@ -471,25 +481,7 @@ pub fn admin_router() -> Router<AppState> {
             "/admin/jobs/discovery-sources/:account_id/:source_id",
             patch(set_account_discovery_source_status),
         )
-}
-
-async fn require_jobs_beta(request: Request<Body>, next: Next) -> Result<Response, ApiError> {
-    let enabled = cfg!(debug_assertions)
-        || std::env::var("BLUEY_JOBS_BETA_ENABLED")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                )
-            })
-            .unwrap_or(false);
-    if !enabled {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Bluey Jobs beta is not enabled.".to_string(),
-        ));
-    }
-    Ok(next.run(request).await)
+        .merge(jobs_beta_access::admin_router())
 }
 
 fn runner_volume_fleet_is_distribution_ready(status: &jobs::RunnerVolumeFleetStatus) -> bool {
@@ -551,8 +543,11 @@ fn distribution_flag_enabled(name: &str) -> bool {
 }
 
 fn jobs_local_browser_distribution_enabled(pool: &crate::db::DbPool) -> bool {
+    jobs_local_browser_distribution_flag_enabled() && runner_volume_fleet_distribution_ready(pool)
+}
+
+fn jobs_local_browser_distribution_flag_enabled() -> bool {
     distribution_flag_enabled("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
-        && runner_volume_fleet_distribution_ready(pool)
 }
 
 fn jobs_cloud_browser_distribution_enabled(pool: &crate::db::DbPool, account_id: &str) -> bool {
@@ -625,7 +620,7 @@ fn runner_channel_availability(
             "Background runner"
         };
         return RunnerChannelAvailability {
-            status: "invited_beta".to_string(),
+            status: "limited_beta".to_string(),
             available: false,
             plan_included: true,
             distribution_enabled: false,
@@ -698,7 +693,7 @@ fn runner_auto_submit_reason(
     } else if cloud.available {
         "Auto-submit can use the background runner while your computer is off.".to_string()
     } else if local.plan_included || cloud.plan_included {
-        "Auto-submit is not available in this release because your included runner is still in invited beta. Review first and job-site handoff remain available.".to_string()
+        "Auto-submit is temporarily unavailable in this limited public beta. Review first and job-site handoff remain available.".to_string()
     } else {
         "Auto-submit requires a Jobs plan with runner access. Review first remains available."
             .to_string()
@@ -736,7 +731,7 @@ fn account_runner_availability(
         };
         if !release.is_available() {
             availability.local.available = false;
-            availability.local.status = "invited_beta".to_string();
+            availability.local.status = "limited_beta".to_string();
             availability.local.reason = match &release {
                 jobs::LocalBrowserReleaseAvailability::Available { reason, .. }
                 | jobs::LocalBrowserReleaseAvailability::Disabled { reason }
@@ -4472,12 +4467,6 @@ async fn claim_local_run(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunClaimRequest>,
 ) -> Result<Response, ApiError> {
-    if !jobs_local_browser_distribution_enabled(&state.pool) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser local runs are currently paused.".to_string(),
-        ));
-    }
     if req.claim_nonce.len() != 64
         || req.claim_nonce != req.claim_nonce.to_ascii_lowercase()
         || !req.claim_nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -4500,11 +4489,14 @@ async fn claim_local_run(
     let server_release_id = browser_server_release_id()?;
     let disposition = jobs::claim_local_run_with_browser_release_for_distribution(
         &state.pool,
-        &run_id,
-        &hash,
-        &req.claim_nonce,
-        &descriptor,
-        &server_release_id,
+        jobs::BrowserLocalRunDistributionClaim {
+            run_id: &run_id,
+            ticket_hash: &hash,
+            claim_nonce: &req.claim_nonce,
+            descriptor: &descriptor,
+            server_release_id: &server_release_id,
+            distribution_enabled: jobs_local_browser_distribution_flag_enabled(),
+        },
         |ticket, binding| {
             let browser_profile_id = ticket
                 .payload
@@ -4704,7 +4696,6 @@ async fn authorize_local_run_submit(
         &run_id,
         exact_click_started_replay,
     )?;
-    let now_ms = capacity.now_ms;
     let server_release_id = browser_server_release_id()?;
     let authorization = jobs::local_run_submit_authorization_for_distribution(
         &state.pool,
@@ -4738,7 +4729,7 @@ async fn authorize_local_run_submit(
     }
     Ok(Json(json!({
         "authorized": true,
-        "authorizedAtMs": now_ms,
+        "authorizedAtMs": authorization.authorized_at_ms,
     })))
 }
 
@@ -11253,17 +11244,19 @@ mod tests {
     }
 
     #[test]
-    fn included_but_undistributed_runner_is_truthfully_invited_beta() {
+    fn included_but_undistributed_runner_is_truthfully_limited_beta() {
         let mut entitlement = test_entitlement(3);
         entitlement.plan = "pro".to_string();
         entitlement.local_browser = true;
         let availability = build_runner_availability(&entitlement, false, false);
 
-        assert_eq!(availability.local.status, "invited_beta");
+        assert_eq!(availability.local.status, "limited_beta");
         assert!(availability.local.plan_included);
         assert!(!availability.local.available);
         assert!(!availability.auto_submit_available);
-        assert!(availability.auto_submit_reason.contains("invited beta"));
+        assert!(availability
+            .auto_submit_reason
+            .contains("limited public beta"));
     }
 
     #[test]
@@ -11348,7 +11341,7 @@ mod tests {
         let runner = auto_submit_request_error(&test_eligibility("certified", true), &unavailable)
             .expect("undistributed runner must block auto submit");
         assert_eq!(runner.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(runner.1.contains("invited beta"));
+        assert!(runner.1.contains("limited public beta"));
     }
 
     fn test_track(id: &str) -> CareerTrack {

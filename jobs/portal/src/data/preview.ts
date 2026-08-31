@@ -701,7 +701,7 @@ export const previewWorkspace: JobsWorkspace = {
   },
   runner_availability: {
     local: {
-      status: "invited_beta",
+      status: "limited_beta",
       available: false,
       plan_included: false,
       distribution_enabled: false,
@@ -858,7 +858,7 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
       ],
       runner_availability: {
         local: {
-          status: "invited_beta",
+          status: "limited_beta",
           available: false,
           plan_included: false,
           distribution_enabled: false,

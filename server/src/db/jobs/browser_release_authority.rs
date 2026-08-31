@@ -82,6 +82,15 @@ pub enum BrowserLocalRunClaimDisposition {
     ConflictingReplay,
 }
 
+pub(crate) struct BrowserLocalRunDistributionClaim<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) ticket_hash: &'a str,
+    pub(crate) claim_nonce: &'a str,
+    pub(crate) descriptor: &'a VerifiedBrowserBuildDescriptor,
+    pub(crate) server_release_id: &'a str,
+    pub(crate) distribution_enabled: bool,
+}
+
 #[derive(Debug, Clone)]
 struct BrowserReleaseActivationRow {
     channel_head_revision: i64,
@@ -285,11 +294,7 @@ pub fn parse_browser_build_proof_for_claim(
 
 pub(crate) fn claim_local_run_with_browser_release_for_distribution<F>(
     pool: &DbPool,
-    run_id: &str,
-    ticket_hash: &str,
-    claim_nonce: &str,
-    descriptor: &VerifiedBrowserBuildDescriptor,
-    server_release_id: &str,
+    request: BrowserLocalRunDistributionClaim<'_>,
     issue_response: F,
 ) -> Result<BrowserLocalRunClaimDisposition>
 where
@@ -297,11 +302,12 @@ where
 {
     claim_local_run_with_browser_release_inner(
         pool,
-        run_id,
-        ticket_hash,
-        claim_nonce,
-        descriptor,
-        server_release_id,
+        request.run_id,
+        request.ticket_hash,
+        request.claim_nonce,
+        request.descriptor,
+        request.server_release_id,
+        request.distribution_enabled,
         true,
         issue_response,
     )
@@ -327,6 +333,7 @@ where
         claim_nonce,
         descriptor,
         server_release_id,
+        true,
         false,
         issue_response,
     )
@@ -340,6 +347,7 @@ fn claim_local_run_with_browser_release_inner<F>(
     claim_nonce: &str,
     descriptor: &VerifiedBrowserBuildDescriptor,
     server_release_id: &str,
+    distribution_enabled: bool,
     require_distribution_ready: bool,
     issue_response: F,
 ) -> Result<BrowserLocalRunClaimDisposition>
@@ -373,6 +381,7 @@ where
                 &claim_request_sha256,
                 descriptor,
                 server_release_id,
+                distribution_enabled,
                 require_distribution_ready,
                 &issue_response,
             )?;
@@ -397,6 +406,11 @@ where
                 transaction.commit()?;
                 return Ok(BrowserLocalRunClaimDisposition::Rejected);
             };
+            let public_beta_effect_authorized =
+                crate::db::jobs_beta_access::public_beta_effect_authorized_postgres_tx(
+                    &mut transaction,
+                    &account_id,
+                )?;
             lock_discovery_account_shared_postgres(&mut transaction, &account_id)?;
             let disposition = postgres_claim_local_run_with_browser_release(
                 &mut transaction,
@@ -407,7 +421,9 @@ where
                 &claim_request_sha256,
                 descriptor,
                 server_release_id,
+                distribution_enabled,
                 require_distribution_ready,
+                public_beta_effect_authorized,
                 &issue_response,
             )?;
             transaction.commit()?;
@@ -644,6 +660,7 @@ fn sqlite_claim_local_run_with_browser_release<F>(
     claim_request_sha256: &str,
     descriptor: &VerifiedBrowserBuildDescriptor,
     server_release_id: &str,
+    distribution_enabled: bool,
     require_distribution_ready: bool,
     issue_response: &F,
 ) -> Result<BrowserLocalRunClaimDisposition>
@@ -684,6 +701,12 @@ where
     let Some(account_id) = account_id else {
         return Ok(BrowserLocalRunClaimDisposition::Rejected);
     };
+    if !crate::db::jobs_beta_access::public_beta_effect_authorized_sqlite_tx(tx, &account_id)? {
+        return Ok(BrowserLocalRunClaimDisposition::Rejected);
+    }
+    if !distribution_enabled {
+        return Ok(BrowserLocalRunClaimDisposition::DistributionUnavailable);
+    }
     if require_distribution_ready && !sqlite_runner_volume_fleet_distribution_ready(tx)? {
         return Ok(BrowserLocalRunClaimDisposition::DistributionUnavailable);
     }
@@ -1044,7 +1067,9 @@ fn postgres_claim_local_run_with_browser_release<F>(
     claim_request_sha256: &str,
     descriptor: &VerifiedBrowserBuildDescriptor,
     server_release_id: &str,
+    distribution_enabled: bool,
     require_distribution_ready: bool,
+    public_beta_effect_authorized: bool,
     issue_response: &F,
 ) -> Result<BrowserLocalRunClaimDisposition>
 where
@@ -1076,6 +1101,12 @@ where
             }
         }
         return Ok(disposition);
+    }
+    if !public_beta_effect_authorized {
+        return Ok(BrowserLocalRunClaimDisposition::Rejected);
+    }
+    if !distribution_enabled {
+        return Ok(BrowserLocalRunClaimDisposition::DistributionUnavailable);
     }
     if require_distribution_ready && !postgres_runner_volume_fleet_distribution_ready(tx)? {
         return Ok(BrowserLocalRunClaimDisposition::DistributionUnavailable);
@@ -3838,6 +3869,7 @@ mod browser_release_authority_tests {
             "lock_managed_cloud_release_registry_shared_postgres_tx",
             "lock_postgres_ats_certification",
             "SELECT account_id FROM jobs_local_run_tickets",
+            "public_beta_effect_authorized_postgres_tx",
             "lock_discovery_account_shared_postgres",
             "postgres_claim_local_run_with_browser_release",
         ] {
@@ -3881,6 +3913,23 @@ mod browser_release_authority_tests {
         assert!(claim.contains(
             "create_ats_application_certification_binding_from_context_postgres_tx_after_prelock"
         ));
+        let replay = claim
+            .find("postgres_browser_claim_replay")
+            .expect("exact Browser claim replay");
+        let public_beta_fence = claim
+            .find("if !public_beta_effect_authorized")
+            .expect("fresh Browser claim public-beta fence");
+        let distribution_flag = claim
+            .find("if !distribution_enabled")
+            .expect("fresh Browser distribution flag fence");
+        let distribution_readiness = claim
+            .find("if require_distribution_ready")
+            .expect("fresh Browser distribution readiness fence");
+        assert!(
+            replay < public_beta_fence
+                && public_beta_fence < distribution_flag
+                && distribution_flag < distribution_readiness
+        );
         for forbidden in [
             "lock_operational_hold_shared_postgres_tx",
             "lock_managed_cloud_release_registry_shared_postgres_tx",

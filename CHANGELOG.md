@@ -7,6 +7,20 @@ under `docs/release/`.
 
 ### Added
 
+- Added a durable, public, first-come Bluey Jobs cohort with an atomic hard cap,
+  sticky admissions, revisioned administrative suspension and denial,
+  privacy-safe aggregate telemetry, and a fail-closed master kill switch. The
+  migration defaults to `draft` with cap `0`; this change does not itself open
+  production access or enable any model, Browser, workflow, mailbox,
+  communication, or provider-write effect.
+- Prepared the bounded Bluey Jobs V1 public-autonomy composition: admitted
+  accounts retain the existing independent Career Track, signed worker,
+  managed runner, final-submit, mailbox, and reviewed communication
+  authorities, while current public-beta denial, suspension, deletion, and the
+  master switch are rechecked before every new employer-facing effect. Exact
+  already-started replay and lookup-only reconciliation remain available. This
+  source preparation does not deploy the portal, open the cohort, or enable an
+  external-write flag.
 - Added the Phase 620A1 Bluey Jobs business-messaging no-egress kernel for original,
   deterministic owner-command planning across WhatsApp Business Platform and Apple Messages for
   Business. A strict synthetic-only TypeScript simulator and non-default Rust verifier share
@@ -302,6 +316,39 @@ under `docs/release/`.
 
 ### Fixed
 
+- Closed the Phase 621/622 acceptance-review findings: deletion-pending
+  accounts cannot enroll, receive an administrator grant, or acquire a new
+  override; audit actors must be current real administrators; all beta
+  responses and portal status reads are private and non-storable; beta-only
+  enrollment and denial data is included in account export without creating a
+  profile; migration-array registration and live-versus-assigned metric
+  invariants are structurally guarded; and queued application/communication
+  work rechecks current beta authority before a new external effect. No raw
+  account, resume, application, message, provider, or credential content was
+  added to logs or metrics.
+- Preserved byte-identical local-submit recovery for both review-first schema-3
+  and ATS-certified schema-4 proofs after beta or runner distribution closes.
+  Exact replay now returns the original database-owned authorization timestamp;
+  fresh submission authority remains fail-closed.
+- Aligned the Jobs operations-route regression tests with the hardened
+  `private, no-store, max-age=0` and `Vary: Authorization` response contract;
+  production routing and cache policy are unchanged.
+- Aligned legacy runner-volume and account-deletion fixtures with the new
+  public-beta effect fence: the exact runner test now creates a durable
+  verified admission, while deletion tests accept the earlier fail-closed
+  denial and retain their no-mutation proofs. Production effect behavior is
+  unchanged.
+- Replaced the local Browser distribution claim's eight-position helper
+  interface with one typed claim request, keeping replay and authorization
+  behavior unchanged while restoring the strict warning-free source gate.
+- Corrected the Phase 621 local-runner authority integration fixture so it sends a schema-valid
+  unauthorized claim and proves the distinct master-off 404 and distribution-paused 503
+  boundaries instead of stopping at JSON extraction with 422.
+- Closed the Phase 621 public-beta administration audit bypass: production cohort, grant, and
+  override mutations now require an actor-backed audit context, while unaudited setup helpers are
+  private to unit tests and source guarded. The configured-PostgreSQL forced-audit-failure fixture
+  now uses transactionally installed, unique, actor-scoped trigger/function names and panic-safe,
+  absence-verified cleanup.
 - Closed Phase 613 review defects FIX-694 through FIX-711: monotonic taxonomy/account/Track replay
   and execution fences; fail-closed canonical classification; typed public-ATS evidence; portal
   mutation/read-back ordering; retry-safe Track writes; PostgreSQL Auto-submit revocation,

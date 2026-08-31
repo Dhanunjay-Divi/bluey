@@ -7,6 +7,7 @@ import {
   checkPhase613MigrationRegistration,
   checkPhase614MigrationRegistration,
   checkPhase614BMigrationRegistration,
+  checkPhase621MigrationRegistration,
   compareJobsSchemas,
 } from "./check-jobs-schema-parity.mjs";
 import {
@@ -202,6 +203,27 @@ function testPortalBundleFreshnessWorkflowGuard() {
   }
 }
 
+function testBuiltPortalPublicBetaTruth() {
+  const assetsDir = path.join(repoRoot, "web/jobs/assets");
+  const bundle = fs
+    .readdirSync(assetsDir)
+    .filter((name) => name.endsWith(".js"))
+    .map((name) => fs.readFileSync(path.join(assetsDir, name), "utf8"))
+    .join("\n");
+  for (const forbidden of [
+    "invited beta accounts",
+    "invited local/cloud runner beta",
+    "join runner beta when it opens",
+    "cloud automation then runs for admitted public-beta accounts",
+  ]) {
+    assert(!bundle.toLowerCase().includes(forbidden), `built Jobs portal contains stale claim: ${forbidden}`);
+  }
+  assert(
+    bundle.includes("Public-beta admission opens the Jobs workspace, not cloud automation"),
+    "built Jobs portal is missing the cohort-versus-runner authority statement",
+  );
+}
+
 function testIntegrationTestSupportContainmentGuard() {
   const cargo = fs.readFileSync(path.join(repoRoot, "server/Cargo.toml"), "utf8");
   assert.match(cargo, /\[features\]\s+default = \[\]\s+integration-test-support = \["dep:serial_test"\]/);
@@ -264,6 +286,54 @@ function testIntegrationTestSupportContainmentGuard() {
       productionBuild,
       /integration-test-support/,
       `${productionPath} must never enable integration test support`,
+    );
+  }
+}
+
+function testPublicBetaAdminMutationAuditBoundary() {
+  const source = fs.readFileSync(
+    path.join(repoRoot, "server/src/db/jobs_beta_access.rs"),
+    "utf8",
+  );
+  const rawMutations = [
+    "update_public_beta_cohort",
+    "grant_public_beta_access",
+    "set_public_beta_override",
+  ];
+  for (const symbol of rawMutations) {
+    assert.match(
+      source,
+      new RegExp(`#\\[cfg\\(test\\)\\]\\s+fn ${symbol}\\s*\\(`),
+      `${symbol} must exist only as a private test helper`,
+    );
+    assert.doesNotMatch(
+      source,
+      new RegExp(`pub(?:\\([^)]*\\))?\\s+fn ${symbol}\\s*\\(`),
+      `${symbol} must not be callable from production code`,
+    );
+    assert.match(
+      source,
+      new RegExp(`pub fn ${symbol}_audited\\s*\\(`),
+      `${symbol}_audited must remain the production mutation API`,
+    );
+  }
+  assert.doesNotMatch(
+    source,
+    /audit_actor:\s*Option<&str>/,
+    "production mutation internals must require a typed audit context",
+  );
+  for (const symbol of [
+    "update_cohort_sqlite",
+    "update_cohort_postgres",
+    "grant_access_sqlite",
+    "grant_access_postgres",
+    "set_override_sqlite",
+    "set_override_postgres",
+  ]) {
+    assert.match(
+      source,
+      new RegExp(`fn ${symbol}\\s*\\([\\s\\S]*?audit:\\s*AdminAuditContext<'_>[\\s\\S]*?\\)\\s*->`),
+      `${symbol} must require the typed administration audit context`,
     );
   }
 }
@@ -346,6 +416,45 @@ function jobsParitySchema(integerType) {
       WHERE status = 'approved';
     CREATE INDEX IF NOT EXISTS idx_jobs_local_resume_actions_application
       ON jobs_local_run_resume_actions(account_id, application_id, created_at_ms DESC);
+    CREATE TABLE IF NOT EXISTS jobs_public_beta_cohorts (
+      id TEXT PRIMARY KEY CHECK(id = 'public-v1'),
+      state TEXT NOT NULL CHECK(state IN ('draft', 'open', 'closed_to_new', 'suspended')),
+      opens_at_ms ${integerType},
+      closes_at_ms ${integerType},
+      hard_cap ${integerType} NOT NULL CHECK(hard_cap >= 0 AND hard_cap <= 10000),
+      assigned_count ${integerType} NOT NULL CHECK(assigned_count >= 0 AND assigned_count <= hard_cap),
+      revision ${integerType} NOT NULL CHECK(revision >= 1),
+      created_at_ms ${integerType} NOT NULL,
+      updated_at_ms ${integerType} NOT NULL,
+      CHECK((opens_at_ms IS NULL) = (closes_at_ms IS NULL)),
+      CHECK(opens_at_ms IS NULL OR (opens_at_ms >= 0 AND closes_at_ms > opens_at_ms)),
+      CHECK(opens_at_ms IS NULL OR closes_at_ms - opens_at_ms <= 7776000000)
+    );
+    CREATE TABLE IF NOT EXISTS jobs_public_beta_enrollments (
+      cohort_id TEXT NOT NULL REFERENCES jobs_public_beta_cohorts(id) ON DELETE RESTRICT,
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      source TEXT NOT NULL CHECK(source IN ('public_window', 'admin')),
+      admitted_at_ms ${integerType} NOT NULL,
+      PRIMARY KEY(cohort_id, account_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_public_beta_enrollments_account
+      ON jobs_public_beta_enrollments(account_id, cohort_id);
+    CREATE INDEX IF NOT EXISTS idx_jobs_public_beta_enrollments_source
+      ON jobs_public_beta_enrollments(cohort_id, source, admitted_at_ms DESC);
+    CREATE TABLE IF NOT EXISTS jobs_public_beta_overrides (
+      cohort_id TEXT NOT NULL REFERENCES jobs_public_beta_cohorts(id) ON DELETE RESTRICT,
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      denied INTEGER NOT NULL CHECK(denied IN (0, 1)),
+      revision ${integerType} NOT NULL CHECK(revision >= 1),
+      created_at_ms ${integerType} NOT NULL,
+      updated_at_ms ${integerType} NOT NULL,
+      PRIMARY KEY(cohort_id, account_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_public_beta_overrides_account
+      ON jobs_public_beta_overrides(account_id, cohort_id);
+    CREATE INDEX IF NOT EXISTS idx_jobs_public_beta_overrides_active
+      ON jobs_public_beta_overrides(cohort_id, denied, updated_at_ms DESC)
+      WHERE denied = 1;
     CREATE TABLE IF NOT EXISTS jobs_submission_evidence_capacity (
       account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
       application_id TEXT NOT NULL REFERENCES jobs_applications(id) ON DELETE CASCADE,
@@ -955,19 +1064,11 @@ function testSchemaParity() {
   assert.deepEqual(checkPhase613MigrationRegistration(migrationRunner), []);
   assert.deepEqual(checkPhase614MigrationRegistration(migrationRunner), []);
   assert.deepEqual(checkPhase614BMigrationRegistration(migrationRunner), []);
+  assert.deepEqual(checkPhase621MigrationRegistration(migrationRunner), []);
   const missingSqliteMigrationRegistration = replaceFirstForGuardTest(
     migrationRunner,
-    "    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n" +
-      "    // 0057 - replay-safe original-source assignment, receipt, transition,\n" +
-      "    // lease, circuit, quarantine, and exact current-head authority.\n" +
-      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
-      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
-      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
-    "    // 0057 - replay-safe original-source assignment, receipt, transition,\n" +
-      "    // lease, circuit, quarantine, and exact current-head authority.\n" +
-      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
-      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
-      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
+    "    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n",
+    "",
     "SQLite 056 migration registration",
   );
   assert(
@@ -993,11 +1094,8 @@ function testSchemaParity() {
   );
   const missingSqlitePhase614Registration = replaceFirstForGuardTest(
     migrationRunner,
-    "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
-      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
-      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
-    "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
-      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
+    "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n",
+    "",
     "SQLite 057 migration registration",
   );
   assert(
@@ -1046,6 +1144,33 @@ function testSchemaParity() {
   assert(
     checkPhase614BMigrationRegistration(
       missingPostgresPhase614BRegistration,
+    ).some((issue) =>
+      issue.includes("Postgres migration runner must register"),
+    ),
+  );
+  const missingSqlitePhase621Registration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    SQLITE_JOBS_PUBLIC_BETA_ACCESS,\n",
+    "",
+    "SQLite 060 migration registration",
+  );
+  assert(
+    checkPhase621MigrationRegistration(missingSqlitePhase621Registration).some(
+      (issue) => issue.includes("SQLite migration runner must register"),
+    ),
+  );
+  const missingPostgresPhase621Registration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    (\n" +
+      "        JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID,\n" +
+      "        POSTGRES_JOBS_PUBLIC_BETA_ACCESS,\n" +
+      "    ),\n",
+    "",
+    "Postgres 038 migration registration",
+  );
+  assert(
+    checkPhase621MigrationRegistration(
+      missingPostgresPhase621Registration,
     ).some((issue) =>
       issue.includes("Postgres migration runner must register"),
     ),
@@ -1385,6 +1510,26 @@ function testSchemaParity() {
     ),
   );
 
+  const weakenedPublicBetaCap = postgres.replace(
+    "      hard_cap BIGINT NOT NULL CHECK(hard_cap >= 0 AND hard_cap <= 10000),",
+    "      hard_cap BIGINT NOT NULL CHECK(hard_cap >= 0),",
+  );
+  assert(
+    compareJobsSchemas(sqlite, weakenedPublicBetaCap).some((issue) =>
+      issue.includes("jobs_public_beta_cohorts definition"),
+    ),
+  );
+
+  const missingPublicBetaActiveIndex = postgres.replace(
+    /CREATE INDEX IF NOT EXISTS idx_jobs_public_beta_overrides_active[\s\S]*?WHERE denied = 1;/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingPublicBetaActiveIndex).some((issue) =>
+      issue.includes("Postgres jobs_public_beta_overrides required index"),
+    ),
+  );
+
   const uncoveredDiscoveryTable = `${postgres}\nCREATE TABLE IF NOT EXISTS jobs_discovery_unchecked (id TEXT PRIMARY KEY);`;
   assert(
     compareJobsSchemas(sqlite, uncoveredDiscoveryTable).some((issue) =>
@@ -1496,7 +1641,9 @@ function testProvenance() {
 testPrivacyPaths();
 testSecretScanning();
 testPortalBundleFreshnessWorkflowGuard();
+testBuiltPortalPublicBetaTruth();
 testIntegrationTestSupportContainmentGuard();
+testPublicBetaAdminMutationAuditBoundary();
 checkBusinessMessagingSimulatorContainment();
 testSchemaParity();
 testLicenseInventory();

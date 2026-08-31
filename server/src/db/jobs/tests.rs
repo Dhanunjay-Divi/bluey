@@ -24,8 +24,25 @@ mod tests {
         db::run_migrations(&pool).unwrap();
         let conn = pool.get().unwrap();
         conn.execute(
-            "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
-             VALUES ('acct-jobs', 'jobs@example.com', 'hash', 0)",
+            "INSERT INTO accounts (
+                id, email, password_hash, trial_seconds_remaining, email_verified_at
+             ) VALUES (
+                'acct-jobs', 'jobs@example.com', 'hash', 0, '2026-08-30T00:00:00Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_public_beta_cohorts
+                SET state = 'closed_to_new', hard_cap = 1, assigned_count = 1, revision = 1
+              WHERE id = 'public-v1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_public_beta_enrollments (
+                cohort_id, account_id, source, admitted_at_ms
+             ) VALUES ('public-v1', 'acct-jobs', 'admin', 1)",
             [],
         )
         .unwrap();
@@ -610,6 +627,12 @@ mod tests {
         let ticket = submit
             .find("postgres_local_run_authority_prelock")
             .expect("ticket authority before registry lock");
+        let ticket_identity = submit
+            .find("SELECT account_id, status FROM jobs_local_run_tickets")
+            .expect("local submit ticket identity");
+        let public_beta = submit
+            .find("public_beta_effect_authorized_postgres_tx")
+            .expect("local submit public-beta cohort/account prelock");
         let discovery_lock = submit
             .find("lock_discovery_account_shared_postgres(&mut tx, &capacity.account_id)")
             .expect("shared discovery-account lock");
@@ -634,6 +657,7 @@ mod tests {
         let capacity = submit
             .find("reserve_submission_evidence_capacity_postgres_tx")
             .expect("capacity reservation after release authority");
+        assert!(ticket_identity < public_beta && public_beta < discovery_lock);
         assert!(discovery_lock < account_fence && account_fence < ticket);
         assert!(ticket < shared_lock && shared_lock < capacity_prelock);
         assert!(capacity_prelock < db_time && db_time < current);
@@ -971,8 +995,7 @@ mod tests {
             ),
         ] {
             assert!(
-                branch.find(replay).unwrap()
-                    < branch.find(hold_evaluation).unwrap(),
+                branch.find(replay).unwrap() < branch.find(hold_evaluation).unwrap(),
                 "durable local click-started replay must remain before hold evaluation"
             );
         }
@@ -1004,9 +1027,7 @@ mod tests {
             .nth(1)
             .expect("PostgreSQL cloud final-submit admission");
         assert!(
-            cloud_submit_postgres
-                .find("if discovered_lease")
-                .unwrap()
+            cloud_submit_postgres.find("if discovered_lease").unwrap()
                 < cloud_submit_postgres
                     .find("operational_hold_context_for_application_postgres_tx")
                     .unwrap(),
@@ -2716,21 +2737,13 @@ mod tests {
         );
         assert_eq!(authority_fixture.runtime_target, runtime_target);
         assert_eq!(authority_fixture.surface, surface);
-        let authorization = authorize_auto_submit(
-            pool,
-            "acct-jobs",
-            "jobs@example.com",
-            "track-default",
-        )
-        .unwrap();
-        let prepared = prepare_application_draft(
-            pool,
-            "acct-jobs",
-            &posting.id,
-            "factual",
-            "auto_submit",
-        )
-        .expect("prepare certified Auto-submit application through the production lifecycle");
+        let authorization =
+            authorize_auto_submit(pool, "acct-jobs", "jobs@example.com", "track-default").unwrap();
+        let prepared =
+            prepare_application_draft(pool, "acct-jobs", &posting.id, "factual", "auto_submit")
+                .expect(
+                    "prepare certified Auto-submit application through the production lifecycle",
+                );
         let eligibility: JobEligibilityDecision =
             serde_json::from_value(prepared.application.receipt["eligibility"].clone()).unwrap();
         assert!(eligibility.can_auto_submit, "{eligibility:#?}");
@@ -2778,10 +2791,12 @@ mod tests {
             application
                 .receipt
                 .pointer("/approved_execution/admission/ats_certification"),
-            Some(&serde_json::to_value(
-                ats_frozen_certification_admission_projection(active).unwrap()
+            Some(
+                &serde_json::to_value(
+                    ats_frozen_certification_admission_projection(active).unwrap()
+                )
+                .unwrap()
             )
-            .unwrap())
         );
 
         let base_proof = test_final_submit_proof(&application);
@@ -2885,7 +2900,8 @@ mod tests {
         suffix: &str,
     ) {
         let mut runtime_target = fixture.runtime_target.clone();
-        runtime_target.runtime_id = format!("{}:ats-successor-{suffix}", runtime_target.runtime_kind);
+        runtime_target.runtime_id =
+            format!("{}:ats-successor-{suffix}", runtime_target.runtime_kind);
         runtime_target.runtime_sha256 =
             ats_certification_sha256(format!("ats-successor-runtime-{suffix}").as_bytes());
         runtime_target.automation_bundle_sha256 =
@@ -3067,13 +3083,9 @@ mod tests {
         assert_eq!(before.status, "released");
         install_certified_ats_successor(&pool, &fixture, "reserve");
 
-        let error = reserve_application_attempt(
-            &pool,
-            "acct-jobs",
-            &fixture.application.id,
-            "cloud",
-        )
-        .unwrap_err();
+        let error =
+            reserve_application_attempt(&pool, "acct-jobs", &fixture.application.id, "cloud")
+                .unwrap_err();
         assert_current_execution_authority_denied(&error);
         assert_eq!(
             certified_reservation(&pool, &fixture.application.id),
@@ -3095,13 +3107,10 @@ mod tests {
         );
         let reservation_before = certified_reservation(&pool, &fixture.application.id);
         assert_eq!(reservation_before.status, "reserved");
-        let (application_before, expected_revision) = get_application_with_revision(
-            &pool,
-            "acct-jobs",
-            &fixture.application.id,
-        )
-        .unwrap()
-        .expect("certified application exists");
+        let (application_before, expected_revision) =
+            get_application_with_revision(&pool, "acct-jobs", &fixture.application.id)
+                .unwrap()
+                .expect("certified application exists");
         install_certified_ats_successor(&pool, &fixture, "running");
 
         let error = update_attempt_reservation_status(
@@ -3121,13 +3130,7 @@ mod tests {
         let mut attempted = application_before.clone();
         attempted.state = "running".to_string();
         attempted.updated_at_ms = attempted.updated_at_ms.saturating_add(1);
-        assert!(save_application(
-            &pool,
-            "acct-jobs",
-            &attempted,
-            &expected_revision,
-        )
-        .is_err());
+        assert!(save_application(&pool, "acct-jobs", &attempted, &expected_revision,).is_err());
         let application_after = get_application(&pool, "acct-jobs", &fixture.application.id)
             .unwrap()
             .expect("certified application remains stored");
@@ -3204,8 +3207,7 @@ mod tests {
                 "released",
             )
             .unwrap());
-            let reservation_before =
-                certified_reservation(&pool, &reserve_fixture.application.id);
+            let reservation_before = certified_reservation(&pool, &reserve_fixture.application.id);
             install_certified_ats_successor(
                 &pool,
                 &reserve_fixture,
@@ -3233,15 +3235,11 @@ mod tests {
                 certified_cloud_runtime_target(&running_runtime),
                 "",
             );
-            let reservation_before =
-                certified_reservation(&pool, &running_fixture.application.id);
-            let (application_before, expected_revision) = get_application_with_revision(
-                &pool,
-                "acct-jobs",
-                &running_fixture.application.id,
-            )
-            .unwrap()
-            .expect("PostgreSQL certified application exists");
+            let reservation_before = certified_reservation(&pool, &running_fixture.application.id);
+            let (application_before, expected_revision) =
+                get_application_with_revision(&pool, "acct-jobs", &running_fixture.application.id)
+                    .unwrap()
+                    .expect("PostgreSQL certified application exists");
             install_certified_ats_successor(
                 &pool,
                 &running_fixture,
@@ -3263,13 +3261,7 @@ mod tests {
             let mut attempted = application_before.clone();
             attempted.state = "running".to_string();
             attempted.updated_at_ms = attempted.updated_at_ms.saturating_add(1);
-            assert!(save_application(
-                &pool,
-                "acct-jobs",
-                &attempted,
-                &expected_revision,
-            )
-            .is_err());
+            assert!(save_application(&pool, "acct-jobs", &attempted, &expected_revision,).is_err());
             let application_after =
                 get_application(&pool, "acct-jobs", &running_fixture.application.id)
                     .unwrap()
@@ -5918,22 +5910,12 @@ mod tests {
         assert_eq!(grant.lease.phase, "prepared");
         assert_eq!(grant.runtime_grant_id, installed.runtime_grant_id);
         assert_eq!(grant.runtime_sha256, installed.runtime_sha256);
-        update_attempt_reservation_status(
-            pool,
-            "acct-jobs",
-            &fixture.application.id,
-            "running",
-        )
-        .unwrap();
-        let application = update_application(
-            pool,
-            "acct-jobs",
-            &fixture.application.id,
-            "running",
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        update_attempt_reservation_status(pool, "acct-jobs", &fixture.application.id, "running")
+            .unwrap();
+        let application =
+            update_application(pool, "acct-jobs", &fixture.application.id, "running", None)
+                .unwrap()
+                .unwrap();
         CertifiedCloudExecutionFixture {
             application,
             run_id: fixture.run_id,
@@ -5965,10 +5947,7 @@ mod tests {
             std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_CHANNEL", "general");
             std::env::set_var("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED", "1");
             std::env::set_var("BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED", "1");
-            std::env::set_var(
-                "BLUEY_JOBS_WORKFLOW_ORIGIN",
-                "https://workflow.example.com",
-            );
+            std::env::set_var("BLUEY_JOBS_WORKFLOW_ORIGIN", "https://workflow.example.com");
             std::env::set_var("BLUEY_JOBS_WORKFLOW_TOKEN", "x".repeat(32));
             Self { prior }
         }
@@ -6077,14 +6056,10 @@ mod tests {
             transaction.commit().unwrap();
             (admission, binding)
         };
-        let command_lease = claim_jobs_workflow_command(
-            pool,
-            &worker_id,
-            sqlite_test_db_now(pool),
-            60_000,
-        )
-        .unwrap()
-        .expect("claim managed workflow command");
+        let command_lease =
+            claim_jobs_workflow_command(pool, &worker_id, sqlite_test_db_now(pool), 60_000)
+                .unwrap()
+                .expect("claim managed workflow command");
         assert_eq!(command_lease.command.id, admission.command.id);
         let (_, request_start) = mark_jobs_workflow_command_request_started_with_managed_cloud(
             pool,
@@ -6095,10 +6070,7 @@ mod tests {
         assert!(request_start.is_some());
         let (managed_cloud_release, _, _, managed_cloud_release_sha256) =
             managed_cloud_release_memo(&binding.binding_sha256, &binding.admission).unwrap();
-        assert_eq!(
-            managed_cloud_release_sha256,
-            binding.release_memo_sha256
-        );
+        assert_eq!(managed_cloud_release_sha256, binding.release_memo_sha256);
         let managed_cloud = ManagedCloudExecutionLeaseClaimInput {
             workflow_request_id: command_lease.command.request_id,
             managed_cloud_release,
@@ -11601,13 +11573,7 @@ mod tests {
             "fenced-worker",
         )
         .unwrap_err();
-        match error {
-            ExecutionLeaseError::Storage(error) => assert!(matches!(
-                error.downcast_ref::<UploadControlError>(),
-                Some(UploadControlError::AccountDeleting)
-            )),
-            other => panic!("expected account-deletion storage fence, got {other:?}"),
-        }
+        assert!(matches!(error, ExecutionLeaseError::Conflict));
 
         let conn = pool.get().unwrap();
         let lease_count: i64 = conn
@@ -11684,15 +11650,18 @@ mod tests {
             &lease.lease_token,
             lease.fence,
         ));
-        assert_account_deleting(start_irreversible_submission(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            &run_id,
-            &lease.lease_token,
-            lease.fence,
-            &test_final_submit_proof(&application),
-            &test_submission_evidence_capacity(&application.id, &run_id),
+        assert!(matches!(
+            start_irreversible_submission(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &lease.lease_token,
+                lease.fence,
+                &test_final_submit_proof(&application),
+                &test_submission_evidence_capacity(&application.id, &run_id),
+            ),
+            Err(ExecutionLeaseError::Conflict)
         ));
         let object_key = format!(
             "accounts/acct-jobs/jobs/browser-profiles/{browser_profile_id}/generation/1.enc"
@@ -14778,12 +14747,7 @@ mod tests {
         let (application, _) =
             prepare_application(&pool, "acct-jobs", &first.id, "factual", "review_first").unwrap();
         assert_eq!(application.state, "awaiting_review");
-        seed_active_reservation_for_quota_eligibility(
-            &pool,
-            &application,
-            &first,
-            &preferences,
-        );
+        seed_active_reservation_for_quota_eligibility(&pool, &application, &first, &preferences);
 
         let mut second = test_posting(
             "https://boards.greenhouse.io/acme/jobs/two",
@@ -16362,9 +16326,13 @@ mod tests {
                 .unwrap()
                 .expect("validated submitted communication claim");
         let access = communication_lease_access(&lease, "fix-728-submitted-communication-worker");
-        let started = mark_communication_action_request_started(&positive_pool, &access).unwrap();
+        let started = mark_communication_action_request_started(&positive_pool, &access)
+            .unwrap()
+            .expect("fresh communication request-start authority");
         assert_eq!(started.status, "dispatching");
-        let replayed = mark_communication_action_request_started(&positive_pool, &access).unwrap();
+        let replayed = mark_communication_action_request_started(&positive_pool, &access)
+            .unwrap()
+            .expect("exact communication request-start replay");
         assert_eq!(replayed.id, started.id);
         assert_eq!(
             positive_pool
@@ -16606,7 +16574,8 @@ mod tests {
                 &pool,
                 &communication_lease_access(&lease, &owner),
             )
-            .unwrap();
+            .unwrap()
+            .expect("fresh communication request-start authority");
             assert!(matches!(
                 finish_communication_action(
                     &pool,
@@ -17136,7 +17105,9 @@ mod tests {
         assert_eq!(lease.action.status, "dispatching");
         assert_eq!(lease.action.attempt_count, 1);
         let access = communication_lease_access(&lease, "mail-worker");
-        mark_communication_action_request_started(&pool, &access).unwrap();
+        mark_communication_action_request_started(&pool, &access)
+            .unwrap()
+            .expect("fresh communication request-start authority");
         let mut wrong_token =
             communication_success_finish(&pool, &lease, "mail-worker", "gmail-message-1");
         wrong_token.lease.lease_token = "wrong-token".to_string();
@@ -17194,8 +17165,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let access = communication_lease_access(&lease, "request-start-worker");
-        mark_communication_action_request_started(&pool, &access).unwrap();
-        mark_communication_action_request_started(&pool, &access).unwrap();
+        mark_communication_action_request_started(&pool, &access)
+            .unwrap()
+            .expect("fresh communication request-start authority");
+        mark_communication_action_request_started(&pool, &access)
+            .unwrap()
+            .expect("exact communication request-start replay");
         let count: i64 = pool
             .get()
             .unwrap()
@@ -17255,7 +17230,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let access = communication_lease_access(&lease, "request-start-hold-worker");
-        let started = mark_communication_action_request_started(&pool, &access).unwrap();
+        let started = mark_communication_action_request_started(&pool, &access)
+            .unwrap()
+            .expect("fresh communication request-start authority");
 
         append_operational_hold_for_scope(
             &pool,
@@ -17285,7 +17262,9 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        let replayed = mark_communication_action_request_started(&pool, &access).unwrap();
+        let replayed = mark_communication_action_request_started(&pool, &access)
+            .unwrap()
+            .expect("exact communication request-start replay");
         assert_eq!(replayed, started);
         let request_started_count: i64 = pool
             .get()
@@ -17592,12 +17571,12 @@ mod tests {
             None,
         );
 
-        let error = mark_communication_action_request_started(
+        let request_started = mark_communication_action_request_started(
             &pool,
             &communication_lease_access(&lease, "communication-hold-race-worker"),
         )
-        .unwrap_err();
-        assert_eq!(error.to_string(), "communication dispatch is unavailable");
+        .unwrap();
+        assert!(request_started.is_none());
         let demoted = communication_action(&pool, "acct-jobs", &action.id)
             .unwrap()
             .unwrap();
@@ -17818,7 +17797,8 @@ mod tests {
             &pool,
             &communication_lease_access(&lease, "account-drain-worker"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("fresh communication request-start authority");
 
         assert!(matches!(
             crate::db::account_data::begin_account_deletion(&pool, "acct-jobs", now_ms())
@@ -17889,7 +17869,9 @@ mod tests {
                     &claim_pool,
                     &communication_lease_access(lease, "account-drain-race-worker"),
                 )
-                .is_ok()
+                .ok()
+                .flatten()
+                .is_some()
             });
             (lease, started)
         });
@@ -17976,7 +17958,8 @@ mod tests {
             &pool,
             &communication_lease_access(&lease, "mailbox-drain-worker"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("fresh communication request-start authority");
         let pending = actions
             .iter()
             .find(|action| action.id != lease.action.id)
@@ -18097,7 +18080,8 @@ mod tests {
             &pool,
             &communication_lease_access(&lease, "revision-monotonic-worker"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("fresh communication request-start authority");
         let finished = finish_communication_action(
             &pool,
             &communication_success_finish(
@@ -18235,7 +18219,8 @@ mod tests {
             &pool,
             &communication_lease_access(&lease, "parent-cleanup-worker"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("fresh communication request-start authority");
         let conn = pool.get().unwrap();
         assert!(conn
             .execute(
@@ -18360,7 +18345,8 @@ mod tests {
             &pool,
             &communication_lease_access(&lease, "mail-worker"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("fresh communication request-start authority");
         pool.get()
             .unwrap()
             .execute(
@@ -18388,6 +18374,158 @@ mod tests {
                 .status,
             "side_effect_unknown"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_dispatch_rechecks_public_beta_before_refresh_and_keeps_reconciliation() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let mut refresh_eligible = jobs_provider_credential(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .unwrap();
+        refresh_eligible.expires_at_ms = now_ms();
+        refresh_eligible.updated_at_ms = now_ms();
+        save_jobs_provider_credential(&pool, "acct-jobs", &refresh_eligible).unwrap();
+        assert!(
+            jobs_provider_credential(&pool, "acct-jobs", &mailbox.id)
+                .unwrap()
+                .unwrap()
+                .expires_at_ms
+                <= now_ms().saturating_add(60_000)
+        );
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "phase-622-public-beta-communication-fence",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_public_beta_overrides (
+                    cohort_id, account_id, denied, revision, created_at_ms, updated_at_ms
+                 ) VALUES ('public-v1', 'acct-jobs', 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert!(claim_communication_action(&pool, "phase-622-denied-worker")
+            .unwrap()
+            .is_none());
+        let denied = communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(denied.status, "approved");
+        assert_eq!(denied.attempt_count, 0);
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_overrides
+                    SET denied = 0, revision = 2, updated_at_ms = 2
+                  WHERE cohort_id = 'public-v1' AND account_id = 'acct-jobs'",
+                [],
+            )
+            .unwrap();
+        let suspended_lease = claim_communication_action(&pool, "phase-622-suspend-worker")
+            .unwrap()
+            .expect("clearing the account denial permits a fresh dispatch claim");
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_cohorts
+                    SET state = 'suspended', revision = revision + 1
+                  WHERE id = 'public-v1'",
+                [],
+            )
+            .unwrap();
+        assert!(mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&suspended_lease, "phase-622-suspend-worker"),
+        )
+        .unwrap()
+        .is_none());
+        let suspended = communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(suspended.status, "needs_input");
+        assert!(suspended.active_attempt_id.is_none());
+        assert_eq!(suspended.approved_grant_revision, 0);
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_communication_action_attempt_evidence
+                      WHERE action_id = ?1 AND event_kind = 'request_started'",
+                    params![stored.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_cohorts
+                    SET state = 'closed_to_new', revision = revision + 1
+                  WHERE id = 'public-v1'",
+                [],
+            )
+            .unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        let dispatch = claim_communication_action(&pool, "phase-622-dispatch-worker")
+            .unwrap()
+            .expect("fresh cohort authority permits an approved communication claim");
+        mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&dispatch, "phase-622-dispatch-worker"),
+        )
+        .unwrap()
+        .expect("fresh public-beta authority permits request start");
+        let unknown = finish_communication_action(
+            &pool,
+            &JobsCommunicationActionFinish {
+                lease: communication_lease_access(&dispatch, "phase-622-dispatch-worker"),
+                outcome: "side_effect_unknown".to_string(),
+                provider_object_id: String::new(),
+                evidence: json!({
+                    "provider": "gmail",
+                    "result": "transport_interrupted"
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(unknown.status, "side_effect_unknown");
+
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "UPDATE jobs_public_beta_overrides
+                    SET denied = 1, revision = 3, updated_at_ms = 3
+                  WHERE cohort_id = 'public-v1' AND account_id = 'acct-jobs';
+                 UPDATE jobs_public_beta_cohorts
+                    SET state = 'suspended', revision = revision + 1
+                  WHERE id = 'public-v1';",
+            )
+            .unwrap();
+        let reconciliation =
+            claim_communication_action_reconciliation(&pool, "phase-622-lookup-only-reconciler")
+                .unwrap()
+                .expect(
+                    "lookup-only reconciliation remains available after effect authority closes",
+                );
+        assert_eq!(reconciliation.action.status, "side_effect_unknown");
+        assert_eq!(reconciliation.lease_kind, "reconcile");
     }
 
     #[test]
@@ -18466,7 +18604,8 @@ mod tests {
             &pool,
             &communication_lease_access(&dispatch, "absence-dispatch-worker"),
         )
-        .unwrap();
+        .unwrap()
+        .expect("fresh communication request-start authority");
         let unknown = finish_communication_action(
             &pool,
             &JobsCommunicationActionFinish {
@@ -20169,10 +20308,8 @@ mod tests {
     #[test]
     fn unmanaged_cloud_worker_submit_and_replay_accept_absent_managed_authority() {
         let pool = test_pool();
-        let fixture = certified_cloud_execution_fixture(
-            &pool,
-            "unmanaged-worker-final-submit-pairing",
-        );
+        let fixture =
+            certified_cloud_execution_fixture(&pool, "unmanaged-worker-final-submit-pairing");
         let capacity = test_submission_evidence_capacity(&fixture.application.id, &fixture.run_id);
         let worker_id = "unmanaged-cloud-worker-final-submit";
 
@@ -20217,17 +20354,12 @@ mod tests {
     fn managed_cloud_final_submit_boundary_denies_omission_and_wrong_worker_without_mutation() {
         let _managed_cloud_environment = ManagedCloudAdmissionEnvironment::staging();
         let pool = test_pool();
-        let fixture = managed_final_submit_execution_fixture(
-            &pool,
-            "managed-worker-final-submit-pairing",
-        );
+        let fixture =
+            managed_final_submit_execution_fixture(&pool, "managed-worker-final-submit-pairing");
         let cloud = &fixture.cloud;
         let capacity = test_submission_evidence_capacity(&cloud.application.id, &cloud.run_id);
-        let prepared = managed_final_submit_boundary_state(
-            &pool,
-            &cloud.application.id,
-            &cloud.run_id,
-        );
+        let prepared =
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id);
         assert_eq!(prepared.lease_phase, "prepared");
         assert_eq!(prepared.certification_phase, "preflight");
         assert_eq!(prepared.certification_fence, 0);
@@ -20253,11 +20385,7 @@ mod tests {
             Err(ExecutionLeaseError::Conflict)
         ));
         assert_eq!(
-            managed_final_submit_boundary_state(
-                &pool,
-                &cloud.application.id,
-                &cloud.run_id,
-            ),
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id,),
             prepared
         );
 
@@ -20278,11 +20406,7 @@ mod tests {
             Err(ExecutionLeaseError::Conflict)
         ));
         assert_eq!(
-            managed_final_submit_boundary_state(
-                &pool,
-                &cloud.application.id,
-                &cloud.run_id,
-            ),
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id,),
             prepared
         );
 
@@ -20308,11 +20432,8 @@ mod tests {
                 .managed_cloud_worker_id,
             fixture.worker_id
         );
-        let click_started = managed_final_submit_boundary_state(
-            &pool,
-            &cloud.application.id,
-            &cloud.run_id,
-        );
+        let click_started =
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id);
         assert_eq!(click_started.lease_phase, "click_started");
         assert_eq!(click_started.certification_phase, "consumed");
         assert_eq!(click_started.certification_fence, 1);
@@ -20338,11 +20459,7 @@ mod tests {
             Err(ExecutionLeaseError::Conflict)
         ));
         assert_eq!(
-            managed_final_submit_boundary_state(
-                &pool,
-                &cloud.application.id,
-                &cloud.run_id,
-            ),
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id,),
             click_started
         );
 
@@ -20362,11 +20479,7 @@ mod tests {
             Err(ExecutionLeaseError::Conflict)
         ));
         assert_eq!(
-            managed_final_submit_boundary_state(
-                &pool,
-                &cloud.application.id,
-                &cloud.run_id,
-            ),
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id,),
             click_started
         );
 
@@ -20385,13 +20498,384 @@ mod tests {
         .expect("exact managed authority replays the stored irreversible effect");
         assert_eq!(replay, started);
         assert_eq!(
-            managed_final_submit_boundary_state(
-                &pool,
-                &cloud.application.id,
-                &cloud.run_id,
-            ),
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id,),
             click_started
         );
+    }
+
+    #[test]
+    fn execution_lease_claim_rechecks_public_beta_before_any_claim_mutation() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "phase-622-public-beta-claim-fence");
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_public_beta_overrides (
+                    cohort_id, account_id, denied, revision, created_at_ms, updated_at_ms
+                 ) VALUES ('public-v1', 'acct-jobs', 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            claim_execution_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                "phase-622-denied-claim-worker",
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_execution_leases WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_overrides
+                    SET denied = 0, revision = 2, updated_at_ms = 2
+                  WHERE cohort_id = 'public-v1' AND account_id = 'acct-jobs'",
+                [],
+            )
+            .unwrap();
+        claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "phase-622-authorized-claim-worker",
+        )
+        .expect("restored public-beta authority permits a fresh execution lease claim");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_effect_rechecks_public_beta_before_new_authority_and_submit() {
+        let _managed_cloud_environment = ManagedCloudAdmissionEnvironment::staging();
+        let pool = test_pool();
+        let fixture =
+            managed_final_submit_execution_fixture(&pool, "phase-622-public-beta-effect-authority");
+        let cloud = &fixture.cloud;
+        let capacity = test_submission_evidence_capacity(&cloud.application.id, &cloud.run_id);
+        let prepared =
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id);
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_public_beta_overrides (
+                    cohort_id, account_id, denied, revision, created_at_ms, updated_at_ms
+                 ) VALUES ('public-v1', 'acct-jobs', 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            authorize_managed_execution_effect(
+                &pool,
+                "acct-jobs",
+                &cloud.application.id,
+                &cloud.run_id,
+                &cloud.lease_token,
+                cloud.lease_fence,
+                &fixture.managed_cloud,
+                &fixture.worker_id,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id,),
+            prepared
+        );
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_overrides
+                    SET denied = 0, revision = 2, updated_at_ms = 2
+                  WHERE cohort_id = 'public-v1' AND account_id = 'acct-jobs'",
+                [],
+            )
+            .unwrap();
+        authorize_managed_execution_effect(
+            &pool,
+            "acct-jobs",
+            &cloud.application.id,
+            &cloud.run_id,
+            &cloud.lease_token,
+            cloud.lease_fence,
+            &fixture.managed_cloud,
+            &fixture.worker_id,
+        )
+        .expect("an admitted account retains the exact managed-effect authority");
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_cohorts
+                    SET state = 'suspended', revision = revision + 1
+                  WHERE id = 'public-v1'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            start_irreversible_submission_authorized(
+                &pool,
+                "acct-jobs",
+                &cloud.application.id,
+                &cloud.run_id,
+                &cloud.lease_token,
+                cloud.lease_fence,
+                &cloud.proof,
+                &capacity,
+                Some(&fixture.managed_cloud),
+                &fixture.worker_id,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id,),
+            prepared
+        );
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_cohorts
+                    SET state = 'closed_to_new', revision = revision + 1
+                  WHERE id = 'public-v1'",
+                [],
+            )
+            .unwrap();
+        let started = start_irreversible_submission_authorized(
+            &pool,
+            "acct-jobs",
+            &cloud.application.id,
+            &cloud.run_id,
+            &cloud.lease_token,
+            cloud.lease_fence,
+            &cloud.proof,
+            &capacity,
+            Some(&fixture.managed_cloud),
+            &fixture.worker_id,
+        )
+        .expect("fresh public-beta authority permits the exact irreversible transition");
+        assert_eq!(started.record.phase, "click_started");
+
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "UPDATE jobs_public_beta_overrides
+                    SET denied = 1, revision = 3, updated_at_ms = 3
+                  WHERE cohort_id = 'public-v1' AND account_id = 'acct-jobs';
+                 UPDATE jobs_public_beta_cohorts
+                    SET state = 'suspended', revision = revision + 1
+                  WHERE id = 'public-v1';",
+            )
+            .unwrap();
+        let replay = start_irreversible_submission_authorized(
+            &pool,
+            "acct-jobs",
+            &cloud.application.id,
+            &cloud.run_id,
+            &cloud.lease_token,
+            cloud.lease_fence,
+            &cloud.proof,
+            &capacity,
+            Some(&fixture.managed_cloud),
+            &fixture.worker_id,
+        )
+        .expect("an exact click-started replay is not a new employer effect");
+        assert_eq!(replay, started);
+    }
+
+    #[test]
+    fn local_claim_rechecks_public_beta_without_stranding_exact_release_replay() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "phase-622-local-claim-beta-fence");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let descriptor = seed_test_local_browser_release_authority(&pool);
+        let nonce = "a".repeat(64);
+        let queued = local_claim_state(&pool, &application.id, &run_id);
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_cohorts
+                    SET state = 'suspended', revision = revision + 1
+                  WHERE id = 'public-v1'",
+                [],
+            )
+            .unwrap();
+        assert!(claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+            .unwrap()
+            .is_none());
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), queued);
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &pool,
+                &run_id,
+                &ticket_hash,
+                &nonce,
+                &descriptor,
+                "test-server",
+                |_, _| Ok(json!({ "unexpected": true })),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::Rejected
+        ));
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), queued);
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_cohorts
+                    SET state = 'closed_to_new', revision = revision + 1
+                  WHERE id = 'public-v1'",
+                [],
+            )
+            .unwrap();
+        let first = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |ticket, _| Ok(json!({ "runId": ticket.id })),
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(first) = first else {
+            panic!("restored public-beta authority did not permit the fresh local claim")
+        };
+        assert!(!first.replayed);
+        let claimed = local_claim_state(&pool, &application.id, &run_id);
+
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO jobs_public_beta_overrides (
+                    cohort_id, account_id, denied, revision, created_at_ms, updated_at_ms
+                 ) VALUES ('public-v1', 'acct-jobs', 1, 1, 1, 1);
+                 UPDATE jobs_public_beta_cohorts
+                    SET state = 'suspended', revision = revision + 1
+                  WHERE id = 'public-v1';",
+            )
+            .unwrap();
+        let replay = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |_, _| anyhow::bail!("exact local claim replay must not issue fresh authority"),
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(replay) = replay else {
+            panic!("public-beta closure stranded an exact local claim replay")
+        };
+        assert!(replay.replayed);
+        assert_eq!(replay.response_json, first.response_json);
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), claimed);
+    }
+
+    #[test]
+    fn local_submit_rechecks_public_beta_without_stranding_click_started_replay() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, proof) =
+            certified_local_intervention_fixture(&pool, "phase-622-local-submit-beta-fence");
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        let claimed = local_claim_state(&pool, &application.id, &run_id);
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_public_beta_overrides (
+                    cohort_id, account_id, denied, revision, created_at_ms, updated_at_ms
+                 ) VALUES ('public-v1', 'acct-jobs', 1, 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &proof,
+            &capacity,
+        )
+        .unwrap());
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), claimed);
+        assert_eq!(submission_capacity_count(&pool, &application.id, &run_id), 0);
+        assert!(get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap()
+            .receipt
+            .get(FINAL_SUBMIT_PROOF_KEY)
+            .is_none());
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_public_beta_overrides
+                    SET denied = 0, revision = 2, updated_at_ms = 2
+                  WHERE cohort_id = 'public-v1' AND account_id = 'acct-jobs'",
+                [],
+            )
+            .unwrap();
+        let started = local_run_submit_authorization_inner(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &proof,
+            &capacity,
+            false,
+        )
+        .unwrap()
+        .expect("restored public-beta authority permits the fresh pre-click transition");
+
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "UPDATE jobs_public_beta_overrides
+                    SET denied = 1, revision = 3, updated_at_ms = 3
+                  WHERE cohort_id = 'public-v1' AND account_id = 'acct-jobs';
+                 UPDATE jobs_public_beta_cohorts
+                    SET state = 'suspended', revision = revision + 1
+                  WHERE id = 'public-v1';
+                 INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', 1, 1, 0, 0);",
+            )
+            .unwrap();
+        let replay = local_run_submit_authorization_for_distribution(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &proof,
+            &capacity,
+        )
+        .unwrap()
+        .expect("public-beta closure must not strand exact click-started replay");
+        assert_eq!(replay, started);
+        assert_eq!(submission_capacity_count(&pool, &application.id, &run_id), 1);
     }
 
     #[test]
@@ -20467,11 +20951,14 @@ mod tests {
 
         let distribution_unavailable = claim_local_run_with_browser_release_for_distribution(
             &pool,
-            &run_id,
-            &ticket_hash,
-            &nonce,
-            &descriptor,
-            "test-server",
+            BrowserLocalRunDistributionClaim {
+                run_id: &run_id,
+                ticket_hash: &ticket_hash,
+                claim_nonce: &nonce,
+                descriptor: &descriptor,
+                server_release_id: "test-server",
+                distribution_enabled: false,
+            },
             |_, _| Ok(json!({ "claim": "accepted" })),
         )
         .unwrap();
@@ -21638,11 +22125,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_account_deletion_fence(claim_authorized_local_run_ticket(
-            &pool,
-            &run_id,
-            &ticket_hash,
-        ));
+        assert!(
+            claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                .unwrap()
+                .is_none()
+        );
         assert_account_deletion_fence(update_local_run_ticket_status(
             &pool,
             &run_id,
@@ -22060,8 +22547,9 @@ mod tests {
         let export = account_export(&pool, "acct-jobs", "jobs@example.com")
             .unwrap()
             .unwrap();
+        let workspace = export.workspace.as_ref().unwrap();
         assert_eq!(export.resume_versions.len(), 1);
-        assert_eq!(export.workspace.application_evidence.len(), 1);
+        assert_eq!(workspace.application_evidence.len(), 1);
         assert_eq!(export.canonical_track_policy_ledger.revisions.len(), 1);
         assert_eq!(
             export.canonical_track_policy_ledger.review_receipts.len(),
@@ -22071,7 +22559,7 @@ mod tests {
         assert!(export.canonical_track_policy_ledger.revisions[0]
             .canonical_policy_json
             .contains("New York, NY"));
-        assert!(export.workspace.browser_sessions[0].takeover_url.is_none());
+        assert!(workspace.browser_sessions[0].takeover_url.is_none());
         let serialized = serde_json::to_string(&export).unwrap();
         assert!(!serialized.contains(ENCRYPTED_PAYLOAD_PREFIX));
         assert!(!serialized.contains("secret-capability"));
@@ -23153,13 +23641,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lease.phase, "prepared");
-        assert!(update_attempt_reservation_status(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            "running",
-        )
-        .unwrap());
+        assert!(
+            update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running",)
+                .unwrap()
+        );
         assert_eq!(
             list_attempt_reservations(&pool, "acct-jobs").unwrap()[0].status,
             "running"
@@ -23511,13 +23996,9 @@ mod tests {
             None,
         );
 
-        let error = reserve_application_attempt(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            &reserved_runner,
-        )
-        .unwrap_err();
+        let error =
+            reserve_application_attempt(&pool, "acct-jobs", &application.id, &reserved_runner)
+                .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<OperationalHoldError>(),
             Some(OperationalHoldError::Held(_))
@@ -23559,14 +24040,9 @@ mod tests {
             Some("held-queue-1"),
         );
         assert_eq!(
-            reserve_application_attempt(
-                &pool,
-                "acct-jobs",
-                &application.id,
-                &reserved_runner,
-            )
-            .unwrap()
-            .runner,
+            reserve_application_attempt(&pool, "acct-jobs", &application.id, &reserved_runner,)
+                .unwrap()
+                .runner,
             reserved_runner
         );
     }

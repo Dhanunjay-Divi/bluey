@@ -26,7 +26,7 @@ const availableCloud: RunnerChannelAvailability = {
 };
 
 const unavailableCloud: RunnerChannelAvailability = {
-  status: "invited_beta",
+  status: "limited_beta",
   available: false,
   plan_included: true,
   distribution_enabled: false,

@@ -339,6 +339,13 @@ pub fn claim_authorized_local_run_ticket(
                 tx.commit()?;
                 return Ok(None);
             };
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_sqlite_tx(
+                &tx,
+                &account_id,
+            )? {
+                tx.commit()?;
+                return Ok(None);
+            }
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx,
                 &account_id,
@@ -399,6 +406,13 @@ pub fn claim_authorized_local_run_ticket(
                 tx.commit()?;
                 return Ok(None);
             };
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_postgres_tx(
+                &mut tx,
+                &account_id,
+            )? {
+                tx.commit()?;
+                return Ok(None);
+            }
             lock_discovery_account_shared_postgres(&mut tx, &account_id)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx,
@@ -491,6 +505,7 @@ fn standalone_local_claim_uses_signed_domain_after_one_postgres_prelock() {
         "lock_managed_cloud_release_registry_shared_postgres_tx",
         "lock_postgres_ats_certification",
         "SELECT account_id FROM jobs_local_run_tickets",
+        "public_beta_effect_authorized_postgres_tx",
         "lock_discovery_account_shared_postgres",
         "require_active_account_write_fence_postgres_tx",
         "postgres_local_run_authority_prelock",
@@ -569,6 +584,42 @@ fn standalone_local_claim_uses_signed_domain_after_one_postgres_prelock() {
 
 #[cfg(test)]
 #[test]
+fn local_submit_public_beta_prelock_precedes_discovery_and_fresh_effect_only() {
+    let source = include_str!("local_runner.rs");
+    let submit = source
+        .rsplit("fn local_run_submit_authorization_inner(")
+        .next()
+        .expect("local FinalSubmit authorization")
+        .split("fn local_click_started_ticket_matches(")
+        .next()
+        .expect("bounded local FinalSubmit authorization");
+    let postgres = submit
+        .split("DbPool::Postgres(_) =>")
+        .nth(1)
+        .expect("PostgreSQL local FinalSubmit authorization");
+    let mut previous = 0;
+    for operation in [
+        "lock_operational_hold_shared_postgres_tx",
+        "lock_managed_cloud_release_registry_shared_postgres_tx",
+        "lock_postgres_ats_certification",
+        "SELECT account_id, status FROM jobs_local_run_tickets",
+        "public_beta_effect_authorized_postgres_tx",
+        "lock_discovery_account_shared_postgres",
+        "if ticket_status == \"click_started\"",
+        "postgres_local_click_started_submit_replay",
+        "if !public_beta_effect_authorized",
+        "if require_distribution_ready",
+    ] {
+        let position = postgres
+            .find(operation)
+            .unwrap_or_else(|| panic!("missing local submit operation {operation}"));
+        assert!(position >= previous, "local submit public-beta order inverted");
+        previous = position;
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn initial_local_submit_uses_one_post_lock_database_time() {
     let source = include_str!("local_runner.rs");
     let submit = source
@@ -634,7 +685,10 @@ fn click_started_submit_replay_samples_database_time_after_exact_capacity_lock()
         .split("if require_distribution_ready")
         .next()
         .expect("bounded PostgreSQL click-started replay branch");
-    assert!(click_started.contains("require_active_account_write_fence_postgres_tx"));
+    assert!(
+        !click_started.contains("require_active_account_write_fence_postgres_tx"),
+        "exact click-started replay must remain available during account deletion"
+    );
     assert!(click_started.contains("postgres_local_click_started_submit_replay"));
     assert!(!click_started.contains("now_ms()"));
     assert!(!click_started.contains("local_run_claim_db_now_postgres"));
@@ -686,6 +740,7 @@ fn click_started_submit_replay_samples_database_time_after_exact_capacity_lock()
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalRunSubmitAuthorization {
     pub ats_certified_receipt_authority: Option<AtsCertifiedReceiptAuthority>,
+    pub authorized_at_ms: i64,
 }
 
 fn local_submission_evidence_capacity_at_ms(
@@ -800,10 +855,6 @@ fn local_run_submit_authorization_inner(
                 |row| row.get(0),
             )?;
             if click_started != 0 {
-                crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                    &tx,
-                    &capacity.account_id,
-                )?;
                 let now = now_ms();
                 let authorization = sqlite_local_click_started_submit_replay(
                     &tx,
@@ -816,6 +867,12 @@ fn local_run_submit_authorization_inner(
                 )?;
                 tx.commit()?;
                 return Ok(authorization);
+            }
+            if !crate::db::jobs_beta_access::public_beta_effect_authorized_sqlite_tx(
+                &tx,
+                &capacity.account_id,
+            )? {
+                return Ok(None);
             }
             if require_distribution_ready && !sqlite_runner_volume_fleet_distribution_ready(&tx)? {
                 return Ok(None);
@@ -896,8 +953,12 @@ fn local_run_submit_authorization_inner(
                 return Ok(None);
             }
             tx.commit()?;
+            let authorized_at_ms = ats_certified_receipt_authority
+                .as_ref()
+                .map_or(now, |authority| authority.binding_consumed_at_ms);
             Ok(Some(LocalRunSubmitAuthorization {
                 ats_certified_receipt_authority,
+                authorized_at_ms,
             }))
         }
         DbPool::Postgres(_) => {
@@ -907,7 +968,6 @@ fn local_run_submit_authorization_inner(
             lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
                 .map_err(anyhow::Error::new)?;
             lock_postgres_ats_certification(&mut tx)?;
-            lock_discovery_account_shared_postgres(&mut tx, &capacity.account_id)?;
             let ticket_identity = tx
                 .query_opt(
                     "SELECT account_id, status FROM jobs_local_run_tickets
@@ -921,11 +981,13 @@ fn local_run_submit_authorization_inner(
             if account_id != capacity.account_id {
                 return Ok(None);
             }
-            if ticket_status == "click_started" {
-                crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+            let public_beta_effect_authorized =
+                crate::db::jobs_beta_access::public_beta_effect_authorized_postgres_tx(
                     &mut tx,
                     &capacity.account_id,
                 )?;
+            lock_discovery_account_shared_postgres(&mut tx, &capacity.account_id)?;
+            if ticket_status == "click_started" {
                 let authorization = postgres_local_click_started_submit_replay(
                     &mut tx,
                     run_id,
@@ -936,6 +998,9 @@ fn local_run_submit_authorization_inner(
                 )?;
                 tx.commit()?;
                 return Ok(authorization);
+            }
+            if !public_beta_effect_authorized {
+                return Ok(None);
             }
             if require_distribution_ready
                 && !postgres_runner_volume_fleet_distribution_ready(&mut tx)?
@@ -1029,8 +1094,12 @@ fn local_run_submit_authorization_inner(
                 return Ok(None);
             }
             tx.commit()?;
+            let authorized_at_ms = ats_certified_receipt_authority
+                .as_ref()
+                .map_or(now, |authority| authority.binding_consumed_at_ms);
             Ok(Some(LocalRunSubmitAuthorization {
                 ats_certified_receipt_authority,
+                authorized_at_ms,
             }))
         }
     })
@@ -1222,7 +1291,7 @@ fn sqlite_local_click_started_submit_replay(
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
     now: i64,
 ) -> Result<Option<LocalRunSubmitAuthorization>> {
-    if final_submit_proof.schema_version != 4 {
+    if !matches!(final_submit_proof.schema_version, 3 | 4) {
         return Ok(None);
     }
     let ticket = tx
@@ -1249,15 +1318,19 @@ fn sqlite_local_click_started_submit_replay(
     {
         return Ok(None);
     }
-    let authority = match recover_terminal_ats_authority_sqlite_tx(
-        tx,
-        &ticket.account_id,
-        &ticket.application_id,
-        run_id,
-    ) {
-        Ok(authority) => authority,
-        Err(ExecutionLeaseError::Storage(error)) => return Err(error),
-        Err(_) => return Ok(None),
+    let ats_certified_receipt_authority = match final_submit_proof.schema_version {
+        4 => match recover_terminal_ats_authority_sqlite_tx(
+            tx,
+            &ticket.account_id,
+            &ticket.application_id,
+            run_id,
+        ) {
+            Ok(authority) => Some(authority),
+            Err(ExecutionLeaseError::Storage(error)) => return Err(error),
+            Err(_) => return Ok(None),
+        },
+        3 => None,
+        _ => unreachable!("final-submit schema was bounded before replay"),
     };
     let application_row: Option<(String, String, String)> = tx
         .query_row(
@@ -1306,8 +1379,14 @@ fn sqlite_local_click_started_submit_replay(
     {
         return Ok(None);
     }
+    let authorized_at_ms = ats_certified_receipt_authority
+        .as_ref()
+        .map_or(ticket.updated_at_ms, |authority| {
+            authority.binding_consumed_at_ms
+        });
     Ok(Some(LocalRunSubmitAuthorization {
-        ats_certified_receipt_authority: Some(authority),
+        ats_certified_receipt_authority,
+        authorized_at_ms,
     }))
 }
 
@@ -1319,7 +1398,7 @@ fn postgres_local_click_started_submit_replay(
     final_submit_proof: &FinalSubmitProof,
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
 ) -> Result<Option<LocalRunSubmitAuthorization>> {
-    if final_submit_proof.schema_version != 4 {
+    if !matches!(final_submit_proof.schema_version, 3 | 4) {
         return Ok(None);
     }
     let ticket = tx
@@ -1349,15 +1428,19 @@ fn postgres_local_click_started_submit_replay(
     )? {
         return Ok(None);
     }
-    let authority = match recover_terminal_ats_authority_postgres_tx(
-        tx,
-        &ticket.account_id,
-        &ticket.application_id,
-        run_id,
-    ) {
-        Ok(authority) => authority,
-        Err(ExecutionLeaseError::Storage(error)) => return Err(error),
-        Err(_) => return Ok(None),
+    let ats_certified_receipt_authority = match final_submit_proof.schema_version {
+        4 => match recover_terminal_ats_authority_postgres_tx(
+            tx,
+            &ticket.account_id,
+            &ticket.application_id,
+            run_id,
+        ) {
+            Ok(authority) => Some(authority),
+            Err(ExecutionLeaseError::Storage(error)) => return Err(error),
+            Err(_) => return Ok(None),
+        },
+        3 => None,
+        _ => unreachable!("final-submit schema was bounded before replay"),
     };
     let application_row = tx.query_opt(
         "SELECT job_id, application_json, state FROM jobs_applications
@@ -1416,8 +1499,14 @@ fn postgres_local_click_started_submit_replay(
     if capacity_expires_at_ms <= now {
         return Ok(None);
     }
+    let authorized_at_ms = ats_certified_receipt_authority
+        .as_ref()
+        .map_or(ticket.updated_at_ms, |authority| {
+            authority.binding_consumed_at_ms
+        });
     Ok(Some(LocalRunSubmitAuthorization {
-        ats_certified_receipt_authority: Some(authority),
+        ats_certified_receipt_authority,
+        authorized_at_ms,
     }))
 }
 

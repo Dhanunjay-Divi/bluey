@@ -33,6 +33,9 @@ use bluey_server::db::jobs::{
     self, ApplicationEvidence, BrowserSession, DiscoverySourceInput, Intervention,
     JobDiscoveryEvidence, JobPosting, JobPreferences,
 };
+use bluey_server::db::jobs_beta_access::{
+    self as jobs_beta_access, PublicBetaAccessReason, PublicBetaCohortState, PublicBetaCohortUpdate,
+};
 use bluey_server::db::object_uploads::NewSubmissionEvidenceCapacity;
 use bluey_server::db::usage::{self, UsageEvent};
 use bluey_server::db::{idempotency, open_pool, run_migrations, DbPool};
@@ -56,6 +59,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const TEST_BROWSER_SERVER_RELEASE_ID: &str = "server-603.1";
 const TEST_BROWSER_RELEASE_KEY_INDEX: usize = 6;
+const TEST_PUBLIC_BETA_AUDIT_ACTOR: &str = "integration-public-beta-admin";
 const EXECUTION_LEASE_SOURCE_RESUME_BYTES: &[u8] =
     b"Exact source resume bytes for execution integration tests";
 
@@ -2636,6 +2640,549 @@ async fn jobs_track_write_is_retry_safe_when_curated_source_enrollment_fails_lat
 
 #[tokio::test]
 #[serial]
+async fn public_beta_status_and_customer_gate_have_shared_standalone_parity() {
+    let harness = boot_harness().await;
+    let access = signup_and_login(
+        &harness,
+        "jobs-public-beta-parity@example.com",
+        "valid-password-123",
+    )
+    .await;
+
+    for router in [&harness.router, &harness.jobs_router] {
+        let unauthenticated = router
+            .clone()
+            .oneshot(
+                Request::get("/api/jobs/beta-access")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unauthenticated.headers()[axum::http::header::CACHE_CONTROL],
+            "private, no-store, max-age=0"
+        );
+        assert_eq!(
+            unauthenticated.headers()[axum::http::header::PRAGMA],
+            "no-cache"
+        );
+        assert!(unauthenticated
+            .headers()
+            .get_all(axum::http::header::VARY)
+            .iter()
+            .any(|value| value == "Authorization"));
+
+        let status = router
+            .clone()
+            .oneshot(
+                Request::get("/api/jobs/beta-access")
+                    .header("authorization", format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(status).await,
+            json!({
+                "schemaVersion": 1,
+                "access": "admitted",
+                "reason": "admitted"
+            })
+        );
+
+        let workspace = router
+            .clone()
+            .oneshot(
+                Request::get("/api/jobs/workspace")
+                    .header("authorization", format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(workspace.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn public_beta_requires_verified_non_temporary_accounts_and_master_flag() {
+    let harness = boot_harness().await;
+    let password = "valid-password-123";
+    let password_hash = auth::password::hash_password(password).unwrap();
+    let unverified = Account::create(
+        &harness.pool,
+        "jobs-public-beta-unverified@example.com",
+        &password_hash,
+    )
+    .unwrap();
+    // Login correctly rejects an unverified account, so mint a test-only
+    // access token to exercise the authorization layer's independent
+    // eligibility check.
+    let unverified_access = auth::jwt::issue(
+        "test-secret-at-least-32-chars-long-xxx",
+        &unverified.id,
+        auth::jwt::TokenKind::Access,
+    )
+    .unwrap();
+
+    let verification = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/beta-access")
+                .header("authorization", format!("Bearer {unverified_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(verification.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(verification).await,
+        json!({
+            "schemaVersion": 1,
+            "access": "not_admitted",
+            "reason": "verification_required"
+        })
+    );
+
+    let blocked_workspace = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/workspace")
+                .header("authorization", format!("Bearer {unverified_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked_workspace.status(), StatusCode::FORBIDDEN);
+
+    let temporary = Account::create(
+        &harness.pool,
+        "jobs-public-beta-temporary@example.com",
+        &password_hash,
+    )
+    .unwrap();
+    let temporary_expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts
+             SET email_verified_at = datetime('now'), is_temporary = 1,
+                 temporary_expires_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![temporary.id, temporary_expires_at],
+        )
+        .unwrap();
+    let temporary_access = auth::jwt::issue(
+        "test-secret-at-least-32-chars-long-xxx",
+        &temporary.id,
+        auth::jwt::TokenKind::Access,
+    )
+    .unwrap();
+    let temporary_status = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/beta-access")
+                .header("authorization", format!("Bearer {temporary_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(temporary_status.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(temporary_status).await["reason"],
+        "verification_required"
+    );
+
+    let verified_access = signup_and_login(
+        &harness,
+        "jobs-public-beta-master-off@example.com",
+        password,
+    )
+    .await;
+    std::env::set_var("BLUEY_JOBS_BETA_ENABLED", "0");
+    for path in ["/api/jobs/beta-access", "/api/jobs/workspace"] {
+        let response = harness
+            .jobs_router
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("authorization", format!("Bearer {verified_access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    std::env::set_var("BLUEY_JOBS_BETA_ENABLED", "1");
+}
+
+#[tokio::test]
+#[serial]
+async fn public_beta_gate_preserves_local_recovery_and_worker_authority_boundaries() {
+    let harness = boot_harness().await;
+    let _environment = TestEnvironmentGuard::install(&[
+        (
+            "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
+            "0".to_string(),
+        ),
+        ("BLUEY_JOBS_BETA_ENABLED", "0".to_string()),
+    ]);
+    let claim_body = json!({
+        "ticket": "invalid",
+        "claimNonce": "0".repeat(64),
+        "buildProof": {
+            "descriptor": "invalid",
+            "signature": "invalid"
+        }
+    });
+
+    let dark_local_runner = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/local-runs/not-authorized/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dark_local_runner.status(), StatusCode::BAD_REQUEST);
+    let dark_local_runner_body = axum::body::to_bytes(dark_local_runner.into_body(), 4 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&dark_local_runner_body).contains("Invalid Browser claim nonce.")
+    );
+
+    let gated_resume = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/local-runs/not-authorized/resume")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gated_resume.status(), StatusCode::NOT_FOUND);
+    let gated_resume_body = axum::body::to_bytes(gated_resume.into_body(), 4 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&gated_resume_body).contains("Bluey Jobs beta is not enabled."));
+
+    let independently_authenticated_worker = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/internal/discovery/lease")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        independently_authenticated_worker.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    std::env::set_var("BLUEY_JOBS_BETA_ENABLED", "1");
+    let paused_local_runner = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/local-runs/not-authorized/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(paused_local_runner.status(), StatusCode::BAD_REQUEST);
+    let paused_local_runner_body = axum::body::to_bytes(paused_local_runner.into_body(), 4 * 1024)
+        .await
+        .unwrap();
+    let paused_local_runner_body = String::from_utf8_lossy(&paused_local_runner_body);
+    assert!(paused_local_runner_body.contains("Invalid Browser claim nonce."));
+    assert!(!paused_local_runner_body.contains("Bluey Jobs beta is not enabled."));
+}
+
+#[tokio::test]
+#[serial]
+async fn public_beta_database_failure_returns_only_closed_unavailable_projection() {
+    let harness = boot_harness().await;
+    let access = signup_and_login(
+        &harness,
+        "jobs-public-beta-db-failure@example.com",
+        "valid-password-123",
+    )
+    .await;
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute("DROP TABLE jobs_public_beta_cohorts", [])
+        .unwrap();
+
+    for path in ["/api/jobs/beta-access", "/api/jobs/workspace"] {
+        let response = harness
+            .jobs_router
+            .clone()
+            .oneshot(
+                Request::get(path)
+                    .header("authorization", format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "schemaVersion": 1,
+                "access": "not_admitted",
+                "reason": "unavailable"
+            })
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn public_beta_admin_routes_are_cas_bound_redacted_and_audited() {
+    let admin_email = "jobs-public-beta-admin@example.com";
+    let harness = boot_harness_with_upstream_and_admin_emails(
+        UpstreamKeys::default(),
+        vec![admin_email.to_string()],
+    )
+    .await;
+    let admin_access = signup_and_login(&harness, admin_email, "valid-password-123").await;
+    let member_email = "jobs-public-beta-member@example.com";
+    let member_access = signup_and_login(&harness, member_email, "valid-password-123").await;
+    let member = Account::fetch_by_email(&harness.pool, member_email)
+        .unwrap()
+        .unwrap();
+
+    let cohort = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/admin/jobs/public-beta")
+                .header("authorization", format!("Bearer {admin_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cohort.status(), StatusCode::OK);
+    let cohort = response_json(cohort).await;
+    let revision = cohort["revision"].as_i64().unwrap();
+    assert!(cohort.get("cohortId").is_none());
+
+    let stale = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::put("/admin/jobs/public-beta")
+                .header("authorization", format!("Bearer {admin_access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "expectedRevision": revision - 1,
+                        "state": "open",
+                        "opensAtMs": cohort["opensAtMs"],
+                        "closesAtMs": cohort["closesAtMs"],
+                        "hardCap": cohort["hardCap"]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(response_json(stale).await["error"], "revision_conflict");
+
+    let grant = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/admin/jobs/public-beta/accounts/{}/grant",
+                member.id
+            ))
+            .header("authorization", format!("Bearer {admin_access}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "expectedRevision": revision })).unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(grant.status(), StatusCode::OK);
+    let grant_body = response_json(grant).await;
+    assert_eq!(
+        grant_body,
+        json!({ "schemaVersion": 1, "access": "admitted", "reason": "admitted" })
+    );
+    assert!(!grant_body.to_string().contains(&member.id));
+
+    let denied = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::put(format!(
+                "/admin/jobs/public-beta/accounts/{}/override",
+                member.id
+            ))
+            .header("authorization", format!("Bearer {admin_access}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "expectedRevision": 0,
+                    "denied": true
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::OK);
+    let denied = response_json(denied).await;
+    assert_eq!(denied["denied"], true);
+    assert_eq!(denied["revision"], 1);
+
+    let denied_grant = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/admin/jobs/public-beta/accounts/{}/grant",
+                member.id
+            ))
+            .header("authorization", format!("Bearer {admin_access}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "expectedRevision": revision })).unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(denied_grant.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(denied_grant).await,
+        json!({
+            "schemaVersion": 1,
+            "access": "not_admitted",
+            "reason": "denied"
+        })
+    );
+
+    let member_status = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/beta-access")
+                .header("authorization", format!("Bearer {member_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(member_status.status(), StatusCode::OK);
+    assert_eq!(response_json(member_status).await["reason"], "denied");
+
+    let cleared = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::put(format!(
+                "/admin/jobs/public-beta/accounts/{}/override",
+                member.id
+            ))
+            .header("authorization", format!("Bearer {admin_access}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "expectedRevision": 1,
+                    "denied": false
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert_eq!(response_json(cleared).await["denied"], false);
+
+    let metrics = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/admin/metrics")
+                .header("authorization", format!("Bearer {admin_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics = axum::body::to_bytes(metrics.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let metrics = String::from_utf8(metrics.to_vec()).unwrap();
+    assert!(metrics.contains("bluey_jobs_public_beta_slots_assigned_total"));
+    assert!(metrics.contains("bluey_jobs_public_beta_active_denials"));
+    assert!(!metrics.contains(&member.id));
+    assert!(!metrics.contains(member_email));
+
+    let (target_hash, actor_hash, metadata): (String, String, String) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT account_id_hash, actor_account_id_hash, metadata_json
+             FROM ops_audit_events
+             WHERE event_type = 'jobs.public_beta.account_override'
+               AND status = 'completed'
+             ORDER BY created_at DESC
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(target_hash, cue_core::account_id_hash_prefix(&member.id));
+    let admin = Account::fetch_by_email(&harness.pool, admin_email)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actor_hash, cue_core::account_id_hash_prefix(&admin.id));
+    assert!(!metadata.contains(&member.id));
+    assert!(!metadata.contains(member_email));
+    assert!(!metadata.contains(admin_email));
+}
+
+#[tokio::test]
+#[serial]
 async fn jobs_discovery_worker_requires_auth_and_persists_a_complete_snapshot() {
     const WORKER_TOKEN: &str = "jobs-discovery-worker-test-token";
     std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
@@ -2871,6 +3418,9 @@ async fn setup_execution_lease_run_for_runner(
     let account = Account::fetch_by_email(&harness.pool, email)
         .unwrap()
         .unwrap();
+    let public_beta = jobs_beta_access::evaluate_or_enroll_public_beta(&harness.pool, &account.id)
+        .expect("admit the execution fixture account to the open public-beta cohort");
+    assert_eq!(public_beta.reason, PublicBetaAccessReason::Admitted);
     let entitlement_plan = if runner_kind == "local" {
         "pro"
     } else {
@@ -4890,6 +5440,54 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         "action": "submit",
         "final_submit_proof": final_submit_proof(&harness, &account_id, &application_id)
     });
+    let managed_release = jobs::ManagedCloudReleaseMemoAuthority {
+        version: 1,
+        execution: jobs::ManagedCloudExecutionAuthority {
+            binding_sha256: "2".repeat(64),
+            admission: jobs::ManagedCloudAdmissionAuthority {
+                scope: jobs::ManagedCloudScope {
+                    environment: "production".to_string(),
+                    region: "us-east-1".to_string(),
+                    channel: "canary".to_string(),
+                },
+                head_revision: 1,
+                transition_sha256: "a".repeat(64),
+                activation_sha256: "b".repeat(64),
+                manifest_sha256: "c".repeat(64),
+                cohort_sha256: "d".repeat(64),
+                trust_generation: 1,
+                channel_sequence: 1,
+                release_id: "release-effect-fence".to_string(),
+                release_sequence: 1,
+                task_queue_sha256: "e".repeat(64),
+                failure_converter_sha256: "f".repeat(64),
+                readiness_sha256: "1".repeat(64),
+                activation_expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
+                resolved_at_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        },
+    };
+    let managed_release_sha256 = jobs::managed_cloud_release_memo_sha256(&managed_release).unwrap();
+    let managed_effect_body = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "lease_token": lease_token,
+        "fence": fence,
+        "workflow_request_id": "wfreq-v2-12345678-1234-5abc-8def-123456789abc",
+        "managed_cloud_release": managed_release,
+        "managed_cloud_release_sha256": managed_release_sha256,
+        "managed_cloud_runtime_instance_id": "runtime-instance-effect-fence",
+        "managed_cloud_runtime_instance_epoch": 1
+    });
+    let mut managed_irreversible_body = irreversible_body.clone();
+    managed_irreversible_body.as_object_mut().unwrap().extend(
+        managed_effect_body
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "lease_token" | "fence"))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
 
     let durable_binding: (String, i64, String, String) = harness
         .pool
@@ -5004,6 +5602,162 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
             rusqlite::params![volume.volume_id, volume.process_instance_id],
         )
         .unwrap();
+
+    let managed_effect_path =
+        format!("/api/jobs/internal/execution-leases/{run_id}/authorize-managed-effect");
+    let irreversible_path = format!("/api/jobs/internal/execution-leases/{run_id}/irreversible");
+    let effect_fence_admin = Account::create_with_admin(
+        &harness.pool,
+        "jobs-effect-fence-admin@example.com",
+        "integration-only-password-hash",
+        true,
+    )
+    .expect("create the public-beta effect-fence audit actor");
+    let beta_override = jobs_beta_access::get_public_beta_override(&harness.pool, &account_id)
+        .expect("load initial public-beta override");
+    jobs_beta_access::set_public_beta_override_audited(
+        &harness.pool,
+        &account_id,
+        beta_override.revision,
+        true,
+        &effect_fence_admin.id,
+    )
+    .expect("deny the admitted account before an external effect");
+    for (operation, path, body) in [
+        (
+            "authorize",
+            managed_effect_path.as_str(),
+            &managed_effect_body,
+        ),
+        (
+            "submit",
+            irreversible_path.as_str(),
+            &managed_irreversible_body,
+        ),
+    ] {
+        let response = harness
+            .router
+            .clone()
+            .oneshot(signed_worker_json_request(
+                path,
+                "execution",
+                &volume.worker_id,
+                now,
+                &format!("execution-public-beta-denied-{operation}-0001"),
+                body,
+                SIGNING_KEY,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+    let beta_override = jobs_beta_access::get_public_beta_override(&harness.pool, &account_id)
+        .expect("load denied public-beta override");
+    jobs_beta_access::set_public_beta_override_audited(
+        &harness.pool,
+        &account_id,
+        beta_override.revision,
+        false,
+        &effect_fence_admin.id,
+    )
+    .expect("clear the account denial");
+
+    let cohort = jobs_beta_access::get_public_beta_cohort(&harness.pool).unwrap();
+    jobs_beta_access::update_public_beta_cohort_audited(
+        &harness.pool,
+        PublicBetaCohortUpdate {
+            expected_revision: cohort.revision,
+            state: PublicBetaCohortState::Suspended,
+            opens_at_ms: cohort.opens_at_ms,
+            closes_at_ms: cohort.closes_at_ms,
+            hard_cap: cohort.hard_cap,
+        },
+        &effect_fence_admin.id,
+    )
+    .expect("suspend the cohort between lease claim and external effect");
+    for (operation, path, body) in [
+        (
+            "authorize",
+            managed_effect_path.as_str(),
+            &managed_effect_body,
+        ),
+        (
+            "submit",
+            irreversible_path.as_str(),
+            &managed_irreversible_body,
+        ),
+    ] {
+        let response = harness
+            .router
+            .clone()
+            .oneshot(signed_worker_json_request(
+                path,
+                "execution",
+                &volume.worker_id,
+                now,
+                &format!("execution-public-beta-suspended-{operation}-0001"),
+                body,
+                SIGNING_KEY,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    let cohort = jobs_beta_access::get_public_beta_cohort(&harness.pool).unwrap();
+    jobs_beta_access::update_public_beta_cohort_audited(
+        &harness.pool,
+        PublicBetaCohortUpdate {
+            expected_revision: cohort.revision,
+            state: PublicBetaCohortState::Open,
+            opens_at_ms: cohort.opens_at_ms,
+            closes_at_ms: cohort.closes_at_ms,
+            hard_cap: cohort.hard_cap,
+        },
+        &effect_fence_admin.id,
+    )
+    .expect("restore the admitted cohort before the master-off race");
+    std::env::set_var("BLUEY_JOBS_BETA_ENABLED", "0");
+    for (operation, path, body) in [
+        (
+            "authorize",
+            managed_effect_path.as_str(),
+            &managed_effect_body,
+        ),
+        (
+            "submit",
+            irreversible_path.as_str(),
+            &managed_irreversible_body,
+        ),
+    ] {
+        let response = harness
+            .router
+            .clone()
+            .oneshot(signed_worker_json_request(
+                path,
+                "execution",
+                &volume.worker_id,
+                now,
+                &format!("execution-public-beta-master-off-{operation}-0001"),
+                body,
+                SIGNING_KEY,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+    std::env::set_var("BLUEY_JOBS_BETA_ENABLED", "1");
+    let pre_effect_phase: String = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT phase FROM jobs_execution_leases WHERE run_id = ?1",
+            rusqlite::params![run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pre_effect_phase, "prepared");
 
     let running = harness
         .router
@@ -6949,6 +7703,32 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker_case(
     );
 
     let claim_body = local_browser_claim_body(&run_id, &ticket);
+    {
+        let _closed_effects = TestEnvironmentGuard::install(&[
+            ("BLUEY_JOBS_BETA_ENABLED", "0".to_string()),
+            (
+                "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
+                "0".to_string(),
+            ),
+        ]);
+        let fresh_claim_while_closed = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh_claim_while_closed.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id),
+            queued_claim_state
+        );
+    }
+
     let claimed = harness
         .router
         .clone()
@@ -6960,10 +7740,16 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker_case(
         )
         .await
         .unwrap();
-    assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed_status = claimed.status();
     let claimed_bytes = axum::body::to_bytes(claimed.into_body(), 64 * 1024)
         .await
         .unwrap();
+    assert_eq!(
+        claimed_status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&claimed_bytes)
+    );
     let claimed_state =
         local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id);
     assert_eq!(
@@ -6978,50 +7764,32 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker_case(
             1,
         )
     );
-    let exact_claim_replay = harness
-        .router
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(exact_claim_replay.status(), StatusCode::OK);
-    let exact_claim_replay_bytes = axum::body::to_bytes(exact_claim_replay.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    assert_eq!(exact_claim_replay_bytes, claimed_bytes);
-    assert_eq!(
-        local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id),
-        claimed_state
-    );
-
-    let conflicting_proof = browser_build_proof_fixture("darwin", "x64");
-    let conflicting_claim_body = local_browser_claim_body_with_proof(
-        &run_id,
-        &ticket,
-        json!({
-            "descriptor": conflicting_proof.descriptor,
-            "signature": conflicting_proof.signature,
-        }),
-    );
-    let conflicting_claim_replay = harness
-        .router
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&conflicting_claim_body).unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(conflicting_claim_replay.status(), StatusCode::CONFLICT);
+    {
+        let _closed_effects = TestEnvironmentGuard::install(&[
+            ("BLUEY_JOBS_BETA_ENABLED", "0".to_string()),
+            (
+                "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
+                "0".to_string(),
+            ),
+        ]);
+        let exact_claim_replay = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_claim_replay.status(), StatusCode::OK);
+        let exact_claim_replay_bytes =
+            axum::body::to_bytes(exact_claim_replay.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+        assert_eq!(exact_claim_replay_bytes, claimed_bytes);
+    }
     assert_eq!(
         local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id),
         claimed_state
@@ -7120,24 +7888,33 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker_case(
             "resolution": { "kind": "browser_takeover", "resumeAfter": true }
         }
     });
-    let paused = harness
-        .router
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "capability": &result_capability,
-                        "receipt": final_review_receipt
-                    }))
+    {
+        let _closed_effects = TestEnvironmentGuard::install(&[
+            ("BLUEY_JOBS_BETA_ENABLED", "0".to_string()),
+            (
+                "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
+                "0".to_string(),
+            ),
+        ]);
+        let paused = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "capability": &result_capability,
+                            "receipt": final_review_receipt
+                        }))
+                        .unwrap(),
+                    ))
                     .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(paused.status(), StatusCode::OK);
+            )
+            .await
+            .unwrap();
+        assert_eq!(paused.status(), StatusCode::OK);
+    }
     let intervention = jobs::list_interventions(&harness.pool, &account_id)
         .unwrap()
         .into_iter()
@@ -7198,24 +7975,53 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker_case(
             .unwrap();
         assert_eq!(legacy_submit.status(), StatusCode::NOT_FOUND);
     }
-    let unapproved_authority = harness
-        .router
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "capability": &submit_capability,
-                        "final_submit_proof": &submit_proof
-                    }))
+    {
+        let _closed_effects = TestEnvironmentGuard::install(&[
+            ("BLUEY_JOBS_BETA_ENABLED", "0".to_string()),
+            (
+                "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
+                "0".to_string(),
+            ),
+        ]);
+        let fresh_submit_while_closed = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "capability": &submit_capability,
+                            "final_submit_proof": &submit_proof
+                        }))
+                        .unwrap(),
+                    ))
                     .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(unapproved_authority.status(), StatusCode::CONFLICT);
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh_submit_while_closed.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let (ticket_status, capacity_count): (String, i64) = harness
+            .pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status,
+                        (SELECT COUNT(*) FROM jobs_submission_evidence_capacity capacity
+                          WHERE capacity.account_id = ticket.account_id
+                            AND capacity.application_id = ticket.application_id
+                            AND capacity.run_id = ticket.id)
+                   FROM jobs_local_run_tickets ticket WHERE ticket.id = ?1",
+                rusqlite::params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "needs_input");
+        assert_eq!(capacity_count, 0);
+    }
 
     let unapproved_submit = harness
         .router
@@ -7471,15 +8277,33 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker_case(
     let authorized_value: serde_json::Value = serde_json::from_slice(&authorized_body).unwrap();
     assert_eq!(authorized_value["authorized"], true);
 
-    jobs::set_entitlement_plan(&harness.pool, &account_id, "free").unwrap();
-    let revoked = harness
-        .router
-        .clone()
-        .oneshot(authorize_submit())
-        .await
-        .unwrap();
-    assert_eq!(revoked.status(), StatusCode::CONFLICT);
-    jobs::set_entitlement_plan(&harness.pool, &account_id, "pro").unwrap();
+    {
+        let _closed_effects = TestEnvironmentGuard::install(&[
+            ("BLUEY_JOBS_BETA_ENABLED", "0".to_string()),
+            (
+                "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
+                "0".to_string(),
+            ),
+        ]);
+        let exact_submit_replay = harness
+            .router
+            .clone()
+            .oneshot(authorize_submit())
+            .await
+            .unwrap();
+        let exact_submit_replay_status = exact_submit_replay.status();
+        let exact_submit_replay_body =
+            axum::body::to_bytes(exact_submit_replay.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+        assert_eq!(
+            exact_submit_replay_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&exact_submit_replay_body)
+        );
+        assert_eq!(exact_submit_replay_body, authorized_body);
+    }
 
     let future_expiry = chrono::Utc::now().timestamp_millis() + 60_000;
     harness
@@ -8522,6 +9346,30 @@ async fn boot_harness_with_config(
     let path = std::env::temp_dir().join(format!("bluey-e2e-{}.db", uuid::Uuid::new_v4()));
     let pool = open_pool(&path).unwrap();
     run_migrations(&pool).unwrap();
+    pool.get()
+        .unwrap()
+        .execute(
+            "INSERT INTO accounts (
+                id, email, password_hash, is_admin, trial_seconds_remaining, email_verified_at
+             ) VALUES (?1, 'integration-public-beta-admin@example.com',
+                       'integration-only-password-hash', 1, 0, datetime('now'))",
+            rusqlite::params![TEST_PUBLIC_BETA_AUDIT_ACTOR],
+        )
+        .expect("seed the public-beta audit actor as a real admin account");
+    let cohort = jobs_beta_access::get_public_beta_cohort(&pool).unwrap();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    jobs_beta_access::update_public_beta_cohort_audited(
+        &pool,
+        PublicBetaCohortUpdate {
+            expected_revision: cohort.revision,
+            state: PublicBetaCohortState::Open,
+            opens_at_ms: Some(now_ms - 60_000),
+            closes_at_ms: Some(now_ms + 24 * 60 * 60 * 1_000),
+            hard_cap: 1_000,
+        },
+        TEST_PUBLIC_BETA_AUDIT_ACTOR,
+    )
+    .unwrap();
 
     let mut config = Config {
         port: 0,
@@ -8565,6 +9413,7 @@ async fn boot_harness_with_config(
     std::env::set_var("BLUEY_TEST_SQUARE_URL", square.uri());
     std::env::set_var("BLUEY_TEST_DEEPGRAM_URL", deepgram.uri());
     std::env::set_var("BLUEY_RESEND_API_BASE_URL", mail.uri());
+    std::env::set_var("BLUEY_JOBS_BETA_ENABLED", "1");
 
     let jobs_router = bluey_server::api::build_jobs_router(pool.clone(), config.clone());
     let router = bluey_server::api::build_router(pool.clone(), config);
@@ -8580,6 +9429,13 @@ async fn boot_harness_with_config(
         deepgram,
         mail,
     }
+}
+
+async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
 }
 
 fn sample_usage(request_id: &str, bluey_cost_cents: i64) -> UsageEvent {
