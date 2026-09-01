@@ -139,6 +139,27 @@ describe("application workflow boundaries", () => {
     })).toEqual([]);
   });
 
+  it("uses the frozen receipt authority when the application job is beyond the ranked page", () => {
+    const queued = {
+      ...application("queued"),
+      job_id: "application-job-051",
+      receipt: { eligibility: job(true).eligibility },
+    };
+    const workspace = {
+      ...automationWorkspace([queued]),
+      matches: [],
+      application_jobs: [{
+        id: queued.job_id,
+        company: "Historical company",
+        title: "Historical role",
+        location: "Remote",
+        track_id: "track-1",
+      }],
+    };
+
+    expect(cloudAutomationEligibleApplications(workspace)).toEqual([queued]);
+  });
+
   it("downgrades Auto-submit unless both the job and a runner are authorized", () => {
     const missingSummary = job(true);
     delete missingSummary.eligibility?.ats_certification;
@@ -270,6 +291,7 @@ function automationWorkspace(applications: JobApplication[]): Parameters<
 >[0] {
   return {
     applications,
+    application_jobs: [],
     browser_sessions: [],
     matches: [job(true)],
     runner_availability: runners(true),

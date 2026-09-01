@@ -28,6 +28,50 @@ describe("career command center summary", () => {
     expect(summary.today_matches.map((job) => job.id)).toEqual(["job-1"]);
   });
 
+  it("marks fresh-match counts as loaded scope while a continuation remains", () => {
+    const summary = commandCenterSummary(workspace({
+      matches_page: {
+        schema_version: 1,
+        page_size: 50,
+        has_more: true,
+        next_cursor: "next-page",
+      },
+    }), now);
+
+    expect(summary.today_matches_loaded_scope).toBe(true);
+  });
+
+  it("keeps intervention labels for an application job beyond the ranked page", () => {
+    const application = {
+      ...previewWorkspace.applications[0],
+      id: "application-history-51",
+      job_id: "application-job-051",
+    };
+    const intervention = {
+      ...previewWorkspace.interventions[0],
+      id: "intervention-history-51",
+      application_id: application.id,
+      status: "open",
+    };
+    const summary = commandCenterSummary(workspace({
+      matches: [],
+      applications: [application],
+      interventions: [intervention],
+      application_jobs: [{
+        id: application.job_id,
+        company: "Historical company",
+        title: "Historical role",
+        location: "Remote",
+        track_id: "track-engineering",
+      }],
+    }), now);
+
+    expect(summary.open_interventions[0]?.job).toMatchObject({
+      company: "Historical company",
+      title: "Historical role",
+    });
+  });
+
   it("keeps unprojected resume and canonical Track authority fail-closed", () => {
     const summary = commandCenterSummary(workspace({
       discovery_sources: previewWorkspace.discovery_sources.map((source, index) => ({

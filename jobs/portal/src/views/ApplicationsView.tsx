@@ -70,6 +70,7 @@ import {
   verifiedCommunicationPayload,
 } from "../lib/communication-actions";
 import { safeDownloadFileName, saveDownloadedBlob } from "../lib/download";
+import { workspaceJobLookup, type WorkspaceJob } from "../lib/workspace-jobs";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -79,9 +80,26 @@ interface Props {
   onReconcileSubmission(application: JobApplication): Promise<void>;
   onCommit(application: JobApplication): Promise<void>;
   onLoadResume(id: string): Promise<ResumeVersion | undefined>;
+  onLoadJob(id: string): Promise<JobPosting | undefined>;
   onResolveIntervention(intervention: Intervention, action: string, resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string }): Promise<void>;
   onSaveCandidateEvent(event: CandidateEventInput): Promise<unknown>;
   preview?: boolean;
+}
+
+export async function commitVerifiedApplicationHandoff(
+  application: JobApplication,
+  onLoadJob: Props["onLoadJob"],
+  onCommit: Props["onCommit"],
+): Promise<JobPosting> {
+  const currentJob = await onLoadJob(application.job_id);
+  const currentEligibility = portalEligibilityDecision(currentJob?.eligibility, false);
+  if (!currentJob?.canonical_url
+    || !["active", "unknown"].includes(currentJob.availability_status)
+    || !currentEligibility.can_prepare) {
+    throw new Error("The current job site could not be verified. Refresh and try again.");
+  }
+  await onCommit(application);
+  return currentJob;
 }
 
 const SERVER_SUBMISSION_FINGERPRINT_KEY = "_bluey_server_submission_fingerprint_v1";
@@ -101,6 +119,7 @@ export function ApplicationsView({
   onReconcileSubmission,
   onCommit,
   onLoadResume,
+  onLoadJob,
   onResolveIntervention,
   onSaveCandidateEvent,
   preview = false,
@@ -143,7 +162,10 @@ export function ApplicationsView({
   const openInterventions = workspace.interventions.filter((item) => item.status === "open");
   const pendingCommunicationActions = communicationActions.filter(communicationActionRequiresReview);
 
-  const jobs = useMemo(() => new Map(workspace.matches.map((job) => [job.id, job])), [workspace.matches]);
+  const jobs = useMemo(
+    () => workspaceJobLookup(workspace),
+    [workspace.application_jobs, workspace.matches],
+  );
   const selectedSession = selected
     ? workspace.browser_sessions.find((session) => session.application_id === selected.id)
     : undefined;
@@ -165,7 +187,7 @@ export function ApplicationsView({
     ? runnerUnavailableReason(selectedEligibility, workspace.runner_availability)
     : "";
   const selectedCanHandoff = Boolean(
-    selectedJob?.canonical_url
+    selectedJob
     && selectedEligibility
     && selectedEligibility.capability !== "blocked",
   );
@@ -528,16 +550,34 @@ export function ApplicationsView({
   };
 
   const openHandoff = async () => {
-    if (!selected || !selectedJob?.canonical_url) return;
+    if (!selected) return;
     const target = window.open("about:blank", "_blank", "noopener,noreferrer");
     setBusy(true);
     setLocalError("");
     try {
-      await onCommit(selected);
-      if (target) target.location.href = selectedJob.canonical_url;
-      else window.location.assign(selectedJob.canonical_url);
+      const currentJob = await commitVerifiedApplicationHandoff(selected, onLoadJob, onCommit);
+      if (target) target.location.href = currentJob.canonical_url;
+      else window.location.assign(currentJob.canonical_url);
     } catch (cause) {
       target?.close();
+      setLocalError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openInterviewPrep = async () => {
+    if (!selected || !selectedResume) return;
+    setBusy(true);
+    setLocalError("");
+    try {
+      const currentJob = await onLoadJob(selected.job_id);
+      if (!currentJob) {
+        throw new Error("The current job detail could not be verified. Refresh and try again.");
+      }
+      setPrepTarget({ application: selected, job: currentJob, resume: selectedResume });
+      setSelected(null);
+    } catch (cause) {
       setLocalError(errorMessage(cause));
     } finally {
       setBusy(false);
@@ -863,10 +903,8 @@ export function ApplicationsView({
                 {selected.state === "submitted" && selectedJob && selectedResume && (
                   <button
                     className="button primary"
-                    onClick={() => {
-                      setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume });
-                      setSelected(null);
-                    }}
+                    disabled={busy}
+                    onClick={() => void openInterviewPrep()}
                   >
                     <Sparkles size={16} />Prepare interview
                   </button>
@@ -1264,7 +1302,15 @@ function errorMessage(cause: unknown): string {
     : "Bluey could not finish that application action. Please try again.";
 }
 
-function ApplicationKitSummary({ application, job, resume }: { application: JobApplication; job?: JobPosting; resume?: ResumeVersion }) {
+function ApplicationKitSummary({
+  application,
+  job,
+  resume,
+}: {
+  application: JobApplication;
+  job?: WorkspaceJob;
+  resume?: ResumeVersion;
+}) {
   const identity = application.receipt.application_identity && typeof application.receipt.application_identity === "object"
     ? application.receipt.application_identity as Record<string, unknown>
     : {};
@@ -1325,7 +1371,15 @@ function CoverLetterPreview({ coverLetter }: { coverLetter: string }) {
   );
 }
 
-function PauseReasons({ application, job, intervention }: { application: JobApplication; job?: JobPosting; intervention?: Intervention }) {
+function PauseReasons({
+  application,
+  job,
+  intervention,
+}: {
+  application: JobApplication;
+  job?: WorkspaceJob;
+  intervention?: Intervention;
+}) {
   const eligibility = applicationEligibility(application, job);
   const reasons = [...eligibility.hard_failures, ...eligibility.review_reasons]
     .map((reason) => reason.message);
@@ -1356,15 +1410,18 @@ function DiffList({ resume }: { resume?: ResumeVersion }) {
 
 export function applicationEligibility(
   application: JobApplication,
-  job?: JobPosting,
+  job?: WorkspaceJob,
 ): JobEligibilityDecision {
   return portalEligibilityDecision(applicationEligibilityAuthority(application, job), true);
 }
 
-function applicationEligibilityAuthority(application: JobApplication, job?: JobPosting): unknown {
+function applicationEligibilityAuthority(
+  application: JobApplication,
+  job?: WorkspaceJob,
+): unknown {
   const stored = application.receipt.eligibility;
   if (stored && typeof stored === "object") return stored;
-  if (job?.eligibility) return job.eligibility;
+  if (job && "eligibility" in job && job.eligibility) return job.eligibility;
   return undefined;
 }
 

@@ -108,6 +108,523 @@ pub fn verified_import_discovery_membership_job_id(
     })
 }
 
+const VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION: i64 = 1;
+const VERIFIED_IMPORT_BACKFILL_LEASE_MS: i64 = 5 * 60 * 1_000;
+
+#[cfg(test)]
+static VERIFIED_IMPORT_BACKFILL_SQLITE_CLAIM_WRITE_TX_COUNT:
+    std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+const VERIFIED_IMPORT_BACKFILL_WRITE_TX_TEST_ACCOUNT: &str = "acct-claim-load";
+
+#[cfg(test)]
+pub(crate) fn reset_verified_import_backfill_sqlite_claim_write_tx_count() {
+    VERIFIED_IMPORT_BACKFILL_SQLITE_CLAIM_WRITE_TX_COUNT
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn verified_import_backfill_sqlite_claim_write_tx_count() -> usize {
+    VERIFIED_IMPORT_BACKFILL_SQLITE_CLAIM_WRITE_TX_COUNT
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub struct VerifiedImportBackfillLease {
+    owner_id: String,
+    token: String,
+    expected_after_job_id: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+pub struct VerifiedImportBackfillBatch {
+    pub expected_after_job_id: String,
+    pub next_after_job_id: String,
+    pub scanned_count: usize,
+    pub postings: Vec<JobPosting>,
+}
+
+fn verified_import_backfill_lease_material() -> (String, String, String) {
+    let owner_id = format!("verified-import-backfill-{}", uuid::Uuid::new_v4());
+    let mut token_bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+    let token_sha256 = hex::encode(Sha256::digest(token.as_bytes()));
+    (owner_id, token, token_sha256)
+}
+
+fn verified_import_backfill_token_sha256(lease: &VerifiedImportBackfillLease) -> String {
+    hex::encode(Sha256::digest(lease.token.as_bytes()))
+}
+
+/// Claim the one durable repair worker for an account before scheduling any
+/// heavyweight work. Expired claims can be replaced, while a live owner keeps
+/// concurrent workspace requests from creating detached repair fan-out.
+pub fn claim_verified_import_backfill(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Option<VerifiedImportBackfillLease>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let observed_now_ms: i64 = conn.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            let unavailable = conn
+                .query_row(
+                    "SELECT completed=1
+                            OR (lease_owner IS NOT NULL AND lease_expires_at_ms>?3)
+                       FROM jobs_verified_import_backfill_checkpoints
+                      WHERE account_id=?1 AND migration_version=?2",
+                    params![
+                        account_id,
+                        VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                        observed_now_ms,
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if unavailable {
+                return Ok(None);
+            }
+            let (owner_id, token, token_sha256) = verified_import_backfill_lease_material();
+            #[cfg(test)]
+            if account_id == VERIFIED_IMPORT_BACKFILL_WRITE_TX_TEST_ACCOUNT {
+                VERIFIED_IMPORT_BACKFILL_SQLITE_CLAIM_WRITE_TX_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now_ms: i64 = tx.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_verified_import_backfill_checkpoints (
+                    account_id, migration_version, after_job_id, completed, updated_at_ms
+                 ) VALUES (?1, ?2, '', 0, ?3)
+                 ON CONFLICT(account_id, migration_version) DO NOTHING",
+                params![account_id, VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION, now_ms],
+            )?;
+            let expires_at_ms = now_ms.saturating_add(VERIFIED_IMPORT_BACKFILL_LEASE_MS);
+            let changed = tx.execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_owner=?3, lease_token_sha256=?4,
+                        lease_expires_at_ms=?5, updated_at_ms=?6
+                  WHERE account_id=?1 AND migration_version=?2 AND completed=0
+                    AND (lease_owner IS NULL OR lease_expires_at_ms<=?6)",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    owner_id,
+                    token_sha256,
+                    expires_at_ms,
+                    now_ms,
+                ],
+            )?;
+            if changed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let expected_after_job_id = tx.query_row(
+                "SELECT after_job_id FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id=?1 AND migration_version=?2
+                    AND lease_owner=?3 AND lease_token_sha256=?4
+                    AND lease_expires_at_ms=?5 AND lease_expires_at_ms>?6",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    owner_id,
+                    token_sha256,
+                    expires_at_ms,
+                    now_ms,
+                ],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok(Some(VerifiedImportBackfillLease {
+                owner_id,
+                token,
+                expected_after_job_id,
+                expires_at_ms,
+            }))
+        }
+        DbPool::Postgres(_) => {
+            let (owner_id, token, token_sha256) = verified_import_backfill_lease_material();
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let now_ms: i64 = tx
+                .query_one(
+                    "SELECT floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )?
+                .get(0);
+            tx.execute(
+                "INSERT INTO jobs_verified_import_backfill_checkpoints (
+                    account_id, migration_version, after_job_id, completed, updated_at_ms
+                 ) VALUES ($1, $2, '', 0, $3)
+                 ON CONFLICT(account_id, migration_version) DO NOTHING",
+                &[&account_id, &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION, &now_ms],
+            )?;
+            let expires_at_ms = now_ms.saturating_add(VERIFIED_IMPORT_BACKFILL_LEASE_MS);
+            let changed = tx.execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_owner=$3, lease_token_sha256=$4,
+                        lease_expires_at_ms=$5, updated_at_ms=$6
+                  WHERE account_id=$1 AND migration_version=$2 AND completed=0
+                    AND (lease_owner IS NULL OR lease_expires_at_ms<=$6)",
+                &[
+                    &account_id,
+                    &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    &owner_id,
+                    &token_sha256,
+                    &expires_at_ms,
+                    &now_ms,
+                ],
+            )?;
+            if changed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let expected_after_job_id = tx
+                .query_one(
+                    "SELECT after_job_id FROM jobs_verified_import_backfill_checkpoints
+                      WHERE account_id=$1 AND migration_version=$2
+                        AND lease_owner=$3 AND lease_token_sha256=$4
+                        AND lease_expires_at_ms=$5",
+                    &[
+                        &account_id,
+                        &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                        &owner_id,
+                        &token_sha256,
+                        &expires_at_ms,
+                    ],
+                )?
+                .get(0);
+            tx.commit()?;
+            Ok(Some(VerifiedImportBackfillLease {
+                owner_id,
+                token,
+                expected_after_job_id,
+                expires_at_ms,
+            }))
+        }
+    })
+}
+
+/// Read one durable, ID-ordered slice of legacy verified imports. The caller
+/// advances the checkpoint only after every retryable operation in the slice
+/// succeeds. A crash or storage failure therefore replays at most one small,
+/// idempotent batch rather than skipping repair work.
+pub fn verified_import_backfill_batch(
+    pool: &DbPool,
+    account_id: &str,
+    lease: &VerifiedImportBackfillLease,
+    limit: usize,
+) -> Result<VerifiedImportBackfillBatch> {
+    if limit == 0 || limit > 250 {
+        anyhow::bail!("verified-import backfill batch size is invalid")
+    }
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now_ms: i64 = tx.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            let token_sha256 = verified_import_backfill_token_sha256(lease);
+            let after_job_id: String = tx
+                .query_row(
+                "SELECT after_job_id
+                   FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id=?1 AND migration_version=?2 AND completed=0
+                    AND after_job_id=?3 AND lease_owner=?4
+                    AND lease_token_sha256=?5 AND lease_expires_at_ms=?6
+                    AND lease_expires_at_ms>?7",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    lease.expected_after_job_id,
+                    lease.owner_id,
+                    token_sha256,
+                    lease.expires_at_ms,
+                    now_ms,
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("verified-import backfill lease is unavailable"))?;
+            let mut statement = tx.prepare(
+                "SELECT id, posting_json, canonical_key, source, canonical_url, company
+                   FROM jobs_postings
+                  WHERE account_id = ?1 AND id > ?2 COLLATE BINARY
+                    AND substr(source, -7) = '_import'
+                  ORDER BY id COLLATE BINARY ASC LIMIT ?3",
+            )?;
+            let raws = statement
+                .query_map(params![account_id, after_job_id, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            let scanned_count = raws.len();
+            let next_after_job_id = raws
+                .last()
+                .map(|row| row.0.clone())
+                .unwrap_or_else(|| after_job_id.clone());
+            let postings = verified_import_backfill_postings(raws)?;
+            tx.commit()?;
+            Ok(VerifiedImportBackfillBatch {
+                expected_after_job_id: after_job_id,
+                next_after_job_id,
+                scanned_count,
+                postings,
+            })
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let now_ms: i64 = tx
+                .query_one(
+                    "SELECT floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )?
+                .get(0);
+            let token_sha256 = verified_import_backfill_token_sha256(lease);
+            let row = tx
+                .query_opt(
+                "SELECT after_job_id
+                   FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id=$1 AND migration_version=$2 AND completed=0
+                    AND after_job_id=$3 AND lease_owner=$4
+                    AND lease_token_sha256=$5 AND lease_expires_at_ms=$6
+                    AND lease_expires_at_ms>$7 FOR UPDATE",
+                &[
+                    &account_id,
+                    &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    &lease.expected_after_job_id,
+                    &lease.owner_id,
+                    &token_sha256,
+                    &lease.expires_at_ms,
+                    &now_ms,
+                ],
+            )?
+            .ok_or_else(|| anyhow::anyhow!("verified-import backfill lease is unavailable"))?;
+            let after_job_id = row.get::<_, String>(0);
+            let raws = tx
+                .query(
+                    r#"SELECT id, posting_json, canonical_key, source, canonical_url, company
+                       FROM jobs_postings
+                      WHERE account_id = $1 AND id COLLATE "C" > $2 COLLATE "C"
+                        AND RIGHT(source, 7) = '_import'
+                      ORDER BY id COLLATE "C" ASC LIMIT $3"#,
+                    &[&account_id, &after_job_id, &(limit as i64)],
+                )?
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get::<_, String>(0),
+                        row.get::<_, String>(1),
+                        row.get::<_, String>(2),
+                        row.get::<_, String>(3),
+                        row.get::<_, Option<String>>(4).unwrap_or_default(),
+                        row.get::<_, String>(5),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let scanned_count = raws.len();
+            let next_after_job_id = raws
+                .last()
+                .map(|row| row.0.clone())
+                .unwrap_or_else(|| after_job_id.clone());
+            let postings = verified_import_backfill_postings(raws)?;
+            tx.commit()?;
+            Ok(VerifiedImportBackfillBatch {
+                expected_after_job_id: after_job_id,
+                next_after_job_id,
+                scanned_count,
+                postings,
+            })
+        }
+    })
+}
+
+fn verified_import_backfill_postings(
+    raws: Vec<(String, String, String, String, String, String)>,
+) -> Result<Vec<JobPosting>> {
+    raws.into_iter()
+        .map(
+            |(relational_id, raw, canonical_key, source, canonical_url, company)| {
+                let mut posting =
+                    parse_json::<JobPosting>(raw, "verified-import backfill posting")?;
+                // Legacy payloads can carry stale embedded identity. The
+                // tenant-bound relational row is the same authority used by
+                // current workspace/detail projections, so repair must not be
+                // permanently pinned by an unrecoverable JSON mismatch.
+                posting.id = relational_id;
+                posting.canonical_key = canonical_key;
+                posting.source = source;
+                posting.canonical_url = canonical_url;
+                posting.company = company;
+                Ok(posting)
+            },
+        )
+        .collect()
+}
+
+/// Compare-and-swap the durable checkpoint. Only a crashed owner whose lease
+/// expires may cause the same idempotent slice to replay; a live or stale owner
+/// can never move the monotonic cursor backwards.
+pub fn advance_verified_import_backfill_checkpoint(
+    pool: &DbPool,
+    account_id: &str,
+    lease: &VerifiedImportBackfillLease,
+    next_after_job_id: &str,
+    completed: bool,
+) -> Result<bool> {
+    let ordering = next_after_job_id
+        .as_bytes()
+        .cmp(lease.expected_after_job_id.as_bytes());
+    if (completed && !ordering.is_eq()) || (!completed && !ordering.is_gt()) {
+        anyhow::bail!("verified-import backfill checkpoint transition is invalid")
+    }
+    let completed = i64::from(completed);
+    let token_sha256 = verified_import_backfill_token_sha256(lease);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let now_ms: i64 = conn.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET after_job_id=?6, completed=?7, lease_owner=NULL,
+                        lease_token_sha256=NULL, lease_expires_at_ms=NULL,
+                        updated_at_ms=?9
+                  WHERE account_id = ?1 AND migration_version = ?2
+                    AND after_job_id=?3 AND completed=0 AND lease_owner=?4
+                    AND lease_token_sha256=?5 AND lease_expires_at_ms=?8
+                    AND lease_expires_at_ms>?9",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    lease.expected_after_job_id,
+                    lease.owner_id,
+                    token_sha256,
+                    next_after_job_id,
+                    completed,
+                    lease.expires_at_ms,
+                    now_ms,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .context("advance verified-import backfill checkpoint")
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET after_job_id=$6, completed=$7, lease_owner=NULL,
+                        lease_token_sha256=NULL, lease_expires_at_ms=NULL,
+                        updated_at_ms=
+                            floor(extract(epoch from clock_timestamp()) * 1000)::bigint
+                  WHERE account_id = $1 AND migration_version = $2
+                    AND after_job_id=$3 AND completed=0 AND lease_owner=$4
+                    AND lease_token_sha256=$5 AND lease_expires_at_ms=$8
+                    AND lease_expires_at_ms>
+                        floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                &[
+                    &account_id,
+                    &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    &lease.expected_after_job_id,
+                    &lease.owner_id,
+                    &token_sha256,
+                    &next_after_job_id,
+                    &(completed as i16),
+                    &lease.expires_at_ms,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .context("advance verified-import backfill checkpoint"),
+    })
+}
+
+/// Release a failed repair attempt without advancing its durable cursor. A
+/// stale owner cannot clear a replacement claim because both owner and secret
+/// token digest participate in the compare-and-swap.
+pub fn release_verified_import_backfill_lease(
+    pool: &DbPool,
+    account_id: &str,
+    lease: &VerifiedImportBackfillLease,
+) -> Result<bool> {
+    let token_sha256 = verified_import_backfill_token_sha256(lease);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let now_ms: i64 = conn.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_owner=NULL, lease_token_sha256=NULL,
+                        lease_expires_at_ms=NULL, updated_at_ms=?6
+                  WHERE account_id=?1 AND migration_version=?2
+                    AND lease_owner=?3 AND lease_token_sha256=?4
+                    AND lease_expires_at_ms=?5 AND lease_expires_at_ms>?6",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    lease.owner_id,
+                    token_sha256,
+                    lease.expires_at_ms,
+                    now_ms,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .context("release verified-import backfill lease")
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_owner=NULL, lease_token_sha256=NULL,
+                        lease_expires_at_ms=NULL,
+                        updated_at_ms=floor(extract(epoch from clock_timestamp()) * 1000)::bigint
+                  WHERE account_id=$1 AND migration_version=$2
+                    AND lease_owner=$3 AND lease_token_sha256=$4
+                    AND lease_expires_at_ms=$5
+                    AND lease_expires_at_ms>
+                        floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                &[
+                    &account_id,
+                    &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    &lease.owner_id,
+                    &token_sha256,
+                    &lease.expires_at_ms,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .context("release verified-import backfill lease"),
+    })
+}
+
 pub fn get_discovery_source(pool: &DbPool, source_id: &str) -> Result<Option<DiscoverySource>> {
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => pool
@@ -661,6 +1178,12 @@ fn verified_import_membership_run_id(
     format!("verified-import-{}", &digest[..32])
 }
 
+fn verified_import_identity_posting(relational_id: String, raw: String) -> Result<JobPosting> {
+    let mut posting = parse_json::<JobPosting>(raw, "job posting")?;
+    posting.id = relational_id;
+    Ok(posting)
+}
+
 fn resolve_verified_import_identity_sqlite(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
@@ -680,13 +1203,13 @@ fn resolve_verified_import_identity_sqlite(
     let membership_posting = match membership_job_id {
         Some(job_id) => tx
             .query_row(
-                "SELECT posting_json FROM jobs_postings
+                "SELECT id, posting_json FROM jobs_postings
                   WHERE account_id = ?1 AND id = ?2",
                 params![account_id, job_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
-            .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+            .map(|(id, raw)| verified_import_identity_posting(id, raw))
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("discovery membership refers to a missing job"))
             .map(Some)?,
@@ -694,23 +1217,23 @@ fn resolve_verified_import_identity_sqlite(
     };
     let canonical_posting = tx
         .query_row(
-            "SELECT posting_json FROM jobs_postings
+            "SELECT id, posting_json FROM jobs_postings
               WHERE account_id = ?1 AND canonical_key = ?2",
             params![account_id, canonical_key],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
-        .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+        .map(|(id, raw)| verified_import_identity_posting(id, raw))
         .transpose()?;
     let mut statement = tx.prepare(
-        "SELECT posting_json FROM jobs_postings
+        "SELECT id, posting_json FROM jobs_postings
           WHERE account_id = ?1 AND canonical_url = ?2
           ORDER BY id LIMIT 2",
     )?;
     let mut rows = statement.query(params![account_id, canonical_url])?;
     let mut url_posting: Option<JobPosting> = None;
     while let Some(row) = rows.next()? {
-        let parsed = parse_json::<JobPosting>(row.get::<_, String>(0)?, "job posting")?;
+        let parsed = verified_import_identity_posting(row.get(0)?, row.get(1)?)?;
         if url_posting
             .as_ref()
             .is_some_and(|existing| existing.id != parsed.id)
@@ -744,11 +1267,11 @@ fn resolve_verified_import_identity_postgres(
     let membership_posting = match membership_job_id {
         Some(job_id) => tx
             .query_opt(
-                "SELECT posting_json FROM jobs_postings
+                "SELECT id, posting_json FROM jobs_postings
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
                 &[&account_id, &job_id],
             )?
-            .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+            .map(|row| verified_import_identity_posting(row.get(0), row.get(1)))
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("discovery membership refers to a missing job"))
             .map(Some)?,
@@ -756,21 +1279,21 @@ fn resolve_verified_import_identity_postgres(
     };
     let canonical_posting = tx
         .query_opt(
-            "SELECT posting_json FROM jobs_postings
+            "SELECT id, posting_json FROM jobs_postings
               WHERE account_id = $1 AND canonical_key = $2 FOR UPDATE",
             &[&account_id, &canonical_key],
         )?
-        .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+        .map(|row| verified_import_identity_posting(row.get(0), row.get(1)))
         .transpose()?;
     let url_rows = tx.query(
-        "SELECT posting_json FROM jobs_postings
+        "SELECT id, posting_json FROM jobs_postings
           WHERE account_id = $1 AND canonical_url = $2
           ORDER BY id LIMIT 2 FOR UPDATE",
         &[&account_id, &canonical_url],
     )?;
     let mut url_posting: Option<JobPosting> = None;
     for row in url_rows {
-        let parsed = parse_json::<JobPosting>(row.get(0), "job posting")?;
+        let parsed = verified_import_identity_posting(row.get(0), row.get(1))?;
         if url_posting
             .as_ref()
             .is_some_and(|existing| existing.id != parsed.id)

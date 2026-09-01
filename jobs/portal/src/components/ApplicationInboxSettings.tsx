@@ -16,6 +16,7 @@ import type {
 } from "../types";
 import { relativeTime } from "../lib/format";
 import { ConfirmDialog, Dialog } from "./Dialog";
+import { workspaceJobById } from "../lib/workspace-jobs";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -509,12 +510,15 @@ function classificationLabel(classification: string): string {
   } as Record<string, string>)[classification] || "Update";
 }
 
-function messageApplicationLabel(message: MailboxMessage, workspace: JobsWorkspace): string {
+export function messageApplicationLabel(
+  message: MailboxMessage,
+  workspace: JobsWorkspace,
+): string {
   const application = workspace.applications.find(
     (item) => item.id === message.application_id,
   );
   const job = application
-    ? workspace.matches.find((item) => item.id === application.job_id)
+    ? workspaceJobById(workspace, application.job_id)
     : undefined;
   const source = message.sender || connectionName(message.provider);
   if (job) return `${job.company} · ${job.title} · ${source}`;

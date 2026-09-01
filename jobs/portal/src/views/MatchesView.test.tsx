@@ -25,6 +25,7 @@ import {
   isMatchVisibleByState,
   isRecentPosting,
   jobEligibility,
+  loadedMatchScopeNotice,
   postingAgeLabel,
   visibleMatches,
 } from "./MatchesView";
@@ -242,6 +243,14 @@ describe("large match sets", () => {
     expect(visibleMatches(matches, 50)).toHaveLength(50);
     expect(visibleMatches(matches, 100)).toHaveLength(100);
     expect(visibleMatches(matches, 150)).toHaveLength(125);
+  });
+
+  it("states that search, sorting, filters, and counts cover loaded rows only", () => {
+    expect(loadedMatchScopeNotice(50, true)).toBe(
+      "Search, sorting, filters, and Career Track counts currently cover "
+        + "the 50 loaded jobs. Load more to expand this view.",
+    );
+    expect(loadedMatchScopeNotice(50, false)).toBeNull();
   });
 
   it("does not let historical or passed rows inflate active tab counts", () => {

@@ -104,6 +104,7 @@ clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["trace"] }
 wiremock = "0.6"
 serial_test = "3"
 bluey-server = { path = "." }

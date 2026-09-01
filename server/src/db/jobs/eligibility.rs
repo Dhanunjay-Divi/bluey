@@ -308,15 +308,23 @@ fn apply_discovery_authorities(
     authorities: &[JobDiscoveryAuthority],
     decision: &mut JobEligibilityDecision,
 ) {
+    apply_discovery_authorities_at_ms(authorities, decision, now_ms());
+}
+
+fn apply_discovery_authorities_at_ms(
+    authorities: &[JobDiscoveryAuthority],
+    decision: &mut JobEligibilityDecision,
+    authority_at_ms: i64,
+) {
     if authorities.is_empty() {
         return;
     }
-    let now = now_ms();
     let runnable = authorities.iter().any(|authority| {
         authority.source_status == "active"
             && authority.source_health == "healthy"
             && authority.membership_status == "active"
-            && authority.last_seen_at_ms >= now - LIVE_VERIFICATION_MAX_AGE_MS
+            && authority.last_seen_at_ms
+                >= authority_at_ms.saturating_sub(LIVE_VERIFICATION_MAX_AGE_MS)
     });
     if runnable {
         decision
@@ -362,7 +370,30 @@ fn enforce_application_finalization_eligibility(
     reservations: &[AttemptReservation],
     authorities: ApplicationFinalizationAuthorities<'_>,
 ) -> Result<()> {
-    let mut decision = build_job_eligibility(
+    enforce_application_finalization_eligibility_at_ms(
+        application,
+        posting,
+        profile,
+        preferences,
+        track,
+        reservations,
+        authorities,
+        now_ms(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enforce_application_finalization_eligibility_at_ms(
+    application: &JobApplication,
+    posting: &JobPosting,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    track: Option<&CareerTrack>,
+    reservations: &[AttemptReservation],
+    authorities: ApplicationFinalizationAuthorities<'_>,
+    eligibility_at_ms: i64,
+) -> Result<()> {
+    let mut decision = build_job_eligibility_at_ms(
         posting,
         profile,
         preferences,
@@ -370,8 +401,13 @@ fn enforce_application_finalization_eligibility(
         false,
         Some(application.id.as_str()),
         track,
+        eligibility_at_ms,
     );
-    apply_discovery_authorities(authorities.discovery, &mut decision);
+    apply_discovery_authorities_at_ms(
+        authorities.discovery,
+        &mut decision,
+        eligibility_at_ms,
+    );
     if let Some(resolution) = authorities.ats {
         apply_ats_certification_resolution(posting, &mut decision, resolution);
     }
@@ -934,7 +970,30 @@ fn build_job_eligibility(
     existing_application_id: Option<&str>,
     track: Option<&CareerTrack>,
 ) -> JobEligibilityDecision {
-    let now = now_ms();
+    build_job_eligibility_at_ms(
+        posting,
+        profile,
+        preferences,
+        reservations,
+        require_live_verification,
+        existing_application_id,
+        track,
+        now_ms(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_job_eligibility_at_ms(
+    posting: &JobPosting,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    reservations: &[AttemptReservation],
+    require_live_verification: bool,
+    existing_application_id: Option<&str>,
+    track: Option<&CareerTrack>,
+    eligibility_at_ms: i64,
+) -> JobEligibilityDecision {
+    let now = eligibility_at_ms;
     let capability = submission_capability(posting);
     let mut hard_failures = Vec::new();
     let mut review_reasons = Vec::new();

@@ -13063,10 +13063,248 @@ mod tests {
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
         let first = commit_packet(&pool, "acct-jobs", &application.id).unwrap();
+        let mut changed_preferences = get_preferences(&pool, "acct-jobs").unwrap();
+        changed_preferences.excluded_companies.push("Acme".to_string());
+        save_preferences(&pool, "acct-jobs", &changed_preferences).unwrap();
+        let mut unavailable = posting.clone();
+        unavailable.availability_status = "expired".to_string();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json=?3
+                  WHERE account_id=?1 AND id=?2",
+                params![
+                    "acct-jobs",
+                    posting.id,
+                    to_json(&unavailable, "expired replay posting").unwrap(),
+                ],
+            )
+            .unwrap();
         let second = commit_packet(&pool, "acct-jobs", &application.id).unwrap();
         assert!(first.newly_metered);
         assert!(!second.newly_metered);
         assert_eq!(first.used_packets, second.used_packets);
+    }
+
+    fn force_packet_overage_effect_fixture(pool: &DbPool) {
+        get_entitlement(pool, "acct-jobs").expect("create Jobs entitlement");
+        let connection = pool.get().expect("packet overage fixture connection");
+        connection
+            .execute(
+                "UPDATE accounts SET balance_cents=500 WHERE id='acct-jobs'",
+                [],
+            )
+            .expect("set packet overage balance");
+        connection
+            .execute(
+                "INSERT INTO credit_batches (
+                    id,account_id,amount_cents,remaining_cents,purchased_at,expires_at
+                 ) VALUES (
+                    'packet-effect-batch','acct-jobs',500,500,
+                    datetime('now'),datetime('now','+1 year')
+                 )",
+                [],
+            )
+            .expect("insert packet overage credit batch");
+        connection
+            .execute(
+                "UPDATE jobs_entitlements SET used_packets=monthly_packet_limit
+                  WHERE account_id='acct-jobs'",
+                [],
+            )
+            .expect("exhaust included packet allowance");
+    }
+
+    fn packet_overage_effect_snapshot(
+        pool: &DbPool,
+        job_id: &str,
+    ) -> (i64, i64, i64, i64, i64, i64, String) {
+        pool.get()
+            .expect("packet effect snapshot connection")
+            .query_row(
+                "SELECT account.balance_cents,entitlement.used_packets,
+                        COALESCE((SELECT SUM(remaining_cents) FROM credit_batches
+                                   WHERE account_id=account.id),0),
+                        (SELECT COUNT(*) FROM jobs_packet_metering
+                          WHERE account_id=account.id AND job_id=?2),
+                        (SELECT COUNT(*) FROM balance_ledger_entries
+                          WHERE account_id=account.id
+                            AND event_type='jobs_packet_overage' AND source_id=?2),
+                        (SELECT COUNT(*) FROM jobs_generation_allowance_reservations
+                          WHERE account_id=account.id AND job_id=?2),
+                        COALESCE((SELECT status || '|' || CAST(period_start_ms AS TEXT) ||
+                                           '|' || COALESCE(application_id,'')
+                                    FROM jobs_generation_allowance_reservations
+                                   WHERE account_id=account.id AND job_id=?2),'')
+                   FROM accounts account
+                   JOIN jobs_entitlements entitlement ON entitlement.account_id=account.id
+                  WHERE account.id=?1",
+                params!["acct-jobs", job_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("read packet effect snapshot")
+    }
+
+    fn prepared_packet_effect_fixture(
+        suffix: &str,
+    ) -> (DbPool, CareerProfile, JobPosting, JobApplication) {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).expect("save packet effect profile");
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .expect("save packet effect posting");
+        let (application, _) = prepare_application(
+            &pool,
+            "acct-jobs",
+            &posting.id,
+            "factual",
+            "review_first",
+        )
+        .expect("prepare packet effect application");
+        force_packet_overage_effect_fixture(&pool);
+        (pool, profile, posting, application)
+    }
+
+    #[test]
+    fn packet_commit_track_drift_has_zero_meter_debit_or_allowance_effect() {
+        let (pool, _profile, posting, application) =
+            prepared_packet_effect_fixture("packet-track-drift");
+        let before = packet_overage_effect_snapshot(&pool, &posting.id);
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_tracks SET active=0
+                  WHERE account_id='acct-jobs' AND id=?1",
+                params![posting.track_id],
+            )
+            .unwrap();
+
+        let error = commit_packet(&pool, "acct-jobs", &application.id)
+            .expect_err("inactive current Track must reject packet metering");
+
+        assert!(error.to_string().contains("Career Track"));
+        assert_eq!(packet_overage_effect_snapshot(&pool, &posting.id), before);
+    }
+
+    #[test]
+    fn packet_commit_profile_drift_has_zero_meter_debit_or_allowance_effect() {
+        let (pool, mut profile, posting, application) =
+            prepared_packet_effect_fixture("packet-profile-drift");
+        let before = packet_overage_effect_snapshot(&pool, &posting.id);
+        profile.summary = "Changed candidate truth after packet preparation.".to_string();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_profiles SET profile_json=?2
+                  WHERE account_id=?1",
+                params![
+                    "acct-jobs",
+                    to_json(&profile, "packet profile drift").unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let error = commit_packet(&pool, "acct-jobs", &application.id)
+            .expect_err("changed current profile must reject packet metering");
+
+        assert!(error.to_string().contains("candidate or Career Track"));
+        assert_eq!(packet_overage_effect_snapshot(&pool, &posting.id), before);
+    }
+
+    #[test]
+    fn packet_commit_preference_inclusion_drift_has_zero_meter_debit_or_allowance_effect() {
+        let (pool, _profile, posting, application) =
+            prepared_packet_effect_fixture("packet-preference-drift");
+        let before = packet_overage_effect_snapshot(&pool, &posting.id);
+        let mut preferences = get_preferences(&pool, "acct-jobs").unwrap();
+        preferences.excluded_companies.push(posting.company.clone());
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_preferences SET preferences_json=?2
+                  WHERE account_id=?1",
+                params![
+                    "acct-jobs",
+                    to_json(&preferences, "packet preference drift").unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let error = commit_packet(&pool, "acct-jobs", &application.id)
+            .expect_err("current company exclusion must reject packet metering");
+
+        assert!(error.to_string().contains("effect eligibility"));
+        assert_eq!(packet_overage_effect_snapshot(&pool, &posting.id), before);
+    }
+
+    #[test]
+    fn packet_commit_rejects_unavailable_current_job_before_any_metering() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/unavailable-packet",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let mut unavailable = posting.clone();
+        unavailable.availability_status = "expired".to_string();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json=?3
+                  WHERE account_id=?1 AND id=?2",
+                params![
+                    "acct-jobs",
+                    posting.id,
+                    to_json(&unavailable, "unavailable packet posting").unwrap(),
+                ],
+            )
+            .unwrap();
+
+        assert!(commit_packet(&pool, "acct-jobs", &application.id).is_err());
+        let (metering, used): (i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM jobs_packet_metering
+                           WHERE account_id=?1 AND job_id=?2),
+                        (SELECT used_packets FROM jobs_entitlements WHERE account_id=?1)",
+                params!["acct-jobs", posting.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((metering, used), (0, 0));
     }
 
     #[test]

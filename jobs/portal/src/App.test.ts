@@ -1,4 +1,5 @@
 import { createElement } from "react";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -8,6 +9,7 @@ import { previewWorkspace } from "./data/preview";
 import type {
   CareerProfile,
   CareerTrackPolicyAuthority,
+  JobsMatchesPage,
   JobsWorkspace,
   MailboxConnection,
   UploadResumeSourceResponse,
@@ -28,6 +30,9 @@ let reconcileWorkspacePolicyAuthority:
 let WorkspaceAuthorityEpoch: typeof import("./App").WorkspaceAuthorityEpoch;
 let installWorkspaceAtAuthorityEpoch:
   typeof import("./App").installWorkspaceAtAuthorityEpoch;
+let appendMatchesAtCursor: typeof import("./App").appendMatchesAtCursor;
+let appendMatchesAtWorkspaceAuthorityEpoch:
+  typeof import("./App").appendMatchesAtWorkspaceAuthorityEpoch;
 let runWorkspacePolicyAuthorityMutation:
   typeof import("./App").runWorkspacePolicyAuthorityMutation;
 let workspaceAfterAutoSubmitAuthorization:
@@ -57,6 +62,8 @@ beforeAll(async () => {
   reconcileWorkspacePolicyAuthority = app.reconcileWorkspacePolicyAuthority;
   WorkspaceAuthorityEpoch = app.WorkspaceAuthorityEpoch;
   installWorkspaceAtAuthorityEpoch = app.installWorkspaceAtAuthorityEpoch;
+  appendMatchesAtCursor = app.appendMatchesAtCursor;
+  appendMatchesAtWorkspaceAuthorityEpoch = app.appendMatchesAtWorkspaceAuthorityEpoch;
   runWorkspacePolicyAuthorityMutation = app.runWorkspacePolicyAuthorityMutation;
   workspaceAfterAutoSubmitAuthorization = app.workspaceAfterAutoSubmitAuthorization;
   workspaceAfterAutoSubmitRevocation = app.workspaceAfterAutoSubmitRevocation;
@@ -98,6 +105,163 @@ describe("Jobs portal home route", () => {
     expect(mobileNavigation).toContain('href="/overview?preview=1"');
     expect(mobileNavigation).not.toContain('href="/settings?preview=1"');
     expect(mobileNavigation.match(/ href=/g)).toHaveLength(5);
+  });
+});
+
+describe("matches keyset pagination", () => {
+  const paginatedWorkspace = (): JobsWorkspace => ({
+    ...previewWorkspace,
+    matches: previewWorkspace.matches.slice(0, 1),
+    matches_page: {
+      schema_version: 1,
+      page_size: 2,
+      has_more: true,
+      next_cursor: "cursor-1",
+    },
+  });
+
+  it("deduplicates appended matches and installs the next page authority", () => {
+    const workspace = paginatedWorkspace();
+    const newMatch = {
+      ...workspace.matches[0],
+      id: "job-next",
+      title: "Next job",
+    };
+    const page: JobsMatchesPage = {
+      matches: [workspace.matches[0], newMatch, newMatch],
+      page: {
+        schema_version: 1,
+        page_size: 2,
+        has_more: false,
+        next_cursor: null,
+      },
+    };
+
+    const appended = appendMatchesAtCursor(workspace, "cursor-1", page);
+
+    expect(appended.matches.map((match) => match.id)).toEqual([
+      workspace.matches[0].id,
+      "job-next",
+    ]);
+    expect(appended.matches_page).toEqual(page.page);
+  });
+
+  it("does not install a response for a cursor that is no longer current", () => {
+    const workspace = paginatedWorkspace();
+    const page: JobsMatchesPage = {
+      matches: [],
+      page: {
+        schema_version: 1,
+        page_size: 2,
+        has_more: false,
+        next_cursor: null,
+      },
+    };
+
+    expect(appendMatchesAtCursor(workspace, "stale-cursor", page)).toBe(workspace);
+  });
+
+  it("rejects a continuation from the workspace authority epoch before a refresh", () => {
+    const authorityEpoch = new WorkspaceAuthorityEpoch();
+    let current: JobsWorkspace | null = paginatedWorkspace();
+    const setWorkspace = (
+      update: (workspace: JobsWorkspace | null) => JobsWorkspace | null,
+    ) => {
+      current = update(current);
+    };
+    const initialRefresh = authorityEpoch.beginRefresh();
+    expect(installWorkspaceAtAuthorityEpoch(
+      setWorkspace,
+      authorityEpoch,
+      initialRefresh,
+      current as JobsWorkspace,
+    )).toBe(true);
+    const continuation = authorityEpoch.beginContinuation();
+    expect(continuation).not.toBeNull();
+
+    const newerRefresh = authorityEpoch.beginRefresh();
+    expect(authorityEpoch.beginContinuation()).toBeNull();
+    expect(appendMatchesAtWorkspaceAuthorityEpoch(
+      current as JobsWorkspace,
+      authorityEpoch,
+      continuation!,
+      "cursor-1",
+      {
+        matches: [],
+        page: {
+          schema_version: 1,
+          page_size: 2,
+          has_more: false,
+          next_cursor: null,
+        },
+      },
+    )).toBe(current);
+    expect(installWorkspaceAtAuthorityEpoch(
+      setWorkspace,
+      authorityEpoch,
+      newerRefresh,
+      current as JobsWorkspace,
+    )).toBe(true);
+    expect(authorityEpoch.canInstallContinuation(continuation!)).toBe(false);
+    expect(authorityEpoch.beginContinuation()).not.toBeNull();
+  });
+
+  it("rejects a continuation as soon as a policy mutation advances authority", () => {
+    const authorityEpoch = new WorkspaceAuthorityEpoch();
+    let current: JobsWorkspace | null = paginatedWorkspace();
+    const refreshToken = authorityEpoch.beginRefresh();
+    expect(installWorkspaceAtAuthorityEpoch(
+      (update) => {
+        current = update(current);
+      },
+      authorityEpoch,
+      refreshToken,
+      current as JobsWorkspace,
+    )).toBe(true);
+    const continuation = authorityEpoch.beginContinuation();
+    expect(continuation).not.toBeNull();
+
+    authorityEpoch.beginMutation();
+
+    expect(appendMatchesAtWorkspaceAuthorityEpoch(
+      current as JobsWorkspace,
+      authorityEpoch,
+      continuation!,
+      "cursor-1",
+      {
+        matches: [],
+        page: {
+          schema_version: 1,
+          page_size: 2,
+          has_more: false,
+          next_cursor: null,
+        },
+      },
+    )).toBe(current);
+    expect(authorityEpoch.beginContinuation()).toBeNull();
+  });
+
+  it("routes the live load-more response through the workspace authority epoch", () => {
+    const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+    const loadMore = source
+      .split("const loadMoreMatches = useCallback")[1]
+      ?.split("const runAuthoritySensitiveWorkspaceMutation = useCallback")[0] ?? "";
+
+    expect(loadMore).toContain("beginContinuation()");
+    expect(loadMore).toContain("appendMatchesAtWorkspaceAuthorityEpoch(");
+    expect(loadMore).not.toContain("return appendMatchesAtCursor(");
+  });
+
+  it("lets the exact server queue authority decide an application beyond the loaded page", () => {
+    const source = readFileSync(new URL("./App.tsx", import.meta.url), "utf8");
+    const queue = source
+      .split("const queueCloudRun = useCallback")[1]
+      ?.split("const resolveIntervention = useCallback")[0] ?? "";
+
+    expect(queue).toContain("workspaceJobById(workspace, application.job_id)");
+    expect(queue).toContain("jobsApi.queueApplicationRun(application.id, \"cloud\")");
+    expect(queue).not.toContain("job is no longer available");
+    expect(queue).not.toContain("if (!job)");
   });
 });
 

@@ -1956,13 +1956,74 @@ impl From<postgres::Error> for ExecutionLeaseError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsMatchesPageInfo {
+    pub schema_version: i64,
+    pub page_size: i64,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+impl Default for JobsMatchesPageInfo {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            page_size: 50,
+            has_more: false,
+            next_cursor: None,
+        }
+    }
+}
+
+impl JobsMatchesPageInfo {
+    fn omitted_from_exhaustive_export() -> Self {
+        Self {
+            schema_version: 1,
+            page_size: 0,
+            has_more: false,
+            next_cursor: None,
+        }
+    }
+
+    fn is_omitted_from_exhaustive_export(&self) -> bool {
+        self.schema_version == 1
+            && self.page_size == 0
+            && !self.has_more
+            && self.next_cursor.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsMatchesPage {
+    pub matches: Vec<JobPosting>,
+    pub page: JobsMatchesPageInfo,
+}
+
+/// Frozen, display-only context for an existing application. It must never be
+/// used as current source, ATS, integrity, handoff, or effect authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplicationJobContext {
+    pub id: String,
+    pub company: String,
+    pub title: String,
+    pub location: String,
+    pub track_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsWorkspace {
     pub profile: CareerProfile,
     pub preferences: JobPreferences,
     pub facts: Vec<CareerFact>,
     pub tracks: Vec<CareerTrack>,
     pub matches: Vec<JobPosting>,
+    #[serde(
+        default,
+        skip_serializing_if = "JobsMatchesPageInfo::is_omitted_from_exhaustive_export"
+    )]
+    pub matches_page: JobsMatchesPageInfo,
     pub applications: Vec<JobApplication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub application_jobs: Vec<ApplicationJobContext>,
     pub application_evidence: Vec<ApplicationEvidence>,
     pub browser_sessions: Vec<BrowserSession>,
     pub interventions: Vec<Intervention>,
@@ -2317,6 +2378,7 @@ include!("jobs/browser_release_authority.rs");
 include!("jobs/browser_release_trust.rs");
 include!("jobs/browser_release_registry.rs");
 include!("jobs/ats_certification_authority.rs");
+include!("jobs/ats_certification_page.rs");
 include!("jobs/managed_cloud_release_authority.rs");
 include!("jobs/original_source_verification.rs");
 include!("jobs/job_integrity_authority.rs");

@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { jobsApi } from "./api";
+import { jobsApi, matchesPageFromWire } from "./api";
 import { previewWorkspace } from "./data/preview";
 import {
   CANONICAL_TAXONOMY,
   canonicalTaxonomyDescriptor,
 } from "./lib/canonical-taxonomy";
-import type { CareerTrackPolicyAuthority } from "./types";
+import type { CareerTrackPolicyAuthority, JobsWorkspace } from "./types";
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -152,7 +152,13 @@ describe("Jobs API authentication", () => {
     const [workspace, account] = await Promise.all([jobsApi.workspace(), jobsApi.account()]);
 
     expect(refreshCalls).toBe(1);
-    expect(workspace).toEqual({ profile: {} });
+    expect(workspace.profile).toEqual({});
+    expect(workspace.matches_page).toEqual({
+      schema_version: 1,
+      page_size: 1,
+      has_more: false,
+      next_cursor: null,
+    });
     expect(account.email).toBe("user@example.com");
     expect(localStorage.getItem("bluey_access_token")).toBe("dummy-fresh-access-token");
     expect(localStorage.getItem("bluey_refresh_token")).toBe("dummy-refresh-token-two");
@@ -191,6 +197,21 @@ describe("Jobs API authentication", () => {
       "application_identity_id",
     );
     expect(workspace.tracks[1].policy.authority?.applicationIdentityId).toBe("");
+  });
+
+  it("loads the authenticated workspace without using a browser cache", async () => {
+    localStorage.setItem("bluey_access_token", "dummy-access-token");
+    const fetchMock = vi.fn(async () => Response.json(previewWorkspace));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await jobsApi.workspace();
+
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(path).toBe("/api/jobs/workspace");
+    expect(init.cache).toBe("no-store");
+    expect(new Headers(init.headers).get("Authorization")).toBe(
+      "Bearer dummy-access-token",
+    );
   });
 
   it("validates the authenticated taxonomy before a Track write and sends its exact binding", async () => {
@@ -567,5 +588,90 @@ describe("Jobs API authentication", () => {
     await expect(jobsApi.communicationAction("action-one")).rejects.toThrow(
       "could not verify this reviewed communication action",
     );
+  });
+
+  it("sends an authenticated opaque match cursor only in a no-store POST body", async () => {
+    localStorage.setItem("bluey_access_token", "dummy-access-token");
+    const fetchMock = vi.fn(async (
+      _input: RequestInfo | URL,
+      _init?: RequestInit,
+    ) => Response.json({
+      matches: [previewWorkspace.matches[0]],
+      page: {
+        schema_version: 1,
+        page_size: 50,
+        has_more: false,
+        next_cursor: null,
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const page = await jobsApi.matchesPage("opaque+/cursor=", 50);
+
+    expect(page.matches).toHaveLength(1);
+    expect(page.page.has_more).toBe(false);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("/api/jobs/matches/page");
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.method).toBe("POST");
+    expect(init?.cache).toBe("no-store");
+    expect(JSON.parse(String(init?.body))).toEqual({
+      cursor: "opaque+/cursor=",
+      limit: 50,
+    });
+    expect(localStorage.getItem("bluey_jobs_match_cursor")).toBeNull();
+  });
+
+  it("accepts an older bounded workspace without pagination metadata", async () => {
+    const legacyWorkspace = { ...previewWorkspace } as Partial<JobsWorkspace>;
+    delete legacyWorkspace.matches_page;
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(legacyWorkspace)));
+
+    const workspace = await jobsApi.workspace();
+
+    expect(workspace.matches_page).toEqual({
+      schema_version: 1,
+      page_size: previewWorkspace.matches.length,
+      has_more: false,
+      next_cursor: null,
+    });
+  });
+
+  it("fails closed on inconsistent match-page continuation metadata", () => {
+    expect(matchesPageFromWire({
+      matches: [],
+      page: {
+        schema_version: 1,
+        page_size: 50,
+        has_more: true,
+        next_cursor: "opaque-next-cursor",
+      },
+    }).page.next_cursor).toBe("opaque-next-cursor");
+    expect(() => matchesPageFromWire({
+      matches: [],
+      page: {
+        schema_version: 1,
+        page_size: 50,
+        has_more: true,
+        next_cursor: null,
+      },
+    })).toThrow("invalid match page");
+    expect(() => matchesPageFromWire({
+      matches: [],
+      page: {
+        schema_version: 1,
+        page_size: 101,
+        has_more: false,
+        next_cursor: null,
+      },
+    })).toThrow("invalid match page");
+    expect(() => matchesPageFromWire({
+      matches: [previewWorkspace.matches[0], previewWorkspace.matches[0]],
+      page: {
+        schema_version: 1,
+        page_size: 1,
+        has_more: false,
+        next_cursor: null,
+      },
+    })).toThrow("invalid match page");
   });
 });

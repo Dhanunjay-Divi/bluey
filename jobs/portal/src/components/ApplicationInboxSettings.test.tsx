@@ -1,12 +1,14 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import { previewWorkspace } from "../data/preview";
 import type { MailboxConnection, MailboxProviderAvailability } from "../types";
 import {
   CommunicationAuthorizationControl,
   mailboxCalendarActionState,
   mailboxCommunicationAuthorizationState,
   mailboxProvidersAfterLoad,
+  messageApplicationLabel,
 } from "./ApplicationInboxSettings";
 
 function connection(
@@ -36,6 +38,40 @@ function availability(
 }
 
 describe("explicit mailbox communication authorization", () => {
+  it("labels a mailbox update from application context beyond the ranked page", () => {
+    const application = {
+      ...previewWorkspace.applications[0],
+      id: "application-history-51",
+      job_id: "application-job-051",
+    };
+    const workspace = {
+      ...previewWorkspace,
+      matches: [],
+      applications: [application],
+      application_jobs: [{
+        id: application.job_id,
+        company: "Historical company",
+        title: "Historical role",
+        location: "Remote",
+        track_id: "track-engineering",
+      }],
+    };
+
+    expect(messageApplicationLabel({
+      id: "message-51",
+      connection_id: "connection-one",
+      provider: "gmail",
+      sender: "recruiter@example.com",
+      subject: "Interview",
+      received_at_ms: 1,
+      application_id: application.id,
+      processing_status: "processed",
+      classification: "interview",
+    }, workspace)).toBe(
+      "Historical company · Historical role · recruiter@example.com",
+    );
+  });
+
   it("offers the account-bound control only when both write capabilities are advertised", () => {
     const writeAvailable = availability([
       "status_sync",

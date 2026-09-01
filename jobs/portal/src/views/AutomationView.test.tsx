@@ -10,6 +10,7 @@ import type {
 } from "../types";
 import {
   AutomationView,
+  automationApplicationLabel,
   automationAction,
   queueCloudApplication,
   submissionApprovalEnabled,
@@ -60,6 +61,23 @@ function renderAutomation(workspace: JobsWorkspace, previewSearch = ""): string 
 }
 
 describe("cloud-first application automation", () => {
+  it("keeps an exact queue label for an application beyond the ranked page", () => {
+    const queued = {
+      ...previewWorkspace.applications[0],
+      job_id: "application-job-051",
+    };
+    expect(automationApplicationLabel({
+      matches: [],
+      application_jobs: [{
+        id: queued.job_id,
+        company: "Historical company",
+        title: "Historical role",
+        location: "Remote",
+        track_id: "track-engineering",
+      }],
+    }, queued)).toBe("Queue Historical role at Historical company");
+  });
+
   it("renders cloud queue access as the only automation path", () => {
     const html = renderAutomation(workspaceWith(availableCloud, {
       browser_sessions: [],

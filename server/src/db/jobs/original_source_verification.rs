@@ -3872,6 +3872,257 @@ pub(crate) fn resolve_original_source_verification_projection_sqlite_tx_at_ms(
     )
 }
 
+/// Resolve one bounded interactive page against exactly one account-global
+/// managed-source authority read and one database timestamp.
+pub(crate) fn resolve_original_source_verification_projection_page_sqlite_tx_at_ms(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    postings: &[JobPosting],
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<Vec<OriginalSourceVerificationProjection>> {
+    original_source_validate_projection_db_time(db_time_ms)?;
+    let authority = sqlite_original_source_verification_authority_for_account_tx(tx, account_id)
+        .map_err(original_source_storage)?;
+    let Some(authority) = authority else {
+        return Ok(postings
+            .iter()
+            .map(|_| original_source_verification_unavailable_projection(false, db_time_ms))
+            .collect());
+    };
+    let subjects = original_source_page_subjects(postings)?;
+    let trusted_job_ids = trusted_original_source_memberships_page_sqlite(
+        tx,
+        account_id,
+        subjects.values(),
+    )?;
+    let heads = original_source_verification_heads_page_sqlite(
+        tx,
+        account_id,
+        &trusted_job_ids,
+    )?;
+    original_source_page_projections(
+        postings,
+        subjects,
+        trusted_job_ids,
+        heads,
+        authority,
+        db_time_ms,
+    )
+}
+
+/// Build the supported canonical subjects once before one batched membership
+/// read. Unsupported providers intentionally stay review-first without a
+/// database membership or source-head lookup, exactly as the single-row path.
+fn original_source_page_subjects(
+    postings: &[JobPosting],
+) -> OriginalSourceVerificationResult<BTreeMap<usize, OriginalSourcePageSubject>> {
+    let mut subjects = BTreeMap::new();
+    for (index, posting) in postings.iter().enumerate() {
+        if original_source_provider(&posting.source).is_some() {
+            subjects.insert(
+                index,
+                OriginalSourcePageSubject {
+                    posting_id: posting.id.clone(),
+                    canonical: original_source_canonical_subject(posting)?,
+                },
+            );
+        }
+    }
+    Ok(subjects)
+}
+
+/// The relational posting identity and the immutable canonical subject are
+/// deliberately kept separate. Discovery memberships and verification heads
+/// are keyed by `posting_id`; their content is revalidated against
+/// `canonical` before the row is trusted.
+#[derive(Debug)]
+struct OriginalSourcePageSubject {
+    posting_id: String,
+    canonical: OriginalSourceCanonicalSubject,
+}
+
+fn trusted_original_source_memberships_page_sqlite<'a>(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    subjects: impl IntoIterator<Item = &'a OriginalSourcePageSubject>,
+) -> OriginalSourceVerificationResult<BTreeSet<String>> {
+    let subjects = subjects.into_iter().collect::<Vec<_>>();
+    if subjects.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let placeholders = (0..subjects.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT membership.job_id, membership.external_id, membership.canonical_key,
+                source.provider, source.source_key
+           FROM jobs_discovery_memberships membership
+           JOIN jobs_discovery_sources source
+             ON source.id=membership.source_id
+            AND source.account_id=membership.account_id
+          WHERE membership.account_id=?1
+            AND membership.job_id IN ({placeholders})
+            AND source.status='active'
+            AND source.health IN ('waiting','healthy')"
+    );
+    let by_job = subjects
+        .iter()
+        .map(|subject| (subject.posting_id.as_str(), *subject))
+        .collect::<BTreeMap<_, _>>();
+    let values = std::iter::once(account_id)
+        .chain(subjects.iter().map(|subject| subject.posting_id.as_str()));
+    let mut statement = tx.prepare(&sql).map_err(original_source_storage)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(original_source_storage)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(original_source_storage)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(job_id, external_id, canonical_key, provider, source_key)| {
+            let subject = by_job.get(job_id.as_str())?;
+            (external_id == subject.canonical.provider_job
+                && canonical_key == subject.canonical.canonical_job_id
+                && provider == subject.canonical.provider_family
+                && source_key == subject.canonical.discovery_source_key)
+                .then_some(job_id)
+        })
+        .collect())
+}
+
+fn original_source_verification_heads_page_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    job_ids: &BTreeSet<String>,
+) -> OriginalSourceVerificationResult<BTreeMap<String, OriginalSourceVerificationHead>> {
+    if job_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = (0..job_ids.len())
+        .map(|index| format!("?{}", index + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "{ORIGINAL_SOURCE_HEAD_SELECT}
+          WHERE h.account_id=?1 AND h.job_id IN ({placeholders})"
+    );
+    let values = std::iter::once(account_id).chain(job_ids.iter().map(String::as_str));
+    let mut statement = tx.prepare(&sql).map_err(original_source_storage)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(values), original_source_head_from_sqlite)
+        .map_err(original_source_storage)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(original_source_storage)?;
+    original_source_page_heads(rows)
+}
+
+fn original_source_page_heads(
+    rows: Vec<OriginalSourceVerificationHead>,
+) -> OriginalSourceVerificationResult<BTreeMap<String, OriginalSourceVerificationHead>> {
+    let mut heads = BTreeMap::new();
+    for head in rows {
+        if heads.insert(head.job_id.clone(), head).is_some() {
+            return Err(OriginalSourceVerificationError::Storage(
+                "original-source page contains duplicate verification heads".to_string(),
+            ));
+        }
+    }
+    Ok(heads)
+}
+
+fn original_source_page_projections(
+    postings: &[JobPosting],
+    subjects: BTreeMap<usize, OriginalSourcePageSubject>,
+    trusted_job_ids: BTreeSet<String>,
+    heads: BTreeMap<String, OriginalSourceVerificationHead>,
+    authority: ManagedCloudOriginalSourceVerificationAuthority,
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<Vec<OriginalSourceVerificationProjection>> {
+    let authority_binding = (!trusted_job_ids.is_empty())
+        .then(|| original_source_managed_authority_binding(&authority))
+        .transpose()?;
+    postings
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let Some(subject) = subjects.get(&index) else {
+                return Ok(original_source_verification_unavailable_projection(true, db_time_ms));
+            };
+            if !trusted_job_ids.contains(&subject.posting_id) {
+                return Ok(original_source_verification_unavailable_projection(true, db_time_ms));
+            }
+            let Some((_, canonical_authority_json, authority_sha256)) = authority_binding.as_ref()
+            else {
+                return Err(OriginalSourceVerificationError::Storage(
+                    "trusted source membership has no managed authority binding".to_string(),
+                ));
+            };
+            original_source_projection_from_subject_and_head(
+                &subject.canonical,
+                heads.get(&subject.posting_id),
+                canonical_authority_json,
+                authority_sha256,
+                db_time_ms,
+            )
+        })
+        .collect()
+}
+
+fn original_source_projection_from_subject_and_head(
+    subject: &OriginalSourceCanonicalSubject,
+    head: Option<&OriginalSourceVerificationHead>,
+    canonical_authority_json: &str,
+    authority_sha256: &str,
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<OriginalSourceVerificationProjection> {
+    let projected = head
+        .map(|head| {
+            original_source_positive_projection(
+                subject,
+                head,
+                authority_sha256,
+                canonical_authority_json,
+                db_time_ms,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let nonpositive_evidence = if projected.is_none() {
+        head.map(|head| {
+            original_source_nonpositive_evidence(
+                subject,
+                head,
+                authority_sha256,
+                canonical_authority_json,
+                db_time_ms,
+            )
+        })
+        .transpose()?
+        .flatten()
+    } else {
+        None
+    };
+    Ok(OriginalSourceVerificationProjection {
+        feature_active: true,
+        evidence: projected
+            .as_ref()
+            .map(|value| value.evidence.clone())
+            .or(nonpositive_evidence),
+        expected_head: projected.as_ref().map(|value| value.expected_head.clone()),
+        integrity_binding: projected.map(|value| value.integrity_binding),
+        db_time_ms,
+    })
+}
+
 fn original_source_verification_unavailable_projection(
     feature_active: bool,
     db_time_ms: i64,
@@ -3915,45 +4166,13 @@ fn resolve_original_source_verification_projection_sqlite_tx_with_authority_at_m
     let (_, canonical_authority_json, authority_sha256) =
         original_source_managed_authority_binding(&authority)?;
     let head = resolve_original_source_verification_head_sqlite_tx(tx, account_id, &posting.id)?;
-    let projected = head
-        .as_ref()
-        .map(|head| {
-            original_source_positive_projection(
-                &subject,
-                head,
-                &authority_sha256,
-                &canonical_authority_json,
-                db_time_ms,
-            )
-        })
-        .transpose()?
-        .flatten();
-    let nonpositive_evidence = if projected.is_none() {
-        head.as_ref()
-            .map(|head| {
-                original_source_nonpositive_evidence(
-                    &subject,
-                    head,
-                    &authority_sha256,
-                    &canonical_authority_json,
-                    db_time_ms,
-                )
-            })
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
-    Ok(OriginalSourceVerificationProjection {
-        feature_active,
-        evidence: projected
-            .as_ref()
-            .map(|value| value.evidence.clone())
-            .or(nonpositive_evidence),
-        expected_head: projected.as_ref().map(|value| value.expected_head.clone()),
-        integrity_binding: projected.map(|value| value.integrity_binding),
+    original_source_projection_from_subject_and_head(
+        &subject,
+        head.as_ref(),
+        &canonical_authority_json,
+        &authority_sha256,
         db_time_ms,
-    })
+    )
 }
 
 pub(crate) fn resolve_original_source_verification_projection_postgres_tx(
@@ -3985,6 +4204,122 @@ pub(crate) fn resolve_original_source_verification_projection_postgres_tx_after_
     resolve_original_source_verification_projection_postgres_tx_with_authority_at_ms(
         tx, account_id, posting, authority, db_time_ms,
     )
+}
+
+/// PostgreSQL page equivalent of the SQLite batch above. The caller owns the
+/// common `H -> M -> ATS -> D -> integrity` prelocks, so the managed release
+/// registry is resolved once and never reacquired per posting.
+pub(crate) fn resolve_original_source_verification_projection_page_postgres_tx_after_prelock_at_ms(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    postings: &[JobPosting],
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<Vec<OriginalSourceVerificationProjection>> {
+    original_source_validate_projection_db_time(db_time_ms)?;
+    let authority = postgres_original_source_verification_authority_for_account_tx_after_prelock(
+        tx, account_id,
+    )
+    .map_err(original_source_storage)?;
+    let Some(authority) = authority else {
+        return Ok(postings
+            .iter()
+            .map(|_| original_source_verification_unavailable_projection(false, db_time_ms))
+            .collect());
+    };
+    let subjects = original_source_page_subjects(postings)?;
+    let trusted_job_ids = trusted_original_source_memberships_page_postgres(
+        tx,
+        account_id,
+        subjects.values(),
+    )?;
+    let heads = original_source_verification_heads_page_postgres(
+        tx,
+        account_id,
+        &trusted_job_ids,
+    )?;
+    original_source_page_projections(
+        postings,
+        subjects,
+        trusted_job_ids,
+        heads,
+        authority,
+        db_time_ms,
+    )
+}
+
+fn trusted_original_source_memberships_page_postgres<'a>(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    subjects: impl IntoIterator<Item = &'a OriginalSourcePageSubject>,
+) -> OriginalSourceVerificationResult<BTreeSet<String>> {
+    let subjects = subjects.into_iter().collect::<Vec<_>>();
+    if subjects.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let job_ids = subjects
+        .iter()
+        .map(|subject| subject.posting_id.clone())
+        .collect::<Vec<_>>();
+    let by_job = subjects
+        .iter()
+        .map(|subject| (subject.posting_id.as_str(), *subject))
+        .collect::<BTreeMap<_, _>>();
+    let rows = tx
+        .query(
+            "SELECT membership.job_id, membership.external_id, membership.canonical_key,
+                    source.provider, source.source_key
+               FROM jobs_discovery_memberships membership
+               JOIN jobs_discovery_sources source
+                 ON source.id=membership.source_id
+                AND source.account_id=membership.account_id
+              WHERE membership.account_id=$1
+                AND membership.job_id = ANY($2)
+                AND source.status='active'
+                AND source.health IN ('waiting','healthy')
+              FOR SHARE OF membership,source",
+            &[&account_id, &job_ids],
+        )
+        .map_err(original_source_storage)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let job_id: String = row.get(0);
+            let subject = by_job.get(job_id.as_str())?;
+            let external_id: String = row.get(1);
+            let canonical_key: String = row.get(2);
+            let provider: String = row.get(3);
+            let source_key: String = row.get(4);
+            (external_id == subject.canonical.provider_job
+                && canonical_key == subject.canonical.canonical_job_id
+                && provider == subject.canonical.provider_family
+                && source_key == subject.canonical.discovery_source_key)
+                .then_some(job_id)
+        })
+        .collect())
+}
+
+fn original_source_verification_heads_page_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    job_ids: &BTreeSet<String>,
+) -> OriginalSourceVerificationResult<BTreeMap<String, OriginalSourceVerificationHead>> {
+    if job_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let job_ids = job_ids.iter().cloned().collect::<Vec<_>>();
+    let rows = tx
+        .query(
+            &format!(
+                "{ORIGINAL_SOURCE_HEAD_SELECT}
+                  WHERE h.account_id=$1 AND h.job_id = ANY($2) FOR SHARE OF h"
+            ),
+            &[&account_id, &job_ids],
+        )
+        .map_err(original_source_storage)?
+        .into_iter()
+        .map(|row| original_source_head_from_postgres(&row))
+        .collect();
+    original_source_page_heads(rows)
 }
 
 fn original_source_validate_projection_db_time(
@@ -4028,45 +4363,13 @@ fn resolve_original_source_verification_projection_postgres_tx_with_authority_at
     let (_, canonical_authority_json, authority_sha256) =
         original_source_managed_authority_binding(&authority)?;
     let head = resolve_original_source_verification_head_postgres_tx(tx, account_id, &posting.id)?;
-    let projected = head
-        .as_ref()
-        .map(|head| {
-            original_source_positive_projection(
-                &subject,
-                head,
-                &authority_sha256,
-                &canonical_authority_json,
-                db_time_ms,
-            )
-        })
-        .transpose()?
-        .flatten();
-    let nonpositive_evidence = if projected.is_none() {
-        head.as_ref()
-            .map(|head| {
-                original_source_nonpositive_evidence(
-                    &subject,
-                    head,
-                    &authority_sha256,
-                    &canonical_authority_json,
-                    db_time_ms,
-                )
-            })
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
-    Ok(OriginalSourceVerificationProjection {
-        feature_active,
-        evidence: projected
-            .as_ref()
-            .map(|value| value.evidence.clone())
-            .or(nonpositive_evidence),
-        expected_head: projected.as_ref().map(|value| value.expected_head.clone()),
-        integrity_binding: projected.map(|value| value.integrity_binding),
+    original_source_projection_from_subject_and_head(
+        &subject,
+        head.as_ref(),
+        &canonical_authority_json,
+        &authority_sha256,
         db_time_ms,
-    })
+    )
 }
 
 pub fn resolve_original_source_verification_projection(
@@ -10031,6 +10334,45 @@ mod original_source_verification_tests {
                 .expect("roll back strict original-source membership fixture");
         }
 
+        cleanup_public_original_source_lifecycle_fixture(fixture);
+    }
+
+    #[test]
+    fn sqlite_page_projection_binds_active_membership_by_posting_id_and_canonical_key() {
+        let fixture = public_original_source_lifecycle_fixture();
+        assert_ne!(fixture.posting.id, fixture.posting.canonical_key);
+        let lease = lease_original_source_verification(&fixture.pool, &fixture.binding)
+            .expect("lease positive page source fixture")
+            .expect("positive page source fixture is due");
+        let completion =
+            public_completion_request(&fixture, &lease, "public-osv-page-membership-0001");
+        complete_original_source_verification(&fixture.pool, &completion)
+            .expect("complete positive page source fixture");
+
+        let mut connection = fixture.pool.get().expect("get positive page fixture");
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .expect("begin positive page projection");
+        let db_time_ms: i64 = tx
+            .query_row("SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)", [], |row| {
+                row.get(0)
+            })
+            .expect("positive page database time");
+        let projections = resolve_original_source_verification_projection_page_sqlite_tx_at_ms(
+            &tx,
+            &fixture.account_id,
+            std::slice::from_ref(&fixture.posting),
+            db_time_ms,
+        )
+        .expect("resolve positive managed-source page");
+        tx.rollback().expect("roll back positive page projection");
+
+        let binding = projections[0]
+            .integrity_binding
+            .as_ref()
+            .expect("positive page preserves the trusted source binding");
+        assert_eq!(binding.canonical_job_id, fixture.posting.canonical_key);
+        assert_eq!(binding.provider_job, fixture.posting.external_id);
         cleanup_public_original_source_lifecycle_fixture(fixture);
     }
 

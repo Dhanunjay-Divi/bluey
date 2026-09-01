@@ -654,6 +654,27 @@ export interface RunnerAvailability {
   auto_submit_reason: string;
 }
 
+export interface JobsMatchesPageInfo {
+  schema_version: 1;
+  page_size: number;
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
+export interface JobsMatchesPage {
+  matches: JobPosting[];
+  page: JobsMatchesPageInfo;
+}
+
+/** Frozen display context only; never current handoff or effect authority. */
+export interface ApplicationJobContext {
+  id: string;
+  company: string;
+  title: string;
+  location: string;
+  track_id: string;
+}
+
 export interface JobsWorkspace {
   profile: CareerProfile;
   preferences: JobPreferences;
@@ -661,7 +682,9 @@ export interface JobsWorkspace {
   tracks: CareerTrack[];
   auto_submit_authorizations: AutoSubmitAuthorization[];
   matches: JobPosting[];
+  matches_page: JobsMatchesPageInfo;
   applications: JobApplication[];
+  application_jobs: ApplicationJobContext[];
   application_evidence: ApplicationEvidence[];
   browser_sessions: BrowserSession[];
   interventions: Intervention[];

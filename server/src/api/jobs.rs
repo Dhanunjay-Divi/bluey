@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    api::middleware::request_id::TraceId,
     api::{
         jobs_beta_access, jobs_import, jobs_resume_generation,
         jobs_worker_auth::JobsWorkerIdentity, AppState,
@@ -29,8 +30,8 @@ use crate::{
             AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CandidateEvent,
             CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
             JobEligibilityDecision, JobPosting, JobPreferences, JobsEntitlement, JobsIntegration,
-            JobsWorkspace, PacketCommitResult, ResumeVersion, RunEvent, RunnerAvailability,
-            RunnerChannelAvailability,
+            JobsMatchesPage, JobsWorkspace, PacketCommitResult, ResumeVersion, RunEvent,
+            RunnerAvailability, RunnerChannelAvailability,
         },
         object_uploads::{
             self, ApplicationObjectBinding, NewObjectUpload, NewSubmissionEvidenceCapacity,
@@ -108,7 +109,7 @@ const LEVER_SUBMISSION_ADAPTER_VERSION: &str = "2026.07.0-beta.1";
 // the durable account-deletion workflow; the generic artifact TTL must not
 // silently sever a Submitted application's receipt pointer.
 const SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRY_MS: i64 = i64::MAX;
-const MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS: usize = 250;
+const MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS: usize = 50;
 
 pub fn router(state: AppState) -> Router<AppState> {
     let customer = Router::new()
@@ -138,6 +139,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             post(authorize_track_auto_submit).delete(revoke_track_auto_submit),
         )
         .route("/api/jobs/matches", get(matches).post(save_match))
+        .route("/api/jobs/matches/page", post(matches_page))
         .route("/api/jobs/matches/:job_id", get(match_detail))
         .route(
             "/api/jobs/discovery/catalog",
@@ -843,10 +845,55 @@ fn ensure_managed_curated_discovery_source_best_effort(
     }
 }
 
+fn schedule_verified_import_discovery_backfill(
+    pool: crate::db::DbPool,
+    account_id: String,
+    email: String,
+) {
+    let account_fingerprint = discovery_log_fingerprint(&account_id);
+    let lease = match jobs::claim_verified_import_backfill(&pool, &account_id) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                account_fingerprint = %account_fingerprint,
+                error_category = discovery_enrollment_error_category(&error),
+                "Jobs could not claim bounded legacy verified-import repair"
+            );
+            return;
+        }
+    };
+    std::mem::drop(tokio::task::spawn_blocking(
+        move || match run_verified_import_discovery_backfill(
+            &pool,
+            &account_id,
+            &email,
+            &lease,
+        ) {
+            Ok(result) if result.scanned_count > 0 || result.completed => tracing::info!(
+                account_fingerprint = %account_fingerprint,
+                scanned_count = result.scanned_count,
+                repaired_count = result.repaired_count,
+                checkpoint_advanced = result.checkpoint_advanced,
+                completed = result.completed,
+                "Jobs advanced the bounded legacy verified-import repair"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                account_fingerprint = %account_fingerprint,
+                error_category = discovery_enrollment_error_category(&error),
+                "Jobs retained the legacy verified-import checkpoint for retry"
+            ),
+        },
+    ));
+}
+
 pub async fn workspace(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-) -> Result<Json<JobsWorkspace>, ApiError> {
+    Extension(TraceId(trace_id)): Extension<TraceId>,
+) -> Result<Response, ApiError> {
+    let request_started = std::time::Instant::now();
     ensure_managed_curated_discovery_source_best_effort(&state.pool, &account.id, "workspace_load");
     schedule_global_candidate_materialization(
         state.pool.clone(),
@@ -854,30 +901,21 @@ pub async fn workspace(
         account.email.clone(),
         "workspace_load",
     );
-    let mut workspace =
-        jobs::workspace(&state.pool, &account.id, &account.email).map_err(internal)?;
-    if backfill_verified_import_discovery_sources(
+    let load = jobs::workspace_page(
         &state.pool,
         &account.id,
-        &workspace.matches,
-        &workspace.profile,
-        &workspace.preferences,
-    ) > 0
-    {
-        match jobs::list_discovery_sources(&state.pool, &account.id) {
-            Ok(sources) => {
-                workspace.discovery_sources = sources
-                    .iter()
-                    .map(jobs::DiscoverySourceSummary::from)
-                    .collect();
-            }
-            Err(_error) => tracing::warn!(
-                account_fingerprint = %discovery_log_fingerprint(&account.id),
-                error_category = "source_summary_refresh_failed",
-                "Jobs workspace completed without refreshed discovery source summaries"
-            ),
-        }
-    }
+        &account.email,
+        jobs::JOBS_WORKSPACE_DEFAULT_PAGE_SIZE,
+        None,
+    )
+    .map_err(internal)?;
+    let diagnostics = load.diagnostics;
+    let mut workspace = load.workspace;
+    schedule_verified_import_discovery_backfill(
+        state.pool.clone(),
+        account.id.clone(),
+        account.email.clone(),
+    );
     workspace.runner_availability =
         account_runner_availability(&state.pool, &account.id, &workspace.entitlement)?;
     apply_jobs_distribution_gates(
@@ -885,7 +923,31 @@ pub async fn workspace(
         workspace.runner_availability.local.available,
         workspace.runner_availability.cloud.available,
     );
-    Ok(Json(workspace))
+    tracing::info!(
+        request_id = %trace_id,
+        candidate_count = diagnostics.candidate_count,
+        returned_count = diagnostics.returned_count,
+        has_more = diagnostics.has_more,
+        authority_batch_count = diagnostics.authority_batch_count,
+        application_context_count = diagnostics.application_context_count,
+        application_context_fallback_batch_count =
+            diagnostics.application_context_fallback_batch_count,
+        representation_ms = diagnostics.representation_ms,
+        ancillary_ms = diagnostics.ancillary_ms,
+        db_total_ms = diagnostics.total_ms,
+        total_ms = request_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        "Bluey Jobs workspace page assembled"
+    );
+    Ok(workspace_response(workspace))
+}
+
+fn workspace_response(workspace: JobsWorkspace) -> Response {
+    let mut response = Json(workspace).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 pub async fn profile(
@@ -1156,6 +1218,77 @@ pub async fn matches(
     current_match_representations(&state.pool, &account)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchesPageRequest {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+pub async fn matches_page(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Extension(TraceId(trace_id)): Extension<TraceId>,
+    Json(request): Json<MatchesPageRequest>,
+) -> Result<Response, ApiError> {
+    let started = std::time::Instant::now();
+    let limit = request
+        .limit
+        .unwrap_or(jobs::JOBS_WORKSPACE_DEFAULT_PAGE_SIZE);
+    let load = jobs::load_current_posting_representation_page(
+        &state.pool,
+        &account.id,
+        &account.email,
+        limit,
+        request.cursor.as_deref(),
+    )
+    .map_err(matches_page_error)?;
+    let diagnostics = load.diagnostics;
+    let page = load.page;
+    tracing::info!(
+        request_id = %trace_id,
+        candidate_count = diagnostics.candidate_count,
+        returned_count = diagnostics.returned_count,
+        has_more = diagnostics.has_more,
+        authority_batch_count = diagnostics.authority_batch_count,
+        application_context_count = diagnostics.application_context_count,
+        application_context_fallback_batch_count =
+            diagnostics.application_context_fallback_batch_count,
+        page_size = page.page.page_size,
+        representation_ms = diagnostics.representation_ms,
+        ancillary_ms = diagnostics.ancillary_ms,
+        db_total_ms = diagnostics.total_ms,
+        total_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        "Bluey Jobs matches page assembled"
+    );
+    Ok(matches_page_response(page))
+}
+
+fn matches_page_response(page: JobsMatchesPage) -> Response {
+    let mut response = Json(page).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+fn matches_page_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.starts_with("Jobs match cursor") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Jobs match cursor is invalid or expired; refresh the workspace".to_string(),
+        )
+    } else if message.starts_with("Jobs match page size") {
+        (StatusCode::BAD_REQUEST, message)
+    } else {
+        internal(error)
+    }
+}
+
 pub async fn match_detail(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -1170,7 +1303,16 @@ fn current_match_representations(
 ) -> Result<Json<Vec<JobPosting>>, ApiError> {
     jobs::list_current_posting_representations(pool, &account.id, &account.email)
         .map(Json)
-        .map_err(internal)
+        .map_err(legacy_matches_error)
+}
+
+fn legacy_matches_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.starts_with("Jobs legacy matches require the paginated matches endpoint") {
+        (StatusCode::CONFLICT, message)
+    } else {
+        internal(error)
+    }
 }
 
 fn current_match_representation(
@@ -1327,39 +1469,88 @@ fn enroll_verified_import_discovery_source(
     Ok(())
 }
 
-fn backfill_verified_import_discovery_sources(
+#[derive(Debug, Default)]
+struct VerifiedImportBackfillRun {
+    scanned_count: usize,
+    repaired_count: usize,
+    checkpoint_advanced: bool,
+    completed: bool,
+}
+
+fn run_verified_import_discovery_backfill(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    email: &str,
+    lease: &jobs::VerifiedImportBackfillLease,
+) -> anyhow::Result<VerifiedImportBackfillRun> {
+    let result = run_verified_import_discovery_backfill_with_lease(
+        pool,
+        account_id,
+        email,
+        lease,
+    );
+    if result.is_err() {
+        if let Err(error) = jobs::release_verified_import_backfill_lease(pool, account_id, lease) {
+            return Err(error.context("release failed verified-import repair lease"));
+        }
+    }
+    result
+}
+
+fn run_verified_import_discovery_backfill_with_lease(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    email: &str,
+    lease: &jobs::VerifiedImportBackfillLease,
+) -> anyhow::Result<VerifiedImportBackfillRun> {
+    let batch = jobs::verified_import_backfill_batch(
+        pool,
+        account_id,
+        lease,
+        MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS,
+    )?;
+    let scanned_count = batch.scanned_count;
+    let completed = batch.scanned_count == 0;
+    let profile = jobs::get_profile(pool, account_id, email)?;
+    let preferences = jobs::get_preferences(pool, account_id)?;
+    let repaired_count = try_backfill_verified_import_discovery_sources(
+        pool,
+        account_id,
+        &batch.postings,
+        &profile,
+        &preferences,
+    )?;
+    let checkpoint_advanced = jobs::advance_verified_import_backfill_checkpoint(
+        pool,
+        account_id,
+        lease,
+        &batch.next_after_job_id,
+        completed,
+    )?;
+    if !checkpoint_advanced {
+        anyhow::bail!("verified-import backfill lease was lost before checkpoint advance")
+    }
+    Ok(VerifiedImportBackfillRun {
+        scanned_count,
+        repaired_count,
+        checkpoint_advanced,
+        completed,
+    })
+}
+
+fn try_backfill_verified_import_discovery_sources(
     pool: &crate::db::DbPool,
     account_id: &str,
     postings: &[JobPosting],
     profile: &CareerProfile,
     preferences: &JobPreferences,
-) -> usize {
-    let tracks = match jobs::list_tracks(pool, account_id) {
-        Ok(tracks) => tracks,
-        Err(error) => {
-            tracing::warn!(
-                account_fingerprint = %discovery_log_fingerprint(account_id),
-                error_category = discovery_enrollment_error_category(&error),
-                "Jobs workspace skipped discovery source backfill because Career Tracks could not be read"
-            );
-            return 0;
-        }
-    };
+) -> anyhow::Result<usize> {
+    let tracks = jobs::list_tracks(pool, account_id)?;
     let valid_track_ids = tracks
         .into_iter()
         .map(|track| track.id)
         .collect::<BTreeSet<_>>();
-    let existing_sources = match jobs::list_discovery_sources(pool, account_id) {
-        Ok(sources) => sources,
-        Err(error) => {
-            tracing::warn!(
-                account_fingerprint = %discovery_log_fingerprint(account_id),
-                error_category = discovery_enrollment_error_category(&error),
-                "Jobs workspace skipped discovery source backfill because sources could not be read"
-            );
-            return 0;
-        }
-    };
+    let existing_sources = jobs::list_discovery_sources(pool, account_id)?;
     let mut known_bindings = existing_sources
         .iter()
         .map(|source| {
@@ -1390,10 +1581,11 @@ fn backfill_verified_import_discovery_sources(
         ))
     });
     let mut enrolled = 0;
+    let mut repaired = 0;
 
     for posting in candidates
         .into_iter()
-        .take(MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS)
+        .take(MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS)
     {
         let source = match jobs::discovery_source_input_from_verified_import(
             &posting.source,
@@ -1432,16 +1624,7 @@ fn backfill_verified_import_discovery_sources(
         ) {
             Ok(Some(job_id)) if binding_exists && job_id == posting.id => continue,
             Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    account_fingerprint = %discovery_log_fingerprint(account_id),
-                    provider = discovery_provider_label(&posting.source),
-                    source_fingerprint = %discovery_log_fingerprint(&format!("{}\0{}", posting.source, posting.canonical_url)),
-                    error_category = discovery_enrollment_error_category(&error),
-                    "Jobs workspace could not inspect a verified-import membership"
-                );
-                continue;
-            }
+            Err(error) => return Err(error.context("inspect verified-import membership")),
         }
         if !binding_exists
             && (existing_sources.len() + enrolled >= jobs::DISCOVERY_MAX_SOURCES_PER_ACCOUNT
@@ -1462,6 +1645,7 @@ fn backfill_verified_import_discovery_sources(
             preferences,
         ) {
             Ok(_) => {
+                repaired += 1;
                 if !binding_exists {
                     known_bindings.insert(binding);
                     *source_counts_by_track
@@ -1470,17 +1654,23 @@ fn backfill_verified_import_discovery_sources(
                     enrolled += 1;
                 }
             }
-            Err(error) => tracing::warn!(
-                account_fingerprint = %discovery_log_fingerprint(account_id),
-                provider = discovery_provider_label(&posting.source),
-                source_fingerprint = %discovery_log_fingerprint(&format!("{}\0{}", posting.source, posting.canonical_url)),
-                error_category = discovery_enrollment_error_category(&error),
-                "Jobs workspace could not backfill a verified-import discovery source"
-            ),
+            Err(error) => return Err(error.context("save verified-import discovery repair")),
         }
     }
 
-    enrolled
+    Ok(repaired)
+}
+
+#[cfg(test)]
+fn backfill_verified_import_discovery_sources(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    postings: &[JobPosting],
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+) -> usize {
+    try_backfill_verified_import_discovery_sources(pool, account_id, postings, profile, preferences)
+        .expect("verified-import test repair")
 }
 
 fn discovery_log_fingerprint(value: &str) -> String {
@@ -10387,6 +10577,135 @@ mod tests {
     use crate::db::jobs::CareerTrackPolicy;
 
     #[test]
+    fn matches_page_cursor_failures_are_one_generic_bad_request() {
+        let expected = "Jobs match cursor is invalid or expired; refresh the workspace";
+        for cursor_failure in [
+            "Jobs match cursor is invalid or expired; refresh the workspace",
+            "Jobs match cursor key rotation could not decrypt opaque data",
+        ] {
+            let error = matches_page_error(anyhow::anyhow!(cursor_failure));
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert_eq!(error.1, expected);
+        }
+
+        let page_size = matches_page_error(anyhow::anyhow!(
+            "Jobs match page size must be between 1 and 100"
+        ));
+        assert_eq!(page_size.0, StatusCode::BAD_REQUEST);
+        assert!(page_size.1.contains("between 1 and 100"));
+    }
+
+    #[test]
+    fn continuation_route_loads_only_the_page_representation() {
+        let source = include_str!("jobs.rs");
+        let handler = source
+            .split_once("pub async fn matches_page(")
+            .expect("matches continuation handler")
+            .1
+            .split_once("fn matches_page_error(")
+            .expect("matches continuation handler boundary")
+            .0;
+        assert!(handler.contains("load_current_posting_representation_page"));
+        assert!(!handler.contains("workspace_page("));
+        assert!(!handler.contains("account_runner_availability"));
+        assert!(!handler.contains("list_application_evidence"));
+        assert!(!handler.contains("Query("));
+        assert!(handler.contains("Json(request): Json<MatchesPageRequest>"));
+        let continuation_log = handler
+            .split_once("tracing::info!(")
+            .expect("continuation aggregate log")
+            .1
+            .split_once("\n    );")
+            .expect("continuation aggregate log boundary")
+            .0;
+        assert!(!continuation_log.contains("cursor"));
+        assert!(!continuation_log.contains("job_id"));
+
+        let request = serde_json::from_value::<MatchesPageRequest>(json!({
+            "limit": 50,
+            "cursor": "opaque-cursor"
+        }))
+        .expect("decode deny-unknown continuation request");
+        assert_eq!(request.limit, Some(50));
+        assert_eq!(request.cursor.as_deref(), Some("opaque-cursor"));
+        assert!(serde_json::from_value::<MatchesPageRequest>(json!({
+            "limit": 50,
+            "cursor": "opaque-cursor",
+            "unexpected": true
+        }))
+        .is_err());
+
+        let response = matches_page_response(JobsMatchesPage {
+            matches: Vec::new(),
+            page: jobs::JobsMatchesPageInfo::default(),
+        });
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+
+        let routes = source
+            .split_once("pub fn router(")
+            .expect("Jobs router")
+            .1
+            .split_once("pub async fn")
+            .expect("Jobs router boundary")
+            .0;
+        assert!(routes.contains(".route(\"/api/jobs/matches/page\", post(matches_page))"));
+        assert!(!routes.contains(".route(\"/api/jobs/matches/page\", get(matches_page))"));
+    }
+
+    #[test]
+    fn workspace_response_is_private_and_never_cacheable() {
+        let pool = discovery_enrollment_test_pool();
+        let workspace = jobs::workspace(&pool, "acct-one", "one@example.com")
+            .expect("build empty Jobs workspace");
+        let response = workspace_response(workspace);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+    }
+
+    #[test]
+    fn legacy_matches_requires_pagination_without_reporting_an_internal_failure() {
+        let error = legacy_matches_error(anyhow::anyhow!(
+            "Jobs legacy matches require the paginated matches endpoint above 500 postings"
+        ));
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("paginated matches endpoint"));
+    }
+
+    #[test]
+    fn verified_import_background_logs_only_bounded_aggregate_state() {
+        let source = include_str!("jobs.rs");
+        let schedule = source
+            .split_once("fn schedule_verified_import_discovery_backfill(")
+            .expect("verified-import repair scheduler")
+            .1
+            .split_once("pub async fn workspace(")
+            .expect("verified-import repair scheduler boundary")
+            .0;
+        let claim = schedule
+            .find("claim_verified_import_backfill")
+            .expect("repair claim before scheduling");
+        let spawn = schedule
+            .find("spawn_blocking")
+            .expect("one claimed background repair");
+        assert!(claim < spawn);
+        assert_eq!(schedule.matches("spawn_blocking").count(), 1);
+        assert!(schedule.contains("scanned_count"));
+        assert!(schedule.contains("repaired_count"));
+        assert!(schedule.contains("checkpoint_advanced"));
+        for forbidden in ["error =", "job_id", "source_fingerprint", "cursor"] {
+            assert!(
+                !schedule.contains(forbidden),
+                "repair logs must not expose {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn operational_hold_domain_error_is_redacted_conflict_and_storage_stays_internal() {
         let scope_secret = "acct-secret-never-return";
         let reason_secret = "incident-secret-never-return";
@@ -11715,6 +12034,417 @@ mod tests {
     }
 
     #[test]
+    fn durable_verified_import_repair_reaches_row_51_and_retains_failed_checkpoint() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        let mut saved = Vec::new();
+        for index in 0..51 {
+            let mut posting = imported_discovery_posting(
+                "lever_import",
+                &format!("https://jobs.lever.co/acme/job-{index:04}"),
+                "track-one",
+            );
+            posting.id = format!("legacy-import-{index:04}");
+            posting.external_id = format!("job-{index:04}");
+            posting.title = format!("Platform Engineer {index:04}");
+            posting.canonical_key = jobs::canonical_job_key(&posting);
+            saved.push(store_discovery_posting(&pool, "acct-one", &posting));
+        }
+        let query_plan_connection = pool.get().unwrap();
+        let mut query_plan_statement = query_plan_connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id,posting_json,canonical_key,source,canonical_url,company
+                   FROM jobs_postings
+                  WHERE account_id=?1 AND id > ?2 COLLATE BINARY
+                    AND substr(source,-7)='_import'
+                  ORDER BY id COLLATE BINARY ASC LIMIT ?3",
+            )
+            .unwrap();
+        let query_plan = query_plan_statement
+            .query_map(rusqlite::params!["acct-one", "", 50_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(query_plan
+            .iter()
+            .any(|detail| detail.contains("idx_jobs_postings_verified_import_backfill")));
+        drop(query_plan_statement);
+        drop(query_plan_connection);
+
+        let mut stale_embedded_id = saved[25].clone();
+        stale_embedded_id.id = "stale-embedded-id".to_string();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json=?3
+                  WHERE account_id=?1 AND id=?2",
+                rusqlite::params![
+                    "acct-one",
+                    saved[25].id,
+                    serde_json::to_string(&stale_embedded_id).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let final_payload: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT posting_json FROM jobs_postings
+                  WHERE account_id=?1 AND id=?2",
+                rusqlite::params!["acct-one", saved[50].id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json='not-json'
+                  WHERE account_id=?1 AND id=?2",
+                rusqlite::params!["acct-one", saved[50].id],
+            )
+            .unwrap();
+
+        let first_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim first durable repair batch");
+        let first = run_verified_import_discovery_backfill(
+            &pool,
+            "acct-one",
+            "one@example.com",
+            &first_lease,
+        )
+        .expect("repair first durable batch");
+        assert_eq!(first.scanned_count, 50);
+        assert_eq!(first.repaired_count, 50);
+        assert!(first.checkpoint_advanced);
+        assert!(!first.completed);
+        assert_eq!(
+            jobs::verified_import_discovery_membership_job_id(
+                &pool, "acct-one", "lever", "acme", "job-0025",
+            )
+            .unwrap(),
+            Some(saved[25].id.clone()),
+            "the relational posting ID must override stale embedded identity"
+        );
+
+        let failed_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim failing durable repair batch");
+        let failure = run_verified_import_discovery_backfill(
+            &pool,
+            "acct-one",
+            "one@example.com",
+            &failed_lease,
+        )
+        .expect_err("a parse/decrypt failure must retain the durable checkpoint");
+        assert!(failure
+            .to_string()
+            .contains("verified-import backfill posting"));
+        let retained: (String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT after_job_id,completed
+                   FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id='acct-one' AND migration_version=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("legacy-import-0049".to_string(), 0));
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json=?3
+                  WHERE account_id=?1 AND id=?2",
+                rusqlite::params!["acct-one", saved[50].id, final_payload],
+            )
+            .unwrap();
+        let resumed_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim resumed durable repair batch");
+        let resumed = run_verified_import_discovery_backfill(
+            &pool,
+            "acct-one",
+            "one@example.com",
+            &resumed_lease,
+        )
+        .expect("resume durable repair from persisted checkpoint");
+        assert_eq!(resumed.scanned_count, 1);
+        assert_eq!(resumed.repaired_count, 1);
+        assert!(resumed.checkpoint_advanced);
+        assert_eq!(
+            jobs::verified_import_discovery_membership_job_id(
+                &pool, "acct-one", "lever", "acme", "job-0050",
+            )
+            .unwrap(),
+            Some(saved[50].id.clone())
+        );
+        let completion_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim completion repair batch");
+        let completed = run_verified_import_discovery_backfill(
+            &pool,
+            "acct-one",
+            "one@example.com",
+            &completion_lease,
+        )
+        .expect("complete durable repair after the final row");
+        assert_eq!(completed.scanned_count, 0);
+        assert!(completed.completed);
+        assert!(completed.checkpoint_advanced);
+    }
+
+    #[test]
+    fn verified_import_checkpoint_rejects_non_monotonic_transitions() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        store_discovery_posting(
+            &pool,
+            "acct-one",
+            &imported_discovery_posting(
+                "lever_import",
+                "https://jobs.lever.co/acme/checkpoint-job",
+                "track-one",
+            ),
+        );
+        let lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim initial backfill batch");
+        let batch = jobs::verified_import_backfill_batch(&pool, "acct-one", &lease, 50).unwrap();
+        assert_eq!(batch.scanned_count, 1);
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &lease,
+            &batch.expected_after_job_id,
+            false,
+        )
+        .is_err());
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &lease,
+            &batch.next_after_job_id,
+            true,
+        )
+        .is_err());
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &lease,
+            &batch.next_after_job_id,
+            false,
+        )
+        .unwrap());
+        let final_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim final backfill batch");
+        let final_batch =
+            jobs::verified_import_backfill_batch(&pool, "acct-one", &final_lease, 50).unwrap();
+        assert_eq!(final_batch.scanned_count, 0);
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &final_lease,
+            "",
+            false,
+        )
+        .is_err());
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &final_lease,
+            &final_batch.expected_after_job_id,
+            true,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn verified_import_backfill_first_sqlite_claim_uses_complete_parameter_binding() {
+        let pool = discovery_enrollment_test_pool();
+
+        let lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .expect("first SQLite claim must not fail parameter binding")
+            .expect("first SQLite claim owns the repair lease");
+
+        let batch = jobs::verified_import_backfill_batch(&pool, "acct-one", &lease, 1)
+            .expect("first SQLite owner can read its empty checkpoint");
+        assert!(batch.expected_after_job_id.is_empty());
+        assert_eq!(batch.scanned_count, 0);
+        let stored: (String, bool, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT after_job_id,
+                        lease_owner IS NOT NULL AND length(lease_token_sha256)=64,
+                        lease_expires_at_ms > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+                   FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id='acct-one' AND migration_version=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (String::new(), true, 1));
+    }
+
+    #[test]
+    fn verified_import_repair_claim_is_single_flight_under_burst_and_fences_expiry() {
+        let pool = discovery_enrollment_test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-claim-load', 'claim-load@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        jobs::reset_verified_import_backfill_sqlite_claim_write_tx_count();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let claims = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let workers = (0..24)
+            .map(|_| {
+                let pool = pool.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                let claims = std::sync::Arc::clone(&claims);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if let Some(lease) =
+                        jobs::claim_verified_import_backfill(&pool, "acct-claim-load").unwrap()
+                    {
+                        claims.lock().unwrap().push(lease);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let original = claims.lock().unwrap().pop().expect("one repair owner");
+        assert!(claims.lock().unwrap().is_empty());
+
+        let write_transactions = jobs::verified_import_backfill_sqlite_claim_write_tx_count();
+        for _ in 0..120 {
+            assert!(jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(
+            jobs::verified_import_backfill_sqlite_claim_write_tx_count(),
+            write_transactions,
+            "live-lease admission must remain on the read-only fast path",
+        );
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_expires_at_ms=0
+                  WHERE account_id='acct-claim-load' AND migration_version=1",
+                [],
+            )
+            .unwrap();
+        assert!(!jobs::release_verified_import_backfill_lease(
+            &pool,
+            "acct-claim-load",
+            &original,
+        )
+        .unwrap(), "an expired owner cannot release an unreplaced lease");
+        let replacement = jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
+            .unwrap()
+            .expect("expired repair lease can be replaced");
+        assert!(jobs::verified_import_backfill_batch(
+            &pool,
+            "acct-claim-load",
+            &original,
+            MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS,
+        )
+        .is_err());
+        assert!(!jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-claim-load",
+            &original,
+            "stale-owner-must-not-advance",
+            false,
+        )
+        .unwrap());
+        assert!(!jobs::release_verified_import_backfill_lease(
+            &pool,
+            "acct-claim-load",
+            &original,
+        )
+        .unwrap());
+        assert!(jobs::release_verified_import_backfill_lease(
+            &pool,
+            "acct-claim-load",
+            &replacement,
+        )
+        .unwrap());
+        let invalid_completed_lease = pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET completed=1,lease_owner='invalid-completed-owner',
+                        lease_token_sha256=?1,lease_expires_at_ms=1
+                  WHERE account_id='acct-claim-load' AND migration_version=1",
+                rusqlite::params!["a".repeat(64)],
+            )
+            .expect_err("a completed checkpoint cannot retain lease material");
+        assert!(invalid_completed_lease
+            .to_string()
+            .contains("CHECK constraint failed"));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints SET completed=1
+                  WHERE account_id='acct-claim-load' AND migration_version=1",
+                [],
+            )
+            .unwrap();
+        let completed_write_transactions =
+            jobs::verified_import_backfill_sqlite_claim_write_tx_count();
+        assert!(jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            jobs::verified_import_backfill_sqlite_claim_write_tx_count(),
+            completed_write_transactions,
+            "completed admission must remain on the read-only fast path",
+        );
+    }
+
+    #[test]
+    fn verified_import_backfill_lease_does_not_expose_raw_token_debug_or_clone() {
+        let source = include_str!("../db/jobs/discovery.rs");
+        let declaration_prefix = source
+            .split_once("pub struct VerifiedImportBackfillLease")
+            .expect("verified-import lease declaration")
+            .0;
+        let declaration_attribute = declaration_prefix
+            .rsplit("\n\n")
+            .next()
+            .unwrap_or_default();
+        assert!(!declaration_attribute.contains("Debug"));
+        assert!(!declaration_attribute.contains("Clone"));
+        let release = source
+            .split_once("pub fn release_verified_import_backfill_lease(")
+            .expect("verified-import lease release")
+            .1
+            .split_once("\npub fn get_discovery_source(")
+            .expect("bounded verified-import lease release")
+            .0;
+        assert!(release.contains("AND lease_expires_at_ms>?6"));
+        assert!(release.contains("clock_timestamp()"));
+    }
+
+    #[test]
     fn workspace_backfill_repairs_a_legacy_source_without_membership() {
         let pool = discovery_enrollment_test_pool();
         jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
@@ -11771,7 +12501,7 @@ mod tests {
     fn workspace_backfill_filters_before_its_bounded_scan() {
         let pool = discovery_enrollment_test_pool();
         jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
-        let mut postings = (0..MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS)
+        let mut postings = (0..MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS)
             .map(|index| {
                 imported_discovery_posting(
                     "pasted_link",

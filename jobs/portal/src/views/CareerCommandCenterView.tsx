@@ -45,6 +45,12 @@ export function CareerCommandCenterView({
   const firstName = workspace.profile.full_name.trim().split(/\s+/)[0] || "there";
   const packetLimit = workspace.entitlement.monthly_packet_limit;
   const packetRemaining = Math.max(0, packetLimit - workspace.entitlement.used_packets);
+  const freshMatchesLabel = summary.today_matches_loaded_scope
+    ? "Fresh in loaded matches"
+    : "Fresh in 24 hours";
+  const freshMatchesDetail = summary.today_matches_loaded_scope
+    ? "This count covers loaded matches. Open Matches and load more to check later rows."
+    : "Posted in the last 24 hours on an active Track and not passed. Freshness does not establish eligibility.";
 
   return (
     <div className="view-shell career-command-center">
@@ -57,7 +63,8 @@ export function CareerCommandCenterView({
           </span>
         </div>
         <Link className="button primary" to={commandCenterHref("/matches", previewSearch)}>
-          <SearchCheck size={16} />Review fresh matches
+          <SearchCheck size={16} />
+          {summary.today_matches_loaded_scope ? "Review loaded matches" : "Review fresh matches"}
         </Link>
       </section>
 
@@ -65,7 +72,7 @@ export function CareerCommandCenterView({
         <CommandMetric
           icon={<Sparkles size={18} />}
           value={summary.today_matches.length}
-          label="Fresh in 24 hours"
+          label={freshMatchesLabel}
           href={commandCenterHref("/matches", previewSearch)}
         />
         <CommandMetric
@@ -144,11 +151,8 @@ export function CareerCommandCenterView({
         <section className="career-command-panel today-panel">
           <CommandSectionHeading
             eyebrow="TODAY"
-            title="Fresh, active matches"
-            detail={(
-              "Posted in the last 24 hours on an active Track and not passed. "
-              + "Freshness does not establish eligibility."
-            )}
+            title={summary.today_matches_loaded_scope ? "Fresh, active loaded matches" : "Fresh, active matches"}
+            detail={freshMatchesDetail}
             icon={<BriefcaseBusiness size={18} />}
             action={(
               <Link to={commandCenterHref("/matches", previewSearch)}>
@@ -185,8 +189,12 @@ export function CareerCommandCenterView({
           ) : (
             <CommandEmpty
               icon={<SearchCheck size={20} />}
-              title="No active match arrived in the last 24 hours"
-              detail="Older active matches remain available in Matches."
+              title={summary.today_matches_loaded_scope
+                ? "No loaded active match arrived in the last 24 hours"
+                : "No active match arrived in the last 24 hours"}
+              detail={summary.today_matches_loaded_scope
+                ? "Open Matches and load more to check later rows."
+                : "Older active matches remain available in Matches."}
             />
           )}
         </section>

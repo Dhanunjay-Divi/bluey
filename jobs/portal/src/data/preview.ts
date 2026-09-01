@@ -189,6 +189,12 @@ export const previewWorkspace: JobsWorkspace = {
       status: "active",
     },
   ],
+  matches_page: {
+    schema_version: 1,
+    page_size: 50,
+    has_more: false,
+    next_cursor: null,
+  },
   matches: [
     {
       id: "job-1",
@@ -287,6 +293,7 @@ export const previewWorkspace: JobsWorkspace = {
       eligibility: betaEligibility([{ code: "salary_needs_review", message: "Review the listed compensation against your preference." }]),
     },
   ],
+  application_jobs: [],
   applications: [
     {
       id: "app-1",
@@ -743,6 +750,7 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
       },
       tracks: [],
       matches: [],
+      application_jobs: [],
       applications: [],
       browser_sessions: [],
       interventions: [],

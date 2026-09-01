@@ -11,6 +11,7 @@ import type {
 import { isJobPassed } from "./candidate-events";
 import { discoverySourceState } from "./discovery-source";
 import { isApprovedTrackPolicyAuthority } from "./track-policy-authority";
+import { workspaceJobLookup, type WorkspaceJob } from "./workspace-jobs";
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1_000;
 
@@ -28,7 +29,7 @@ export interface ReadinessItem {
 export interface CommandCenterIntervention {
   intervention: Intervention;
   application?: JobApplication;
-  job?: JobPosting;
+  job?: WorkspaceJob;
 }
 
 export interface ApplicationOutcomeSummary {
@@ -73,6 +74,8 @@ export interface CommandCenterSummary {
   readiness_ready: number;
   readiness_required: number;
   today_matches: JobPosting[];
+  /** Fresh-match values are computed only from rows installed in this browser. */
+  today_matches_loaded_scope: boolean;
   open_interventions: CommandCenterIntervention[];
   source_health: SourceHealthSummary;
   outcomes: ApplicationOutcomeSummary;
@@ -214,7 +217,7 @@ export function commandCenterSummary(
   const applicationById = new Map(
     workspace.applications.map((application) => [application.id, application]),
   );
-  const jobById = new Map(workspace.matches.map((job) => [job.id, job]));
+  const jobById = workspaceJobLookup(workspace);
   const openInterventions = workspace.interventions
     .filter((intervention) => intervention.status === "open")
     .sort((left, right) => right.created_at_ms - left.created_at_ms)
@@ -305,6 +308,7 @@ export function commandCenterSummary(
     readiness_ready: readiness.filter((item) => item.state === "ready").length,
     readiness_required: readiness.filter((item) => item.state !== "optional").length,
     today_matches: todayMatches,
+    today_matches_loaded_scope: workspace.matches_page.has_more,
     open_interventions: openInterventions,
     source_health: sourceHealth,
     outcomes,
@@ -393,9 +397,10 @@ function nextBestActions(
   }
 
   if (todayMatches.length > 0) {
+    const matchScope = workspace.matches_page.has_more ? "fresh loaded" : "fresh";
     actions.push({
       id: "fresh-matches",
-      title: `Review ${todayMatches.length} fresh ${todayMatches.length === 1 ? "match" : "matches"}`,
+      title: `Review ${todayMatches.length} ${matchScope} ${todayMatches.length === 1 ? "match" : "matches"}`,
       detail: "Open the source details and verification evidence before preparing an application.",
       href: commandCenterHref("/matches", previewSearch),
       tone: "ready",

@@ -378,6 +378,8 @@ const SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY: &str = include_str!(
 );
 const SQLITE_JOBS_PUBLIC_BETA_ACCESS: &str =
     include_str!("../../../infra/sqlite/server-runtime/060_jobs_public_beta_access.sql");
+const SQLITE_JOBS_WORKSPACE_PAGINATION: &str =
+    include_str!("../../../infra/sqlite/server-runtime/061_jobs_workspace_pagination.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1733,6 +1735,8 @@ const MIGRATIONS: &[&str] = &[
     // 0060 - durable, dark-by-default public first-come cohort authority.
     // 0059 remains reserved for the separate business-messaging authority.
     SQLITE_JOBS_PUBLIC_BETA_ACCESS,
+    // 0061 - stable bounded interactive workspace keyset order.
+    SQLITE_JOBS_WORKSPACE_PAGINATION,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2863,6 +2867,9 @@ const POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY: &str = include_str!(
 pub const JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID: &str = "038_jobs_public_beta_access.sql";
 const POSTGRES_JOBS_PUBLIC_BETA_ACCESS: &str =
     include_str!("../../../infra/postgres/server-runtime/038_jobs_public_beta_access.sql");
+pub const JOBS_WORKSPACE_PAGINATION_MIGRATION_ID: &str = "039_jobs_workspace_pagination.sql";
+const POSTGRES_JOBS_WORKSPACE_PAGINATION: &str =
+    include_str!("../../../infra/postgres/server-runtime/039_jobs_workspace_pagination.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2999,6 +3006,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID,
         POSTGRES_JOBS_PUBLIC_BETA_ACCESS,
+    ),
+    (
+        JOBS_WORKSPACE_PAGINATION_MIGRATION_ID,
+        POSTGRES_JOBS_WORKSPACE_PAGINATION,
     ),
 ];
 
@@ -6121,23 +6132,25 @@ mod postgres_migration_tests {
         JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
         JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
         JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
-        MIGRATIONS, POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
-        POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
-        POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
-        POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
-        POSTGRES_JOBS_OPERATIONAL_HOLDS, POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
-        POSTGRES_JOBS_PUBLIC_BETA_ACCESS, POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
+        JOBS_WORKSPACE_PAGINATION_MIGRATION_ID, MIGRATIONS, POSTGRES_ACCOUNT_DELETION_INTENTS,
+        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+        POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY, POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY,
+        POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+        POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY, POSTGRES_JOBS_OPERATIONAL_HOLDS,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY, POSTGRES_JOBS_PUBLIC_BETA_ACCESS,
+        POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
-        POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
-        SQLITE_ACCOUNT_DELETION_INTENTS, SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
-        SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
-        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
-        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_OPERATIONAL_HOLDS,
-        SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY, SQLITE_JOBS_PUBLIC_BETA_ACCESS,
-        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
-        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
-        SQLITE_JOBS_WORKFLOW_COMMANDS,
+        POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_JOBS_WORKSPACE_PAGINATION, POSTGRES_MIGRATIONS,
+        POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
+        SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
+        SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+        SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+        SQLITE_JOBS_OPERATIONAL_HOLDS, SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+        SQLITE_JOBS_PUBLIC_BETA_ACCESS, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
+        SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY, SQLITE_JOBS_WORKFLOW_COMMANDS,
+        SQLITE_JOBS_WORKSPACE_PAGINATION,
     };
 
     #[test]
@@ -6624,10 +6637,7 @@ mod postgres_migration_tests {
             .find(|(version, _)| *version == JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID)
             .expect("public beta authority must exist before Jobs routes are served");
         assert_eq!(*postgres_sql, POSTGRES_JOBS_PUBLIC_BETA_ACCESS);
-        assert_eq!(
-            MIGRATIONS.last().copied(),
-            Some(SQLITE_JOBS_PUBLIC_BETA_ACCESS)
-        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_PUBLIC_BETA_ACCESS));
 
         for table in [
             "jobs_public_beta_cohorts",
@@ -6653,6 +6663,67 @@ mod postgres_migration_tests {
                 SQLITE_JOBS_PUBLIC_BETA_ACCESS.contains(required),
                 "SQLite missing {required}"
             );
+        }
+    }
+
+    #[test]
+    fn jobs_workspace_pagination_index_is_paired_and_runtime_ledgered() {
+        let (_, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_WORKSPACE_PAGINATION_MIGRATION_ID)
+            .expect("workspace pagination index must exist before Jobs routes are served");
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_WORKSPACE_PAGINATION);
+        assert_eq!(
+            MIGRATIONS.last().copied(),
+            Some(SQLITE_JOBS_WORKSPACE_PAGINATION)
+        );
+
+        let postgres_normalized = postgres_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(postgres_normalized
+            .contains("ON jobs_postings(account_id, (-match_score), (-updated_at_ms), id ASC)"));
+        assert!(postgres_normalized.contains(concat!(
+            "idx_jobs_postings_verified_import_backfill ON jobs_postings(",
+            "account_id, (id COLLATE \"C\")) WHERE RIGHT(source, 7) = '_import'"
+        )));
+        assert!(postgres_normalized
+            .contains("CREATE TABLE IF NOT EXISTS jobs_verified_import_backfill_checkpoints"));
+        for required in [
+            "lease_owner",
+            "lease_token_sha256",
+            "lease_expires_at_ms",
+            concat!(
+                "CHECK(completed = 0 OR ( lease_owner IS NULL AND ",
+                "lease_token_sha256 IS NULL AND lease_expires_at_ms IS NULL ))"
+            ),
+        ] {
+            assert!(postgres_normalized.contains(required));
+        }
+        let sqlite_normalized = SQLITE_JOBS_WORKSPACE_PAGINATION
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(sqlite_normalized.contains(
+            "ON jobs_postings(account_id, match_score DESC, updated_at_ms DESC, id ASC)"
+        ));
+        assert!(sqlite_normalized.contains(concat!(
+            "idx_jobs_postings_verified_import_backfill ON jobs_postings(account_id, id) ",
+            "WHERE substr(source, -7) = '_import'"
+        )));
+        assert!(sqlite_normalized
+            .contains("CREATE TABLE IF NOT EXISTS jobs_verified_import_backfill_checkpoints"));
+        for required in [
+            "lease_owner",
+            "lease_token_sha256",
+            "lease_expires_at_ms",
+            concat!(
+                "CHECK(completed = 0 OR ( lease_owner IS NULL AND ",
+                "lease_token_sha256 IS NULL AND lease_expires_at_ms IS NULL ))"
+            ),
+        ] {
+            assert!(sqlite_normalized.contains(required));
         }
     }
 

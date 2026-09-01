@@ -58,6 +58,41 @@ under `docs/release/`.
   Direct and global discovery remain false; every checked-in production/provider-write flag stays
   off. This source change does not dispatch a release workflow, sign or activate a candidate,
   contact a provider, open a cohort, deploy, or create an employer-facing effect.
+- Added bounded Bluey Jobs authenticated-workspace pagination for accounts with large posting
+  histories. The workspace now returns the first 50 current interactive matches with a stable
+  score/time/ID keyset and an encrypted, account-bound, 30-minute continuation cursor; the portal
+  loads subsequent pages without duplicate installation and labels search/filter/count scope as
+  loaded-only until more rows are requested. Command Center freshness likewise states loaded scope
+  while a continuation remains. Application history outside the ranked page carries a lightweight,
+  tenant-bound frozen display context; queueing never treats page absence as nonexistence, while
+  handoff and effect paths reload exact current authority. Workspace and continuation responses are
+  private/no-store; continuation uses a POST body so opaque cursors do not enter access-log URIs.
+  Legacy GET matches remain exhaustive through 500 and explicitly require pagination above that
+  limit. SQLite and PostgreSQL receive paired keyset and partial legacy-import repair indexes plus
+  a durable, monotonic 50-row background checkpoint with a claim-before-spawn owner/token/expiry
+  lease; parse/decrypt/storage failure retains progress. ATS policy/trust-key revocation resolves
+  as bounded global flags, while non-global revocations are limited to keyed exact-page subjects.
+  Canary membership and mutable quarantine/circuit reads are likewise restricted to exact bounded
+  page identities, and signed manifest child counts are enforced in scalar and page resolution.
+  Portal handoff verifies current preparation eligibility before metering or navigation. Load-more
+  installation now requires both the current cursor and the exact installed workspace authority
+  epoch. A first packet commit transactionally recomposes current profile, safe preferences,
+  Career Track/policy, reservations, discovery, signed source destination, ATS, and integrity
+  before any allowance, debit, ledger, or meter effect, while exact replay remains first and
+  side-effect-free. PostgreSQL then locks global authority, the parent Account, the exact
+  application/posting, and the entitlement before reading at most 51 indexed relevant attempt
+  reservations; the locked entitlement is reused for metering, and one post-lock database
+  timestamp governs discovery freshness, daily-period eligibility, packet/allowance updates, and
+  any overage ledger entry. Failed repair workers may release only a database-time-live lease,
+  whose secret-bearing value is neither debug-printable nor cloneable; SQLite's first claim now
+  binds the complete liveness predicate.
+  Account exports and ID-based detail/action authority remain exhaustive and independently
+  revalidated, with export composition chunked at 100 and 102-row positive dialect fixtures.
+  Privacy-safe request logs report only stage timings and bounded counts. The fresh independent
+  full line-by-line source/static review is GREEN with zero P0–P3 findings. Exact-source
+  Rust/Cargo, portal typecheck/Vitest, configured PostgreSQL, hosted CI, deployment, and flag gates
+  remain pending; this change does not deploy, enable a production flag, submit an application, or
+  alter any external-effect authority.
 - Added a durable, public, first-come Bluey Jobs cohort with an atomic hard cap,
   sticky admissions, revisioned administrative suspension and denial,
   privacy-safe aggregate telemetry, and a fail-closed master kill switch. The

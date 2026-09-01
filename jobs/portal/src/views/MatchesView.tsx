@@ -62,12 +62,21 @@ interface Props {
   onSaveCandidateEvent(event: CandidateEventInput): Promise<unknown>;
   onSearchDiscoverySources(query: string, trackId: string, provider: string): Promise<DiscoverySourceCatalogResponse>;
   onConnectDiscoverySource(trackId: string, entry: DiscoverySourceCatalogEntry): Promise<DiscoverySource>;
+  onLoadMore(): Promise<void>;
 }
 
 export const MATCH_PAGE_SIZE = 50;
 
 export function visibleMatches<T>(matches: T[], count: number): T[] {
   return matches.slice(0, Math.max(0, count));
+}
+
+export function loadedMatchScopeNotice(loadedCount: number, hasMore: boolean): string | null {
+  if (!hasMore) return null;
+  return [
+    "Search, sorting, filters, and Career Track counts currently cover",
+    `the ${loadedCount} loaded jobs. Load more to expand this view.`,
+  ].join(" ");
 }
 
 export function MatchesView({
@@ -78,6 +87,7 @@ export function MatchesView({
   onSaveCandidateEvent,
   onSearchDiscoverySources,
   onConnectDiscoverySource,
+  onLoadMore,
 }: Props) {
   const [searchParams, setSearchParams] = useSearchParams();
   const [selected, setSelected] = useState<JobPosting | null>(null);
@@ -93,6 +103,8 @@ export function MatchesView({
   const [sourceOpen, setSourceOpen] = useState(false);
   const [visibleCount, setVisibleCount] = useState(MATCH_PAGE_SIZE);
   const [actionError, setActionError] = useState("");
+  const [pageBusy, setPageBusy] = useState(false);
+  const [pageError, setPageError] = useState("");
 
   const activeTracks = useMemo(
     () => workspace.tracks.filter((track) => track.active),
@@ -216,6 +228,18 @@ export function MatchesView({
       ? `${trackScope}. Managed sources are behind schedule. Bluey is retrying; you can still add an urgent job link.`
       : `${trackScope}. Add a job link now; automatic discovery begins when a source is connected.`
     : trackScope;
+  const emptyFilteredTitle = showPassed
+    ? "No passed jobs in this view"
+    : activeTrack !== "all"
+      ? "No loaded jobs in this Career Track"
+      : workspace.matches_page.has_more
+        ? "No loaded jobs match these filters"
+        : "No jobs match these filters";
+  const emptyFilteredDetail = showPassed
+    ? "Return to active matches or choose another Career Track."
+    : workspace.matches_page.has_more
+      ? "Load more to search the next results, or broaden this view."
+      : "Try a broader search, lower the minimum fit, or view every active Career Track.";
 
   const prepare = async () => {
     if (!selected) return;
@@ -288,6 +312,23 @@ export function MatchesView({
     }
   };
 
+  const loadMore = async () => {
+    setPageBusy(true);
+    setPageError("");
+    try {
+      await onLoadMore();
+      setVisibleCount((current) => current + MATCH_PAGE_SIZE);
+    } catch (cause) {
+      setPageError(
+        cause instanceof Error
+          ? cause.message
+          : "Bluey could not load more matches right now.",
+      );
+    } finally {
+      setPageBusy(false);
+    }
+  };
+
   const selectedCanAutoSubmit = selected
     ? canAutoSubmit(
         selected,
@@ -304,7 +345,7 @@ export function MatchesView({
       </section>
 
       <section className="metric-band">
-        <div><Target /><span><b>{filtered.length}</b><small>relevant jobs</small></span></div>
+        <div><Target /><span><b>{filtered.length}</b><small>relevant loaded</small></span></div>
         <div><Sparkles /><span><b>{averageScore ? `${averageScore}%` : "—"}</b><small>average fit</small></span></div>
         <div><BriefcaseBusiness /><span><b>{workspace.applications.filter((item) => item.state === "submitted").length}</b><small>submitted</small></span></div>
         <div className="metric-action"><span><b>{Math.max(0, workspace.entitlement.monthly_packet_limit - workspace.entitlement.used_packets)}</b><small>applications left this month</small></span><Link to={`../settings${previewSearch}#plans`}>Plan details<ChevronRight size={14} /></Link></div>
@@ -339,6 +380,11 @@ export function MatchesView({
         <button className={`button secondary compact ${activeFilterCount ? "active-filter" : ""}`} onClick={() => setFilterOpen(true)}><Filter size={15} />Filters{activeFilterCount ? <span className="filter-count">{activeFilterCount}</span> : null}</button>
         <button className="icon-button" title={`Use ${density === "comfortable" ? "compact" : "comfortable"} rows`} onClick={() => updateFilters({ density: density === "comfortable" ? "compact" : "comfortable" })}><SlidersHorizontal size={17} /></button>
       </section>
+      {workspace.matches_page.has_more && (
+        <p className="pagination-scope-note" role="status">
+          {loadedMatchScopeNotice(workspace.matches.length, workspace.matches_page.has_more)}
+        </p>
+      )}
 
       <section className={`job-list ${density}`} aria-label="Job matches">
         <div className="job-list-head"><span>ROLE</span><span>FIT</span><span>LOCATION</span><span>STATUS</span><span /></div>
@@ -352,8 +398,38 @@ export function MatchesView({
             <ChevronRight size={18} />
           </button>
         ))}
-        {visibleJobs.length < filtered.length && <div className="job-list-more"><span>Showing {visibleJobs.length} of {filtered.length} relevant jobs</span><button className="button secondary compact" onClick={() => setVisibleCount((current) => current + MATCH_PAGE_SIZE)}>Show {Math.min(MATCH_PAGE_SIZE, filtered.length - visibleJobs.length)} more</button></div>}
-        {filtered.length === 0 && (hasOnlyExcludedMatches ? (
+        {visibleJobs.length < filtered.length ? (
+          <div className="job-list-more">
+            <span>Showing {visibleJobs.length} of {filtered.length} loaded jobs</span>
+            <button
+              className="button secondary compact"
+              onClick={() => setVisibleCount((current) => current + MATCH_PAGE_SIZE)}
+            >
+              Show {Math.min(MATCH_PAGE_SIZE, filtered.length - visibleJobs.length)} more
+            </button>
+          </div>
+        ) : workspace.matches_page.has_more ? (
+          <div className="job-list-more">
+            <span>
+              Showing {visibleJobs.length} relevant loaded jobs · load more to check later rows
+            </span>
+            <button
+              className="button secondary compact"
+              disabled={pageBusy}
+              onClick={() => void loadMore()}
+            >
+              {pageBusy ? "Loading…" : `Load ${workspace.matches_page.page_size} more`}
+            </button>
+          </div>
+        ) : null}
+        {pageError && <p className="inline-error" role="alert">{pageError}</p>}
+        {filtered.length === 0 && (workspace.matches_page.has_more ? (
+          <div className="empty-state match-empty-state">
+            <Search />
+            <h3>No relevant jobs in the loaded rows yet</h3>
+            <p>Later match rows are still available. Load the next bounded page before drawing an account-wide conclusion.</p>
+          </div>
+        ) : hasOnlyExcludedMatches ? (
           <div className="empty-state match-empty-state">
             <Filter />
             <h3>{outsideCurrentTrackCount} job{outsideCurrentTrackCount === 1 ? "" : "s"} outside this Career Track</h3>
@@ -366,8 +442,8 @@ export function MatchesView({
         ) : hasViewFilters || activeTrack !== "all" || showPassed ? (
           <div className="empty-state match-empty-state">
             <Search />
-            <h3>{showPassed ? "No passed jobs in this view" : activeTrack !== "all" ? "No jobs in this Career Track" : "No jobs match these filters"}</h3>
-            <p>{showPassed ? "Return to active matches or choose another Career Track." : "Try a broader search, lower the minimum fit, or view every active Career Track."}</p>
+            <h3>{emptyFilteredTitle}</h3>
+            <p>{emptyFilteredDetail}</p>
             <div className="empty-actions">
               <button
                 className="button primary"
@@ -442,7 +518,20 @@ export function MatchesView({
       />
       <Dialog open={filterOpen} title="Filter matches" description="Narrow this view without changing your Career Track." onClose={() => setFilterOpen(false)}>
         <div className="dialog-form"><label><span>Minimum match score</span><div className="range-field"><input type="range" min="0" max="100" step="5" value={minimumScore} onChange={(event) => updateFilters({ minimumScore: Number(event.target.value) })} /><b>{minimumScore || "Any"}{minimumScore ? "%" : ""}</b></div></label><label><span>Workplace</span><select value={workplace} onChange={(event) => updateFilters({ workplace: event.target.value as MatchFilterState["workplace"] })}><option value="all">Any workplace</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label><label className="setting-line simple"><div><b>Only jobs not prepared</b><span>Hide applications you already prepared.</span></div><button type="button" className={`toggle ${onlyUnprepared ? "on" : ""}`} role="switch" aria-checked={onlyUnprepared} onClick={() => updateFilters({ onlyUnprepared: !onlyUnprepared })}><span /></button></label><label className="setting-line simple"><div><b>Show jobs outside my rules</b><span>{outsideCurrentTrackCount ? `Review ${outsideCurrentTrackCount} job${outsideCurrentTrackCount === 1 ? "" : "s"} excluded by location, job type, experience, authorization, or other Career Track rules.` : "No jobs are currently excluded by your Career Track rules."}</span></div><button type="button" className={`toggle ${showOutsideTrack ? "on" : ""}`} role="switch" aria-checked={showOutsideTrack} onClick={() => updateFilters({ showOutsideTrack: !showOutsideTrack })}><span /></button></label></div>
-        <div className="dialog-actions"><button className="button secondary" onClick={() => updateFilters({ ...clearMatchViewFilters(filters), showOutsideTrack: false })}>Reset</button><button className="button primary" onClick={() => setFilterOpen(false)}>Show {filtered.length} match{filtered.length === 1 ? "" : "es"}</button></div>
+        <div className="dialog-actions">
+          <button
+            className="button secondary"
+            onClick={() => updateFilters({
+              ...clearMatchViewFilters(filters),
+              showOutsideTrack: false,
+            })}
+          >
+            Reset
+          </button>
+          <button className="button primary" onClick={() => setFilterOpen(false)}>
+            Show {filtered.length} loaded match{filtered.length === 1 ? "" : "es"}
+          </button>
+        </div>
       </Dialog>
     </div>
   );

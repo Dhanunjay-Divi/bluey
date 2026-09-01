@@ -223,6 +223,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .track-strip button.active b { background: var(--accent); color: #061219; }
 .track-strip .add-track { width: 36px; padding: 0; justify-content: center; }
 .toolbar, .application-toolbar { min-height: 42px; display: flex; align-items: center; gap: 8px; }
+.pagination-scope-note { margin: -2px 0 10px; color: var(--muted); font-size: 12px; font-weight: 650; }
 .search-field { height: 40px; min-width: 240px; max-width: 460px; flex: 1; padding: 0 12px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--muted); }
 .search-field.small { max-width: 320px; }
 .search-field input { width: 100%; border: 0; outline: 0; background: transparent; color: var(--text); font-size: 12px; }

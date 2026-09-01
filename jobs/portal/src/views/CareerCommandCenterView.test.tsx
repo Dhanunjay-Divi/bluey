@@ -45,6 +45,24 @@ describe("career command center", () => {
     expect(html).not.toMatch(/onClick|<button/i);
   });
 
+  it("does not present first-page freshness as an account-wide result", () => {
+    const html = renderCommandCenter({
+      ...previewWorkspace,
+      matches: [],
+      matches_page: {
+        schema_version: 1,
+        page_size: 50,
+        has_more: true,
+        next_cursor: "next-page",
+      },
+    });
+
+    expect(html).toContain("Fresh in loaded matches");
+    expect(html).toContain("No loaded active match arrived in the last 24 hours");
+    expect(html).toContain("Open Matches and load more to check later rows.");
+    expect(html).not.toContain("Fresh in 24 hours");
+  });
+
   it("shows connection truth without claiming LinkedIn access", () => {
     const html = renderCommandCenter();
 

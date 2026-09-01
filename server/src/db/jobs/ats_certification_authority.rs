@@ -9026,6 +9026,9 @@ struct StoredAtsBindingRow {
     layout_contract_version: i64,
     layout_contract_sha256: String,
     layout_set_sha256: String,
+    layout_observation_count: i64,
+    evidence_count: i64,
+    runtime_target_count: i64,
     manifest_not_before_ms: i64,
     manifest_expires_at_ms: i64,
     last_verified_at_ms: i64,
@@ -9148,6 +9151,8 @@ fn sqlite_ats_inactive_target_status(
                FROM jobs_ats_certification_heads head
                JOIN jobs_ats_certification_activations activation
                  ON activation.activation_sha256 = head.current_activation_sha256
+                AND activation.scope_sha256 = head.scope_sha256
+                AND activation.channel = head.channel
                JOIN jobs_ats_certification_manifests manifest
                  ON manifest.manifest_sha256 = activation.manifest_sha256
               WHERE head.channel = ?1 AND manifest.provider = ?2
@@ -9384,6 +9389,8 @@ fn postgres_ats_inactive_target_status(
                FROM jobs_ats_certification_heads head
                JOIN jobs_ats_certification_activations activation
                  ON activation.activation_sha256 = head.current_activation_sha256
+                AND activation.scope_sha256 = head.scope_sha256
+                AND activation.channel = head.channel
                JOIN jobs_ats_certification_manifests manifest
                  ON manifest.manifest_sha256 = activation.manifest_sha256
               WHERE head.channel = $1 AND manifest.provider = $2
@@ -10247,10 +10254,14 @@ pub fn resolve_ats_certification_target_status_sqlite_tx(
                     head.current_channel_sequence, head.updated_by,
                     activation.trust_policy_sha256, manifest.layout_set_sha256,
                     manifest.allowed_provider_hosts_json,
-                    manifest.final_submit_control_id, manifest.tested_at_ms
+                    manifest.final_submit_control_id, manifest.tested_at_ms,
+                    manifest.layout_observation_count, manifest.evidence_count,
+                    manifest.runtime_target_count
                FROM jobs_ats_certification_heads head
                JOIN jobs_ats_certification_activations activation
                  ON activation.activation_sha256 = head.current_activation_sha256
+                AND activation.scope_sha256 = head.scope_sha256
+                AND activation.channel = head.channel
                JOIN jobs_ats_certification_manifests manifest
                  ON manifest.manifest_sha256 = activation.manifest_sha256
                 AND manifest.trust_policy_sha256 = activation.trust_policy_sha256
@@ -10334,10 +10345,14 @@ pub fn resolve_ats_certification_target_status_postgres_tx(
                     head.current_channel_sequence, head.updated_by,
                     activation.trust_policy_sha256, manifest.layout_set_sha256,
                     manifest.allowed_provider_hosts_json,
-                    manifest.final_submit_control_id, manifest.tested_at_ms
+                    manifest.final_submit_control_id, manifest.tested_at_ms,
+                    manifest.layout_observation_count, manifest.evidence_count,
+                    manifest.runtime_target_count
                FROM jobs_ats_certification_heads head
                JOIN jobs_ats_certification_activations activation
                  ON activation.activation_sha256 = head.current_activation_sha256
+                AND activation.scope_sha256 = head.scope_sha256
+                AND activation.channel = head.channel
                JOIN jobs_ats_certification_manifests manifest
                  ON manifest.manifest_sha256 = activation.manifest_sha256
                 AND manifest.trust_policy_sha256 = activation.trust_policy_sha256
@@ -10509,10 +10524,14 @@ fn resolve_sqlite_ats_certification_tx(
                     head.current_channel_sequence, head.updated_by,
                     activation.trust_policy_sha256, manifest.layout_set_sha256,
                     manifest.allowed_provider_hosts_json,
-                    manifest.final_submit_control_id, manifest.tested_at_ms
+                    manifest.final_submit_control_id, manifest.tested_at_ms,
+                    manifest.layout_observation_count, manifest.evidence_count,
+                    manifest.runtime_target_count
                FROM jobs_ats_certification_heads head
                JOIN jobs_ats_certification_activations activation
                  ON activation.activation_sha256 = head.current_activation_sha256
+                AND activation.scope_sha256 = head.scope_sha256
+                AND activation.channel = head.channel
                JOIN jobs_ats_certification_manifests manifest
                  ON manifest.manifest_sha256 = activation.manifest_sha256
                 AND manifest.trust_policy_sha256 = activation.trust_policy_sha256
@@ -10580,6 +10599,9 @@ fn sqlite_ats_binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAts
         layout_contract_version: row.get(24)?,
         layout_contract_sha256: row.get(25)?,
         layout_set_sha256: row.get(34)?,
+        layout_observation_count: row.get(38)?,
+        evidence_count: row.get(39)?,
+        runtime_target_count: row.get(40)?,
         last_verified_at_ms: row.get(37)?,
         manifest_not_before_ms: row.get(26)?,
         manifest_expires_at_ms: row.get(27)?,
@@ -10613,6 +10635,12 @@ fn resolve_sqlite_ats_binding_row(
     let layout_observation_sha256s =
         sqlite_ats_manifest_layouts(tx, &row.activation.manifest_sha256)?;
     let runtimes = sqlite_ats_runtime_targets(tx, &row.activation.manifest_sha256)?;
+    validate_ats_binding_child_counts(
+        &row,
+        evidence_sha256s.len(),
+        layout_observation_sha256s.len(),
+        runtimes.len(),
+    )?;
     let runtimes = sqlite_available_ats_runtimes(
         tx,
         runtimes,
@@ -10663,10 +10691,14 @@ fn resolve_postgres_ats_certification_tx(
                     head.current_channel_sequence, head.updated_by,
                     activation.trust_policy_sha256, manifest.layout_set_sha256,
                     manifest.allowed_provider_hosts_json,
-                    manifest.final_submit_control_id, manifest.tested_at_ms
+                    manifest.final_submit_control_id, manifest.tested_at_ms,
+                    manifest.layout_observation_count, manifest.evidence_count,
+                    manifest.runtime_target_count
                FROM jobs_ats_certification_heads head
                JOIN jobs_ats_certification_activations activation
                  ON activation.activation_sha256 = head.current_activation_sha256
+                AND activation.scope_sha256 = head.scope_sha256
+                AND activation.channel = head.channel
                JOIN jobs_ats_certification_manifests manifest
                  ON manifest.manifest_sha256 = activation.manifest_sha256
                 AND manifest.trust_policy_sha256 = activation.trust_policy_sha256
@@ -10709,6 +10741,12 @@ fn resolve_postgres_ats_certification_tx(
     let layout_observation_sha256s =
         postgres_ats_manifest_layouts(tx, &row.activation.manifest_sha256)?;
     let runtimes = postgres_ats_runtime_targets(tx, &row.activation.manifest_sha256)?;
+    validate_ats_binding_child_counts(
+        &row,
+        evidence_sha256s.len(),
+        layout_observation_sha256s.len(),
+        runtimes.len(),
+    )?;
     let runtimes = postgres_available_ats_runtimes(
         tx,
         runtimes,
@@ -10759,6 +10797,9 @@ fn postgres_ats_binding_row(row: postgres::Row) -> StoredAtsBindingRow {
         layout_contract_version: row.get(24),
         layout_contract_sha256: row.get(25),
         layout_set_sha256: row.get(34),
+        layout_observation_count: row.get(38),
+        evidence_count: row.get(39),
+        runtime_target_count: row.get(40),
         last_verified_at_ms: row.get(37),
         manifest_not_before_ms: row.get(26),
         manifest_expires_at_ms: row.get(27),
@@ -10770,6 +10811,24 @@ fn postgres_ats_binding_row(row: postgres::Row) -> StoredAtsBindingRow {
             updated_by: row.get(32),
         },
     }
+}
+
+fn validate_ats_binding_child_counts(
+    row: &StoredAtsBindingRow,
+    evidence_count: usize,
+    layout_observation_count: usize,
+    runtime_target_count: usize,
+) -> Result<(), AtsCertificationAuthorityError> {
+    if row.evidence_count != evidence_count as i64
+        || row.layout_observation_count != layout_observation_count as i64
+        || row.runtime_target_count != runtime_target_count as i64
+        || !(1..=64).contains(&row.evidence_count)
+        || !(1..=64).contains(&row.layout_observation_count)
+        || !(1..=32).contains(&row.runtime_target_count)
+    {
+        return Err(AtsCertificationAuthorityError::InvalidAuthority);
+    }
+    Ok(())
 }
 
 fn ats_binding_row_channel_allowed(
@@ -15763,6 +15822,104 @@ pub(super) mod ats_certification_authority_tests {
         runtime_target: AtsCertificationRuntimeTarget,
         now_ms: i64,
     ) -> Result<InstalledAtsAuthorityFixture, AtsCertificationAuthorityError> {
+        install_signed_ats_authority_fixture_for_channel(
+            pool,
+            target_evidence,
+            surface,
+            runtime_target,
+            now_ms,
+            None,
+        )
+    }
+
+    pub(super) fn install_signed_ats_canary_authority_fixture(
+        pool: &DbPool,
+        target_evidence: AtsCertificationFreshTargetEvidence,
+        surface: AtsObservedSurface,
+        runtime_target: AtsCertificationRuntimeTarget,
+        now_ms: i64,
+        account_id: &str,
+    ) -> Result<InstalledAtsAuthorityFixture, AtsCertificationAuthorityError> {
+        install_signed_ats_authority_fixture_for_channel(
+            pool,
+            target_evidence,
+            surface,
+            runtime_target,
+            now_ms,
+            Some(account_id),
+        )
+    }
+
+    pub(super) fn install_signed_ats_canary_activation_for_existing_manifest(
+        pool: &DbPool,
+        installed: &InstalledAtsAuthorityFixture,
+        now_ms: i64,
+        account_id: &str,
+    ) -> Result<String, AtsCertificationAuthorityError> {
+        let authority = test_authority();
+        let (provider, target_key) =
+            validate_ats_certification_fresh_target_evidence(&installed.target_evidence, now_ms)?;
+        let scope_sha256 = ats_certification_scope_sha256(
+            &provider,
+            &target_key,
+            &installed.surface.variant_key,
+            &installed.surface.surface_sha256,
+        )?;
+        let (policy_sha256, _) = load_current_ats_certification_trust_policy(pool, now_ms)?;
+        let suffix = ats_certification_sha256(
+            format!("{}:{account_id}:shared-canary", installed.manifest_sha256).as_bytes(),
+        );
+        let mut activation = test_activation(
+            installed.manifest_sha256.clone(),
+            scope_sha256,
+            &policy_sha256,
+        );
+        configure_test_canary_activation(
+            pool,
+            &mut activation,
+            &suffix,
+            vec![account_id.to_string()],
+            (100, 100, 10, 100),
+        );
+        activation.issued_at_ms = now_ms.saturating_sub(700);
+        activation.not_before_ms = now_ms.saturating_sub(600);
+        activation.expires_at_ms = now_ms
+            .checked_add(850_000)
+            .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+        let activation_envelope = envelope(
+            &activation,
+            "activation",
+            ATS_CERTIFICATION_ACTIVATION_AUDIENCE,
+            activation.issued_at_ms,
+            &authority,
+            &format!("authorize-shared-canary-{suffix}"),
+        );
+        import_ats_certification_activation_at(
+            pool,
+            &activation_envelope,
+            "fixture-promoter",
+            now_ms,
+        )?;
+        let activation_sha256 = envelope_sha256(&activation_envelope);
+        apply_ats_certification_activation_at(
+            pool,
+            &activation_sha256,
+            0,
+            None,
+            "fixture-promoter",
+            now_ms,
+        )?;
+        Ok(activation_sha256)
+    }
+
+    fn install_signed_ats_authority_fixture_for_channel(
+        pool: &DbPool,
+        target_evidence: AtsCertificationFreshTargetEvidence,
+        surface: AtsObservedSurface,
+        runtime_target: AtsCertificationRuntimeTarget,
+        now_ms: i64,
+        canary_account_id: Option<&str>,
+    ) -> Result<InstalledAtsAuthorityFixture, AtsCertificationAuthorityError> {
         let authority = test_authority();
         let (provider, target_key) =
             validate_ats_certification_fresh_target_evidence(&target_evidence, now_ms)?;
@@ -15777,6 +15934,7 @@ pub(super) mod ats_certification_authority_tests {
             "runtimeTarget": runtime_target,
             "surface": surface,
             "targetEvidence": target_evidence,
+            "canaryAccountId": canary_account_id,
         });
         let fixture_id = ats_certification_sha256(
             &ats_certification_canonical_json(&fixture_identity)
@@ -15952,7 +16110,12 @@ pub(super) mod ats_certification_authority_tests {
         manifest.issued_at_ms = now_ms.saturating_sub(900);
         manifest.not_before_ms = now_ms.saturating_sub(800);
         manifest.expires_at_ms = manifest_expires_at_ms;
-        let current_head = installed_fixture_head(pool, &manifest.scope_sha256, "general")?;
+        let channel = if canary_account_id.is_some() {
+            "canary"
+        } else {
+            "general"
+        };
+        let current_head = installed_fixture_head(pool, &manifest.scope_sha256, channel)?;
         if let Some(head) = current_head.as_ref() {
             manifest.manifest_generation = head
                 .manifest_generation
@@ -16000,6 +16163,15 @@ pub(super) mod ats_certification_authority_tests {
             .checked_add(800_000)
             .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?
             .min(manifest_expires_at_ms);
+        if let Some(account_id) = canary_account_id {
+            configure_test_canary_activation(
+                pool,
+                &mut activation,
+                &fixture_id,
+                vec![account_id.to_string()],
+                (100, 100, 10, 100),
+            );
+        }
         let activation_envelope = envelope(
             &activation,
             "activation",

@@ -2692,7 +2692,7 @@ mod queue_admission_tests {
     }
 
     #[test]
-    fn postgres_packet_commit_locks_account_before_entitlement() {
+    fn postgres_packet_commit_rechecks_authority_before_account_metering() {
         let postgres = include_str!("applications.rs")
             .rsplit_once("pub fn commit_packet(")
             .expect("packet commit implementation")
@@ -2703,24 +2703,308 @@ mod queue_admission_tests {
         assert_source_order(
             postgres,
             &[
-                "SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE",
-                "jobs-allowance:{account_id}",
+                "JOIN jobs_packet_metering meter",
+                "lock_operational_hold_shared_postgres_tx(&mut tx)",
+                "lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)",
+                "lock_postgres_ats_certification(&mut tx)",
+                "lock_discovery_account_shared_postgres(&mut tx, account_id)",
+                "lock_job_integrity_publication_fence_shared_postgres_tx(&mut tx)",
+                "require_packet_commit_account_write_fence_postgres_tx",
+                "lock_account_policy_inputs_postgres(&mut tx, account_id, false)",
+                "packet_commit_current_job_postgres_after_prelock",
                 "SELECT used_packets, monthly_packet_limit, period_start_ms",
                 "FROM jobs_entitlements",
+                "FROM jobs_packet_metering",
+                "packet_commit_current_authority_postgres_after_entitlement",
+                "packet_commit_relevant_attempt_reservations_postgres",
+                "validate_packet_commit_current_job",
+                "SELECT balance_cents FROM accounts WHERE id = $1",
+                "jobs-allowance:{account_id}",
                 "FROM jobs_generation_allowance_reservations",
                 "if amount_cents > 0",
                 "UPDATE accounts SET balance_cents",
                 "consume_credit_batches_pg_tx",
-                "insert_balance_ledger_pg_tx",
+                "insert_balance_ledger_pg_tx_at_ms",
             ],
-            "PostgreSQL packet Account -> entitlement -> allowance -> credit order",
+            "PostgreSQL replay -> global -> Account -> A -> E -> R -> allowance order",
         );
         assert_eq!(
             postgres
-                .matches("SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE")
+                .matches("require_packet_commit_account_write_fence_postgres_tx")
                 .count(),
             1
         );
+        assert!(postgres.contains("JOIN jobs_packet_metering meter"));
+        assert!(postgres.contains("FROM jobs_packet_metering"));
+        let sqlite = include_str!("applications.rs")
+            .rsplit_once("pub fn commit_packet(")
+            .expect("packet commit implementation")
+            .1
+            .split_once("DbPool::Postgres(_) => {")
+            .expect("bounded SQLite packet commit branch")
+            .0;
+        assert_source_order(
+            sqlite,
+            &[
+                "JOIN jobs_packet_metering meter",
+                "require_active_account_write_fence_sqlite_tx",
+                "packet_commit_current_job_sqlite",
+                "SELECT used_packets, monthly_packet_limit, period_start_ms",
+                "packet_commit_current_authority_sqlite_after_entitlement",
+                "packet_commit_relevant_attempt_reservations_sqlite",
+                "validate_packet_commit_current_job",
+                "UPDATE accounts SET balance_cents",
+                "INSERT INTO jobs_packet_metering",
+            ],
+            "SQLite replay -> Account -> A -> E -> R -> debit -> meter order",
+        );
+    }
+
+    #[test]
+    fn packet_commit_recomposes_current_effect_eligibility_in_both_dialects() {
+        let source = include_str!("applications.rs");
+        let validator = source
+            .rsplit_once("fn validate_packet_commit_current_job(")
+            .expect("packet commit current-effect validator")
+            .1
+            .split_once("\nfn packet_commit_current_inputs_sqlite(")
+            .expect("bounded packet commit current-effect validator")
+            .0;
+        for required in [
+            "candidate_truth_fingerprint(profile)",
+            "career_track_policy_authority",
+            "posting_with_original_source_projection",
+            "composed.discovery_evidence.clone()",
+            "enforce_application_finalization_eligibility_at_ms",
+        ] {
+            assert!(validator.contains(required), "missing current-effect gate {required}");
+        }
+
+        let sqlite = source
+            .rsplit_once("fn packet_commit_current_inputs_sqlite(")
+            .expect("SQLite packet commit current inputs")
+            .1
+            .split_once("\nfn packet_commit_current_inputs_postgres(")
+            .expect("bounded SQLite packet commit current inputs")
+            .0;
+        let postgres = source
+            .rsplit_once("fn packet_commit_current_inputs_postgres(")
+            .expect("PostgreSQL packet commit current inputs")
+            .1
+            .split_once("\nfn packet_commit_attempt_reservation_from_sqlite_row(")
+            .expect("bounded PostgreSQL packet commit current inputs")
+            .0;
+        for (label, loader) in [("SQLite", sqlite), ("PostgreSQL", postgres)] {
+            for required in [
+                "jobs_profiles",
+                "jobs_preferences",
+                "jobs_tracks",
+                "jobs_discovery_memberships",
+                "jobs_discovery_sources",
+                "downgrade_track_policy_ledger",
+            ] {
+                assert!(loader.contains(required), "{label} omits {required}");
+            }
+        }
+        assert!(postgres.contains("FOR SHARE OF m,s"));
+
+        let sqlite_reservations = source
+            .rsplit_once("fn packet_commit_relevant_attempt_reservations_sqlite(")
+            .expect("SQLite bounded packet reservations")
+            .1
+            .split_once("\nfn packet_commit_relevant_attempt_reservations_postgres(")
+            .expect("bounded SQLite packet reservations")
+            .0;
+        let postgres_reservations = source
+            .rsplit_once("fn packet_commit_relevant_attempt_reservations_postgres(")
+            .expect("PostgreSQL bounded packet reservations")
+            .1
+            .split_once("\nfn packet_commit_current_job_sqlite(")
+            .expect("bounded PostgreSQL packet reservations")
+            .0;
+        for (label, loader) in [
+            ("SQLite", sqlite_reservations),
+            ("PostgreSQL", postgres_reservations),
+        ] {
+            for required in [
+                "company_key",
+                "period_key",
+                "application_id<>",
+                "status IN ('reserved','running','side_effect_unknown','submitted')",
+                "LIMIT 1",
+                "daily_limit",
+            ] {
+                assert!(loader.contains(required), "{label} omits bounded {required}");
+            }
+            assert!(!loader.contains("WHERE account_id=?1 ORDER BY reserved_at_ms DESC"));
+            assert!(!loader.contains("WHERE account_id=$1 ORDER BY reserved_at_ms DESC"));
+        }
+        assert!(postgres_reservations.contains("LIMIT $4 FOR SHARE"));
+    }
+
+    #[test]
+    fn postgres_packet_commit_locks_parent_account_before_application_and_posting_children() {
+        let source = include_str!("applications.rs");
+        let commit = source
+            .rsplit_once("pub fn commit_packet(")
+            .expect("packet commit implementation")
+            .1
+            .split_once("DbPool::Postgres(_) => {")
+            .expect("PostgreSQL packet commit branch")
+            .1;
+        assert_source_order(
+            commit,
+            &[
+                "JOIN jobs_packet_metering meter",
+                "lock_job_integrity_publication_fence_shared_postgres_tx",
+                "require_packet_commit_account_write_fence_postgres_tx",
+                "lock_account_policy_inputs_postgres(&mut tx, account_id, false)",
+                "packet_commit_current_job_postgres_after_prelock",
+                "SELECT used_packets, monthly_packet_limit, period_start_ms",
+                "WHERE account_id = $1 FOR UPDATE",
+                "packet_commit_current_authority_postgres_after_entitlement",
+                "packet_commit_relevant_attempt_reservations_postgres",
+            ],
+            "PostgreSQL replay -> globals -> Account -> A -> E -> R lock order",
+        );
+        let application_lock = commit
+            .find("packet_commit_current_job_postgres_after_prelock")
+            .expect("packet A lock call");
+        let entitlement_lock = commit[application_lock..]
+            .find("SELECT used_packets, monthly_packet_limit, period_start_ms")
+            .map(|offset| application_lock + offset)
+            .expect("packet E lock query");
+        assert!(
+            !commit[application_lock..entitlement_lock]
+                .contains("jobs_attempt_reservations"),
+            "packet commit must not read R between A and E",
+        );
+        let child_loader = source
+            .rsplit_once("fn packet_commit_current_job_postgres_after_prelock(")
+            .expect("PostgreSQL packet current-job loader")
+            .1
+            .split_once("\npub fn commit_packet(")
+            .expect("bounded PostgreSQL packet current-job loader")
+            .0;
+        assert!(child_loader.contains("FOR SHARE OF application,posting"));
+        assert!(!child_loader.contains("FROM accounts"));
+        assert!(!child_loader.contains("jobs_attempt_reservations"));
+
+        let account_fence = source
+            .rsplit_once("fn require_packet_commit_account_write_fence_postgres_tx(")
+            .expect("packet-specific Account fence")
+            .1
+            .split_once("\nfn validate_packet_commit_current_job(")
+            .expect("bounded packet-specific Account fence")
+            .0;
+        assert!(account_fence.contains("FOR NO KEY UPDATE"));
+        assert!(account_fence.contains("account_deletion_intents"));
+        assert!(!account_fence.contains("accounts WHERE id=$1 FOR UPDATE"));
+
+        let post_entitlement_authority = source
+            .rsplit_once("fn packet_commit_current_authority_postgres_after_entitlement(")
+            .expect("post-E current packet authority")
+            .1
+            .split_once("\npub fn commit_packet(")
+            .expect("bounded post-E current packet authority")
+            .0;
+        assert_source_order(
+            post_entitlement_authority,
+            &[
+                "original_source_db_now_postgres",
+                "resolve_composed_job_integrity_projection_postgres_tx_after_prelock_at_ms",
+                "packet_commit_current_inputs_postgres",
+            ],
+            "PostgreSQL packet authority timestamp and composition after E",
+        );
+    }
+
+    #[test]
+    fn packet_commit_uses_post_entitlement_database_time_for_freshness_and_effects() {
+        let eligibility = include_str!("eligibility.rs");
+        let discovery_at_ms = eligibility
+            .rsplit_once("fn apply_discovery_authorities_at_ms(")
+            .expect("database-time discovery authority evaluator")
+            .1
+            .split_once("\nstruct ApplicationFinalizationAuthorities")
+            .expect("bounded database-time discovery authority evaluator")
+            .0;
+        assert!(discovery_at_ms.contains(
+            "authority_at_ms.saturating_sub(LIVE_VERIFICATION_MAX_AGE_MS)"
+        ));
+        assert!(!discovery_at_ms.contains("now_ms()"));
+
+        let validator = eligibility
+            .rsplit_once("fn enforce_application_finalization_eligibility_at_ms(")
+            .expect("database-time packet eligibility validator")
+            .1
+            .split_once("\npub fn posting_age_days(")
+            .expect("bounded database-time packet eligibility validator")
+            .0;
+        assert!(validator.contains("build_job_eligibility_at_ms("));
+        assert!(validator.contains("apply_discovery_authorities_at_ms("));
+        assert!(validator.matches("eligibility_at_ms").count() >= 3);
+
+        let source = include_str!("applications.rs");
+        let commit = source
+            .rsplit_once("pub fn commit_packet(")
+            .expect("packet commit implementation")
+            .1;
+        assert!(!commit.contains("let now = now_ms();"));
+        let (sqlite, postgres) = commit
+            .split_once("DbPool::Postgres(_) => {")
+            .expect("packet commit database branches");
+        for (label, branch, authority, ledger) in [
+            (
+                "SQLite",
+                sqlite,
+                "packet_commit_current_authority_sqlite_after_entitlement",
+                "insert_balance_ledger_sqlite_tx_at_ms",
+            ),
+            (
+                "PostgreSQL",
+                postgres,
+                "packet_commit_current_authority_postgres_after_entitlement",
+                "insert_balance_ledger_pg_tx_at_ms",
+            ),
+        ] {
+            assert_source_order(
+                branch,
+                &[
+                    authority,
+                    "let effect_at_ms = current.eligibility_at_ms",
+                    ledger,
+                    "INSERT INTO jobs_packet_metering",
+                    "UPDATE jobs_entitlements",
+                    "UPDATE jobs_generation_allowance_reservations",
+                ],
+                &format!("{label} post-entitlement database-time effect order"),
+            );
+            assert!(
+                branch.matches("effect_at_ms").count() >= 4,
+                "{label} packet effects do not consistently use database time",
+            );
+        }
+
+        let balance = include_str!("../balance.rs");
+        let sqlite_ledger = balance
+            .split_once("pub(crate) fn insert_balance_ledger_sqlite_tx_at_ms(")
+            .expect("SQLite database-time ledger helper")
+            .1
+            .split_once("\npub(crate) fn insert_balance_ledger_pg_tx(")
+            .expect("bounded SQLite database-time ledger helper")
+            .0;
+        assert!(sqlite_ledger.contains("metadata_json, created_at"));
+        assert!(sqlite_ledger.contains("datetime(?14 / 1000, 'unixepoch')"));
+        let postgres_ledger = balance
+            .split_once("pub(crate) fn insert_balance_ledger_pg_tx_at_ms(")
+            .expect("PostgreSQL database-time ledger helper")
+            .1
+            .split_once("\n/// Atomically deduct")
+            .expect("bounded PostgreSQL database-time ledger helper")
+            .0;
+        assert!(postgres_ledger.contains("metadata_json, created_at"));
+        assert!(postgres_ledger.contains("to_timestamp(($14::bigint)::double precision"));
     }
 
     #[test]
@@ -4758,34 +5042,567 @@ pub fn set_entitlement_plan(
     })
 }
 
+struct PacketCommitCurrentJobAuthority {
+    application: JobApplication,
+    posting: JobPosting,
+    composed: ComposedJobIntegrityProjection,
+    profile: CareerProfile,
+    preferences: JobPreferences,
+    track: Option<CareerTrack>,
+    discovery_authorities: Vec<JobDiscoveryAuthority>,
+    eligibility_at_ms: i64,
+}
+
+fn require_packet_commit_account_write_fence_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> Result<()> {
+    // Packet commits mutate only non-key Account fields. NO KEY UPDATE remains
+    // exclusive with deletion/FOR UPDATE and other balance writers, while a
+    // reservation transaction that already owns E may still satisfy its R
+    // foreign-key check before releasing E. This preserves Account -> A -> E -> R
+    // without creating an E <-> Account deadlock.
+    if tx
+        .query_opt(
+            "SELECT id FROM accounts WHERE id=$1 FOR NO KEY UPDATE",
+            &[&account_id],
+        )?
+        .is_none()
+    {
+        return Err(
+            crate::db::object_uploads::UploadControlError::SessionNotOwned.into(),
+        );
+    }
+    if tx
+        .query_opt(
+            "SELECT account_id FROM account_deletion_intents
+              WHERE account_id=$1 FOR SHARE",
+            &[&account_id],
+        )?
+        .is_some()
+    {
+        return Err(
+            crate::db::object_uploads::UploadControlError::AccountDeleting.into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_packet_commit_current_job(
+    current: &PacketCommitCurrentJobAuthority,
+    reservations: &[AttemptReservation],
+) -> Result<()> {
+    let application = &current.application;
+    let posting = &current.posting;
+    let composed = &current.composed;
+    let profile = &current.profile;
+    let preferences = &current.preferences;
+    let track = current.track.as_ref();
+    if !matches!(posting.availability_status.as_str(), "active" | "unknown") {
+        anyhow::bail!("current job is unavailable for packet commit")
+    }
+    let frozen_source = application_original_source_expected_head(application)?;
+    let frozen_integrity = application_job_integrity_receipt(application)?;
+    let current_authority_required = composed.original_source.feature_active
+        || frozen_source.is_some()
+        || frozen_integrity.is_some();
+    if current_authority_required
+        && (!original_source_projection_matches_application(
+            application,
+            &composed.original_source,
+        )? || !job_integrity_resolution_matches_application(
+            application,
+            &composed.job_integrity,
+        )?)
+    {
+        anyhow::bail!("current job integrity does not permit packet commit")
+    }
+
+    let track = track.ok_or_else(|| {
+        anyhow::anyhow!("current Career Track does not permit packet commit")
+    })?;
+    let current_track_policy_authority = serde_json::to_value(&track.policy.authority)
+        .context("encode current Career Track policy authority for packet commit")?;
+    let frozen_track_id = application
+        .receipt
+        .get("career_track_id")
+        .and_then(Value::as_str);
+    let frozen_track_policy_authority = application
+        .receipt
+        .get("career_track_policy_authority");
+    let frozen_truth_fingerprint = application
+        .receipt
+        .get("candidate_truth_fingerprint")
+        .and_then(Value::as_str);
+    let current_truth_fingerprint = candidate_truth_fingerprint(profile);
+    if frozen_track_id != Some(track.id.as_str())
+        || frozen_track_policy_authority != Some(&current_track_policy_authority)
+        || frozen_truth_fingerprint != Some(current_truth_fingerprint.as_str())
+    {
+        anyhow::bail!("current candidate or Career Track authority does not permit packet commit")
+    }
+    let mut authority_posting =
+        posting_with_original_source_projection(posting, &composed.original_source);
+    if let Some(source) = composed.original_source.integrity_binding.as_ref() {
+        authority_posting.canonical_url = source.canonical_application_url.clone();
+        authority_posting.source = source.provider_family.clone();
+    }
+    authority_posting.discovery_evidence = composed.discovery_evidence.clone();
+    enforce_application_finalization_eligibility_at_ms(
+        application,
+        &authority_posting,
+        profile,
+        preferences,
+        Some(track),
+        reservations,
+        ApplicationFinalizationAuthorities {
+            discovery: &current.discovery_authorities,
+            ats: composed.ats_certification.as_ref(),
+        },
+        current.eligibility_at_ms,
+    )
+    .context("recompose current packet-commit effect eligibility")?;
+    Ok(())
+}
+
+fn packet_commit_current_inputs_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+) -> Result<(
+    CareerProfile,
+    JobPreferences,
+    Option<CareerTrack>,
+    Vec<JobDiscoveryAuthority>,
+)> {
+    let profile = tx
+        .query_row(
+            "SELECT profile_json FROM jobs_profiles WHERE account_id=?1",
+            params![account_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| parse_json(raw, "Jobs profile during packet commit"))
+        .transpose()?
+        .unwrap_or_else(|| default_profile(""));
+    let preferences = tx
+        .query_row(
+            "SELECT preferences_json FROM jobs_preferences WHERE account_id=?1",
+            params![account_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| parse_json::<JobPreferences>(raw, "Jobs preferences during packet commit"))
+        .transpose()?
+        .map(enforce_job_preference_safety)
+        .unwrap_or_default();
+    let track = tx
+        .query_row(
+            "SELECT id,track_json,active FROM jobs_tracks
+              WHERE account_id=?1 AND id=?2",
+            params![account_id, posting.track_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(authoritative_id, raw, authoritative_active)| {
+            let mut track = parse_json::<CareerTrack>(raw, "Career Track during packet commit")?;
+            track.id = authoritative_id;
+            let activation_drift = track.active != authoritative_active;
+            track.active = authoritative_active;
+            if track.policy.authority.review_state == "approved"
+                && (activation_drift
+                    || validate_track_policy_ledger_sqlite(tx, account_id, &track).is_err())
+            {
+                downgrade_track_policy_ledger(&mut track);
+            }
+            Ok(track)
+        })
+        .transpose()?;
+    let discovery_authorities = {
+        let mut statement = tx.prepare(
+            "SELECT s.id,s.provider,s.status,s.health,m.availability_status,
+                    m.last_seen_at_ms,m.last_seen_run_id
+               FROM jobs_discovery_memberships m
+               JOIN jobs_discovery_sources s ON s.id=m.source_id
+              WHERE m.account_id=?1 AND m.job_id=?2
+              ORDER BY m.last_seen_at_ms DESC",
+        )?;
+        statement
+            .query_map(params![account_id, posting.id], |row| {
+                Ok(JobDiscoveryAuthority {
+                    source_id: row.get(0)?,
+                    provider: row.get(1)?,
+                    source_status: row.get(2)?,
+                    source_health: row.get(3)?,
+                    membership_status: row.get(4)?,
+                    last_seen_at_ms: row.get(5)?,
+                    last_seen_run_id: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    Ok((profile, preferences, track, discovery_authorities))
+}
+
+fn packet_commit_current_inputs_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+) -> Result<(
+    CareerProfile,
+    JobPreferences,
+    Option<CareerTrack>,
+    Vec<JobDiscoveryAuthority>,
+)> {
+    let profile = tx
+        .query_opt(
+            "SELECT profile_json FROM jobs_profiles WHERE account_id=$1",
+            &[&account_id],
+        )?
+        .map(|row| parse_json(row.get(0), "Jobs profile during packet commit"))
+        .transpose()?
+        .unwrap_or_else(|| default_profile(""));
+    let preferences = tx
+        .query_opt(
+            "SELECT preferences_json FROM jobs_preferences WHERE account_id=$1",
+            &[&account_id],
+        )?
+        .map(|row| {
+            parse_json::<JobPreferences>(row.get(0), "Jobs preferences during packet commit")
+        })
+        .transpose()?
+        .map(enforce_job_preference_safety)
+        .unwrap_or_default();
+    let track = tx
+        .query_opt(
+            "SELECT id,track_json,active FROM jobs_tracks
+              WHERE account_id=$1 AND id=$2",
+            &[&account_id, &posting.track_id],
+        )?
+        .map(|row| {
+            let authoritative_id: String = row.get(0);
+            let authoritative_active = row.get::<_, i32>(2) != 0;
+            let mut track = parse_json::<CareerTrack>(
+                row.get(1),
+                "Career Track during packet commit",
+            )?;
+            track.id = authoritative_id;
+            let activation_drift = track.active != authoritative_active;
+            track.active = authoritative_active;
+            if track.policy.authority.review_state == "approved"
+                && (activation_drift
+                    || validate_track_policy_ledger_postgres(tx, account_id, &track).is_err())
+            {
+                downgrade_track_policy_ledger(&mut track);
+            }
+            Ok(track)
+        })
+        .transpose()?;
+    let discovery_authorities = tx
+        .query(
+            "SELECT s.id,s.provider,s.status,s.health,m.availability_status,
+                    m.last_seen_at_ms,m.last_seen_run_id
+               FROM jobs_discovery_memberships m
+               JOIN jobs_discovery_sources s ON s.id=m.source_id
+              WHERE m.account_id=$1 AND m.job_id=$2
+              ORDER BY m.last_seen_at_ms DESC
+              FOR SHARE OF m,s",
+            &[&account_id, &posting.id],
+        )?
+        .into_iter()
+        .map(|row| JobDiscoveryAuthority {
+            source_id: row.get(0),
+            provider: row.get(1),
+            source_status: row.get(2),
+            source_health: row.get(3),
+            membership_status: row.get(4),
+            last_seen_at_ms: row.get(5),
+            last_seen_run_id: row.get(6),
+        })
+        .collect();
+    Ok((profile, preferences, track, discovery_authorities))
+}
+
+fn packet_commit_attempt_reservation_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AttemptReservation> {
+    Ok(AttemptReservation {
+        id: row.get(0)?,
+        application_id: row.get(1)?,
+        company_key: row.get(2)?,
+        period_key: row.get(3)?,
+        runner: row.get(4)?,
+        status: row.get(5)?,
+        reserved_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+    })
+}
+
+fn packet_commit_attempt_reservation_from_postgres_row(
+    row: postgres::Row,
+) -> AttemptReservation {
+    AttemptReservation {
+        id: row.get(0),
+        application_id: row.get(1),
+        company_key: row.get(2),
+        period_key: row.get(3),
+        runner: row.get(4),
+        status: row.get(5),
+        reserved_at_ms: row.get(6),
+        updated_at_ms: row.get(7),
+    }
+}
+
+fn packet_commit_relevant_attempt_reservations_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    posting: &JobPosting,
+    preferences: &JobPreferences,
+    eligibility_at_ms: i64,
+) -> Result<Vec<AttemptReservation>> {
+    let company_key = normalize_company_key(&posting.company);
+    let period_key = attempt_period_key(
+        eligibility_at_ms,
+        preferences.time_zone_offset_minutes,
+    );
+    let daily_limit = preferences.daily_limit.clamp(1, 50);
+    let mut relevant = BTreeMap::new();
+    if let Some(reservation) = tx
+        .query_row(
+            "SELECT id,application_id,company_key,period_key,runner,status,
+                    reserved_at_ms,updated_at_ms
+               FROM jobs_attempt_reservations
+              WHERE account_id=?1 AND company_key=?2 AND application_id<>?3
+                AND status IN ('reserved','running','side_effect_unknown','submitted')
+              LIMIT 1",
+            params![account_id, company_key, application_id],
+            packet_commit_attempt_reservation_from_sqlite_row,
+        )
+        .optional()?
+    {
+        relevant.insert(reservation.id.clone(), reservation);
+    }
+    let mut statement = tx.prepare(
+        "SELECT id,application_id,company_key,period_key,runner,status,
+                reserved_at_ms,updated_at_ms
+           FROM jobs_attempt_reservations
+          WHERE account_id=?1 AND period_key=?2 AND application_id<>?3
+            AND status IN ('reserved','running','side_effect_unknown','submitted')
+          ORDER BY reserved_at_ms DESC,id LIMIT ?4",
+    )?;
+    for reservation in statement.query_map(
+        params![account_id, period_key, application_id, daily_limit],
+        packet_commit_attempt_reservation_from_sqlite_row,
+    )? {
+        let reservation = reservation?;
+        relevant.insert(reservation.id.clone(), reservation);
+    }
+    Ok(relevant.into_values().collect())
+}
+
+fn packet_commit_relevant_attempt_reservations_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    posting: &JobPosting,
+    preferences: &JobPreferences,
+    eligibility_at_ms: i64,
+) -> Result<Vec<AttemptReservation>> {
+    let company_key = normalize_company_key(&posting.company);
+    let period_key = attempt_period_key(
+        eligibility_at_ms,
+        preferences.time_zone_offset_minutes,
+    );
+    let daily_limit = preferences.daily_limit.clamp(1, 50);
+    let mut relevant = BTreeMap::new();
+    if let Some(row) = tx.query_opt(
+        "SELECT id,application_id,company_key,period_key,runner,status,
+                reserved_at_ms,updated_at_ms
+           FROM jobs_attempt_reservations
+          WHERE account_id=$1 AND company_key=$2 AND application_id<>$3
+            AND status IN ('reserved','running','side_effect_unknown','submitted')
+          LIMIT 1 FOR SHARE",
+        &[&account_id, &company_key, &application_id],
+    )? {
+        let reservation = packet_commit_attempt_reservation_from_postgres_row(row);
+        relevant.insert(reservation.id.clone(), reservation);
+    }
+    for row in tx.query(
+        "SELECT id,application_id,company_key,period_key,runner,status,
+                reserved_at_ms,updated_at_ms
+           FROM jobs_attempt_reservations
+          WHERE account_id=$1 AND period_key=$2 AND application_id<>$3
+            AND status IN ('reserved','running','side_effect_unknown','submitted')
+          ORDER BY reserved_at_ms DESC,id LIMIT $4 FOR SHARE",
+        &[&account_id, &period_key, &application_id, &daily_limit],
+    )? {
+        let reservation = packet_commit_attempt_reservation_from_postgres_row(row);
+        relevant.insert(reservation.id.clone(), reservation);
+    }
+    Ok(relevant.into_values().collect())
+}
+
+fn packet_commit_current_job_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<(JobApplication, JobPosting)> {
+    let (id, job_id, resume_version_id, application_raw, posting_id, posting_raw) = tx
+        .query_row(
+            "SELECT application.id,application.job_id,application.resume_version_id,
+                    application.application_json,posting.id,posting.posting_json
+               FROM jobs_applications application
+               JOIN jobs_postings posting
+                 ON posting.account_id=application.account_id
+                AND posting.id=application.job_id
+              WHERE application.account_id=?1 AND application.id=?2",
+            params![account_id, application_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("application or current job not found"))?;
+    let mut application =
+        parse_application_json(application_raw, &id, &job_id, "packet commit application")?;
+    application.resume_version_id = resume_version_id;
+    if application.resume_version_id.is_none() {
+        anyhow::bail!("application packet has no job-specific resume")
+    }
+    let mut posting: JobPosting = parse_json(posting_raw, "packet commit posting")?;
+    posting.id = posting_id;
+    Ok((application, posting))
+}
+
+fn packet_commit_current_authority_sqlite_after_entitlement(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application: JobApplication,
+    posting: JobPosting,
+) -> Result<PacketCommitCurrentJobAuthority> {
+    let db_time_ms = original_source_db_now_sqlite(tx)?;
+    let composed = resolve_composed_job_integrity_projection_sqlite_tx_at_ms(
+        tx,
+        account_id,
+        &posting,
+        db_time_ms,
+    )?;
+    let (profile, preferences, track, discovery_authorities) =
+        packet_commit_current_inputs_sqlite(tx, account_id, &posting)?;
+    Ok(PacketCommitCurrentJobAuthority {
+        application,
+        posting,
+        composed,
+        profile,
+        preferences,
+        track,
+        discovery_authorities,
+        eligibility_at_ms: db_time_ms,
+    })
+}
+
+fn packet_commit_current_job_postgres_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<(JobApplication, JobPosting)> {
+    let row = tx
+        .query_opt(
+            "SELECT application.id,application.job_id,application.resume_version_id,
+                    application.application_json,posting.id,posting.posting_json
+               FROM jobs_applications application
+               JOIN jobs_postings posting
+                 ON posting.account_id=application.account_id
+                AND posting.id=application.job_id
+              WHERE application.account_id=$1 AND application.id=$2
+              FOR SHARE OF application,posting",
+            &[&account_id, &application_id],
+        )?
+        .ok_or_else(|| anyhow::anyhow!("application or current job not found"))?;
+    let id: String = row.get(0);
+    let job_id: String = row.get(1);
+    let mut application = parse_application_json(
+        row.get(3),
+        &id,
+        &job_id,
+        "packet commit application",
+    )?;
+    application.resume_version_id = row.get(2);
+    if application.resume_version_id.is_none() {
+        anyhow::bail!("application packet has no job-specific resume")
+    }
+    let posting_id: String = row.get(4);
+    let mut posting: JobPosting = parse_json(row.get(5), "packet commit posting")?;
+    posting.id = posting_id;
+    Ok((application, posting))
+}
+
+fn packet_commit_current_authority_postgres_after_entitlement(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: JobApplication,
+    posting: JobPosting,
+) -> Result<PacketCommitCurrentJobAuthority> {
+    let db_time_ms = original_source_db_now_postgres(tx)?;
+    let composed = resolve_composed_job_integrity_projection_postgres_tx_after_prelock_at_ms(
+        tx,
+        account_id,
+        &posting,
+        db_time_ms,
+    )?;
+    let (profile, preferences, track, discovery_authorities) =
+        packet_commit_current_inputs_postgres(tx, account_id, &posting)?;
+    Ok(PacketCommitCurrentJobAuthority {
+        application,
+        posting,
+        composed,
+        profile,
+        preferences,
+        track,
+        discovery_authorities,
+        eligibility_at_ms: db_time_ms,
+    })
+}
+
 pub fn commit_packet(
     pool: &DbPool,
     account_id: &str,
     application_id: &str,
 ) -> Result<PacketCommitResult> {
-    let application = get_application(pool, account_id, application_id)?
-        .ok_or_else(|| anyhow::anyhow!("application not found"))?;
-    if application.resume_version_id.is_none() {
-        anyhow::bail!("application packet has no job-specific resume");
-    }
-    let _ = get_entitlement(pool, account_id)?;
-    let now = now_ms();
-    let metering_key = format!("jobs-packet:{}", application.job_id);
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             if let Some((included, amount_cents)) = tx
                 .query_row(
-                    "SELECT included, amount_cents FROM jobs_packet_metering
-                      WHERE account_id = ?1 AND job_id = ?2",
-                    params![account_id, application.job_id],
+                    "SELECT meter.included,meter.amount_cents
+                       FROM jobs_applications application
+                       JOIN jobs_packet_metering meter
+                         ON meter.account_id=application.account_id
+                        AND meter.job_id=application.job_id
+                      WHERE application.account_id=?1 AND application.id=?2",
+                    params![account_id, application_id],
                     |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)?)),
                 )
                 .optional()?
             {
                 let (used, limit): (i64, i64) = tx.query_row(
-                    "SELECT used_packets, monthly_packet_limit FROM jobs_entitlements WHERE account_id = ?1",
+                    "SELECT used_packets, monthly_packet_limit
+                       FROM jobs_entitlements WHERE account_id = ?1",
                     params![account_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
@@ -4797,12 +5614,35 @@ pub fn commit_packet(
                     monthly_packet_limit: limit,
                 });
             }
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let (application, posting) =
+                packet_commit_current_job_sqlite(&tx, account_id, application_id)?;
             let (used, limit, period_start): (i64, i64, i64) = tx.query_row(
                 "SELECT used_packets, monthly_packet_limit, period_start_ms
                    FROM jobs_entitlements WHERE account_id = ?1",
                 params![account_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
+            let current = packet_commit_current_authority_sqlite_after_entitlement(
+                &tx,
+                account_id,
+                application,
+                posting,
+            )?;
+            let reservations = packet_commit_relevant_attempt_reservations_sqlite(
+                &tx,
+                account_id,
+                &current.application.id,
+                &current.posting,
+                &current.preferences,
+                current.eligibility_at_ms,
+            )?;
+            validate_packet_commit_current_job(&current, &reservations)?;
+            let effect_at_ms = current.eligibility_at_ms;
+            let application = current.application;
+            let metering_key = format!("jobs-packet:{}", application.job_id);
             let allowance: Option<(String, i64)> = tx
                 .query_row(
                     "SELECT status, period_start_ms
@@ -4838,7 +5678,7 @@ pub fn commit_packet(
                     anyhow::bail!("insufficient Bluey balance for Jobs overage");
                 }
                 crate::db::balance::consume_credit_batches_tx(&tx, account_id, amount_cents)?;
-                crate::db::balance::insert_balance_ledger_sqlite_tx(
+                crate::db::balance::insert_balance_ledger_sqlite_tx_at_ms(
                     &tx,
                     crate::db::balance::BalanceLedgerEntry {
                         account_id,
@@ -4854,6 +5694,7 @@ pub fn commit_packet(
                         request_id: Some(&metering_key),
                         metadata_json: Some("{\"product\":\"bluey_jobs\"}"),
                     },
+                    effect_at_ms,
                 )?;
             }
             tx.execute(
@@ -4868,13 +5709,13 @@ pub fn commit_packet(
                     metering_key,
                     i64::from(included),
                     amount_cents,
-                    now,
+                    effect_at_ms,
                 ],
             )?;
             tx.execute(
                 "UPDATE jobs_entitlements SET used_packets = used_packets + 1,
                     updated_at_ms = ?2 WHERE account_id = ?1 AND ?3 = 0",
-                params![account_id, now, i64::from(pre_reserved)],
+                params![account_id, effect_at_ms, i64::from(pre_reserved)],
             )?;
             if allowance
                 .as_ref()
@@ -4884,7 +5725,12 @@ pub fn commit_packet(
                     "UPDATE jobs_generation_allowance_reservations
                         SET status = 'committed', application_id = ?3, updated_at_ms = ?4
                       WHERE account_id = ?1 AND job_id = ?2 AND status = 'reserved'",
-                    params![account_id, application.job_id, application.id, now],
+                    params![
+                        account_id,
+                        application.job_id,
+                        application.id,
+                        effect_at_ms,
+                    ],
                 )?;
             }
             tx.commit()?;
@@ -4899,21 +5745,41 @@ pub fn commit_packet(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            // Account balance writers acquire Account before any Jobs metering child. Hold
-            // Account even for an included packet so allowance serialization and the entitlement
-            // decision cannot create a child -> Account inversion with another account writer.
-            let balance_before: i64 = tx
-                .query_one(
-                    "SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE",
+            if let Some(row) = tx.query_opt(
+                "SELECT meter.included,meter.amount_cents
+                   FROM jobs_applications application
+                   JOIN jobs_packet_metering meter
+                     ON meter.account_id=application.account_id
+                    AND meter.job_id=application.job_id
+                  WHERE application.account_id=$1 AND application.id=$2",
+                &[&account_id, &application_id],
+            )? {
+                let entitlement = tx.query_one(
+                    "SELECT used_packets, monthly_packet_limit
+                       FROM jobs_entitlements WHERE account_id = $1",
                     &[&account_id],
-                )?
-                .get(0);
-            tx.query_one(
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                &[&format!(
-                    "jobs-allowance:{account_id}:{}",
-                    application.job_id
-                )],
+                )?;
+                return Ok(PacketCommitResult {
+                    newly_metered: false,
+                    included: row.get::<_, i32>(0) != 0,
+                    amount_cents: row.get(1),
+                    used_packets: entitlement.get(0),
+                    monthly_packet_limit: entitlement.get(1),
+                });
+            }
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                .map_err(anyhow::Error::new)?;
+            lock_postgres_ats_certification(&mut tx).map_err(anyhow::Error::new)?;
+            lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+            lock_job_integrity_publication_fence_shared_postgres_tx(&mut tx)
+                .map_err(anyhow::Error::new)?;
+            require_packet_commit_account_write_fence_postgres_tx(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, false)?;
+            let (application, posting) = packet_commit_current_job_postgres_after_prelock(
+                &mut tx,
+                account_id,
+                application_id,
             )?;
             let entitlement = tx.query_one(
                 "SELECT used_packets, monthly_packet_limit, period_start_ms
@@ -4937,6 +5803,39 @@ pub fn commit_packet(
             let used: i64 = entitlement.get(0);
             let limit: i64 = entitlement.get(1);
             let period_start: i64 = entitlement.get(2);
+            let current = packet_commit_current_authority_postgres_after_entitlement(
+                &mut tx,
+                account_id,
+                application,
+                posting,
+            )?;
+            let reservations = packet_commit_relevant_attempt_reservations_postgres(
+                &mut tx,
+                account_id,
+                &current.application.id,
+                &current.posting,
+                &current.preferences,
+                current.eligibility_at_ms,
+            )?;
+            validate_packet_commit_current_job(&current, &reservations)?;
+            let effect_at_ms = current.eligibility_at_ms;
+            let application = current.application;
+            let metering_key = format!("jobs-packet:{}", application.job_id);
+            // The active-account fence already owns Account before the application/posting and
+            // metering children. Re-read the locked balance for the possible overage ledger.
+            let balance_before: i64 = tx
+                .query_one(
+                    "SELECT balance_cents FROM accounts WHERE id = $1",
+                    &[&account_id],
+                )?
+                .get(0);
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&format!(
+                    "jobs-allowance:{account_id}:{}",
+                    application.job_id
+                )],
+            )?;
             let allowance = tx.query_opt(
                 "SELECT status, period_start_ms
                    FROM jobs_generation_allowance_reservations
@@ -4969,7 +5868,7 @@ pub fn commit_packet(
                     account_id,
                     amount_cents,
                 )?;
-                crate::db::balance::insert_balance_ledger_pg_tx(
+                crate::db::balance::insert_balance_ledger_pg_tx_at_ms(
                     &mut tx,
                     crate::db::balance::BalanceLedgerEntry {
                         account_id,
@@ -4985,6 +5884,7 @@ pub fn commit_packet(
                         request_id: Some(&metering_key),
                         metadata_json: Some("{\"product\":\"bluey_jobs\"}"),
                     },
+                    effect_at_ms,
                 )?;
             }
             tx.execute(
@@ -4999,13 +5899,13 @@ pub fn commit_packet(
                     &metering_key,
                     &included_db,
                     &amount_cents,
-                    &now,
+                    &effect_at_ms,
                 ],
             )?;
             tx.execute(
                 "UPDATE jobs_entitlements SET used_packets = used_packets + 1,
                     updated_at_ms = $2 WHERE account_id = $1 AND $3 = 0",
-                &[&account_id, &now, &i32::from(pre_reserved)],
+                &[&account_id, &effect_at_ms, &i32::from(pre_reserved)],
             )?;
             if allowance
                 .as_ref()
@@ -5015,7 +5915,12 @@ pub fn commit_packet(
                     "UPDATE jobs_generation_allowance_reservations
                         SET status = 'committed', application_id = $3, updated_at_ms = $4
                       WHERE account_id = $1 AND job_id = $2 AND status = 'reserved'",
-                    &[&account_id, &application.job_id, &application.id, &now],
+                    &[
+                        &account_id,
+                        &application.job_id,
+                        &application.id,
+                        &effect_at_ms,
+                    ],
                 )?;
             }
             tx.commit()?;

@@ -8,10 +8,11 @@ import type {
   SubmissionMode,
 } from "../types";
 import { portalEligibilityDecision } from "./ats-certification";
+import { workspaceJobById } from "./workspace-jobs";
 
 export function cloudAutomationEligibleApplications(workspace: Pick<
   JobsWorkspace,
-  "applications" | "browser_sessions" | "matches" | "runner_availability"
+  "application_jobs" | "applications" | "browser_sessions" | "matches" | "runner_availability"
 >): JobApplication[] {
   return workspace.applications.filter(
     (application) => isCloudAutomationEligibleApplication(workspace, application),
@@ -36,7 +37,7 @@ export function workspaceNeedsCloudAutomationRefresh(workspace: Pick<
 export function isCloudAutomationEligibleApplication(
   workspace: Pick<
     JobsWorkspace,
-    "browser_sessions" | "matches" | "runner_availability"
+    "application_jobs" | "browser_sessions" | "matches" | "runner_availability"
   >,
   application: JobApplication,
 ): boolean {
@@ -49,12 +50,14 @@ export function isCloudAutomationEligibleApplication(
   )) {
     return false;
   }
-  const job = workspace.matches.find((item) => item.id === application.job_id);
+  const job = workspaceJobById(workspace, application.job_id);
   const storedEligibility = application.receipt.eligibility;
   const eligibility = portalEligibilityDecision(
     storedEligibility && typeof storedEligibility === "object"
       ? storedEligibility
-      : job?.eligibility,
+      : job && "eligibility" in job
+        ? job.eligibility
+        : undefined,
   );
   return eligibility.can_queue_cloud;
 }

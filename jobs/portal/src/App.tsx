@@ -27,6 +27,7 @@ import type {
   JobApplication,
   JobPosting,
   JobPreferences,
+  JobsMatchesPage,
   JobsWorkspace,
   MailboxConnection,
   MailboxMessage,
@@ -54,6 +55,7 @@ import {
   workspaceNeedsCloudAutomationRefresh,
 } from "./lib/application-flow";
 import { validateMailboxOAuthAuthorizationUrl } from "./lib/mailbox-oauth";
+import { workspaceJobById } from "./lib/workspace-jobs";
 
 const MatchesView = lazy(() => import("./views/MatchesView").then((module) => ({ default: module.MatchesView })));
 const ApplicationsView = lazy(() => import("./views/ApplicationsView").then((module) => ({ default: module.ApplicationsView })));
@@ -240,7 +242,7 @@ type JobsWorkspaceStateSetter = (
   update: (current: JobsWorkspace | null) => JobsWorkspace | null,
 ) => void;
 
-interface WorkspaceAuthorityRefreshToken {
+export interface WorkspaceAuthorityRefreshToken {
   authorityEpoch: number;
   refreshGeneration: number;
 }
@@ -269,6 +271,7 @@ interface WorkspaceAuthorityReadbackToken extends WorkspaceAuthorityRefreshToken
 export class WorkspaceAuthorityEpoch {
   private authorityEpoch = 0;
   private refreshGeneration = 0;
+  private installedWorkspaceToken: WorkspaceAuthorityRefreshToken | null = null;
   private readonly activeMutationEpochs = new Set<number>();
   private currentMutationCycle: WorkspaceAuthorityMutationCycle | null = null;
   private readbackCycle: WorkspaceAuthorityMutationCycle | null = null;
@@ -331,6 +334,26 @@ export class WorkspaceAuthorityEpoch {
       && this.activeMutationEpochs.size === 0;
   }
 
+  recordWorkspaceInstall(token: WorkspaceAuthorityRefreshToken): boolean {
+    if (!this.canInstall(token)) return false;
+    this.installedWorkspaceToken = { ...token };
+    return true;
+  }
+
+  beginContinuation(): WorkspaceAuthorityRefreshToken | null {
+    const token = this.installedWorkspaceToken;
+    if (!token || !this.canInstallContinuation(token)) return null;
+    return { ...token };
+  }
+
+  canInstallContinuation(token: WorkspaceAuthorityRefreshToken): boolean {
+    const installed = this.installedWorkspaceToken;
+    return installed !== null
+      && installed.authorityEpoch === token.authorityEpoch
+      && installed.refreshGeneration === token.refreshGeneration
+      && this.canInstall(token);
+  }
+
   private createMutationCycle(): WorkspaceAuthorityMutationCycle {
     let resolve: () => void = () => undefined;
     let reject: (error: unknown) => void = () => undefined;
@@ -368,12 +391,43 @@ export function installWorkspaceAtAuthorityEpoch(
   token: WorkspaceAuthorityRefreshToken,
   nextWorkspace: JobsWorkspace,
 ): boolean {
-  if (!authorityEpoch.canInstall(token)) return false;
+  if (!authorityEpoch.recordWorkspaceInstall(token)) return false;
   setWorkspace(() => ({
     ...nextWorkspace,
     runner_availability: runnerAvailabilityOrLocked(nextWorkspace.runner_availability),
   }));
   return true;
+}
+
+export function appendMatchesAtCursor(
+  current: JobsWorkspace,
+  expectedCursor: string,
+  page: JobsMatchesPage,
+): JobsWorkspace {
+  if (current.matches_page.next_cursor !== expectedCursor) return current;
+  const seen = new Set(current.matches.map((job) => job.id));
+  const appended = page.matches.filter((job) => {
+    if (seen.has(job.id)) return false;
+    seen.add(job.id);
+    return true;
+  });
+  return {
+    ...current,
+    matches: [...current.matches, ...appended],
+    application_jobs: current.application_jobs.filter((job) => !seen.has(job.id)),
+    matches_page: page.page,
+  };
+}
+
+export function appendMatchesAtWorkspaceAuthorityEpoch(
+  current: JobsWorkspace,
+  authorityEpoch: WorkspaceAuthorityEpoch,
+  authorityToken: WorkspaceAuthorityRefreshToken,
+  expectedCursor: string,
+  page: JobsMatchesPage,
+): JobsWorkspace {
+  if (!authorityEpoch.canInstallContinuation(authorityToken)) return current;
+  return appendMatchesAtCursor(current, expectedCursor, page);
 }
 
 export function workspaceAfterAutoSubmitAuthorization(
@@ -414,6 +468,8 @@ export function workspaceAfterTrackDeletion(
       (authorization) => authorization.career_track_id !== trackId,
     ),
     matches: workspace.matches.map((job) =>
+      job.track_id === trackId ? { ...job, track_id: "" } : job),
+    application_jobs: workspace.application_jobs.map((job) =>
       job.track_id === trackId ? { ...job, track_id: "" } : job),
   };
 }
@@ -596,6 +652,42 @@ export default function App() {
       }
     }
   }, [isPreview]);
+
+  const loadMoreMatches = useCallback(async () => {
+    if (isPreview) return;
+    const cursor = workspace?.matches_page.next_cursor;
+    const pageSize = workspace?.matches_page.page_size ?? 50;
+    const authorityToken = workspaceAuthorityEpoch.current.beginContinuation();
+    if (!cursor || !authorityToken) return;
+    let page: JobsMatchesPage;
+    try {
+      page = await jobsApi.matchesPage(cursor, pageSize);
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 400) {
+        await refresh();
+        throw new ApiError(
+          400,
+          "Match results changed or the page link expired. Bluey refreshed the workspace; load more again.",
+        );
+      }
+      throw cause;
+    }
+    setWorkspace((current) => {
+      if (!current) return current;
+      return appendMatchesAtWorkspaceAuthorityEpoch(
+        current,
+        workspaceAuthorityEpoch.current,
+        authorityToken,
+        cursor,
+        page,
+      );
+    });
+  }, [
+    isPreview,
+    refresh,
+    workspace?.matches_page.next_cursor,
+    workspace?.matches_page.page_size,
+  ]);
 
   const runAuthoritySensitiveWorkspaceMutation = useCallback(
     <T,>(
@@ -1031,7 +1123,9 @@ export default function App() {
       if (resumeVersions[id]) return resumeVersions[id];
       if (isPreview) {
         const application = workspace?.applications.find((item) => item.resume_version_id === id);
-        const job = application ? workspace?.matches.find((item) => item.id === application.job_id) : undefined;
+        const job = application
+          ? workspace?.matches.find((item) => item.id === application.job_id)
+          : undefined;
         if (!workspace || !job) return undefined;
         const resume = previewResume(workspace, job, id, "factual", account?.email || "");
         setResumeVersions((current) => ({ ...current, [id]: resume }));
@@ -1043,6 +1137,13 @@ export default function App() {
     },
     [account?.email, resumeVersions, workspace],
   );
+
+  const loadCurrentJobDetail = useCallback(async (jobId: string) => {
+    if (isPreview) {
+      return workspace?.matches.find((job) => job.id === jobId);
+    }
+    return jobsApi.matchDetail(jobId);
+  }, [workspace]);
 
   const createApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
     const saved = await runAuthoritySensitiveWorkspaceMutation(
@@ -1263,8 +1364,7 @@ export default function App() {
 
   const queueCloudRun = useCallback(async (application: JobApplication) => {
     if (!workspace) return;
-    const job = workspace.matches.find((item) => item.id === application.job_id);
-    if (!job) throw new Error("That job is no longer available.");
+    const job = workspaceJobById(workspace, application.job_id);
     if (application.state !== "queued") {
       throw new Error("Approve this application before starting cloud automation.");
     }
@@ -1278,7 +1378,7 @@ export default function App() {
       id: "",
       runner: "cloud",
       status: "queued",
-      current_company: job.company,
+      current_company: job?.company ?? "Application",
       current_step: "Waiting for cloud automation",
       application_id: application.id,
       created_at_ms: 0,
@@ -1298,7 +1398,7 @@ export default function App() {
       applications: current.applications.map((item) => item.id === application.id ? updatedApplication : item),
       browser_sessions: [session, ...current.browser_sessions.filter((item) => item.id !== session.id)],
     } : current);
-    setToast(`${job.company} is queued for cloud automation.`);
+    setToast(`${job?.company ?? "Application"} is queued for cloud automation.`);
   }, [workspace]);
 
   const resolveIntervention = useCallback(async (
@@ -1412,6 +1512,7 @@ export default function App() {
               onSaveCandidateEvent={saveCandidateEvent}
               onSearchDiscoverySources={searchDiscoverySources}
               onConnectDiscoverySource={connectDiscoverySource}
+              onLoadMore={loadMoreMatches}
             />
           }
         />
@@ -1426,6 +1527,7 @@ export default function App() {
               onReconcileSubmission={reconcileSubmissionNotSubmitted}
               onCommit={commitApplication}
               onLoadResume={loadResumeVersion}
+              onLoadJob={loadCurrentJobDetail}
               onResolveIntervention={resolveIntervention}
               onSaveCandidateEvent={saveCandidateEvent}
               preview={isPreview}

@@ -1,6 +1,7 @@
 import type {
   AccountSummary,
   ApproveApplicationResponse,
+  ApplicationJobContext,
   ApplicationEvidence,
   ApplicationIdentity,
   AutoSubmitAuthorization,
@@ -21,6 +22,8 @@ import type {
   UserJobInput,
   JobPreferences,
   JobsIntegration,
+  JobsMatchesPage,
+  JobsMatchesPageInfo,
   JobsWorkspace,
   MailboxConnection,
   MailboxMessage,
@@ -387,11 +390,125 @@ function trackFromWire(track: CareerTrack): CareerTrack {
 }
 
 function workspaceFromWire(workspace: JobsWorkspace): JobsWorkspace {
-  if (!Array.isArray(workspace.tracks)) return workspace;
+  const matchesPage = matchesPageInfoFromWire(
+    (workspace as Partial<JobsWorkspace>).matches_page,
+    Array.isArray(workspace.matches) ? workspace.matches.length : 0,
+  );
+  if (Array.isArray(workspace.matches) && workspace.matches.length > matchesPage.page_size) {
+    throw new ApiError(0, "Bluey Jobs returned an invalid match page.");
+  }
+  const applicationJobs = applicationJobsFromWire(workspace);
+  if (!Array.isArray(workspace.tracks)) {
+    return {
+      ...workspace,
+      application_jobs: applicationJobs,
+      matches_page: matchesPage,
+    };
+  }
   return {
     ...workspace,
+    application_jobs: applicationJobs,
     tracks: workspace.tracks.map(trackFromWire),
+    matches_page: matchesPage,
   };
+}
+
+function applicationJobsFromWire(workspace: JobsWorkspace): ApplicationJobContext[] {
+  const raw = (workspace as Partial<JobsWorkspace>).application_jobs;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || !Array.isArray(workspace.matches)) {
+    throw new ApiError(0, "Bluey Jobs returned invalid application job context.");
+  }
+  const matchIds = new Set(workspace.matches.map((job) => job.id));
+  const seen = new Set<string>();
+  for (const value of raw) {
+    const keys = value && typeof value === "object"
+      ? Object.keys(value).sort().join(",")
+      : "";
+    if (
+      !value
+      || typeof value !== "object"
+      || keys !== "company,id,location,title,track_id"
+      || typeof value.id !== "string"
+      || value.id.length === 0
+      || typeof value.company !== "string"
+      || value.company.trim().length === 0
+      || [...value.company].length > 200
+      || typeof value.title !== "string"
+      || value.title.trim().length === 0
+      || [...value.title].length > 500
+      || typeof value.location !== "string"
+      || [...value.location].length > 500
+      || typeof value.track_id !== "string"
+      || [...value.track_id].length > 500
+      || seen.has(value.id)
+      || matchIds.has(value.id)
+    ) {
+      throw new ApiError(0, "Bluey Jobs returned invalid application job context.");
+    }
+    seen.add(value.id);
+  }
+  if (Array.isArray(workspace.applications)) {
+    for (const application of workspace.applications) {
+      if (!matchIds.has(application.job_id) && !seen.has(application.job_id)) {
+        throw new ApiError(0, "Bluey Jobs returned incomplete application job context.");
+      }
+    }
+  }
+  return raw;
+}
+
+function matchesPageInfoFromWire(
+  value: unknown,
+  fallbackSize: number,
+): JobsMatchesPageInfo {
+  if (value === undefined) {
+    return {
+      schema_version: 1,
+      page_size: Math.max(1, fallbackSize),
+      has_more: false,
+      next_cursor: null,
+    };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(0, "Bluey Jobs returned an invalid match page.");
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (
+    keys.join(",") !== "has_more,next_cursor,page_size,schema_version" ||
+    record.schema_version !== 1 ||
+    !Number.isInteger(record.page_size) ||
+    Number(record.page_size) < 1 ||
+    Number(record.page_size) > 100 ||
+    typeof record.has_more !== "boolean" ||
+    (record.next_cursor !== null && typeof record.next_cursor !== "string") ||
+    (typeof record.next_cursor === "string" && record.next_cursor.length > 2_048) ||
+    (record.has_more &&
+      (typeof record.next_cursor !== "string" || record.next_cursor.length === 0)) ||
+    (!record.has_more && record.next_cursor !== null)
+  ) {
+    throw new ApiError(0, "Bluey Jobs returned an invalid match page.");
+  }
+  return record as unknown as JobsMatchesPageInfo;
+}
+
+export function matchesPageFromWire(value: unknown): JobsMatchesPage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(0, "Bluey Jobs returned an invalid match page.");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).sort().join(",") !== "matches,page" ||
+    !Array.isArray(record.matches)
+  ) {
+    throw new ApiError(0, "Bluey Jobs returned an invalid match page.");
+  }
+  const page = matchesPageInfoFromWire(record.page, record.matches.length);
+  if (record.matches.length > page.page_size) {
+    throw new ApiError(0, "Bluey Jobs returned an invalid match page.");
+  }
+  return { matches: record.matches as JobPosting[], page };
 }
 
 function trackToWire(track: CareerTrack): CareerTrack {
@@ -480,7 +597,22 @@ export const jobsApi = {
     }
   },
   workspace: async () =>
-    workspaceFromWire(await request<JobsWorkspace>("/api/jobs/workspace")),
+    workspaceFromWire(
+      await request<JobsWorkspace>("/api/jobs/workspace", { cache: "no-store" }),
+    ),
+  matchesPage: async (cursor: string, limit = 50) => {
+    return matchesPageFromWire(
+      await request<unknown>("/api/jobs/matches/page", {
+        method: "POST",
+        cache: "no-store",
+        body: JSON.stringify({ cursor, limit }),
+      }),
+    );
+  },
+  matchDetail: (jobId: string) =>
+    request<JobPosting>(`/api/jobs/matches/${encodeURIComponent(jobId)}`, {
+      cache: "no-store",
+    }),
   account: () => request<AccountSummary>("/account/me"),
   completeOnboarding: async (
     profile: CareerProfile,

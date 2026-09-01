@@ -309,6 +309,22 @@ pub(crate) fn resolve_composed_job_integrity_projection_sqlite_tx_at_ms(
         tx, account_id, posting, db_time_ms,
     )
     .context("resolve original-source authority for job-integrity composition")?;
+    resolve_composed_job_integrity_projection_sqlite_tx_with_source(
+        tx,
+        account_id,
+        posting,
+        original_source,
+        db_time_ms,
+    )
+}
+
+fn resolve_composed_job_integrity_projection_sqlite_tx_with_source(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+    original_source: OriginalSourceVerificationProjection,
+    integrity_time_ms: i64,
+) -> Result<ComposedJobIntegrityProjection> {
     let Some(source_binding) = original_source.integrity_binding.clone() else {
         let denial = original_source_composition_denial(&original_source);
         return Ok(compose_job_integrity_projection(
@@ -354,7 +370,7 @@ pub(crate) fn resolve_composed_job_integrity_projection_sqlite_tx_at_ms(
             }
         };
     let job_integrity =
-        resolve_current_job_integrity_authority_sqlite_tx_at_ms(tx, &expected, db_time_ms)
+        resolve_current_job_integrity_authority_sqlite_tx_at_ms(tx, &expected, integrity_time_ms)
         .context("resolve signed job-integrity authority")?;
     Ok(compose_job_integrity_projection(
         posting,
@@ -363,6 +379,22 @@ pub(crate) fn resolve_composed_job_integrity_projection_sqlite_tx_at_ms(
         job_integrity,
         true,
     ))
+}
+
+pub(crate) fn resolve_composed_job_integrity_projection_page_sqlite_tx_at_ms(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    postings: &[JobPosting],
+    db_time_ms: i64,
+) -> Result<Vec<ComposedJobIntegrityProjection>> {
+    let sources = resolve_original_source_verification_projection_page_sqlite_tx_at_ms(
+        tx,
+        account_id,
+        postings,
+        db_time_ms,
+    )
+    .context("resolve original-source page authority for job-integrity composition")?;
+    compose_job_integrity_page_after_sources_sqlite(tx, account_id, postings, sources, db_time_ms)
 }
 
 /// Compose source, ATS, and signed integrity after the caller has acquired
@@ -407,6 +439,258 @@ pub(crate) fn resolve_composed_job_integrity_projection_postgres_tx_after_preloc
         original_source,
         db_time_ms,
     )
+}
+
+pub(crate) fn resolve_composed_job_integrity_projection_page_postgres_tx_after_prelock_at_ms(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    postings: &[JobPosting],
+    db_time_ms: i64,
+) -> Result<Vec<ComposedJobIntegrityProjection>> {
+    let sources =
+        resolve_original_source_verification_projection_page_postgres_tx_after_prelock_at_ms(
+            tx,
+            account_id,
+            postings,
+            db_time_ms,
+        )
+        .context("resolve original-source page authority for job-integrity composition")?;
+    compose_job_integrity_page_after_sources_postgres(
+        tx,
+        account_id,
+        postings,
+        sources,
+        db_time_ms,
+    )
+}
+
+struct PendingJobIntegrityComposition {
+    index: usize,
+    original_source: OriginalSourceVerificationProjection,
+    ats_certification: AtsCertificationPostingResolution,
+    expected: JobIntegrityExpectedSource,
+}
+
+struct PendingAtsPageComposition {
+    index: usize,
+    original_source: OriginalSourceVerificationProjection,
+    source_binding: OriginalSourceIntegrityBinding,
+    ats_posting: JobPosting,
+}
+
+fn compose_job_integrity_page_after_sources_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    postings: &[JobPosting],
+    sources: Vec<OriginalSourceVerificationProjection>,
+    db_time_ms: i64,
+) -> Result<Vec<ComposedJobIntegrityProjection>> {
+    let mut results = (0..postings.len()).map(|_| None).collect::<Vec<_>>();
+    let mut ats_pending = Vec::new();
+    let mut pending = Vec::new();
+    for (index, (posting, original_source)) in postings.iter().zip(sources).enumerate() {
+        let Some(source_binding) = original_source.integrity_binding.clone() else {
+            results[index] = Some(compose_job_integrity_projection(
+                posting,
+                original_source.clone(),
+                None,
+                original_source_composition_denial(&original_source),
+                false,
+            ));
+            continue;
+        };
+        let ats_posting =
+            original_source_projected_ats_posting(posting, &original_source, &source_binding);
+        ats_pending.push(PendingAtsPageComposition {
+            index,
+            original_source,
+            source_binding,
+            ats_posting,
+        });
+    }
+    let ats_resolutions = resolve_ats_certification_for_postings_page_sqlite_tx(
+        tx,
+        account_id,
+        &ats_pending
+            .iter()
+            .map(|value| value.ats_posting.clone())
+            .collect::<Vec<_>>(),
+        db_time_ms,
+    )
+    .context("resolve ATS page authority for job-integrity composition")?;
+    for (ats_pending, ats_resolution) in ats_pending.into_iter().zip(ats_resolutions) {
+        let PendingAtsPageComposition {
+            index,
+            original_source,
+            source_binding,
+            ..
+        } = ats_pending;
+        let ats_certification = match ats_resolution {
+            Ok(value) => value,
+            Err(error) => {
+                results[index] = Some(compose_job_integrity_projection(
+                    &postings[index],
+                    original_source,
+                    None,
+                    ats_composition_denial(error)?,
+                    false,
+                ));
+                continue;
+            }
+        };
+        let expected = match job_integrity_expected_source_from_composition(
+            &source_binding,
+            &ats_certification,
+        ) {
+            Ok(value) => value,
+            Err(denial) => {
+                results[index] = Some(compose_job_integrity_projection(
+                    &postings[index],
+                    original_source,
+                    Some(ats_certification),
+                    *denial,
+                    false,
+                ));
+                continue;
+            }
+        };
+        pending.push(PendingJobIntegrityComposition {
+            index,
+            original_source,
+            ats_certification,
+            expected,
+        });
+    }
+    let resolutions = resolve_current_job_integrity_authority_page_sqlite_tx_at_ms(
+        tx,
+        &pending
+            .iter()
+            .map(|value| value.expected.clone())
+            .collect::<Vec<_>>(),
+        db_time_ms,
+    )
+    .context("resolve signed job-integrity page authority")?;
+    for (pending, resolution) in pending.into_iter().zip(resolutions) {
+        results[pending.index] = Some(compose_job_integrity_projection(
+            &postings[pending.index],
+            pending.original_source,
+            Some(pending.ats_certification),
+            resolution,
+            true,
+        ));
+    }
+    results
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow::anyhow!("job-integrity page composition omitted a posting"))
+}
+
+fn compose_job_integrity_page_after_sources_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    postings: &[JobPosting],
+    sources: Vec<OriginalSourceVerificationProjection>,
+    db_time_ms: i64,
+) -> Result<Vec<ComposedJobIntegrityProjection>> {
+    let mut results = (0..postings.len()).map(|_| None).collect::<Vec<_>>();
+    let mut ats_pending = Vec::new();
+    let mut pending = Vec::new();
+    for (index, (posting, original_source)) in postings.iter().zip(sources).enumerate() {
+        let Some(source_binding) = original_source.integrity_binding.clone() else {
+            results[index] = Some(compose_job_integrity_projection(
+                posting,
+                original_source.clone(),
+                None,
+                original_source_composition_denial(&original_source),
+                false,
+            ));
+            continue;
+        };
+        let ats_posting =
+            original_source_projected_ats_posting(posting, &original_source, &source_binding);
+        ats_pending.push(PendingAtsPageComposition {
+            index,
+            original_source,
+            source_binding,
+            ats_posting,
+        });
+    }
+    let ats_resolutions = resolve_ats_certification_for_postings_page_postgres_tx(
+        tx,
+        account_id,
+        &ats_pending
+            .iter()
+            .map(|value| value.ats_posting.clone())
+            .collect::<Vec<_>>(),
+        db_time_ms,
+    )
+    .context("resolve ATS page authority for job-integrity composition")?;
+    for (ats_pending, ats_resolution) in ats_pending.into_iter().zip(ats_resolutions) {
+        let PendingAtsPageComposition {
+            index,
+            original_source,
+            source_binding,
+            ..
+        } = ats_pending;
+        let ats_certification = match ats_resolution {
+            Ok(value) => value,
+            Err(error) => {
+                results[index] = Some(compose_job_integrity_projection(
+                    &postings[index],
+                    original_source,
+                    None,
+                    ats_composition_denial(error)?,
+                    false,
+                ));
+                continue;
+            }
+        };
+        let expected = match job_integrity_expected_source_from_composition(
+            &source_binding,
+            &ats_certification,
+        ) {
+            Ok(value) => value,
+            Err(denial) => {
+                results[index] = Some(compose_job_integrity_projection(
+                    &postings[index],
+                    original_source,
+                    Some(ats_certification),
+                    *denial,
+                    false,
+                ));
+                continue;
+            }
+        };
+        pending.push(PendingJobIntegrityComposition {
+            index,
+            original_source,
+            ats_certification,
+            expected,
+        });
+    }
+    let resolutions =
+        resolve_current_job_integrity_authority_page_postgres_tx_after_publication_fence_at_ms(
+            tx,
+            &pending
+                .iter()
+                .map(|value| value.expected.clone())
+                .collect::<Vec<_>>(),
+            db_time_ms,
+        )
+        .context("resolve signed job-integrity page authority")?;
+    for (pending, resolution) in pending.into_iter().zip(resolutions) {
+        results[pending.index] = Some(compose_job_integrity_projection(
+            &postings[pending.index],
+            pending.original_source,
+            Some(pending.ats_certification),
+            resolution,
+            true,
+        ));
+    }
+    results
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| anyhow::anyhow!("job-integrity page composition omitted a posting"))
 }
 
 fn resolve_composed_job_integrity_projection_postgres_tx_with_source(

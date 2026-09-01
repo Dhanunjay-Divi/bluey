@@ -1,6 +1,8 @@
 import { createElement } from "react";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { previewWorkspace } from "../data/preview";
 import type {
   ApplicationEvidence,
   AtsCertificationSummary,
@@ -13,8 +15,10 @@ import type {
 import { reviewedCommunicationPayload } from "../lib/communication-actions";
 import {
   answerInterventionActionLabel,
+  ApplicationsView,
   CommunicationActionReview,
   CommunicationActionsSection,
+  commitVerifiedApplicationHandoff,
   applicationCountFor,
   applicationEligibility,
   applicationNeedsReview,
@@ -87,6 +91,80 @@ const runners = (cloudAvailable: boolean): RunnerAvailability => ({
 });
 
 describe("reviewed application runner availability", () => {
+  it("keeps exact application labels when the job is beyond the ranked page", () => {
+    const application = {
+      ...previewWorkspace.applications[0],
+      id: "application-history-51",
+      job_id: "application-job-051",
+    };
+    const workspace = {
+      ...previewWorkspace,
+      matches: [],
+      applications: [application],
+      application_jobs: [{
+        id: application.job_id,
+        company: "Historical company",
+        title: "Historical role",
+        location: "Remote",
+        track_id: "track-engineering",
+      }],
+    };
+    const html = renderToStaticMarkup(createElement(ApplicationsView, {
+      workspace,
+      previewSearch: "",
+      resumeVersions: {},
+      onUpdate: vi.fn(async () => undefined),
+      onReconcileSubmission: vi.fn(async () => undefined),
+      onCommit: vi.fn(async () => undefined),
+      onLoadResume: vi.fn(async () => undefined),
+      onLoadJob: vi.fn(async () => undefined),
+      onResolveIntervention: vi.fn(async () => undefined),
+      onSaveCandidateEvent: vi.fn(async () => undefined),
+    }));
+
+    expect(html).toContain("Historical role");
+    expect(html).toContain("Historical company");
+  });
+
+  it("requires current action eligibility before commit and handoff", () => {
+    const source = readFileSync(new URL("./ApplicationsView.tsx", import.meta.url), "utf8");
+    const handoff = source
+      .split("export async function commitVerifiedApplicationHandoff(")[1]
+      ?.split("export function applicationCountFor(")[0] ?? "";
+
+    expect(handoff.indexOf("await onLoadJob(application.job_id)")).toBeGreaterThanOrEqual(0);
+    expect(handoff.indexOf("await onCommit(application)")).toBeGreaterThan(
+      handoff.indexOf("currentEligibility.can_prepare"),
+    );
+    expect(handoff).toContain('["active", "unknown"].includes(currentJob.availability_status)');
+    expect(handoff).toContain("portalEligibilityDecision(currentJob?.eligibility, false)");
+    expect(handoff).toContain("currentJob.canonical_url");
+    expect(handoff).not.toContain("selectedJob.canonical_url");
+  });
+
+  it("does not commit when exact current handoff authority is unavailable", async () => {
+    const application = previewWorkspace.applications[0];
+    const commit = vi.fn(async () => undefined);
+
+    await expect(commitVerifiedApplicationHandoff(
+      application,
+      vi.fn(async () => undefined),
+      commit,
+    )).rejects.toThrow("could not be verified");
+    expect(commit).not.toHaveBeenCalled();
+
+    await expect(commitVerifiedApplicationHandoff(
+      application,
+      vi.fn(async () => ({
+        ...previewWorkspace.matches[0],
+        availability_status: "expired",
+        eligibility: eligibility("certified", true),
+      })),
+      commit,
+    )).rejects.toThrow("could not be verified");
+    expect(commit).not.toHaveBeenCalled();
+  });
+
   it("keeps beta, handoff, and unknown application systems in review or handoff", () => {
     expect(runnerUnavailableReason(eligibility("beta_review"), runners(true))).toContain("still in beta");
     expect(runnerUnavailableReason(eligibility("handoff"), runners(true))).toContain("user-controlled handoff");

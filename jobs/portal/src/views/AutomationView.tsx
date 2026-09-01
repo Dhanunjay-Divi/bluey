@@ -25,6 +25,7 @@ import {
 import { titleCase } from "../lib/format";
 import { cloudRunnerAccessCopy } from "../lib/runner-access";
 import { Dialog } from "../components/Dialog";
+import { workspaceJobById } from "../lib/workspace-jobs";
 
 interface AutomationViewProps {
   workspace: JobsWorkspace;
@@ -60,6 +61,14 @@ export async function queueCloudApplication(
     throw new Error(access.reason || "Background automation is not available right now.");
   }
   await onQueueCloud(application);
+}
+
+export function automationApplicationLabel(
+  workspace: Pick<JobsWorkspace, "application_jobs" | "matches">,
+  application: JobApplication,
+): string {
+  const job = workspaceJobById(workspace, application.job_id);
+  return job ? `Queue ${job.title} at ${job.company}` : "Queue approved application";
 }
 
 export function submissionApprovalEnabled(
@@ -327,10 +336,8 @@ export function AutomationView({
       >
         <div className="cloud-queue-list">
           {queuedApplications.map((application) => {
-            const job = workspace.matches.find((item) => item.id === application.job_id);
-            const label = job
-              ? `Queue ${job.title} at ${job.company}`
-              : "Queue approved application";
+            const job = workspaceJobById(workspace, application.job_id);
+            const label = automationApplicationLabel(workspace, application);
             return (
               <button
                 aria-label={label}

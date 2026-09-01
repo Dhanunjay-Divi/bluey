@@ -23,6 +23,7 @@ import {
   type ResumeImportPreview,
 } from "../lib/documents";
 import { Dialog } from "../components/Dialog";
+import { workspaceJobById } from "../lib/workspace-jobs";
 import {
   CareerEducationEditor,
   CareerEmploymentEditor,
@@ -262,7 +263,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, 
             <div className="section-heading compact"><div><p>JOB-SPECIFIC</p><h2>Version history</h2></div><History size={19} /></div>
             <div className="version-list">
               {applicationsWithResume.map((application) => {
-                const job = workspace.matches.find((item) => item.id === application.job_id);
+                const job = workspaceJobById(workspace, application.job_id);
                 return <button key={application.id} onClick={() => void openVersion(application.resume_version_id)}><FileCheck2 size={17} /><span><b>{job?.title || "Tailored resume"}</b><small>{job?.company} · {relativeTime(application.updated_at_ms)}</small></span><ChevronRight size={16} /></button>;
               })}
               {applicationsWithResume.length === 0 && <p className="muted-copy">Prepare your first application from Matches to create a tailored version.</p>}

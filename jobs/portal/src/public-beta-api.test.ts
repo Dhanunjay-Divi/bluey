@@ -80,7 +80,10 @@ describe("Jobs public-beta access", () => {
       "/account/me",
     ]);
     expect(loaded.betaAccess.access).toBe("admitted");
-    expect(loaded.workspace).toEqual({ profile: {} });
+    expect(loaded.workspace).not.toBeNull();
+    expect(loaded.workspace?.profile).toEqual({});
+    expect(loaded.workspace?.application_jobs).toEqual([]);
+    expect(loaded.workspace?.matches_page.has_more).toBe(false);
   });
 
   it("does not request workspace or account data when access is not admitted", async () => {

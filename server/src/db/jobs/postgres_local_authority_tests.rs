@@ -4,7 +4,7 @@ use super::production_positive_authority_fixture::{
 use super::*;
 use crate::db;
 use serde_json::json;
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier};
 
 struct LocalAuthorityFixture {
     account_id: String,
@@ -183,6 +183,613 @@ fn postgres_pool() -> Option<DbPool> {
     assert_eq!(phase614b_triggers, expected_phase614b_triggers);
     drop(conn);
     Some(pool)
+}
+
+struct PreparedPacketCommitFixture {
+    account_id: String,
+    profile: CareerProfile,
+    preferences: JobPreferences,
+    application: JobApplication,
+    posting: JobPosting,
+}
+
+fn prepared_packet_commit_fixture(pool: &DbPool, label: &str) -> PreparedPacketCommitFixture {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let account_id = format!("acct_packet_commit_{label}_{suffix}");
+    let email = format!("packet-commit-{label}-{suffix}@example.test");
+    pool.get_pg()
+        .expect("get PostgreSQL packet-commit fixture connection")
+        .execute(
+            "INSERT INTO accounts (id,email,password_hash,trial_seconds_remaining)
+             VALUES ($1,$2,'hash',0)",
+            &[&account_id, &email],
+        )
+        .expect("insert PostgreSQL packet-commit account");
+    let identity = ensure_primary_application_identity(pool, &account_id, &email)
+        .expect("create PostgreSQL packet-commit identity");
+    let now = now_ms();
+    let source = ResumeSourceAsset {
+        id: format!("resume-source-packet-commit-{suffix}"),
+        file_name: "packet-commit-source-resume.pdf".to_string(),
+        media_type: "application/pdf".to_string(),
+        file_type: "pdf".to_string(),
+        storage_key: format!("accounts/{account_id}/jobs/packet-commit-source-resume.pdf"),
+        sha256: "e".repeat(64),
+        size_bytes: 1_024,
+        page_count: Some(1),
+        template_status: "converted_layout".to_string(),
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let mut profile = default_profile(&email);
+    profile.onboarding_complete = true;
+    profile.source_resume_name = source.file_name.clone();
+    profile.source_resume_asset_id = source.id.clone();
+    profile.source_resume_sha256 = source.sha256.clone();
+    profile.source_resume_media_type = source.media_type.clone();
+    profile.source_resume_template_status = source.template_status.clone();
+    let (_, profile) = save_resume_source_asset(pool, &account_id, &source, &profile)
+        .expect("save PostgreSQL packet-commit source resume");
+    let preferences = save_preferences(
+        pool,
+        &account_id,
+        &JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        },
+    )
+    .expect("save PostgreSQL packet-commit preferences");
+    let track = upsert_track(
+        pool,
+        &account_id,
+        &CareerTrack {
+            id: format!("track-packet-commit-{suffix}"),
+            name: "Software engineering".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: Some(identity.id),
+            policy: CareerTrackPolicy {
+                role_family: "software_engineering".to_string(),
+                ..CareerTrackPolicy::default()
+            },
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .expect("create approved PostgreSQL packet-commit Track");
+    assert_eq!(track.policy.authority.review_state, "approved");
+    set_entitlement_plan(pool, &account_id, "pro")
+        .expect("create PostgreSQL packet-commit entitlement");
+    let posting = JobPosting {
+        id: String::new(),
+        canonical_key: String::new(),
+        source: "greenhouse_import".to_string(),
+        external_id: format!("packet-commit-{label}-{suffix}"),
+        company: "Acme".to_string(),
+        title: "Software Engineer".to_string(),
+        location: "New York, NY".to_string(),
+        workplace: "hybrid".to_string(),
+        canonical_url: format!(
+            "https://boards.greenhouse.io/acme/jobs/packet-commit-{label}-{suffix}"
+        ),
+        description: "Build reliable products with Rust and TypeScript.".to_string(),
+        compensation: "$170k-$200k".to_string(),
+        employment_type: "full_time".to_string(),
+        track_id: track.id,
+        match_score: 90,
+        matched_reasons: Vec::new(),
+        missing_requirements: Vec::new(),
+        posted_at_ms: Some(now - 60_000),
+        last_verified_at_ms: Some(now),
+        availability_status: "active".to_string(),
+        status: "matched".to_string(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        discovery_evidence: JobDiscoveryEvidence::default(),
+        eligibility: None,
+    };
+    let (posting, managed) = save_production_positive_verified_import(
+        pool,
+        &account_id,
+        &posting,
+        &profile,
+        &preferences,
+    );
+    let posting = install_production_positive_job_authorities(
+        pool,
+        &account_id,
+        &posting,
+        &managed,
+        "acme.com",
+        &format!("packet-commit-{label}-{suffix}"),
+    )
+    .posting;
+    let (application, _) = prepare_application(
+        pool,
+        &account_id,
+        &posting.id,
+        "factual",
+        "review_first",
+    )
+    .expect("prepare PostgreSQL packet-commit application");
+    PreparedPacketCommitFixture {
+        account_id,
+        profile,
+        preferences,
+        application,
+        posting,
+    }
+}
+
+fn force_postgres_packet_overage(pool: &DbPool, account_id: &str, suffix: &str) {
+    let mut connection = pool
+        .get_pg()
+        .expect("get PostgreSQL packet-overage fixture connection");
+    let mut transaction = connection
+        .transaction()
+        .expect("begin PostgreSQL packet-overage fixture");
+    transaction
+        .execute(
+            "UPDATE accounts SET balance_cents=500 WHERE id=$1",
+            &[&account_id],
+        )
+        .expect("set PostgreSQL packet-overage balance");
+    transaction
+        .execute(
+            "INSERT INTO credit_batches (
+                id,account_id,amount_cents,remaining_cents,purchased_at,expires_at
+             ) VALUES ($1,$2,500,500,clock_timestamp(),clock_timestamp()+interval '1 year')",
+            &[&format!("packet-overage-{suffix}"), &account_id],
+        )
+        .expect("insert PostgreSQL packet-overage credit batch");
+    transaction
+        .execute(
+            "UPDATE jobs_entitlements SET used_packets=monthly_packet_limit
+              WHERE account_id=$1",
+            &[&account_id],
+        )
+        .expect("exhaust PostgreSQL included packets");
+    transaction
+        .commit()
+        .expect("commit PostgreSQL packet-overage fixture");
+}
+
+fn postgres_packet_effect_snapshot(
+    pool: &DbPool,
+    account_id: &str,
+    job_id: &str,
+) -> (i64, i64, i64, i64, i64, i64, String) {
+    let row = pool
+        .get_pg()
+        .expect("get PostgreSQL packet-effect snapshot connection")
+        .query_one(
+            "SELECT account.balance_cents,entitlement.used_packets,
+                    COALESCE((SELECT SUM(remaining_cents) FROM credit_batches
+                               WHERE account_id=account.id),0)::bigint,
+                    (SELECT COUNT(*) FROM jobs_packet_metering
+                      WHERE account_id=account.id AND job_id=$2),
+                    (SELECT COUNT(*) FROM balance_ledger_entries
+                      WHERE account_id=account.id
+                        AND event_type='jobs_packet_overage' AND source_id=$2),
+                    (SELECT COUNT(*) FROM jobs_generation_allowance_reservations
+                      WHERE account_id=account.id AND job_id=$2),
+                    COALESCE((SELECT status || '|' || period_start_ms::text ||
+                                       '|' || COALESCE(application_id,'')
+                                FROM jobs_generation_allowance_reservations
+                               WHERE account_id=account.id AND job_id=$2),'')
+               FROM accounts account
+               JOIN jobs_entitlements entitlement ON entitlement.account_id=account.id
+              WHERE account.id=$1",
+            &[&account_id, &job_id],
+        )
+        .expect("read PostgreSQL packet-effect snapshot");
+    (
+        row.get(0),
+        row.get(1),
+        row.get(2),
+        row.get(3),
+        row.get(4),
+        row.get(5),
+        row.get(6),
+    )
+}
+
+fn delete_postgres_packet_fixture(pool: &DbPool, account_id: &str) {
+    pool.get_pg()
+        .expect("get PostgreSQL packet fixture cleanup connection")
+        .execute("DELETE FROM accounts WHERE id=$1", &[&account_id])
+        .expect("delete PostgreSQL packet fixture account");
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_packet_commit_recomposes_current_effect_inputs_before_any_meter_or_debit() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    for drift in ["track", "profile", "preferences"] {
+        let mut fixture = prepared_packet_commit_fixture(&pool, drift);
+        force_postgres_packet_overage(&pool, &fixture.account_id, drift);
+        let before =
+            postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id);
+        match drift {
+            "track" => {
+                pool.get_pg()
+                    .unwrap()
+                    .execute(
+                        "UPDATE jobs_tracks SET active=0
+                          WHERE account_id=$1 AND id=$2",
+                        &[&fixture.account_id, &fixture.posting.track_id],
+                    )
+                    .unwrap();
+            }
+            "profile" => {
+                fixture.profile.summary =
+                    "Changed PostgreSQL candidate truth after packet preparation.".to_string();
+                let payload = to_json(&fixture.profile, "PostgreSQL packet profile drift").unwrap();
+                pool.get_pg()
+                    .unwrap()
+                    .execute(
+                        "UPDATE jobs_profiles SET profile_json=$2 WHERE account_id=$1",
+                        &[&fixture.account_id, &payload],
+                    )
+                    .unwrap();
+            }
+            "preferences" => {
+                fixture
+                    .preferences
+                    .excluded_companies
+                    .push(fixture.posting.company.clone());
+                let payload = to_json(
+                    &fixture.preferences,
+                    "PostgreSQL packet preference inclusion drift",
+                )
+                .unwrap();
+                pool.get_pg()
+                    .unwrap()
+                    .execute(
+                        "UPDATE jobs_preferences SET preferences_json=$2 WHERE account_id=$1",
+                        &[&fixture.account_id, &payload],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        commit_packet(&pool, &fixture.account_id, &fixture.application.id)
+            .expect_err("current PostgreSQL effect drift must reject packet commit");
+
+        assert_eq!(
+            postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id),
+            before,
+            "{drift} drift must leave every packet effect unchanged"
+        );
+        delete_postgres_packet_fixture(&pool, &fixture.account_id);
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_packet_commit_exact_replay_precedes_current_policy_revalidation() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let mut fixture = prepared_packet_commit_fixture(&pool, "replay");
+    let first = commit_packet(&pool, &fixture.account_id, &fixture.application.id)
+        .expect("first PostgreSQL packet commit");
+    assert!(first.newly_metered);
+    let before = postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id);
+    fixture
+        .preferences
+        .excluded_companies
+        .push(fixture.posting.company.clone());
+    let payload = to_json(&fixture.preferences, "PostgreSQL replay policy drift").unwrap();
+    pool.get_pg()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_preferences SET preferences_json=$2 WHERE account_id=$1",
+            &[&fixture.account_id, &payload],
+        )
+        .unwrap();
+
+    let replay = commit_packet(&pool, &fixture.account_id, &fixture.application.id)
+        .expect("exact PostgreSQL meter replay remains idempotent after policy drift");
+
+    assert!(!replay.newly_metered);
+    assert_eq!(
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id),
+        before
+    );
+    delete_postgres_packet_fixture(&pool, &fixture.account_id);
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_packet_commit_locks_entitlement_before_rechecking_attempt_reservations() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let fixture = prepared_packet_commit_fixture(&pool, "entitlement-reservation-race");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    force_postgres_packet_overage(
+        &pool,
+        &fixture.account_id,
+        &format!("entitlement-reservation-race-{suffix}"),
+    );
+
+    let competing_job_id = format!("job-packet-reservation-race-{suffix}");
+    let competing_application_id = format!("app-packet-reservation-race-{suffix}");
+    let competing_canonical_key = format!("packet-reservation-race-{suffix}");
+    let fixture_at_ms = now_ms();
+    let mut fixture_connection = pool
+        .get_pg()
+        .expect("get PostgreSQL packet reservation-race fixture connection");
+    let mut fixture_transaction = fixture_connection
+        .transaction()
+        .expect("begin PostgreSQL packet reservation-race fixture");
+    assert_eq!(
+        fixture_transaction
+            .execute(
+                "INSERT INTO jobs_postings (
+                    id,account_id,canonical_key,posting_json,source,canonical_url,
+                    company,title,location,match_score,status,created_at_ms,updated_at_ms
+                 )
+                 SELECT $1,account_id,$2,posting_json,source,canonical_url,
+                        company,title,location,match_score,status,$3,$3
+                   FROM jobs_postings
+                  WHERE account_id=$4 AND id=$5",
+                &[
+                    &competing_job_id,
+                    &competing_canonical_key,
+                    &fixture_at_ms,
+                    &fixture.account_id,
+                    &fixture.posting.id,
+                ],
+            )
+            .expect("clone competing PostgreSQL packet posting"),
+        1,
+    );
+    assert_eq!(
+        fixture_transaction
+            .execute(
+                "INSERT INTO jobs_applications (
+                    id,account_id,job_id,state,application_json,created_at_ms,updated_at_ms
+                 ) VALUES ($1,$2,$3,'matched','{}',$4,$4)",
+                &[
+                    &competing_application_id,
+                    &fixture.account_id,
+                    &competing_job_id,
+                    &fixture_at_ms,
+                ],
+            )
+            .expect("insert competing PostgreSQL packet application"),
+        1,
+    );
+    fixture_transaction
+        .commit()
+        .expect("commit PostgreSQL packet reservation-race fixture");
+
+    let before =
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id);
+    let mut entitlement_connection = pool
+        .get_pg()
+        .expect("get PostgreSQL packet entitlement owner connection");
+    let mut entitlement_owner = entitlement_connection
+        .transaction()
+        .expect("begin PostgreSQL packet entitlement owner transaction");
+    entitlement_owner
+        .batch_execute("SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='10s'")
+        .expect("bound PostgreSQL packet reservation-race fixture statements");
+    let entitlement_owner_pid: i32 = entitlement_owner
+        .query_one("SELECT pg_backend_pid()", &[])
+        .expect("read PostgreSQL packet entitlement owner pid")
+        .get(0);
+    entitlement_owner
+        .query_one(
+            "SELECT account_id FROM jobs_entitlements
+              WHERE account_id=$1 FOR UPDATE",
+            &[&fixture.account_id],
+        )
+        .expect("fixture transaction owns packet entitlement E");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let worker_barrier = Arc::clone(&barrier);
+    let worker_pool = pool.clone();
+    let worker_account_id = fixture.account_id.clone();
+    let worker_application_id = fixture.application.id.clone();
+    let (result_sender, result_receiver) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        worker_barrier.wait();
+        let result = commit_packet(&worker_pool, &worker_account_id, &worker_application_id)
+            .map_err(|error| error.to_string());
+        result_sender
+            .send(result)
+            .expect("send PostgreSQL packet reservation-race result");
+    });
+    barrier.wait();
+
+    let mut observer = pool
+        .get_pg()
+        .expect("get PostgreSQL packet entitlement-wait observer");
+    let mut blocked_on_entitlement = false;
+    for _ in 0..250 {
+        blocked_on_entitlement = observer
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_stat_activity activity
+                     WHERE activity.pid<>$1
+                       AND $1=ANY(pg_blocking_pids(activity.pid))
+                       AND activity.wait_event_type='Lock'
+                       AND activity.query LIKE '%jobs_entitlements%'
+                       AND activity.query LIKE '%FOR UPDATE%'
+                )",
+                &[&entitlement_owner_pid],
+            )
+            .expect("observe PostgreSQL packet entitlement wait")
+            .get(0);
+        if blocked_on_entitlement {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        blocked_on_entitlement,
+        "actual packet commit must block specifically on entitlement E before reading R",
+    );
+
+    let reservation_at_ms: i64 = entitlement_owner
+        .query_one(
+            "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+            &[],
+        )
+        .expect("read PostgreSQL packet reservation database time")
+        .get(0);
+    let company_key = normalize_company_key(&fixture.posting.company);
+    let period_key = attempt_period_key(
+        reservation_at_ms,
+        fixture.preferences.time_zone_offset_minutes,
+    );
+    let reservation_id = format!("attempt-packet-reservation-race-{suffix}");
+    assert_eq!(
+        entitlement_owner
+            .execute(
+                "INSERT INTO jobs_attempt_reservations (
+                    id,account_id,application_id,company_key,period_key,runner,status,
+                    reserved_at_ms,updated_at_ms
+                 ) VALUES ($1,$2,$3,$4,$5,'local','reserved',$6,$6)",
+                &[
+                    &reservation_id,
+                    &fixture.account_id,
+                    &competing_application_id,
+                    &company_key,
+                    &period_key,
+                    &reservation_at_ms,
+                ],
+            )
+            .expect("E owner inserts current-period same-company R without Account timeout"),
+        1,
+    );
+    entitlement_owner
+        .commit()
+        .expect("commit PostgreSQL packet entitlement and reservation transaction");
+
+    let worker_result = result_receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("packet commit must wake after E is released");
+    worker
+        .join()
+        .expect("join PostgreSQL packet reservation-race worker");
+    let worker_error = worker_result
+        .expect_err("packet commit must re-read the newly committed relevant R and reject");
+    assert_eq!(
+        worker_error,
+        "recompose current packet-commit effect eligibility",
+        "the newly committed relevant R must be the packet denial authority",
+    );
+    assert_eq!(
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id),
+        before,
+        "reservation drift after E wait must leave every packet effect unchanged",
+    );
+    let reservation = observer
+        .query_one(
+            "SELECT company_key,period_key,status FROM jobs_attempt_reservations
+              WHERE account_id=$1 AND id=$2",
+            &[&fixture.account_id, &reservation_id],
+        )
+        .expect("read committed PostgreSQL packet competing reservation");
+    assert_eq!(reservation.get::<_, String>(0), company_key);
+    assert_eq!(reservation.get::<_, String>(1), period_key);
+    assert_eq!(reservation.get::<_, String>(2), "reserved");
+    delete_postgres_packet_fixture(&pool, &fixture.account_id);
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_packet_commit_waits_on_parent_account_before_deletion_children() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let fixture = prepared_packet_commit_fixture(&pool, "account-delete-race");
+    let mut deletion_connection = pool
+        .get_pg()
+        .expect("get PostgreSQL packet deletion connection");
+    let mut deletion = deletion_connection
+        .transaction()
+        .expect("begin PostgreSQL packet deletion transaction");
+    deletion
+        .batch_execute("SET LOCAL lock_timeout='2s'")
+        .expect("bound PostgreSQL deletion lock wait");
+    let deletion_pid: i32 = deletion
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    deletion
+        .query_one(
+            "SELECT id FROM accounts WHERE id=$1 FOR UPDATE",
+            &[&fixture.account_id],
+        )
+        .expect("deletion owns parent Account");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let worker_barrier = Arc::clone(&barrier);
+    let worker_pool = pool.clone();
+    let worker_account_id = fixture.account_id.clone();
+    let worker_application_id = fixture.application.id.clone();
+    let worker = std::thread::spawn(move || {
+        worker_barrier.wait();
+        commit_packet(&worker_pool, &worker_account_id, &worker_application_id)
+    });
+    barrier.wait();
+
+    let mut observer = pool
+        .get_pg()
+        .expect("get PostgreSQL packet deletion observer");
+    let mut blocked_on_parent = false;
+    for _ in 0..250 {
+        blocked_on_parent = observer
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_stat_activity activity
+                     WHERE activity.pid<>$1
+                       AND $1=ANY(pg_blocking_pids(activity.pid))
+                )",
+                &[&deletion_pid],
+            )
+            .unwrap()
+            .get(0);
+        if blocked_on_parent {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(blocked_on_parent, "packet commit must wait on the parent Account lock");
+
+    deletion
+        .execute("DELETE FROM accounts WHERE id=$1", &[&fixture.account_id])
+        .expect("Account-first deletion must not wait on packet child locks");
+    deletion
+        .commit()
+        .expect("commit Account-first packet deletion");
+    let worker_error = worker
+        .join()
+        .expect("join PostgreSQL packet commit worker")
+        .expect_err("packet commit must fail after Account deletion wins");
+    assert!(
+        worker_error.to_string().contains("not owned")
+            || worker_error.to_string().contains("account")
+    );
+    let remaining: i64 = observer
+        .query_one(
+            "SELECT COUNT(*) FROM accounts WHERE id=$1",
+            &[&fixture.account_id],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(remaining, 0);
 }
 
 fn postgres_phase613_check_constraint_name(

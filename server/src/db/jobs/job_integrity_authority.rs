@@ -3930,6 +3930,600 @@ pub(crate) fn resolve_current_job_integrity_authority_sqlite_tx_at_ms(
     )
 }
 
+/// Resolve all signed-integrity heads needed by one bounded workspace page.
+///
+/// The interactive workspace has already resolved source and ATS authority before
+/// it reaches this boundary.  Reading the integrity control, subject heads,
+/// historical policies, and revocations one subject at a time used to turn a
+/// fully-positive 50-row page into a database statement multiplier.  This is a
+/// page snapshot, not a cache: every authority table is read at `now_ms` from
+/// the caller's transaction, and every candidate still runs the same strict
+/// parser/signature/transition evaluation as the exact-ID resolver.
+pub(crate) fn resolve_current_job_integrity_authority_page_sqlite_tx_at_ms(
+    tx: &rusqlite::Transaction<'_>,
+    expected: &[JobIntegrityExpectedSource],
+    now_ms: i64,
+) -> JobIntegrityResult<Vec<JobIntegrityResolution>> {
+    for value in expected {
+        if !job_integrity_expected_source_valid(value) {
+            return Err(JobIntegrityAuthorityError::InvalidAuthority);
+        }
+    }
+    if expected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let control = load_job_integrity_control_sqlite(tx)?;
+    let Some(current_policy_sha256) = control.policy_sha256.as_deref() else {
+        return Ok(expected
+            .iter()
+            .map(|_| {
+                job_integrity_resolution(
+                    JobIntegrityResolutionStatus::Absent,
+                    "job_integrity_policy_absent",
+                    Vec::new(),
+                    None,
+                )
+            })
+            .collect());
+    };
+    let stored = load_stored_job_integrity_authority_page_sqlite(
+        tx,
+        &expected
+            .iter()
+            .map(|value| value.subject_sha256.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let policies = load_job_integrity_policies_page_sqlite(
+        tx,
+        std::iter::once(current_policy_sha256.to_string()).chain(
+            stored
+                .values()
+                .map(|value| value.policy_sha256.clone()),
+        ),
+    )?;
+    let current_policy = policies
+        .get(current_policy_sha256)
+        .ok_or(JobIntegrityAuthorityError::NotInitialized)?;
+    if current_policy.trust_generation != control.trust_generation {
+        return Err(JobIntegrityAuthorityError::IdentityConflict);
+    }
+    evaluate_job_integrity_authority_page(
+        expected,
+        &stored,
+        current_policy_sha256,
+        current_policy,
+        &policies,
+        |candidates| job_integrity_page_revocations_sqlite(tx, now_ms, candidates),
+        now_ms,
+    )
+}
+
+/// PostgreSQL equivalent of the SQLite page resolver.  The caller already owns
+/// the integrity publication fence, so this keeps the exact existing head and
+/// attestation `FOR SHARE` locks while replacing the per-subject reads with
+/// bounded `ANY(...)` queries.
+pub(crate) fn resolve_current_job_integrity_authority_page_postgres_tx_after_publication_fence_at_ms(
+    tx: &mut postgres::Transaction<'_>,
+    expected: &[JobIntegrityExpectedSource],
+    now_ms: i64,
+) -> JobIntegrityResult<Vec<JobIntegrityResolution>> {
+    for value in expected {
+        if !job_integrity_expected_source_valid(value) {
+            return Err(JobIntegrityAuthorityError::InvalidAuthority);
+        }
+    }
+    if expected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let control = load_job_integrity_control_postgres_after_publication_fence(tx)?;
+    let Some(current_policy_sha256) = control.policy_sha256.as_deref() else {
+        return Ok(expected
+            .iter()
+            .map(|_| {
+                job_integrity_resolution(
+                    JobIntegrityResolutionStatus::Absent,
+                    "job_integrity_policy_absent",
+                    Vec::new(),
+                    None,
+                )
+            })
+            .collect());
+    };
+    let stored = load_stored_job_integrity_authority_page_postgres_after_publication_fence(
+        tx,
+        &expected
+            .iter()
+            .map(|value| value.subject_sha256.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let policies = load_job_integrity_policies_page_postgres_after_publication_fence(
+        tx,
+        std::iter::once(current_policy_sha256.to_string()).chain(
+            stored
+                .values()
+                .map(|value| value.policy_sha256.clone()),
+        ),
+    )?;
+    let current_policy = policies
+        .get(current_policy_sha256)
+        .ok_or(JobIntegrityAuthorityError::NotInitialized)?;
+    if current_policy.trust_generation != control.trust_generation {
+        return Err(JobIntegrityAuthorityError::IdentityConflict);
+    }
+    evaluate_job_integrity_authority_page(
+        expected,
+        &stored,
+        current_policy_sha256,
+        current_policy,
+        &policies,
+        |candidates| job_integrity_page_revocations_postgres(tx, now_ms, candidates),
+        now_ms,
+    )
+}
+
+fn job_integrity_page_subjects(subject_sha256s: &[String]) -> Vec<String> {
+    let mut subjects = subject_sha256s.to_vec();
+    subjects.sort();
+    subjects.dedup();
+    subjects
+}
+
+fn load_stored_job_integrity_authority_page_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    subject_sha256s: &[String],
+) -> JobIntegrityResult<BTreeMap<String, StoredJobIntegrityAuthority>> {
+    let subjects = job_integrity_page_subjects(subject_sha256s);
+    if subjects.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = (1..=subjects.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        "SELECT head.subject_sha256,head.head_revision,head.transition_sha256,
+                head.attestation_sha256,head.attestation_generation,head.policy_sha256,
+                attestation.canonical_attestation_base64url,
+                attestation.employer_identity_authorization_id,
+                attestation.employer_authorization_sha256,
+                attestation.canonical_employer_authorization_base64url,
+                attestation.job_risk_authorization_id,attestation.risk_authorization_sha256,
+                attestation.canonical_risk_authorization_base64url,
+                attestation.effective_expires_at_ms,transition.previous_head_revision,
+                transition.predecessor_transition_sha256,
+                transition.previous_attestation_sha256,transition.transition_actor,
+                transition.transitioned_at_ms,transition.subject_sha256,
+                transition.head_revision,transition.attestation_sha256,
+                transition.attestation_generation,transition.policy_sha256
+           FROM jobs_job_integrity_heads head
+           LEFT JOIN jobs_job_integrity_attestations attestation
+             ON attestation.attestation_sha256=head.attestation_sha256
+           LEFT JOIN jobs_job_integrity_head_transitions transition
+             ON transition.transition_sha256=head.transition_sha256
+          WHERE head.subject_sha256 IN ({placeholders})"
+    );
+    let mut statement = tx.prepare(&query).map_err(job_integrity_storage)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(subjects.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<i64>>(18)?,
+                row.get::<_, Option<String>>(19)?,
+                row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, Option<i64>>(22)?,
+                row.get::<_, Option<String>>(23)?,
+            ))
+        })
+        .map_err(job_integrity_storage)?;
+    let mut stored = BTreeMap::new();
+    for row in rows {
+        let row = row.map_err(job_integrity_storage)?;
+        let values = (
+            row.6, row.7, row.8, row.9, row.10, row.11, row.12, row.13, row.14, row.15,
+            row.16, row.17, row.18, row.19, row.20, row.21, row.22, row.23,
+        );
+        let (
+            Some(canonical_attestation_base64url),
+            Some(employer_authorization_id),
+            Some(employer_authorization_sha256),
+            Some(employer_authorization_base64url),
+            Some(risk_authorization_id),
+            Some(risk_authorization_sha256),
+            Some(risk_authorization_base64url),
+            Some(effective_expires_at_ms),
+            Some(previous_head_revision),
+            predecessor_transition_sha256,
+            previous_attestation_sha256,
+            Some(transition_actor),
+            Some(transitioned_at_ms),
+            Some(transition_subject_sha256),
+            Some(transition_head_revision),
+            Some(transition_attestation_sha256),
+            Some(transition_attestation_generation),
+            Some(transition_policy_sha256),
+        ) = values
+        else {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        };
+        if transition_subject_sha256 != row.0
+            || transition_head_revision != row.1
+            || transition_attestation_sha256 != row.3
+            || transition_attestation_generation != row.4
+            || transition_policy_sha256 != row.5
+        {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        }
+        let value = StoredJobIntegrityAuthority {
+            head_revision: row.1,
+            transition_sha256: row.2,
+            attestation_sha256: row.3,
+            attestation_generation: row.4,
+            policy_sha256: row.5,
+            canonical_attestation_base64url,
+            employer_authorization_id,
+            employer_authorization_sha256,
+            employer_authorization_base64url,
+            risk_authorization_id,
+            risk_authorization_sha256,
+            risk_authorization_base64url,
+            effective_expires_at_ms,
+            previous_head_revision,
+            predecessor_transition_sha256,
+            previous_attestation_sha256,
+            transition_actor,
+            transitioned_at_ms,
+        };
+        if stored.insert(row.0, value).is_some() {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        }
+    }
+    Ok(stored)
+}
+
+fn load_stored_job_integrity_authority_page_postgres_after_publication_fence(
+    tx: &mut postgres::Transaction<'_>,
+    subject_sha256s: &[String],
+) -> JobIntegrityResult<BTreeMap<String, StoredJobIntegrityAuthority>> {
+    let subjects = job_integrity_page_subjects(subject_sha256s);
+    if subjects.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let heads = tx
+        .query(
+            "SELECT subject_sha256,head_revision,transition_sha256,attestation_sha256,
+                    attestation_generation,policy_sha256
+               FROM jobs_job_integrity_heads
+              WHERE subject_sha256=ANY($1) FOR SHARE",
+            &[&subjects],
+        )
+        .map_err(job_integrity_storage)?;
+    let mut head_by_subject = BTreeMap::new();
+    for row in heads {
+        let subject: String = row.get(0);
+        let head = (
+            row.get::<_, i64>(1),
+            row.get::<_, String>(2),
+            row.get::<_, String>(3),
+            row.get::<_, i64>(4),
+            row.get::<_, String>(5),
+        );
+        if head_by_subject.insert(subject, head).is_some() {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        }
+    }
+    if head_by_subject.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows = tx
+        .query(
+            "SELECT transition.subject_sha256,attestation.canonical_attestation_base64url,
+                    attestation.employer_identity_authorization_id,
+                    attestation.employer_authorization_sha256,
+                    attestation.canonical_employer_authorization_base64url,
+                    attestation.job_risk_authorization_id,attestation.risk_authorization_sha256,
+                    attestation.canonical_risk_authorization_base64url,
+                    attestation.effective_expires_at_ms,transition.previous_head_revision,
+                    transition.predecessor_transition_sha256,
+                    transition.previous_attestation_sha256,transition.transition_actor,
+                    transition.transitioned_at_ms,transition.head_revision,
+                    transition.attestation_sha256,transition.attestation_generation,
+                    transition.policy_sha256
+               FROM jobs_job_integrity_heads head
+               JOIN jobs_job_integrity_attestations attestation
+                 ON attestation.attestation_sha256=head.attestation_sha256
+               JOIN jobs_job_integrity_head_transitions transition
+                 ON transition.transition_sha256=head.transition_sha256
+              WHERE head.subject_sha256=ANY($1)
+              FOR SHARE OF head,attestation,transition",
+            &[&subjects],
+        )
+        .map_err(job_integrity_storage)?;
+    let mut stored = BTreeMap::new();
+    for row in rows {
+        let subject: String = row.get(0);
+        let Some((head_revision, transition_sha256, attestation_sha256, attestation_generation, policy_sha256)) =
+            head_by_subject.get(&subject).cloned()
+        else {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        };
+        if row.get::<_, i64>(14) != head_revision
+            || row.get::<_, String>(15) != attestation_sha256
+            || row.get::<_, i64>(16) != attestation_generation
+            || row.get::<_, String>(17) != policy_sha256
+        {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        }
+        let value = StoredJobIntegrityAuthority {
+            head_revision,
+            transition_sha256,
+            attestation_sha256,
+            attestation_generation,
+            policy_sha256,
+            canonical_attestation_base64url: row.get(1),
+            employer_authorization_id: row.get(2),
+            employer_authorization_sha256: row.get(3),
+            employer_authorization_base64url: row.get(4),
+            risk_authorization_id: row.get(5),
+            risk_authorization_sha256: row.get(6),
+            risk_authorization_base64url: row.get(7),
+            effective_expires_at_ms: row.get(8),
+            previous_head_revision: row.get(9),
+            predecessor_transition_sha256: row.get(10),
+            previous_attestation_sha256: row.get(11),
+            transition_actor: row.get(12),
+            transitioned_at_ms: row.get(13),
+        };
+        if stored.insert(subject, value).is_some() {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        }
+    }
+    if stored.len() != head_by_subject.len() {
+        return Err(JobIntegrityAuthorityError::IdentityConflict);
+    }
+    Ok(stored)
+}
+
+fn decode_job_integrity_policy_page(
+    policy_sha256: String,
+    encoded: String,
+) -> JobIntegrityResult<JobIntegrityTrustPolicyV1> {
+    let policy = job_integrity_policy_from_base64(&encoded)?;
+    let bytes = job_integrity_decode_base64url_bounded(&encoded)?;
+    if job_integrity_sha256(bytes) != policy_sha256 {
+        return Err(JobIntegrityAuthorityError::IdentityConflict);
+    }
+    Ok(policy)
+}
+
+fn load_job_integrity_policies_page_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    policy_sha256s: impl IntoIterator<Item = String>,
+) -> JobIntegrityResult<BTreeMap<String, JobIntegrityTrustPolicyV1>> {
+    let mut hashes = policy_sha256s.into_iter().collect::<Vec<_>>();
+    hashes.sort();
+    hashes.dedup();
+    if hashes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let placeholders = (1..=hashes.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let query = format!(
+        "SELECT policy_sha256,canonical_policy_base64url
+           FROM jobs_job_integrity_trust_policies WHERE policy_sha256 IN ({placeholders})"
+    );
+    let mut statement = tx.prepare(&query).map_err(job_integrity_storage)?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(hashes.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(job_integrity_storage)?;
+    let mut values = BTreeMap::new();
+    for row in rows {
+        let (sha256, encoded) = row.map_err(job_integrity_storage)?;
+        let value = decode_job_integrity_policy_page(sha256.clone(), encoded)?;
+        if values.insert(sha256, value).is_some() {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        }
+    }
+    if values.len() != hashes.len() {
+        return Err(JobIntegrityAuthorityError::NotInitialized);
+    }
+    Ok(values)
+}
+
+fn load_job_integrity_policies_page_postgres_after_publication_fence(
+    tx: &mut postgres::Transaction<'_>,
+    policy_sha256s: impl IntoIterator<Item = String>,
+) -> JobIntegrityResult<BTreeMap<String, JobIntegrityTrustPolicyV1>> {
+    let mut hashes = policy_sha256s.into_iter().collect::<Vec<_>>();
+    hashes.sort();
+    hashes.dedup();
+    if hashes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows = tx
+        .query(
+            "SELECT policy_sha256,canonical_policy_base64url
+               FROM jobs_job_integrity_trust_policies WHERE policy_sha256=ANY($1)",
+            &[&hashes],
+        )
+        .map_err(job_integrity_storage)?;
+    let mut values = BTreeMap::new();
+    for row in rows {
+        let sha256: String = row.get(0);
+        let value = decode_job_integrity_policy_page(sha256.clone(), row.get(1))?;
+        if values.insert(sha256, value).is_some() {
+            return Err(JobIntegrityAuthorityError::IdentityConflict);
+        }
+    }
+    if values.len() != hashes.len() {
+        return Err(JobIntegrityAuthorityError::NotInitialized);
+    }
+    Ok(values)
+}
+
+fn evaluate_job_integrity_authority_page<F>(
+    expected: &[JobIntegrityExpectedSource],
+    stored: &BTreeMap<String, StoredJobIntegrityAuthority>,
+    current_policy_sha256: &str,
+    _current_policy: &JobIntegrityTrustPolicyV1,
+    policies: &BTreeMap<String, JobIntegrityTrustPolicyV1>,
+    mut revoked: F,
+    now_ms: i64,
+) -> JobIntegrityResult<Vec<JobIntegrityResolution>>
+where
+    F: FnMut(&BTreeSet<(String, String, String)>) -> JobIntegrityResult<BTreeSet<(String, String, String)>>,
+{
+    let mut candidates = BTreeSet::new();
+    for expected in expected {
+        let Some(stored) = stored.get(&expected.subject_sha256) else {
+            continue;
+        };
+        let policy = policies
+            .get(&stored.policy_sha256)
+            .ok_or(JobIntegrityAuthorityError::NotInitialized)?;
+        let _ = evaluate_job_integrity_authority(
+            stored.clone(),
+            current_policy_sha256,
+            policy,
+            expected,
+            now_ms,
+            |values| {
+                candidates.extend(values.iter().map(|(kind, id, sha256)| {
+                    ((*kind).to_string(), (*id).to_string(), (*sha256).to_string())
+                }));
+                Ok(false)
+            },
+        )?;
+    }
+    let revoked = revoked(&candidates)?;
+    expected
+        .iter()
+        .map(|expected| {
+            let Some(stored) = stored.get(&expected.subject_sha256) else {
+                return Ok(job_integrity_resolution(
+                    JobIntegrityResolutionStatus::Absent,
+                    "job_integrity_attestation_absent",
+                    Vec::new(),
+                    None,
+                ));
+            };
+            let policy = policies
+                .get(&stored.policy_sha256)
+                .ok_or(JobIntegrityAuthorityError::NotInitialized)?;
+            evaluate_job_integrity_authority(
+                stored.clone(),
+                current_policy_sha256,
+                policy,
+                expected,
+                now_ms,
+                |values| {
+                    Ok(values.iter().any(|(kind, id, sha256)| {
+                        revoked.contains(&((*kind).to_string(), (*id).to_string(), (*sha256).to_string()))
+                    }))
+                },
+            )
+        })
+        .collect()
+}
+
+fn job_integrity_page_revocations_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    now_ms: i64,
+    candidates: &BTreeSet<(String, String, String)>,
+) -> JobIntegrityResult<BTreeSet<(String, String, String)>> {
+    if candidates.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let candidates_json = serde_json::to_string(
+        &candidates
+            .iter()
+            .map(|(kind, id, sha256)| serde_json::json!([kind, id, sha256]))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| JobIntegrityAuthorityError::InvalidAuthority)?;
+    let mut statement = tx
+        .prepare(
+            "SELECT revocation.subject_kind,revocation.subject_id,revocation.subject_sha256
+               FROM jobs_job_integrity_revocations revocation
+               JOIN json_each(?1) candidate
+                 ON revocation.subject_kind=json_extract(candidate.value, '$[0]')
+                AND revocation.subject_id=json_extract(candidate.value, '$[1]')
+                AND revocation.subject_sha256=json_extract(candidate.value, '$[2]')
+              WHERE revocation.effective_at_ms<=?2",
+        )
+        .map_err(job_integrity_storage)?;
+    let rows = statement
+        .query_map(params![candidates_json, now_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(job_integrity_storage)?;
+    rows.collect::<std::result::Result<BTreeSet<_>, _>>()
+        .map_err(job_integrity_storage)
+}
+
+fn job_integrity_page_revocations_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    now_ms: i64,
+    candidates: &BTreeSet<(String, String, String)>,
+) -> JobIntegrityResult<BTreeSet<(String, String, String)>> {
+    if candidates.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let kinds = candidates
+        .iter()
+        .map(|(kind, _, _)| kind.clone())
+        .collect::<Vec<_>>();
+    let ids = candidates
+        .iter()
+        .map(|(_, id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let sha256s = candidates
+        .iter()
+        .map(|(_, _, sha256)| sha256.clone())
+        .collect::<Vec<_>>();
+    let rows = tx
+        .query(
+            "SELECT revocation.subject_kind,revocation.subject_id,revocation.subject_sha256
+               FROM jobs_job_integrity_revocations revocation
+               JOIN unnest($1::TEXT[],$2::TEXT[],$3::TEXT[]) candidate(kind,id,sha256)
+                 ON revocation.subject_kind=candidate.kind
+                AND revocation.subject_id=candidate.id
+                AND revocation.subject_sha256=candidate.sha256
+              WHERE revocation.effective_at_ms<=$4 FOR SHARE OF revocation",
+            &[&kinds, &ids, &sha256s, &now_ms],
+        )
+        .map_err(job_integrity_storage)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect())
+}
+
 fn evaluate_stored_job_integrity_authority_sqlite(
     tx: &rusqlite::Transaction<'_>,
     expected: &JobIntegrityExpectedSource,
@@ -4118,6 +4712,15 @@ fn evaluate_stored_job_integrity_authority_postgres(
 pub(crate) mod job_integrity_authority_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PAGE_AUTHORITY_SELECTS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_page_authority_selects(sql: &str) {
+        if sql.trim_start().to_ascii_uppercase().starts_with("SELECT") {
+            PAGE_AUTHORITY_SELECTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     struct Fixture {
         pool: DbPool,
@@ -4143,6 +4746,50 @@ pub(crate) mod job_integrity_authority_tests {
         let pool = crate::db::open_pool(&path).expect("open job-integrity test pool");
         crate::db::run_migrations(&pool).expect("migrate job-integrity test pool");
         pool
+    }
+
+    fn page_expected_source(index: usize, now_ms: i64) -> JobIntegrityExpectedSource {
+        JobIntegrityExpectedSource {
+            subject_sha256: format!("{index:064x}"),
+            source_material_sha256: "a".repeat(64),
+            source_expires_at_ms: now_ms + 60_000,
+            canonical_job_id: format!("page-job-{index}"),
+            provider_family: "greenhouse".to_string(),
+            provider_record_id: format!("greenhouse:acme:{index}"),
+            provider_host: "boards.greenhouse.io".to_string(),
+            provider_tenant: "acme".to_string(),
+            provider_job: index.to_string(),
+            provider_variant: "default".to_string(),
+            canonical_application_url: format!(
+                "https://boards.greenhouse.io/acme/jobs/{index}"
+            ),
+            application_domain: "boards.greenhouse.io".to_string(),
+            ats_tenant_binding_sha256: "b".repeat(64),
+        }
+    }
+
+    #[test]
+    fn page_integrity_authority_statement_budget_is_constant_for_fifty_subjects() {
+        let fixture = fixture();
+        let mut connection = fixture.pool.get().expect("get page connection");
+        PAGE_AUTHORITY_SELECTS.store(0, Ordering::Relaxed);
+        connection.trace(Some(count_page_authority_selects));
+        let transaction = connection.transaction().expect("start page transaction");
+        let resolution = resolve_current_job_integrity_authority_page_sqlite_tx_at_ms(
+            &transaction,
+            &(0..50)
+                .map(|index| page_expected_source(index, fixture.now_ms))
+                .collect::<Vec<_>>(),
+            fixture.now_ms,
+        )
+        .expect("resolve bounded page authority");
+        drop(transaction);
+        connection.trace(None);
+        assert_eq!(resolution.len(), 50);
+        // Control, policy, and all 50 missing heads are three page reads. This
+        // is an execution trace, not a source-string assertion: restoring the
+        // old iterator shape makes it perform 150 selects.
+        assert_eq!(PAGE_AUTHORITY_SELECTS.load(Ordering::Relaxed), 3);
     }
 
     fn test_now(pool: &DbPool) -> i64 {
