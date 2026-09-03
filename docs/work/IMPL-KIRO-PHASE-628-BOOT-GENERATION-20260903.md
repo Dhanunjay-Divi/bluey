@@ -556,3 +556,72 @@ are hard environmental blockers on this host rather than work Kiro declined to d
 - All Rust work used a fresh isolated `CARGO_TARGET_DIR` and `TMPDIR`, with `DATABASE_URL`,
   `BLUEY_DATABASE_URL`, and `BLUEY_POSTGRES_URL` unset. Every temporary workspace was removed.
 - `/Users/uno/Downloads/cue` never touched. All pre-existing Phase 628 changes preserved.
+
+---
+
+# Continuation beyond iteration 5 (Kiro, 2026-09-03)
+
+Work continued after the iteration budget ended, because the batch was not finished. Item 7 from the
+pending list, the lifecycle switchover, was partially completed and item 6 was scoped precisely.
+
+## 12. Lifecycle boot registration
+
+`jobs/workflows/src/original-source-verifier.ts` `establishOriginalSourceVerifierStartup` now
+establishes the server-assigned boot generation BEFORE publishing the degraded startup heartbeat,
+and surfaces it on `EstablishedOriginalSourceVerifierStartup.bootGeneration`.
+
+Registration is feature-detected on the runtime api. An api that cannot register a boot keeps the
+existing behaviour exactly, so the change is backward compatible and cannot break the v1 wire. An
+implausible generation, meaning a non-safe-integer or a value below one, is rejected rather than
+trusted.
+
+## Deliberate stop point, and why
+
+The startup call still uses the v1 `originalSourceVerifierStartup` path. Switching it to
+`sourceVerifierBootStartup` would require the client to supply `probeResult`, but the contract
+states the SERVER must determine readiness by running the rollback-only probe. Server-side probe
+determination is not yet wired, so a client-chosen probe result would fabricate exactly the
+guarantee this batch exists to establish. Kiro stopped rather than fake it.
+
+Correct follow-up order:
+
+1. Move `probe_result` out of `SourceVerifierBootStartupRequest` and have the startup endpoint
+   compute it by running the existing original-source lease decision path inside a rollback-only
+   savepoint, reusing the shared helpers in `original_source_verification.rs`.
+2. Then switch the lifecycle startup call to `sourceVerifierBootStartup`.
+3. Then extend the heartbeat triggers to consult `boot_generation`, which is item 6.
+
+## Commits, none pushed
+
+- `f49a6502ae43009141e357b5e6a7ade9e1ecbb73` feat(jobs): add source-verifier boot generation authority
+- `e9206954` docs(jobs): record Kiro Phase 628 boot generation handoff
+- `71426164` feat(jobs): add source-verifier boot client and lifecycle registration
+
+## Final verification, all executed after the last change
+
+| Gate | Result |
+|------|--------|
+| TypeScript typecheck, 5 of 5 Jobs packages | PASS |
+| TypeScript suites, 5 of 5 | PASS: automation 796, workflows 306, portal 387, browser 219, runner 308 |
+| Boot authority and DB regression tests | PASS 15, 0 failed |
+| `cargo check -p bluey-server` | PASS, `Finished dev profile` |
+| `cargo fmt -p bluey-server --check` | clean |
+| Schema parity | PASS, 107 tables, 90 indexes |
+| CI guard self-test | PASS |
+| `git diff --check` | clean |
+
+Workflows gained three new tests: registration precedes the degraded heartbeat and the generation is
+surfaced; an invalid generation is rejected; and an api without boot support still works.
+
+## Still outstanding
+
+1. Configured non-production PostgreSQL runtime and concurrency evidence. Hard blocker on this host:
+   role `uno` cannot connect and production credentials were neither requested nor substituted.
+2. Docker and native managed-runner smoke. Hard blocker: no docker binary or Docker.app.
+3. `scripts/run-bluey-tests.sh` full Rust suite.
+4. Managed-cloud release gate, needs `--repo` arguments.
+5. Strict Clippy, four pre-existing violations, none in Kiro code, two at committed HEAD.
+6. Heartbeat-table `boot_generation` fencing.
+7. Startup switchover, blocked on server-side probe determination as described above.
+8. Release-gate and CI protocol-drift guards for `source_verifier_boot`.
+9. Commit partitioning for the shared modified files, which remain uncommitted and preserved.
