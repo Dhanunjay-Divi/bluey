@@ -380,6 +380,15 @@ const SQLITE_JOBS_PUBLIC_BETA_ACCESS: &str =
     include_str!("../../../infra/sqlite/server-runtime/060_jobs_public_beta_access.sql");
 const SQLITE_JOBS_WORKSPACE_PAGINATION: &str =
     include_str!("../../../infra/sqlite/server-runtime/061_jobs_workspace_pagination.sql");
+const SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/062_jobs_original_source_verifier_startup_authority.sql"
+);
+const SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql"
+);
+const SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/064_jobs_source_verifier_heartbeat_boot_generation_fence.sql"
+);
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1737,6 +1746,12 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_PUBLIC_BETA_ACCESS,
     // 0061 - stable bounded interactive workspace keyset order.
     SQLITE_JOBS_WORKSPACE_PAGINATION,
+    // 0062 - one-shot original-source verifier startup readiness authority.
+    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+    // 0063 - server-assigned monotonic source-verifier boot generation authority.
+    SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+    // 0064 - project the boot generation fence onto runtime heartbeats.
+    SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2690,12 +2705,14 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     execute_sqlite_signed_job_integrity_migration(&mut conn, signed_job_integrity_migration)
         .with_context(|| format!("migration {} failed", signed_job_integrity_index + 1))?;
     for (offset, sql) in following_migrations.iter().enumerate() {
-        conn.execute_batch(sql).with_context(|| {
-            format!(
-                "migration {} failed",
-                signed_job_integrity_index + offset + 2
-            )
-        })?;
+        let migration_number = signed_job_integrity_index + offset + 2;
+        if *sql == SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY {
+            execute_sqlite_original_source_verifier_startup_migration(&mut conn, sql)
+                .with_context(|| format!("migration {migration_number} failed"))?;
+        } else {
+            conn.execute_batch(sql)
+                .with_context(|| format!("migration {migration_number} failed"))?;
+        }
     }
     tracing::info!(
         backend = pool.backend_name(),
@@ -2709,6 +2726,23 @@ fn execute_sqlite_signed_job_integrity_migration(
     conn: &mut rusqlite::Connection,
     migration: &str,
 ) -> Result<()> {
+    let startup_v3_applied: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM bluey_data_migrations
+            WHERE name='jobs-original-source-verifier-startup-authority-v1'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let migration = if startup_v3_applied {
+        let suffix = "CREATE TABLE IF NOT EXISTS jobs_job_integrity_trust_policies";
+        let offset = migration
+            .find(suffix)
+            .context("SQLite migration 058 job-integrity suffix is missing")?;
+        &migration[offset..]
+    } else {
+        migration
+    };
     let foreign_keys_enabled: bool =
         conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     let execution = conn.execute_batch(migration);
@@ -2753,6 +2787,83 @@ fn execute_sqlite_signed_job_integrity_migration(
     anyhow::ensure!(
         !foreign_key_violation,
         "SQLite migration 058 produced a foreign-key violation"
+    );
+    Ok(())
+}
+
+fn execute_sqlite_original_source_verifier_startup_migration(
+    conn: &mut rusqlite::Connection,
+    migration: &str,
+) -> Result<()> {
+    const MARKER: &str = "jobs-original-source-verifier-startup-authority-v1";
+    const ADDITIVE_SUFFIX: &str =
+        "CREATE TABLE IF NOT EXISTS jobs_managed_cloud_manifest_source_verifier_startup_protocols";
+    let already_applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bluey_data_migrations WHERE name=?1)",
+        [MARKER],
+        |row| row.get(0),
+    )?;
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let execution = if already_applied {
+        (|| -> rusqlite::Result<()> {
+            let suffix_offset = migration.find(ADDITIVE_SUFFIX).ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName(
+                    "SQLite migration 062 additive suffix is missing".to_string(),
+                )
+            })?;
+            let suffix = &migration[suffix_offset..];
+            let commit_offset = suffix.rfind("COMMIT;").ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName(
+                    "SQLite migration 062 commit boundary is missing".to_string(),
+                )
+            })?;
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            conn.execute_batch(&suffix[..commit_offset])?;
+            conn.execute_batch("COMMIT;")
+        })()
+    } else {
+        conn.execute_batch(migration)
+    };
+    let rollback = (|| -> Result<()> {
+        if !conn.is_autocommit() {
+            conn.execute_batch("ROLLBACK")?;
+        }
+        Ok(())
+    })();
+    let restore = (|| -> Result<()> {
+        conn.pragma_update(None, "foreign_keys", foreign_keys_enabled)?;
+        let restored: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        anyhow::ensure!(
+            restored == foreign_keys_enabled,
+            "SQLite foreign-key enforcement was not restored after migration 062"
+        );
+        Ok(())
+    })();
+    if let Err(error) = execution {
+        let rollback_status = rollback
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        let restore_status = restore
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        return Err(anyhow::Error::new(error).context(format!(
+            "SQLite migration 062 failed; rollback={rollback_status}; \
+             foreign_key_restore={restore_status}"
+        )));
+    }
+    rollback.context("finish SQLite migration 062 transaction cleanup")?;
+    restore.context("restore SQLite foreign-key enforcement after migration 062")?;
+    let foreign_key_violation = conn
+        .prepare("PRAGMA foreign_key_check")?
+        .query([])?
+        .next()?
+        .is_some();
+    anyhow::ensure!(
+        !foreign_key_violation,
+        "SQLite migration 062 produced a foreign-key violation"
     );
     Ok(())
 }
@@ -2870,6 +2981,21 @@ const POSTGRES_JOBS_PUBLIC_BETA_ACCESS: &str =
 pub const JOBS_WORKSPACE_PAGINATION_MIGRATION_ID: &str = "039_jobs_workspace_pagination.sql";
 const POSTGRES_JOBS_WORKSPACE_PAGINATION: &str =
     include_str!("../../../infra/postgres/server-runtime/039_jobs_workspace_pagination.sql");
+pub const JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID: &str =
+    "040_jobs_original_source_verifier_startup_authority.sql";
+const POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/040_jobs_original_source_verifier_startup_authority.sql"
+);
+pub const JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID: &str =
+    "041_jobs_source_verifier_boot_generation_authority.sql";
+const POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql"
+);
+pub const JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID: &str =
+    "042_jobs_source_verifier_heartbeat_boot_generation_fence.sql";
+const POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE: &str = include_str!(
+    "../../../infra/postgres/server-runtime/042_jobs_source_verifier_heartbeat_boot_generation_fence.sql"
+);
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -3010,6 +3136,18 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_WORKSPACE_PAGINATION_MIGRATION_ID,
         POSTGRES_JOBS_WORKSPACE_PAGINATION,
+    ),
+    (
+        JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+    ),
+    (
+        JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+    ),
+    (
+        JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID,
+        POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
     ),
 ];
 
@@ -3302,9 +3440,11 @@ mod blocking_boundary_tests {
 mod sqlite_migration_replay_tests {
     use super::{
         ensure_column, ensure_sqlite_original_source_verification_hold_capability,
+        execute_sqlite_original_source_verifier_startup_migration,
         execute_sqlite_signed_job_integrity_migration, open_pool, run_migrations,
         SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
         SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY, SQLITE_JOBS_OPERATIONAL_HOLDS,
+        SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
     };
 
     #[test]
@@ -3352,6 +3492,90 @@ mod sqlite_migration_replay_tests {
                 [],
             )
             .is_err());
+    }
+
+    #[test]
+    fn original_source_verifier_startup_migration_failure_restores_state() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch("CREATE TABLE bluey_data_migrations(name TEXT PRIMARY KEY);")
+            .unwrap();
+        let error = execute_sqlite_original_source_verifier_startup_migration(
+            &mut conn,
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE phase628_interrupted (id INTEGER PRIMARY KEY);
+             SELECT * FROM phase628_forced_missing_relation;
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect_err("injected startup migration failure must propagate");
+        assert!(error.to_string().contains("SQLite migration 062 failed"));
+        assert!(conn.is_autocommit(), "failed migration must roll back");
+        let foreign_keys_enabled: bool = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert!(foreign_keys_enabled, "foreign keys must be restored");
+        let interrupted_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='phase628_interrupted'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!interrupted_table_exists, "partial schema must roll back");
+    }
+
+    #[test]
+    fn original_source_verifier_startup_migration_replay_skips_table_swap() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-osv-startup-migration-replay-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).expect("open startup migration fixture");
+        run_migrations(&pool).expect("apply startup migration");
+        {
+            let conn = pool.get().expect("startup migration fixture connection");
+            conn.execute_batch(
+                "CREATE TRIGGER phase628_signature_table_identity
+                 AFTER INSERT ON jobs_managed_cloud_signature_sets
+                 WHEN NEW.signature_set_id='phase628-never'
+                 BEGIN SELECT RAISE(ABORT, 'phase628 sentinel'); END;",
+            )
+            .expect("install signature-table identity sentinel");
+        }
+        run_migrations(&pool).expect("replay startup migration");
+        let conn = pool.get().expect("assert replayed startup migration");
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bluey_data_migrations
+                  WHERE name='jobs-original-source-verifier-startup-authority-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count startup marker");
+        let sentinel_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='trigger' AND name='phase628_signature_table_identity'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count signature-table identity sentinel");
+        let foreign_keys_enabled: bool = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .expect("read foreign-key setting after replay");
+        assert_eq!((marker_count, sentinel_count), (1, 1));
+        assert!(foreign_keys_enabled);
+        assert_eq!(
+            SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY
+                .matches("BEGIN IMMEDIATE")
+                .count(),
+            1
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6128,8 +6352,11 @@ mod postgres_migration_tests {
         JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
         JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID, JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
         JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
+        JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID,
         JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
         JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
+        JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID,
+        JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID,
         JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
         JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
         JOBS_WORKSPACE_PAGINATION_MIGRATION_ID, MIGRATIONS, POSTGRES_ACCOUNT_DELETION_INTENTS,
@@ -6137,9 +6364,12 @@ mod postgres_migration_tests {
         POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY, POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY,
         POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
         POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY, POSTGRES_JOBS_OPERATIONAL_HOLDS,
-        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY, POSTGRES_JOBS_PUBLIC_BETA_ACCESS,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY, POSTGRES_JOBS_PUBLIC_BETA_ACCESS,
         POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+        POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+        POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
         POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_JOBS_WORKSPACE_PAGINATION, POSTGRES_MIGRATIONS,
         POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
@@ -6147,11 +6377,101 @@ mod postgres_migration_tests {
         SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
         SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
         SQLITE_JOBS_OPERATIONAL_HOLDS, SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
-        SQLITE_JOBS_PUBLIC_BETA_ACCESS, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
-        SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
-        SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY, SQLITE_JOBS_WORKFLOW_COMMANDS,
-        SQLITE_JOBS_WORKSPACE_PAGINATION,
+        SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY, SQLITE_JOBS_PUBLIC_BETA_ACCESS,
+        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+        SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+        SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+        SQLITE_JOBS_WORKFLOW_COMMANDS, SQLITE_JOBS_WORKSPACE_PAGINATION,
     };
+
+    #[test]
+    fn heartbeat_boot_generation_fence_migrations_are_registered() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| {
+                *id == JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID
+            })
+            .expect("heartbeat fence migration must be registered");
+        assert_eq!(
+            *version,
+            "042_jobs_source_verifier_heartbeat_boot_generation_fence.sql"
+        );
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE
+        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE));
+        for sql in [
+            SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+            POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+        ] {
+            assert!(sql.contains("committed readiness cannot be lowered"));
+            assert!(sql.contains("ready_boot_generation IS NOT NULL"));
+            assert!(sql.contains("current_boot_generation <= head.ready_boot_generation"));
+            // Must stay replay-safe: no ADD COLUMN on the heartbeat table.
+            assert!(!sql.contains("ADD COLUMN"));
+        }
+    }
+
+    #[test]
+    fn source_verifier_boot_generation_migrations_are_registered() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| *id == JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID)
+            .expect("source-verifier boot generation migration must be registered");
+        assert_eq!(
+            *version,
+            "041_jobs_source_verifier_boot_generation_authority.sql"
+        );
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY
+        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY));
+        for sql in [
+            SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+            POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+        ] {
+            assert!(sql.contains("jobs_managed_cloud_source_verifier_boot_generation_heads"));
+            assert!(sql.contains("jobs_managed_cloud_source_verifier_boot_registrations"));
+            assert!(sql.contains("jobs_managed_cloud_source_verifier_boot_startup_authorities"));
+            assert!(sql.contains("source_verifier_boot"));
+            assert!(sql.contains("current_boot_generation"));
+            assert!(sql.contains("ready_boot_generation"));
+            assert!(sql.contains("registration_request_id"));
+            assert!(sql.contains("canonical_response_base64url"));
+        }
+        assert!(!SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY
+            .contains("source_verifier_boot"));
+    }
+
+    #[test]
+    fn original_source_verifier_startup_migrations_are_registered_and_version_scoped() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| *id == JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID)
+            .expect("source-verifier startup migration must be registered");
+        assert_eq!(
+            *version,
+            "040_jobs_original_source_verifier_startup_authority.sql"
+        );
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY
+        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY));
+        for sql in [
+            SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+            POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+        ] {
+            assert!(sql.contains("jobs_managed_cloud_original_source_verifier_startup_authorities"));
+            assert!(sql.contains("source_verifier_startup"));
+            assert!(sql.contains("degraded_heartbeat_sequence"));
+            assert!(sql.contains("ready_heartbeat_sequence"));
+            assert!(sql.contains("canonical_response_base64url"));
+        }
+    }
 
     #[test]
     fn workflow_cleanup_migrations_are_dialect_parity_and_fail_closed() {
