@@ -5,6 +5,13 @@ import {
   type OriginalSourceVerificationObservation,
   type OriginalSourceVerificationSubject,
 } from "@bluey/jobs-automation/original-source-verification";
+import {
+  runManagedCloudRuntimeHeartbeats,
+  type ManagedCloudOriginalSourceVerifierStartupApi,
+  type ManagedCloudRuntimeHeartbeat,
+  type ManagedCloudRuntimeInstance,
+  type ManagedCloudRuntimeObservation,
+} from "@bluey/jobs-automation/managed-cloud-runtime-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -22,6 +29,7 @@ import {
   terminalRequestId,
 } from "../src/original-source-verification-runtime.js";
 import {
+  establishOriginalSourceVerifierStartup,
   runOriginalSourceVerifierFromEnvironment,
   runOriginalSourceVerifierLifecycle,
 } from "../src/original-source-verifier.js";
@@ -39,6 +47,38 @@ const BINDING: OriginalSourceVerifierBinding = {
   runtime_instance_epoch: 7,
   runtime_authority_sha256: "a".repeat(64),
   runtime_session_token: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+};
+const MANAGED_INSTANCE: ManagedCloudRuntimeInstance = {
+  grantId: "original-source-runtime-grant-123",
+  runtimeInstanceId: BINDING.runtime_instance_id,
+  runtimeIdentitySha256: RUNTIME_IDENTITY_SHA256,
+  workerId: BINDING.worker_id,
+  scope: { environment: "staging", region: "us-east-1", channel: "shadow" },
+  activationSha256: "2".repeat(64),
+  activationExpiresAtMs: 1_800_000_000_000,
+  manifestSha256: "3".repeat(64),
+  componentId: "jobs-workflows",
+  role: "original_source_verifier",
+  headRevision: 4,
+  transitionSha256: "5".repeat(64),
+  artifactSha256: "6".repeat(64),
+  configSchemaSha256: "7".repeat(64),
+  migrationSetSha256: "8".repeat(64),
+  protocolSetSha256: "9".repeat(64),
+  taskQueueSha256: "a".repeat(64),
+  failureConverterSha256: "b".repeat(64),
+  dependencyEvidenceSha256: "c".repeat(64),
+  instanceEpoch: BINDING.runtime_instance_epoch,
+  nextHeartbeatSequence: 11,
+  claimedAtMs: 1_750_000_000_000,
+  replayed: false,
+};
+const MANAGED_OBSERVATION: ManagedCloudRuntimeObservation = {
+  taskQueueSha256: MANAGED_INSTANCE.taskQueueSha256,
+  failureConverterSha256: MANAGED_INSTANCE.failureConverterSha256,
+  dependencyEvidenceSha256: MANAGED_INSTANCE.dependencyEvidenceSha256,
+  healthState: "ready",
+  reasonCode: null,
 };
 
 afterEach(() => vi.unstubAllEnvs());
@@ -126,6 +166,68 @@ function heartbeat(sequence: number): OriginalSourceVerificationHeartbeat {
     hard_deadline_at_ms: 1_800_000_600_000,
     heartbeat_sequence: sequence,
     replayed: false,
+  };
+}
+
+function managedHeartbeat(
+  sequence: number,
+  healthState: "ready" | "degraded",
+  reasonCode: "startup" | "probe_failed" | null,
+  replayed = false,
+): ManagedCloudRuntimeHeartbeat {
+  return {
+    runtimeInstanceId: MANAGED_INSTANCE.runtimeInstanceId,
+    workerId: MANAGED_INSTANCE.workerId,
+    instanceEpoch: MANAGED_INSTANCE.instanceEpoch,
+    heartbeatSequence: sequence,
+    observedHeadRevision: MANAGED_INSTANCE.headRevision,
+    observedTransitionSha256: MANAGED_INSTANCE.transitionSha256,
+    activationSha256: MANAGED_INSTANCE.activationSha256,
+    manifestSha256: MANAGED_INSTANCE.manifestSha256,
+    componentId: MANAGED_INSTANCE.componentId,
+    role: "original_source_verifier" as const,
+    artifactSha256: MANAGED_INSTANCE.artifactSha256,
+    migrationSetSha256: MANAGED_INSTANCE.migrationSetSha256,
+    configSchemaSha256: MANAGED_INSTANCE.configSchemaSha256,
+    protocolSetSha256: MANAGED_INSTANCE.protocolSetSha256,
+    taskQueueSha256: MANAGED_INSTANCE.taskQueueSha256,
+    failureConverterSha256: MANAGED_INSTANCE.failureConverterSha256,
+    dependencyEvidenceSha256: MANAGED_INSTANCE.dependencyEvidenceSha256,
+    healthState,
+    reasonCode,
+    heartbeatAtMs: 1_750_000_001_000 + sequence,
+    replayed,
+  };
+}
+
+function managedStartup() {
+  return {
+    version: 1 as const,
+    audience:
+      "bluey-jobs-managed-cloud-original-source-verifier-startup-v1" as const,
+    startupRequestId: "osv-startup-" + "d".repeat(64),
+    runtimeInstanceId: MANAGED_INSTANCE.runtimeInstanceId,
+    workerId: MANAGED_INSTANCE.workerId,
+    instanceEpoch: MANAGED_INSTANCE.instanceEpoch,
+    runtimeIdentitySha256: MANAGED_INSTANCE.runtimeIdentitySha256,
+    observedHeadRevision: MANAGED_INSTANCE.headRevision,
+    observedTransitionSha256: MANAGED_INSTANCE.transitionSha256,
+    activationSha256: MANAGED_INSTANCE.activationSha256,
+    manifestSha256: MANAGED_INSTANCE.manifestSha256,
+    componentId: MANAGED_INSTANCE.componentId,
+    role: "original_source_verifier" as const,
+    artifactSha256: MANAGED_INSTANCE.artifactSha256,
+    migrationSetSha256: MANAGED_INSTANCE.migrationSetSha256,
+    configSchemaSha256: MANAGED_INSTANCE.configSchemaSha256,
+    protocolSetSha256: MANAGED_INSTANCE.protocolSetSha256,
+    taskQueueSha256: MANAGED_INSTANCE.taskQueueSha256,
+    failureConverterSha256: MANAGED_INSTANCE.failureConverterSha256,
+    dependencyEvidenceSha256: MANAGED_INSTANCE.dependencyEvidenceSha256,
+    degradedHeartbeatSequence: MANAGED_INSTANCE.nextHeartbeatSequence,
+    readyHeartbeatSequence: MANAGED_INSTANCE.nextHeartbeatSequence + 1,
+    probeResult: "idle" as const,
+    startupAuthoritySha256: "e".repeat(64),
+    startupAtMs: 1_750_000_002_000,
   };
 }
 
@@ -429,7 +531,242 @@ describe("original-source verifier runtime", () => {
     ).toThrow(/identity/);
   });
 
-  it("establishes a verifier poll before the immediate managed-runtime probe", async () => {
+
+  it("registers the server-assigned boot generation before the degraded heartbeat", async () => {
+    const order: string[] = [];
+    const runtimeApi: ManagedCloudOriginalSourceVerifierStartupApi & {
+      registerSourceVerifierBoot: (
+        instance: ManagedCloudRuntimeInstance,
+      ) => Promise<{ bootGeneration: number }>;
+    } = {
+      claim: async () => MANAGED_INSTANCE,
+      registerSourceVerifierBoot: async () => {
+        order.push("register-boot");
+        return { bootGeneration: 7 };
+      },
+      heartbeat: async (_instance, sequence, observation) => {
+        order.push(
+          `heartbeat:${sequence}:${observation.healthState}:${String(observation.reasonCode)}`,
+        );
+        return managedHeartbeat(
+          sequence,
+          observation.healthState === "ready" ? "ready" : "degraded",
+          observation.reasonCode === "startup" ||
+            observation.reasonCode === "probe_failed"
+            ? observation.reasonCode
+            : null,
+        );
+      },
+      originalSourceVerifierStartup: async (_instance, sequence) => {
+        order.push(`startup:${sequence}`);
+        return managedStartup();
+      },
+    };
+    const established = await establishOriginalSourceVerifierStartup(
+      runtimeApi,
+      MANAGED_INSTANCE,
+      MANAGED_OBSERVATION,
+    );
+    expect(order[0]).toBe("register-boot");
+    expect(order[1]).toBe(
+      `heartbeat:${MANAGED_INSTANCE.nextHeartbeatSequence}:degraded:startup`,
+    );
+    expect(established.bootGeneration).toBe(7);
+  });
+
+  it("rejects an invalid server-assigned boot generation", async () => {
+    const runtimeApi: ManagedCloudOriginalSourceVerifierStartupApi & {
+      registerSourceVerifierBoot: (
+        instance: ManagedCloudRuntimeInstance,
+      ) => Promise<{ bootGeneration: number }>;
+    } = {
+      claim: async () => MANAGED_INSTANCE,
+      registerSourceVerifierBoot: async () => ({ bootGeneration: 0 }),
+      heartbeat: async (_instance, sequence, observation) =>
+        managedHeartbeat(
+          sequence,
+          observation.healthState === "ready" ? "ready" : "degraded",
+          observation.reasonCode === "startup" ? "startup" : null,
+        ),
+      originalSourceVerifierStartup: async () => managedStartup(),
+    };
+    await expect(
+      establishOriginalSourceVerifierStartup(
+        runtimeApi,
+        MANAGED_INSTANCE,
+        MANAGED_OBSERVATION,
+      ),
+    ).rejects.toThrow(/boot generation is invalid/);
+  });
+
+  it("remains compatible with a runtime api that cannot register a boot", async () => {
+    const order: string[] = [];
+    const runtimeApi: ManagedCloudOriginalSourceVerifierStartupApi = {
+      claim: async () => MANAGED_INSTANCE,
+      heartbeat: async (_instance, sequence, observation) => {
+        order.push(`heartbeat:${sequence}`);
+        return managedHeartbeat(
+          sequence,
+          observation.healthState === "ready" ? "ready" : "degraded",
+          observation.reasonCode === "startup" ? "startup" : null,
+        );
+      },
+      originalSourceVerifierStartup: async () => managedStartup(),
+    };
+    const established = await establishOriginalSourceVerifierStartup(
+      runtimeApi,
+      MANAGED_INSTANCE,
+      MANAGED_OBSERVATION,
+    );
+    expect(order[0]).toBe(
+      `heartbeat:${MANAGED_INSTANCE.nextHeartbeatSequence}`,
+    );
+    expect(established.bootGeneration).toBeUndefined();
+  });
+
+  it("orders degraded startup, one readiness CAS, one poll, then sequence N+2", async () => {
+    const order: string[] = [];
+    const controller = new AbortController();
+    const runtimeApi: ManagedCloudOriginalSourceVerifierStartupApi = {
+      claim: async () => {
+        order.push("claim");
+        return MANAGED_INSTANCE;
+      },
+      heartbeat: async (_instance, sequence, observation) => {
+        order.push(
+          `managed:${sequence}:${observation.healthState}:${String(observation.reasonCode)}`,
+        );
+        if (sequence === MANAGED_INSTANCE.nextHeartbeatSequence + 2)
+          controller.abort();
+        return managedHeartbeat(
+          sequence,
+          observation.healthState === "ready" ? "ready" : "degraded",
+          observation.reasonCode === "startup" ||
+            observation.reasonCode === "probe_failed"
+            ? observation.reasonCode
+            : null,
+        );
+      },
+      originalSourceVerifierStartup: async (_instance, sequence) => {
+        order.push(`startup:${sequence}`);
+        return managedStartup();
+      },
+    };
+    const claimedInstance = await runtimeApi.claim();
+    const { reportingInstance } = await establishOriginalSourceVerifierStartup(
+      runtimeApi,
+      claimedInstance,
+      MANAGED_OBSERVATION,
+    );
+    const workerApi: OriginalSourceVerificationWorkerApi = {
+      lease: async () => {
+        order.push("worker-poll");
+        return null;
+      },
+      heartbeat: vi.fn(),
+      complete: vi.fn(),
+      fail: vi.fn(),
+    };
+    const runtime = new OriginalSourceVerifierRuntime({
+      api: workerApi,
+      workerRuntimeIdentitySha256: RUNTIME_IDENTITY_SHA256,
+      pollIntervalMs: 250,
+    });
+
+    await runOriginalSourceVerifierLifecycle(
+      runtime,
+      controller,
+      managedStartup(),
+      () =>
+        runManagedCloudRuntimeHeartbeats(
+          runtimeApi,
+          reportingInstance,
+          async () => {
+            expect(runtime.managedCloudReady()).toBe(true);
+            return MANAGED_OBSERVATION;
+          },
+          5_000,
+          controller.signal,
+        ),
+    );
+
+    expect(order).toEqual([
+      "claim",
+      "managed:11:degraded:startup",
+      "startup:11",
+      "worker-poll",
+      "managed:13:ready:null",
+    ]);
+  });
+
+  it("reports one N+1 probe failure and starts no worker when startup fails", async () => {
+    const order: string[] = [];
+    const runtimeApi: ManagedCloudOriginalSourceVerifierStartupApi = {
+      claim: async () => MANAGED_INSTANCE,
+      heartbeat: async (_instance, sequence, observation) => {
+        order.push(
+          `managed:${sequence}:${observation.healthState}:${String(observation.reasonCode)}`,
+        );
+        return managedHeartbeat(
+          sequence,
+          "degraded",
+          observation.reasonCode === "startup" ? "startup" : "probe_failed",
+        );
+      },
+      originalSourceVerifierStartup: async (_instance, sequence) => {
+        order.push(`startup:${sequence}`);
+        throw new Error("probe rejected");
+      },
+    };
+    const workerStarted = vi.fn();
+
+    await expect(
+      (async () => {
+        await establishOriginalSourceVerifierStartup(
+          runtimeApi,
+          MANAGED_INSTANCE,
+          MANAGED_OBSERVATION,
+        );
+        workerStarted();
+      })(),
+    ).rejects.toThrow("startup probe failed");
+    expect(workerStarted).not.toHaveBeenCalled();
+    expect(order).toEqual([
+      "managed:11:degraded:startup",
+      "startup:11",
+      "managed:12:degraded:probe_failed",
+    ]);
+  });
+
+  it("does not retry startup or its single failed-probe acknowledgement", async () => {
+    const startup = vi.fn(async () => {
+      throw new Error("startup unavailable");
+    });
+    const heartbeatCalls: number[] = [];
+    const runtimeApi: ManagedCloudOriginalSourceVerifierStartupApi = {
+      claim: async () => MANAGED_INSTANCE,
+      heartbeat: async (_instance, sequence, observation) => {
+        heartbeatCalls.push(sequence);
+        if (observation.reasonCode === "probe_failed") {
+          throw new Error("failure acknowledgement unavailable");
+        }
+        return managedHeartbeat(sequence, "degraded", "startup");
+      },
+      originalSourceVerifierStartup: startup,
+    };
+
+    await expect(
+      establishOriginalSourceVerifierStartup(
+        runtimeApi,
+        MANAGED_INSTANCE,
+        MANAGED_OBSERVATION,
+      ),
+    ).rejects.toThrow("probe-failure acknowledgement failed");
+    expect(startup).toHaveBeenCalledTimes(1);
+    expect(heartbeatCalls).toEqual([11, 12]);
+  });
+
+  it("starts one verifier poll alongside the immediate managed-runtime report", async () => {
     const api: OriginalSourceVerificationWorkerApi = {
       lease: vi.fn(async () => null),
       heartbeat: vi.fn(),
@@ -444,13 +781,18 @@ describe("original-source verifier runtime", () => {
     const controller = new AbortController();
     const readinessAtImmediateProbe: boolean[] = [];
 
-    await runOriginalSourceVerifierLifecycle(runtime, controller, async () => {
-      readinessAtImmediateProbe.push(runtime.managedCloudReady());
-      controller.abort();
-    });
+    await runOriginalSourceVerifierLifecycle(
+      runtime,
+      controller,
+      managedStartup(),
+      async () => {
+        readinessAtImmediateProbe.push(runtime.managedCloudReady());
+        controller.abort();
+      },
+    );
 
     expect(readinessAtImmediateProbe).toEqual([true]);
-    expect(api.lease).toHaveBeenCalled();
+    expect(api.lease).toHaveBeenCalledTimes(1);
   });
 
   it("has no unmanaged legacy startup mode", async () => {
