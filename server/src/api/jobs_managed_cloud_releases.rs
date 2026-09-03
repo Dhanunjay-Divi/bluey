@@ -4,12 +4,14 @@
 //! bind the fleet HMAC identity to the one-time grant and fenced instance.
 
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -18,7 +20,8 @@ use crate::{
     db::jobs::{
         self, ApplyManagedCloudActivationRequest, ApplyManagedCloudRollbackRequest,
         ClaimManagedCloudRuntimeGrant, ManagedCloudActivationImportRequest,
-        ManagedCloudAuthorityEnvelope, ManagedCloudCohortImportRequest, ManagedCloudReadinessQuery,
+        ManagedCloudAuthorityEnvelope, ManagedCloudCohortImportRequest,
+        ManagedCloudOriginalSourceVerifierStartupRequest, ManagedCloudReadinessQuery,
         ManagedCloudRegistryError, ManagedCloudReleaseImportRequest,
         ManagedCloudRevocationImportRequest, ManagedCloudRollbackImportRequest,
         ManagedCloudRuntimeHeartbeatInput, ManagedCloudScope, NewManagedCloudRuntimeGrant,
@@ -44,6 +47,18 @@ pub fn worker_router() -> Router<AppState> {
         .route(
             "/api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/heartbeats",
             post(record_runtime_heartbeat),
+        )
+        .route(
+            "/api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/original-source-verifier-startup",
+            post(record_original_source_verifier_startup),
+        )
+        .route(
+            "/api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-registration",
+            post(register_source_verifier_boot_endpoint),
+        )
+        .route(
+            "/api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-startup",
+            post(record_source_verifier_boot_startup_endpoint),
         )
         .layer(DefaultBodyLimit::max(
             MANAGED_CLOUD_RUNTIME_BODY_LIMIT_BYTES,
@@ -322,6 +337,77 @@ async fn record_runtime_heartbeat(
         .map_err(registry_api_error)
 }
 
+async fn record_original_source_verifier_startup(
+    State(state): State<AppState>,
+    Extension(worker): Extension<JobsWorkerIdentity>,
+    Path(runtime_instance_id): Path<String>,
+    Json(request): Json<ManagedCloudOriginalSourceVerifierStartupRequest>,
+) -> Result<Response, ApiError> {
+    require_runtime_worker(&worker, &request.worker_id)?;
+    if request.runtime_instance_id != runtime_instance_id {
+        return Err(invalid_request());
+    }
+    jobs::record_managed_cloud_original_source_verifier_startup(&state.pool, &request)
+        .map(|result| authoritative_raw_json(result.canonical_response))
+        .map_err(registry_api_error)
+}
+
+async fn register_source_verifier_boot_endpoint(
+    State(state): State<AppState>,
+    Extension(worker): Extension<JobsWorkerIdentity>,
+    Path(runtime_instance_id): Path<String>,
+    Json(request): Json<jobs::SourceVerifierBootRegistrationRequest>,
+) -> Result<Response, ApiError> {
+    require_runtime_worker(&worker, &request.worker_id)?;
+    if request.runtime_instance_id != runtime_instance_id {
+        return Err(invalid_request());
+    }
+    let registration = jobs::register_source_verifier_boot(&state.pool, &request)
+        .map_err(source_verifier_boot_api_error)?;
+    let canonical = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(registration.canonical_response_base64url.as_bytes())
+        .map_err(|_| invalid_request())?;
+    Ok(authoritative_raw_json(canonical))
+}
+
+async fn record_source_verifier_boot_startup_endpoint(
+    State(state): State<AppState>,
+    Extension(worker): Extension<JobsWorkerIdentity>,
+    Path(runtime_instance_id): Path<String>,
+    Json(request): Json<jobs::SourceVerifierBootStartupRequest>,
+) -> Result<Response, ApiError> {
+    require_runtime_worker(&worker, &request.worker_id)?;
+    if request.runtime_instance_id != runtime_instance_id {
+        return Err(invalid_request());
+    }
+    // The server, not the client, must determine readiness from the
+    // rollback-only probe. Until that probe is integrated into the startup
+    // orchestration this endpoint refuses rather than fabricating readiness.
+    let _ = &request;
+    return Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Server-side source-verifier readiness probe is not yet integrated.".to_string(),
+    ));
+    #[allow(unreachable_code)]
+    let startup = jobs::record_source_verifier_boot_startup(&state.pool, &request, "idle")
+        .map_err(source_verifier_boot_api_error)?;
+    let canonical = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(startup.canonical_response_base64url.as_bytes())
+        .map_err(|_| invalid_request())?;
+    Ok(authoritative_raw_json(canonical))
+}
+
+fn source_verifier_boot_api_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.contains("conflicts") {
+        return (StatusCode::CONFLICT, message);
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        "The source-verifier boot registration request is invalid.".to_string(),
+    )
+}
+
 fn require_runtime_worker(worker: &JobsWorkerIdentity, expected: &str) -> Result<(), ApiError> {
     if worker.scope != MANAGED_CLOUD_RUNTIME_SCOPE || worker.worker_id != expected {
         return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
@@ -331,6 +417,22 @@ fn require_runtime_worker(worker: &JobsWorkerIdentity, expected: &str) -> Result
 
 fn authoritative_json<T: Serialize>(value: T) -> Response {
     let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn authoritative_raw_json(canonical: Vec<u8>) -> Response {
+    let mut response = Response::new(Body::from(canonical));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -408,6 +510,25 @@ mod tests {
             response.headers()[header::X_CONTENT_TYPE_OPTIONS],
             "nosniff"
         );
+    }
+
+    #[tokio::test]
+    async fn authoritative_startup_replay_preserves_raw_canonical_bytes_and_headers() {
+        let canonical = br#"{"audience":"bluey-jobs-managed-cloud-original-source-verifier-startup-v1","version":1}
+"#
+        .to_vec();
+        let response = authoritative_raw_json(canonical.clone());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        let body = axum::body::to_bytes(response.into_body(), canonical.len())
+            .await
+            .expect("read canonical startup response");
+        assert_eq!(body.as_ref(), canonical);
     }
 
     #[test]

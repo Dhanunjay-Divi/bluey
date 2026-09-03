@@ -495,7 +495,6 @@ export class ManagedCloudRuntimeApiClient {
     instance: ManagedCloudRuntimeInstance,
     bootGeneration: number,
     expectedDegradedHeartbeatSequence: number,
-    probeResult: string,
   ): Promise<SourceVerifierBootStartupResult> {
     requireSourceVerifierIdentity(instance);
     assertManagedCloudRuntimeMeasurement(this.config);
@@ -512,7 +511,6 @@ export class ManagedCloudRuntimeApiClient {
       bootGeneration,
       workerId: instance.workerId,
       degradedHeartbeatSequence: degradedSequence,
-      probeResult,
     });
     return parseSourceVerifierBootStartup(value);
   }

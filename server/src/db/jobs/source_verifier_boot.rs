@@ -60,7 +60,6 @@ pub(crate) struct SourceVerifierBootStartupRequest {
     pub boot_generation: i64,
     pub worker_id: String,
     pub degraded_heartbeat_sequence: i64,
-    pub probe_result: String,
 }
 
 /// Result of an idempotent startup transition.
@@ -147,7 +146,6 @@ fn source_verifier_boot_startup_fields(
         request.degraded_heartbeat_sequence.to_string(),
     );
     fields.insert("instanceEpoch", request.instance_epoch.to_string());
-    fields.insert("probeResult", request.probe_result.clone());
     fields.insert("runtimeInstanceId", request.runtime_instance_id.clone());
     fields.insert("startupRequestId", request.startup_request_id.clone());
     fields.insert("workerId", request.worker_id.clone());
@@ -195,9 +193,11 @@ fn source_verifier_boot_registration_response(
 /// Canonical startup response. Also free of any mutable replay flag.
 fn source_verifier_boot_startup_response(
     request: &SourceVerifierBootStartupRequest,
+    probe_result: &str,
     startup_at_ms: i64,
 ) -> (String, String, String) {
     let mut fields = source_verifier_boot_startup_fields(request);
+    fields.insert("probeResult", probe_result.to_string());
     fields.insert(
         "readyHeartbeatSequence",
         (request.degraded_heartbeat_sequence + 1).to_string(),
@@ -449,10 +449,17 @@ pub(crate) fn register_source_verifier_boot(
 /// A repeated `startup_request_id` with the same canonical payload replays the
 /// stored bytes without re-running the probe. A different payload conflicts. A
 /// stale generation is rejected by the migration fence.
+///  MUST be determined by the server from the rollback-only
+/// readiness probe. It is deliberately not part of the client request, so a
+/// client can never dictate its own readiness.
 pub(crate) fn record_source_verifier_boot_startup(
     pool: &DbPool,
     request: &SourceVerifierBootStartupRequest,
+    probe_result: &str,
 ) -> Result<SourceVerifierBootStartup> {
+    if probe_result != "idle" && probe_result != "leaseable" {
+        anyhow::bail!("source-verifier boot startup probe result is invalid")
+    }
     let request_sha256 = source_verifier_boot_startup_request_sha256(request);
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
@@ -509,7 +516,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                 });
             }
             let (canonical_response_base64url, response_sha256, authority_sha256) =
-                source_verifier_boot_startup_response(request, now);
+                source_verifier_boot_startup_response(request, probe_result, now);
             tx.execute(
                 "INSERT INTO jobs_managed_cloud_source_verifier_boot_startup_authorities (
                     startup_request_id, boot_id, runtime_instance_id, instance_epoch,
@@ -527,7 +534,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                     request_sha256,
                     request.degraded_heartbeat_sequence,
                     request.degraded_heartbeat_sequence + 1,
-                    request.probe_result,
+                    probe_result,
                     authority_sha256,
                     canonical_response_base64url,
                     response_sha256,
@@ -554,7 +561,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                 boot_generation: request.boot_generation,
                 degraded_heartbeat_sequence: request.degraded_heartbeat_sequence,
                 ready_heartbeat_sequence: request.degraded_heartbeat_sequence + 1,
-                probe_result: request.probe_result.clone(),
+                probe_result: probe_result.to_string(),
                 canonical_response_base64url,
                 response_sha256,
                 startup_at_ms: now,
@@ -592,7 +599,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                 return Ok(startup);
             }
             let (canonical_response_base64url, response_sha256, authority_sha256) =
-                source_verifier_boot_startup_response(request, now);
+                source_verifier_boot_startup_response(request, probe_result, now);
             let ready_sequence = request.degraded_heartbeat_sequence + 1;
             tx.execute(
                 "INSERT INTO jobs_managed_cloud_source_verifier_boot_startup_authorities (
@@ -611,7 +618,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                     &request_sha256,
                     &request.degraded_heartbeat_sequence,
                     &ready_sequence,
-                    &request.probe_result,
+                    &probe_result,
                     &authority_sha256,
                     &canonical_response_base64url,
                     &response_sha256,
@@ -636,7 +643,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                 boot_generation: request.boot_generation,
                 degraded_heartbeat_sequence: request.degraded_heartbeat_sequence,
                 ready_heartbeat_sequence: ready_sequence,
-                probe_result: request.probe_result.clone(),
+                probe_result: probe_result.to_string(),
                 canonical_response_base64url,
                 response_sha256,
                 startup_at_ms: now,
@@ -674,7 +681,6 @@ mod source_verifier_boot_tests {
             boot_generation: 1,
             worker_id: "w-1".to_string(),
             degraded_heartbeat_sequence: 1,
-            probe_result: "idle".to_string(),
         }
     }
 
@@ -704,7 +710,7 @@ mod source_verifier_boot_tests {
             source_verifier_boot_startup_request_sha256(&request.clone())
         );
         let mut changed = startup_request();
-        changed.probe_result = "leaseable".to_string();
+        changed.degraded_heartbeat_sequence = 9;
         assert_ne!(
             first,
             source_verifier_boot_startup_request_sha256(&changed)
@@ -749,14 +755,14 @@ mod source_verifier_boot_tests {
     #[test]
     fn startup_response_binds_ready_sequence_to_degraded_plus_one() {
         let request = startup_request();
-        let (response, _, _) = source_verifier_boot_startup_response(&request, 2_000);
+        let (response, _, _) = source_verifier_boot_startup_response(&request, "idle", 2_000);
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(response.as_bytes())
             .expect("canonical response must be base64url");
         let decoded = String::from_utf8_lossy(&decoded);
         assert!(decoded.contains("readyHeartbeatSequence"));
         assert!(decoded.contains("degradedHeartbeatSequence"));
-        let (other, _, _) = source_verifier_boot_startup_response(&request, 3_000);
+        let (other, _, _) = source_verifier_boot_startup_response(&request, "idle", 3_000);
         assert_ne!(
             response, other,
             "startup time participates in canonical bytes"
@@ -804,7 +810,6 @@ mod source_verifier_boot_tests {
             boot_generation,
             worker_id: "worker-1234567890abcd".to_string(),
             degraded_heartbeat_sequence: degraded_sequence,
-            probe_result: "idle".to_string(),
         }
     }
 
@@ -892,12 +897,12 @@ mod source_verifier_boot_tests {
         )
         .expect("registration");
         let request = db_startup("sreq-000000000000001", "boot-0000000000000001", 1, 1);
-        let first = record_source_verifier_boot_startup(&pool, &request).expect("startup");
+        let first = record_source_verifier_boot_startup(&pool, &request, "idle").expect("startup");
         assert!(!first.replayed);
         assert_eq!(first.degraded_heartbeat_sequence, 1);
         assert_eq!(first.ready_heartbeat_sequence, 2);
         assert_eq!(ready_generation(&pool), Some(1));
-        let retry = record_source_verifier_boot_startup(&pool, &request).expect("startup retry");
+        let retry = record_source_verifier_boot_startup(&pool, &request, "idle").expect("startup retry");
         assert!(retry.replayed, "startup retry must replay");
         assert_eq!(
             first.canonical_response_base64url, retry.canonical_response_base64url,
@@ -921,10 +926,10 @@ mod source_verifier_boot_tests {
         )
         .expect("registration");
         let request = db_startup("sreq-000000000000001", "boot-0000000000000001", 1, 1);
-        record_source_verifier_boot_startup(&pool, &request).expect("startup");
+        record_source_verifier_boot_startup(&pool, &request, "idle").expect("startup");
         let mut changed = request.clone();
-        changed.probe_result = "leaseable".to_string();
-        let error = record_source_verifier_boot_startup(&pool, &changed)
+        changed.degraded_heartbeat_sequence = 9;
+        let error = record_source_verifier_boot_startup(&pool, &changed, "idle")
             .expect_err("changed startup payload must conflict");
         assert!(
             error.to_string().contains("conflicts"),
@@ -949,12 +954,14 @@ mod source_verifier_boot_tests {
         record_source_verifier_boot_startup(
             &pool,
             &db_startup("sreq-000000000000002", "boot-0000000000000002", 2, 5),
+            "idle",
         )
         .expect("generation 2 startup");
         assert_eq!(ready_generation(&pool), Some(2));
         let stale = record_source_verifier_boot_startup(
             &pool,
             &db_startup("sreq-000000000000001", "boot-0000000000000001", 1, 1),
+            "idle",
         );
         assert!(
             stale.is_err(),
