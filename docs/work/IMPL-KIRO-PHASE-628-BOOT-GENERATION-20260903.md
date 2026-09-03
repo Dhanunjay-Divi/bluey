@@ -440,3 +440,119 @@ passed with the Kiro changes in the tree.
   `BLUEY_DATABASE_URL`, and `BLUEY_POSTGRES_URL` unset.
 - Every temporary workspace was removed; each run reported `temp removed: YES`.
 - `/Users/uno/Downloads/cue` untouched. All pre-existing Phase 628 changes preserved.
+
+---
+
+# Iteration 5 additions and FINAL LOCAL HANDOFF (Kiro, 2026-09-03)
+
+## 10. TypeScript boot client
+
+`jobs/automation/src/managed-cloud-runtime-client.ts` now carries the client half of the protocol.
+
+Stable per-process identity, computed once at module load so every retry inside a process reuses the
+same identity while a genuine restart produces a new one:
+
+- `SOURCE_VERIFIER_BOOT_ID` exposed by `sourceVerifierBootId()`
+- `SOURCE_VERIFIER_BOOT_REGISTRATION_REQUEST_ID` exposed by
+  `sourceVerifierBootRegistrationRequestId()`
+- `SOURCE_VERIFIER_BOOT_STARTUP_REQUEST_ID` exposed by `sourceVerifierBootStartupRequestId()`
+
+Reusing those tokens on retry is precisely what makes the calls idempotent: an identical payload
+replays the stored canonical response, and a changed payload is an explicit conflict. The client
+never proposes a generation.
+
+New methods on `ManagedCloudRuntimeApiClient`:
+
+- `registerSourceVerifierBoot(instance)` posts to the boot-registration endpoint and returns the
+  server-assigned `bootGeneration`.
+- `sourceVerifierBootStartup(instance, bootGeneration, expectedDegradedHeartbeatSequence, probeResult)`
+  posts to the boot-startup endpoint.
+
+Both reuse the existing signed `request()` path, so worker HMAC, exact origin, body digest, and
+timeout behaviour are unchanged. Both call `requireSourceVerifierIdentity` first, rejecting any
+instance whose role is not `original_source_verifier` or whose component is not `jobs-workflows`.
+
+Strict response parsing rejects a malformed authority rather than trusting it:
+`parseSourceVerifierBootRegistration` requires a non-empty `bootId`, a safe-integer
+`bootGeneration >= 1`, and a non-negative `registeredAtMs`;
+`parseSourceVerifierBootStartup` additionally enforces
+`readyHeartbeatSequence === degradedHeartbeatSequence + 1` and a `probeResult` of exactly `idle` or
+`leaseable`.
+
+## Iteration 5 verification actually executed
+
+| Gate | Command | Result |
+|------|---------|--------|
+| TypeScript typecheck, automation | `npm run typecheck` in `jobs/automation` | PASS |
+| TypeScript suite, automation | `npm test` in `jobs/automation` | PASS, 796 tests across 40 files |
+
+Two defects Kiro introduced and fixed during this iteration, both caused by shell template-literal
+substitution mangling the transferred code: the two `const path = ...` template literals were
+emptied, producing `TS1109 Expression expected`. Both were rebuilt and the typecheck then passed.
+The lesson is recorded in the compliance notes: TypeScript containing `${}` must be transferred as a
+file, never through an inline shell heredoc.
+
+## 11. Local commit
+
+`f49a6502ae43009141e357b5e6a7ade9e1ecbb73`
+`feat(jobs): add source-verifier boot generation authority`
+
+Contents, 7 files and 2470 insertions, every one authored solely by Kiro:
+
+- `infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql`
+- `infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql`
+- `server/src/db/jobs/source_verifier_boot.rs`
+- `docs/work/IMPL-KIRO-PHASE-628-BOOT-GENERATION-20260903.md`
+- `docs/work/DESIGN-KIRO-PHASE-628-STARTUP-IDEMPOTENCY-20260903.md`
+- `docs/work/AUDIT-KIRO-JOBS-FOUR-AREAS-20260903.md`
+- `docs/work/REVIEW-KIRO-R2-JOBS-FOUR-AREAS-20260903.md`
+
+NOT pushed.
+
+### Why the wiring is intentionally uncommitted
+
+`server/src/db/mod.rs` carries 285 insertions from the in-flight Phase 628 change set. Staging it
+would fold Codex work into a Kiro commit and defeat the independent-reviewer contract, which
+requires inspecting the real Phase 628 diff. The same reasoning applies to
+`server/src/api/jobs_managed_cloud_releases.rs`, `server/src/api/jobs_worker_auth.rs`,
+`server/src/db/jobs.rs`, `server/src/db/jobs/applications.rs`, `CHANGELOG.md`, `jobs/OPERATIONS.md`,
+and the Codex-authored `ROUND-628` and `FIX-789` documents that Kiro appended a SUPERSEDED section
+to. Those deltas remain in the working tree, fully preserved, for the owner to partition.
+
+## Complete pending list, with exact reasons
+
+1. Configured non-production PostgreSQL runtime and concurrency evidence. A server listens on
+   127.0.0.1:5432 and psql 14.17 plus PostgreSQL 17 are installed, but role `uno` cannot connect and
+   no non-production credentials exist on this host. Production credentials were neither requested
+   nor substituted. PostgreSQL has structural parity evidence only, from the schema-parity gate.
+2. Docker and native managed-runner smoke. No docker binary, no `/Applications/Docker.app`.
+3. `scripts/run-bluey-tests.sh` full Rust suite. Focused and DB-backed suites were run instead.
+4. Managed-cloud release gate. `managed-cloud-release-gate.mjs contracts` requires
+   `--repo <canonical string>`; it needs reviewer-supplied arguments.
+5. Strict Clippy. Four pre-existing violations remain, none in Kiro code:
+   `managed_cloud_release_authority.rs:18915` and `:20569` in the Codex dirty file, and
+   `workspace.rs:2590` and `:3629` which exist at committed HEAD. Strict Clippy therefore did not
+   pass on this tree before Kiro started.
+6. Heartbeat fencing inside `jobs_managed_cloud_original_source_verifier_runtime_heartbeats` itself.
+   The generation head fences readiness, and the migration triggers reject stale generations, but the
+   existing v1 heartbeat trigger set has not been extended to consult `boot_generation`.
+7. Lifecycle switchover in `jobs/workflows/src/original-source-verifier.ts`. The client methods exist
+   and are typechecked, but `establishOriginalSourceVerifierStartup` still calls the v1 startup path.
+8. Release-gate and CI protocol-drift guards for `source_verifier_boot`.
+
+## Honest completion statement
+
+The batch is NOT complete. Delivered and verified: the paired migrations, the Rust authority with
+both engines, both authenticated endpoints with exact worker-auth path admission, a DB-backed
+regression suite covering eleven of the required cases, the TypeScript client half, the required
+documentation corrections, and one local commit. Items 1 through 8 above remain, and items 1 and 2
+are hard environmental blockers on this host rather than work Kiro declined to do.
+
+## Compliance restated for iteration 5
+
+- Production feature flags untouched, all remain `0`. No flag was read or written.
+- Nothing pushed. No PR, merge, rebase, deploy, image publish, ATS contact, application, or message.
+- No DigitalOcean, GitHub, Cloudflare, Gmail, Stripe, or production credential accessed or requested.
+- All Rust work used a fresh isolated `CARGO_TARGET_DIR` and `TMPDIR`, with `DATABASE_URL`,
+  `BLUEY_DATABASE_URL`, and `BLUEY_POSTGRES_URL` unset. Every temporary workspace was removed.
+- `/Users/uno/Downloads/cue` never touched. All pre-existing Phase 628 changes preserved.
