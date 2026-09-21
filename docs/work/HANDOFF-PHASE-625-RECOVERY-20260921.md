@@ -1,5 +1,7 @@
 # Bluey AI Phase 625 recovery and mainline handoff
 
+**Status: partial recovery checkpoint; NOT mergeable or deployable.**
+
 > Codex preflight: read `$bluey-ops`, inspect current Git/PR state, and use the
 > isolated test launcher before heavy validation. This document records source
 > recovery, not a deployment or release claim.
@@ -183,8 +185,9 @@ position. At this checkpoint 79 literal patches had applied; the next patch,
 `caee4ddfdc44`, stopped on a missing Windows sign-out precursor. Do not skip a
 failed preimage or replay a historical failed patch as if it succeeded.
 
-Complete captured diffs have already restored missing streaming-latency and
-macOS/Windows sign-in precursors. The complete SignInPresentation.swift file
+Complete captured diffs have restored streaming-latency and macOS sign-in
+precursors. The Windows snapshot is only an early partial diff, not a complete
+file delta; its remaining account-state handler is still missing. The complete SignInPresentation.swift file
 and seven otherwise-uncovered core IPC, observability, secret-store, embedding,
 and transcription files were restored from independently checked snapshots.
 Details/hashes are in the private `manual-reconstruction-log.md` and saved diffs.
@@ -197,3 +200,119 @@ then failed `replacement_ready_hydrates_while_exited_event_waits_for_command`
 because its overlay fixture was outside the verified install directory (606
 daemon tests passed, one failed, five ignored). Recheck this test after recovery.
 These are actual source/test failures; the old Actions budget block is resolved.
+
+## Next-agent start here
+
+The owner requested this handoff before further work. Supporting agents have
+finished their evidence audits. No new feature implementation should begin until
+recovery is complete. The partial product-source checkpoint is **`512a94b1`**
+on `feat/phase-625-recovery-mainline`; it preserves 37 files and is deliberately
+not release-ready. Subsequent handoff-only commits may advance the branch tip.
+
+```sh
+cd /Users/uno/.codex/worktrees/bluey-phase625-recovery/cue
+git status --short
+git log -6 --oneline
+git fetch origin
+git diff --stat ca046c48..HEAD
+shasum -a 256 /Users/uno/Downloads/cue/.git/bluey-recovery-20260921/mutation_candidates-v3-supplemented.json
+```
+
+1. Read this document, `IMPL-PHASE-625-RECOVERY.md`,
+   `REVIEW-PHASE-625-RECOVERY.md`, and the private manual reconstruction log.
+   Do not regenerate the corpus from the experimental extractor: v1/v2 and
+   experimental v4 had known errors. The frozen supplemented v3 hash above is
+   the reviewed input. It includes failed and read-only candidates; only the
+   reviewed successful IDs are eligible for replay.
+2. Restore the **complete missing Windows predecessor**, not just one line.
+   The first Windows agent read already contains the full account-state block:
+   journal `01a05877-21e4-7510-9b5d-5a01c42ef865`, call `call_O9qpz...`, output
+   `ctco_01a058ae-87b8-70a3-ad31-6ece63153bc6` (near journal line 98).
+   Find the exact full call ID from that output's `call_id`. The failed replay
+   is `caee4ddfdc44e8747cb89ebb3cc4186118008d3983f13fe0cef1b2e2154759c6`
+   / `call_99tnWZQXPiFUMMpLnSMncAqD`. The last successful literal is
+   `12f471f74f952218acc2ba0c54d5a5f900da9aa3b928293744a2aeaa0693abb0`.
+   Do not replay later account-state patches wholesale as a predecessor:
+   they already contain changes owned by the currently blocked patch.
+3. After recording and checking that restoration, resume **one patch** first:
+
+```sh
+/opt/homebrew/bin/python3 -B /Users/uno/Downloads/cue/.git/bluey-recovery-20260921/replay_safe.py \
+  --manifest /Users/uno/Downloads/cue/.git/bluey-recovery-20260921/mutation_candidates-v3-supplemented.json \
+  --max 1 --apply
+git diff --check
+```
+
+4. Stop on every nonzero replay result. A clean hunk count does not prove a
+   complete file delta: `sed` can truncate exactly between hunks. Verify source
+   command bounds, output truncation markers, next-file boundaries, and hashes.
+   All transcript parsing is data-only. Never execute captured JavaScript,
+   shell, installers, cleanup commands, or credential operations.
+5. Reconcile formatter checkpoints. Rustfmt 1.98 is required; formatting is
+   source-mutating even when not represented by an apply-patch record. Whole
+   root/server formatting is caught up through roughly 16:49. Later recorded
+   checkpoints occur at 17:48/17:53, 18:47/18:50, 19:06/19:09/19:14/19:39,
+   20:24/20:32/20:47/20:52, 21:01/21:34/21:36, 23:28/23:51/23:56, and many
+   times from September 1 00:00 through 00:39. Inspect their exact tool inputs
+   for file lists and toolchain, then run only separately reviewed formatter
+   argv against this checkout. Cumulative root/server `cargo +1.98 fmt` can
+   reconcile formatting-only differences; it cannot repair missing source.
+6. The successful generated split is
+   `call_Pp6nsTDFxFJpHMoVjEvXoW41` at 23:59:55.558Z in journal
+   `01a05a3a-2233-7bd3-b838-aad33045611b`, near line 284. It moves the final
+   inline `#[cfg(test)] mod tests { ... }` body into `app/tests.rs` and leaves
+   `#[cfg(test)] mod tests;`. Recreate the transformation through apply_patch
+   from the exact current source and record its before/after hashes. The
+   replayer stops at `manual_required_ids.txt` until this is recorded.
+   Earlier attempts `call_T686...` and `call_5VG...` failed; do not replay them.
+
+## Remaining snapshot inventory
+
+The following captures were independently located and apply-checked but **not
+applied** before handoff. Output IDs are authoritative; human line/ordinal
+numbers may differ by one. The source journal map is `selected_sessions-v3.json`.
+
+- `crates/cue-cloud-client/src/types.rs`: call
+  `call_F7Z34FR4q39sNcKkumBVaESA`, output
+  `ctco_01a05964-c3f1-7ad3-aad9-b74363077734`; isolate its diff header through
+  EOF. Review extraction: 67 lines / 2,394 bytes, SHA-256
+  `4ce080ceffb3dd7f101067496c9f4c5ab63e627c452e177b950bdf32a7009f3b`.
+- `Cargo.lock`: call `call_ysVh862dlQ2Fz6RbqXLJ0B4i`, output
+  `ctco_01a05958-9950-7bb0-85c5-c05ea4dc3ca7`; first complete diff section.
+  Review extraction: 182 lines / 2,914 bytes, SHA-256
+  `5f2bbac77ecdb5ad937b370bbcae172be2dc1ec3895496034d738fe138b76979`.
+
+The reviewer's print/awk pipelines sometimes add one EOF newline. Compare raw
+capture and capture-plus-one-newline separately; document which hash is used.
+Never normalize or alter actual source lines to make a hash match.
+
+Still not recovered/verified: `crates/cue-llm/src/bluey_managed.rs`, changes to
+`docs/work/FIX-588-account-bound-diagnostics.md`, complete macOS overlay
+`Tests/*`, complete `web/assets/bluey-product-demo.css` and `.js`, and complete
+`web/tests/*`. The final recorded status call `call_AlzyT24pRfiLCohdSxGIqiah`
+listed 116 status paths, including directory entries; compare expanded files,
+not only counts, against all successful mutations and snapshots. More missing
+precursors may be exposed by later patch preimage failures.
+
+## Handoff preservation and final gates
+
+- The recovery checkout's source is checkpointed in Git. Canonical
+  `/Users/uno/Downloads/cue` still has unrelated owner/other-task changes; do not
+  claim those are cleaned, merged, or deployed. Preserve them untouched.
+- Raw session journals and private recovery evidence are **local only**, under
+  `.codex/sessions` and canonical `.git/bluey-recovery-20260921`. They are not
+  pushed to the public repository. A next agent on another host must receive
+  these through an explicitly approved private transfer, not a public PR.
+- At handoff, root/server Rustfmt and diff checks pass. Reconstructed product
+  build, strict Clippy, tests, visible UI, platform runtime, and latency gates
+  remain unverified. The broad hygiene scan identified existing baseline
+  fixture/development strings in `cue-cli/src/logs.rs` and dashboard commands;
+  exact flagged lines were confirmed already present in `ca046c48`.
+- Finish recovery and the specific correctness findings above, run the
+  isolated-launcher self-test, then all relevant root/server/web/native gates.
+  Preserve honest local-versus-cloud and consent/diagnostic boundaries.
+- Open a reviewed consolidated successor PR to `main` only when source is
+  coherent. Do not merge PR #38 independently. Merge only with green required
+  CI, then perform exact-artifact Windows/macOS release validation and the
+  existing trusted-key release workflow. No deploy or Jobs flag change has
+  occurred during this recovery/handoff.
