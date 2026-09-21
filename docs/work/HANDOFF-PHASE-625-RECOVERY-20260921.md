@@ -19,6 +19,26 @@ clean at the stop check. No merge, release, deployment, or Jobs flag changed.
 > isolated test launcher before heavy validation. This document records source
 > recovery, not a deployment or release claim.
 
+## Portable skill and next-agent ownership
+
+Read the branch-local [$bluey-ops](../../.agents/skills/bluey-ops/SKILL.md)
+and [agent round checklist](BLUEY-AGENT-ROUND-CHECKLIST.md). Personal skill files
+are no longer required. This documentation-only update does not authorize
+resuming recovery. Future owners below are **unassigned**; no agent was restarted.
+
+| Work item | Next owner | Exact starting scope | Completion evidence |
+|---|---|---|---|
+| Recovery blocker | Unassigned recovery agent | Inspect the uncommitted `native/windows/cue-overlay/main.c` diff, then the exact predecessor evidence under “Next-agent start here” | Complete verified predecessor, hashes, journal entry; one blocked patch replayed safely |
+| Remaining source | Unassigned recovery agent, after blocker | Remaining snapshots, chronological mutations, formatter checkpoints, and generated test split below | Complete source inventory reconciled to successful evidence; explicit unknowns |
+| Correctness fixes | Unassigned implementation agent, after recovery | Seven “Last unresolved correctness findings” plus six parent PR P1s | Focused regressions and linked FIX records for every finding |
+| Validation/review | Unassigned reviewer, after fixes | Reconstructed root/server/dashboard/web/native surfaces and launcher | Fresh gates, independent review, platform limitations; update IMPL/REVIEW/round |
+| Mainline integration | Unassigned coordinator, after green gates and authorization | Consolidated successor to PR #38, not a standalone parent merge | Reviewed successor, required CI, exact merge SHA, updated handoff |
+| Release | Unassigned release agent, separately authorized | Exact Windows/macOS artifacts and shipped UI surfaces | Hardware smoke, hashes, trusted-key release and rollback evidence; Jobs unchanged |
+
+For each resumed or new round, copy the ownership and remaining-work fields from
+[TEMPLATE-ROUND.md](TEMPLATE-ROUND.md). Link every task to its actual record;
+do not mark an entire round complete while a listed task or gate remains open.
+
 ## Owner direction
 
 - Finish Bluey AI and the native desktop overlay first. Bluey Jobs remains a

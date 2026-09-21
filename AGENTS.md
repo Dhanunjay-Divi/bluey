@@ -2,9 +2,15 @@
 
 ## Codex Preflight
 
-Before any Bluey task, load the local `$bluey-ops` skill from
-`/Users/uno/.codex/skills/bluey-ops/SKILL.md`. Use it as navigation and operating
-memory; this file and the current repository remain authoritative.
+Before any Bluey task, load the branch-local `$bluey-ops` skill at
+[`.agents/skills/bluey-ops/SKILL.md`](.agents/skills/bluey-ops/SKILL.md).
+Personal skill installations may supplement it but are not required. Use skills
+as navigation; this file, current source, and the latest user scope remain authoritative.
+
+Follow [the agent round checklist](docs/work/BLUEY-AGENT-ROUND-CHECKLIST.md)
+for each new or active round. Record agent/task ownership, exact files, actual
+verification, every remaining item, and the next agent's starting action.
+Use [the round template](docs/work/TEMPLATE-ROUND.md); do not rewrite historical rounds.
 
 ## Architecture
 

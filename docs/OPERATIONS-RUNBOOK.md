@@ -1,8 +1,9 @@
 # Bluey Operations Runbook
 
 > **Codex preflight:** Load `$bluey-ops` from
-> `/Users/uno/.codex/skills/bluey-ops/SKILL.md`, inspect current repository and
+> the branch's `.agents/skills/bluey-ops/SKILL.md`, inspect current repository and
 > production state, and treat this runbook as authority where memory differs.
+> Record ownership and remaining tasks using [the round checklist](work/BLUEY-AGENT-ROUND-CHECKLIST.md).
 
 > **Secrets, server layout, smoke tests, daily ops.**
 > Mirrors Pinky's `OPERATIONS-RUNBOOK.md` shape but Bluey-only.

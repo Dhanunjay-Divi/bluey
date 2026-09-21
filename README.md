@@ -1,8 +1,9 @@
 # Bluey
 
-> **Codex:** Start every Bluey task by loading the local `$bluey-ops` skill at
-> `/Users/uno/.codex/skills/bluey-ops/SKILL.md`, then verify its guidance against
-> the current repository state.
+> **Codex:** Start every Bluey task by loading the branch-local
+> [$bluey-ops](.agents/skills/bluey-ops/SKILL.md), then follow the
+> [agent round checklist](docs/work/BLUEY-AGENT-ROUND-CHECKLIST.md) and verify
+> guidance against the current repository state.
 
 Bluey is a consent-first live-context assistant for engineering meetings and
 technical work. Its native desktop overlay can answer from the conversation,

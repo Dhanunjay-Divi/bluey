@@ -1,5 +1,8 @@
 ## Summary
 
+<!-- Preflight: read $bluey-ops at .agents/skills/bluey-ops/SKILL.md and
+docs/work/BLUEY-AGENT-ROUND-CHECKLIST.md. Link the round and exact agent handoff. -->
+
 -
 -
 -
@@ -7,6 +10,11 @@
 ## Task IDs
 
 <!-- e.g. D0.1, D0.2, B3.4 -->
+
+**Owner/task / round / IMPL / REVIEW / FIX / next-agent handoff links:**
+**Remaining tasks, owners, and unrun gates:**
+**Jobs/other-agent impact and coordination:**
+**Merge / release / deployment evidence (or not done):**
 
 ## Type of Change
 

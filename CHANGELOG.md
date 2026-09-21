@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Recovery checkpoint (not release-ready)
 
+- Added a portable branch-local `bluey-ops` skill, round ownership/handoff
+  checklist, and linked agent/work/PR templates. Recovery remains stopped and
+  incomplete; this documentation update does not certify or deploy product code.
 - Preserved partial Phase 625 desktop UI/latency source after the temporary
   checkout disappeared. Recovery, review, and release gates remain open; see
   `docs/work/HANDOFF-PHASE-625-RECOVERY-20260921.md` before continuing.

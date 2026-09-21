@@ -1,17 +1,18 @@
 # Bluey Agent Onboarding
 
-Last updated: 2026-05-25
+Entry-point routing updated: 2026-09-21. Historical snapshot below: 2026-05-25.
 
-> **Codex preflight:** Load `$bluey-ops` from
-> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before working in this repo.
-> Treat it as navigation and operating memory; current checked-in docs and code
-> remain authoritative.
+> **Codex preflight:** Load the branch-local [$bluey-ops](.agents/skills/bluey-ops/SKILL.md)
+> and [agent round checklist](docs/work/BLUEY-AGENT-ROUND-CHECKLIST.md).
+> Read the current routing in [AGENT-HANDOFF.md](AGENT-HANDOFF.md), not just
+> the historical branch snapshot below. Record ownership and next actions in each round.
 
-This file is the short onboarding path. For the complete current project state,
-read `AGENT-HANDOFF.md` and then
-`docs/rounds/END-TO-END-AGENT-CONTEXT-2026-05-25.md`.
+For the stopped Phase 625 branch, read the
+[recovery handoff](docs/work/HANDOFF-PHASE-625-RECOVERY-20260921.md) first.
+It is incomplete and not deployable; this documentation update does not release
+the stop instruction. The May 2026 references below are historical context only.
 
-## Repo And Branch
+## Historical Repo And Branch Snapshot
 
 - Repo: `/Users/uno/Downloads/cue`
 - Current long-running branch: `feat/phase-3-round-12`

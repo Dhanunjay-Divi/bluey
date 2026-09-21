@@ -31,6 +31,24 @@ supporting agents inspected evidence and validated captured diffs.
 
 ## Deviations and follow-ups
 
+### Documentation-only continuation, September 21
+
+Root added the portable `.agents/skills/bluey-ops/SKILL.md`, shared agent/round
+checklist and round template, and linked agent entry points, work templates,
+PR template, and this recovery handoff. Future ownership is explicitly unassigned.
+No agents resumed, product source changed, merge, push, deployment, or Jobs
+mutation occurred in this continuation. The existing uncommitted Windows edit
+remains separate and unreviewed. See the handoff for each remaining task.
+
+Documentation checks: `bash scripts/check-bluey-ops-docs.sh` and
+`git diff --check` passed. Ruby's YAML parser verified the portable skill's
+required name/description frontmatter. The bundled `quick_validate.py` was
+attempted but could not run because available Python runtimes lack PyYAML;
+no dependencies were installed. Links and instructions were self-reviewed.
+Product tests were not rerun for this documentation-only change.
+
+### Recovery follow-ups
+
 The temporary checkout was missing and original mutation records do not cover
 all of its dirty source. Recovery stops at a missing Windows account-state
 predecessor. The handoff documents exact next source evidence, unresolved

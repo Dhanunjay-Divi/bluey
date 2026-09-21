@@ -1,14 +1,23 @@
 # Bluey Agent Handoff
 
-Last updated: 2026-06-02
+Entry-point routing updated: 2026-09-21. Historical snapshot below: 2026-06-02.
 
-> **Codex preflight:** Load `$bluey-ops` from
-> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before continuing this handoff.
-> Reconcile its memory against the current branch, code, and newest docs.
+> **Codex preflight:** Load the branch-local [$bluey-ops](.agents/skills/bluey-ops/SKILL.md)
+> and [agent round checklist](docs/work/BLUEY-AGENT-ROUND-CHECKLIST.md).
+> Reconcile dated memory against the actual checkout and latest user instruction.
+
+## Current recovery handoff
+
+For `feat/phase-625-recovery-mainline`, start with
+[Phase 625 recovery](docs/work/HANDOFF-PHASE-625-RECOVERY-20260921.md).
+Recovery is partial, stopped by the owner, and **not mergeable or deployable**.
+Its remaining-work table and exact evidence take precedence over the historical
+snapshot below. Bluey Jobs is outside this recovery scope. Do not resume from this
+document without a new user instruction.
 
 Start here when joining the Bluey repo.
 
-## Read First
+## Historical context references
 
 1. `docs/rounds/END-TO-END-AGENT-CONTEXT-2026-05-25.md`
 2. `docs/rounds/END-TO-END-READINESS-PASS-2026-05-29.md`
@@ -19,7 +28,7 @@ Start here when joining the Bluey repo.
 7. `docs/PRELAUNCH-CHECKLIST.md`
 8. `docs/rounds/SESSION-KNOWLEDGE-RAG-2026-06-01.md`
 
-The first file is the complete current context: product flow, architecture,
+The first file records the May 2026 context: product flow, architecture,
 implemented state, provider routing, capacity policy, cloud/RAG/storage plan,
 environment variables, QA commands, known gaps, and what to tell the next
 agent.

@@ -1,8 +1,9 @@
 # Bluey Release Runbook
 
 > **Codex preflight:** Load `$bluey-ops` from
-> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before release work. The current
+> the branch's `.agents/skills/bluey-ops/SKILL.md` before release work. The current
 > repository, release document, and this runbook override stale skill memory.
+> Record ownership and remaining gates using [the round checklist](work/BLUEY-AGENT-ROUND-CHECKLIST.md).
 
 > **Step-by-step procedure for cutting a new Bluey release.**
 > Mirrors Pinky's `RELEASE-RUNBOOK.md`.

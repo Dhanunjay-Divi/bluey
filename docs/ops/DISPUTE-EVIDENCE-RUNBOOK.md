@@ -1,8 +1,9 @@
 # Bluey Dispute, Refund, And Credit Evidence Runbook
 
 > **Codex preflight:** Load `$bluey-ops` from
-> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before handling billing evidence.
+> the branch's `.agents/skills/bluey-ops/SKILL.md` before handling billing evidence.
 > Current account, provider, and repository evidence remain authoritative.
+> Record ownership and next actions using [the round checklist](../work/BLUEY-AGENT-ROUND-CHECKLIST.md).
 
 Date: 2026-07-02
 

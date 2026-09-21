@@ -1,8 +1,9 @@
 # docs/work/ — Work Documentation Index
 
-> **Codex preflight:** Load `$bluey-ops` from
-> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before starting or reviewing a
-> Bluey work batch.
+> **Codex preflight:** Load the branch-local
+> [$bluey-ops](../../.agents/skills/bluey-ops/SKILL.md) before starting or reviewing
+> a Bluey work batch. Follow the [agent round checklist](BLUEY-AGENT-ROUND-CHECKLIST.md)
+> for ownership, remaining tasks, evidence, and next-agent instructions.
 
 This directory contains implementation records, review reports, and bug fix docs for every batch of work.
 
@@ -13,6 +14,7 @@ This directory contains implementation records, review reports, and bug fix docs
 | `IMPL-*.md` | Implementation doc per task batch | `TEMPLATE-IMPL.md` |
 | `REVIEW-*.md` | Review report per task batch | `TEMPLATE-REVIEW.md` |
 | `FIX-*.md` | Bug fix documentation | `TEMPLATE-FIX.md` |
+| `../rounds/ROUND-*.md` | Round ownership, evidence, delivery state, and handoff | `TEMPLATE-ROUND.md` |
 
 ## Naming Conventions
 

@@ -3,6 +3,10 @@
 > **Codex preflight:** Load `$bluey-ops` before diagnosis or implementation and
 > verify its memory against the current repository state.
 
+Use the branch skill at `.agents/skills/bluey-ops/SKILL.md` and
+[agent round checklist](BLUEY-AGENT-ROUND-CHECKLIST.md).
+**Owner/task / branch / source SHA / round / review links:**
+
 ## Issue
 
 <!-- One-line description + link to issue/task if applicable -->
@@ -34,4 +38,5 @@
 ## Known Limitations
 
 <!-- Anything this fix does NOT address, or follow-up work needed. -->
-- None
+**Remaining issue / next owner (or unassigned) / files / acceptance evidence:**
+**Implementation / tests / merge / deployment status (separately):**

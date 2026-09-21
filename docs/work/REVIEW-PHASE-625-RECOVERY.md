@@ -40,3 +40,17 @@ real and failed, not budget-blocked: Ubuntu/Windows fail launcher cleanup;
 macOS builds then fails an overlay-fixture install-directory test (606 daemon
 tests passed, one failed, five ignored). Those counts describe the parent,
 not the reconstructed source. See the handoff for exact continuation commands.
+
+## Documentation-only follow-up review, September 21
+
+Root self-reviewed the portable skill and agent/round routing changes. The
+branch skill has no personal-path dependency; active entry points and templates
+link ownership, remaining tasks, and next-agent instructions. The recovery
+handoff still records the owner stop, unassigned future agents, untouched Jobs
+scope, and the unreviewed Windows diff. Historical round/review records were
+not rewritten.
+
+Documentation coverage and whitespace checks passed. YAML name/description
+validation passed via Ruby; the bundled Python skill validator was unavailable
+because PyYAML is missing. No product gates were run or upgraded. The overall
+**REQUEST CHANGES / NOT MERGEABLE / NOT DEPLOYABLE** verdict is unchanged.
