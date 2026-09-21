@@ -160,3 +160,40 @@ Finish the successful-edit recovery manifest, replay/reconstruct source into
 the managed recovery checkout, checkpoint it in Git, then close the specific
 correctness findings and run the gates. Preserve partial recovery plus this
 handoff if the owner's usage stop point arrives first.
+
+## Recovery checkpoint, September 21
+
+The verified data-only corpus contains 703 literal patches plus one successful
+generated test-module split. Compacted child journals flatten top-level times;
+actual ordering comes from paired tool-output UUIDv7 completion timestamps.
+Independent review confirmed the original 701 JSON-literal records had unique
+call/output identities, no same-time overlapping-file conflicts, and no Jobs
+paths. Two further literals use reviewed JavaScript Unicode-codepoint escapes;
+they were decoded without evaluating JavaScript. Arbitrary historical shell or
+JavaScript commands are never replayed.
+
+Private recovery inputs and per-patch before/after hashes live under
+`.git/bluey-recovery-20260921/` in the canonical repository. Use
+`mutation_candidates-v3-supplemented.json`, `replay_safe.py`,
+`reviewed_patch_ids.txt`, `manual_required_ids.txt`, and `replay-journal.jsonl`.
+The supplemented manifest SHA-256 is
+`e3a05e8ce76471acc097685e9d4ff44a203aa3a2e1df03c898ca85dd5aa2774a`.
+The current journal, rather than this progress paragraph, owns the exact replay
+position. At this checkpoint 79 literal patches had applied; the next patch,
+`caee4ddfdc44`, stopped on a missing Windows sign-out precursor. Do not skip a
+failed preimage or replay a historical failed patch as if it succeeded.
+
+Complete captured diffs have already restored missing streaming-latency and
+macOS/Windows sign-in precursors. The complete SignInPresentation.swift file
+and seven otherwise-uncovered core IPC, observability, secret-store, embedding,
+and transcription files were restored from independently checked snapshots.
+Details/hashes are in the private `manual-reconstruction-log.md` and saved diffs.
+Other uncovered source files and intervening Windows changes remain under audit.
+The partial source tree has not been compiled, reviewed for merge, or deployed.
+
+Fresh PR #38 CI attempt 2 completed on all three platforms. Ubuntu and Windows
+failed the launcher cleanup self-test. macOS passed formatting, Clippy and build,
+then failed `replacement_ready_hydrates_while_exited_event_waits_for_command`
+because its overlay fixture was outside the verified install directory (606
+daemon tests passed, one failed, five ignored). Recheck this test after recovery.
+These are actual source/test failures; the old Actions budget block is resolved.
