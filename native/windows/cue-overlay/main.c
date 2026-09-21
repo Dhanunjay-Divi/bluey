@@ -4300,6 +4300,42 @@ static bool process_stdin_record(const char *line, size_t line_len, void *contex
         if (safe_extract_json_number(line, line_len, "opacity", &opacity)) {
             set_window_opacity(opacity);
         }
+    } else if (strcmp(msg_type, "set_account_state") == 0) {
+        bool signed_in = false;
+        if (bluey_parse_account_signed_in(
+                line,
+                line_len,
+                &signed_in)) {
+            BlueyOverlayAccountTransition transition = bluey_account_transition(
+                g_account_state,
+                signed_in,
+                g_shortcut_coachmark_shown);
+            g_account_state = transition.next;
+            if (transition.changed) {
+                emit_lifecycle_event(
+                    "auth_state_changed",
+                    signed_in ? "signed_in" : "signed_out",
+                    "platform=windows");
+            }
+            if (!signed_in) {
+                dismiss_shortcut_coachmark("signed_out");
+                cancel_auto_send_timer("signed_out");
+                if (g_manual_send_timer_armed && g_hwnd) {
+                    KillTimer(g_hwnd, ID_MANUAL_SEND_TIMER);
+                    g_manual_send_timer_armed = false;
+                    g_manual_send_started_ms = 0;
+                }
+                g_interactive_mode = true;
+                show_full_overlay(false);
+                apply_account_control_state();
+            } else {
+                apply_account_control_state();
+                if (transition.show_shortcut_coachmark) {
+                    present_shortcut_coachmark();
+                }
+            }
+            InvalidateRect(g_hwnd, NULL, TRUE);
+        }
     } else if (strcmp(msg_type, "set_context_items") == 0) {
         set_context_chips_from_json(line, line_len);
         InvalidateRect(g_hwnd, NULL, TRUE);
