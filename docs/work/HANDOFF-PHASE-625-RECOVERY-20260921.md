@@ -11,9 +11,9 @@
 - Recover all work from the interrupted UI/latency batch, review it, and merge
   through PRs. Never push directly to `main`.
 - Preserve a concrete handoff for the next agent and stop at the owner's usage
-  threshold. On 2026-09-21 the account reported 46% used / 54% remaining;
-  clarification of whether "25%" means used or remaining was pending when this
-  initial checkpoint was written. Check the latest owner response before work.
+  threshold. The owner confirmed stop at **25% remaining**. On 2026-09-21 the
+  account reported 46% used / 54% remaining. Check actual account usage during
+  work; checkpoint and hand off before crossing the remaining-usage threshold.
 
 ## Exact source state
 
@@ -122,10 +122,22 @@ For the recovered final tree:
 5. Merge PR #38 and the recovery PR only after required CI passes and the
    checked-in review verdict is resolved. Do not label zero-step failures passes.
 
-Current live GitHub check annotations for all eight PR #38 checks say:
-"The job was not started because an Actions budget is preventing further use."
-This external budget blocker prevents satisfying the repository's CI-before-
-merge rule. The checked-in Phase 624 review also still says pending final gates.
+The August 31 GitHub runs reported an Actions budget block. That was historical,
+not proof that the block remained active on September 21. A fresh API check
+confirmed the repository is public and CI uses standard GitHub-hosted runners.
+PR #38 CI run `33372372821`, attempt 2, was rerun on September 21 at 06:39 UTC;
+real Ubuntu, Windows, and macOS runners started. Ubuntu then failed the isolated
+launcher self-test with `failure case left temporary workspace`, confirming the
+known source defect rather than a billing blocker. Inspect the other jobs and
+the final recovered-tree CI before merge. Do not increase spending settings to
+work around the old annotation. The Phase 624 review remains pending final gates.
+
+The base PR also has six independently verified P1 findings to reconcile with
+the recovered fixes: launcher cleanup exit status; diagnostics-only upload
+incorrectly requiring a live cloud session; deletion retry blocked by a retained
+transition flag; upload consent revision not enforced transactionally; refreshed
+tokens rotated only in memory; and a prepared deletion receipt reported as an
+already-established deletion fence.
 
 ## Deployment is a separate remaining gate
 
