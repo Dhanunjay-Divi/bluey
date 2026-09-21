@@ -2,6 +2,19 @@
 
 **Status: partial recovery checkpoint; NOT mergeable or deployable.**
 
+**Owner stop instruction (latest):** stop spending credits and hand this work
+to the next developer. All three supporting agents were interrupted. Do not
+resume automatically. Bluey Jobs is outside scope and was not modified.
+
+**Final local state:** committed recovery source is `512a94b1`; handoff tip
+before this stop note was `01bb3823`. The branch is local only (no remote branch
+was published). One additional **uncommitted** edit remains in
+`native/windows/cue-overlay/main.c` from the briefly resumed predecessor
+recovery agent. It has not been reviewed, tested, or entered into the replay
+journal. Preserve and inspect that diff first; do not assume the Windows
+blocker is resolved or blindly replay over it. All other recovery source was
+clean at the stop check. No merge, release, deployment, or Jobs flag changed.
+
 > Codex preflight: read `$bluey-ops`, inspect current Git/PR state, and use the
 > isolated test launcher before heavy validation. This document records source
 > recovery, not a deployment or release claim.
