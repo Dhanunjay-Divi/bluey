@@ -12,7 +12,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
-use cue_cloud_client::{CredentialSnapshot, SecureAccountStore, TokenStore};
+use cue_cloud_client::{
+    CredentialFreeHttpTransport, CredentialSnapshot, SecureAccountStore, TokenStore,
+};
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
     CostBudget, CostEstimate, LatencyBudget, ProviderClientConfig, ProviderRequestPayload,
@@ -2306,6 +2308,9 @@ struct Daemon {
     cloud_sync_flight: Mutex<()>,
     balance_poll_task: Mutex<Option<BalancePollTask>>,
     balance_watch: crate::cloud::balance::BalanceWatch,
+    /// Credential-free DNS/TLS/connection pool shared by managed and direct
+    /// answer requests. Credentials and observability ids stay per request.
+    answer_http_transport: CredentialFreeHttpTransport,
     overlay_answer_active: Mutex<bool>,
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
@@ -3238,6 +3243,8 @@ pub async fn run() -> Result<()> {
     let overlay_bin = args.overlay_bin.clone();
     let rag_indexer = RagIndexCoordinator::from_paths(&paths, store.clone())?;
     let balance_watch = crate::cloud::balance::BalanceWatch::default();
+    let answer_http_transport =
+        CredentialFreeHttpTransport::new().context("failed to initialize answer HTTP transport")?;
     let meeting_watch = MeetingWatch::default();
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     for app_id in load_settings(&paths)
@@ -3294,6 +3301,7 @@ pub async fn run() -> Result<()> {
         cloud_sync_flight: Mutex::new(()),
         balance_poll_task: Mutex::new(None),
         balance_watch,
+        answer_http_transport,
         overlay_answer_active: Mutex::new(false),
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
@@ -4262,6 +4270,7 @@ async fn handle_request_inner(
             let meeting_snapshot =
                 set_answer_instructions(daemon, Some(text), &account_context).await?;
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+            send_active_session_overlay(daemon, Some(&meeting_snapshot)).await;
             push_system_card(
                 daemon,
                 CardKind::System,
@@ -4293,6 +4302,7 @@ async fn handle_request_inner(
             let account_context = validate_session_mutation_fence(daemon, &fence, false).await?;
             let meeting_snapshot = set_answer_instructions(daemon, None, &account_context).await?;
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+            send_active_session_overlay(daemon, Some(&meeting_snapshot)).await;
             push_system_card(
                 daemon,
                 CardKind::System,
@@ -5573,6 +5583,22 @@ async fn resume_pending_deleted_account_purge(daemon: &Arc<Daemon>) -> Result<Op
 
 impl AccountCloudContext {
     fn snapshot(paths: &AppPaths, trace_id: Option<&str>) -> Result<Self> {
+        Self::snapshot_with_transport(paths, trace_id, None)
+    }
+
+    fn snapshot_for_answer(
+        paths: &AppPaths,
+        trace_id: Option<&str>,
+        transport: &CredentialFreeHttpTransport,
+    ) -> Result<Self> {
+        Self::snapshot_with_transport(paths, trace_id, Some(transport))
+    }
+
+    fn snapshot_with_transport(
+        paths: &AppPaths,
+        trace_id: Option<&str>,
+        transport: Option<&CredentialFreeHttpTransport>,
+    ) -> Result<Self> {
         let account = load_account(paths)?
             .ok_or_else(|| anyhow!("Bluey cloud account is not linked; run `bluey login`"))?;
         let owner_account_id = account
@@ -5606,7 +5632,14 @@ impl AccountCloudContext {
             },
             ..Default::default()
         };
-        let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))?;
+        let client = match transport {
+            Some(transport) => cue_cloud_client::CloudClient::with_transport(
+                config,
+                Arc::new(store),
+                transport.clone(),
+            )?,
+            None => cue_cloud_client::CloudClient::new(config, Arc::new(store))?,
+        };
         Ok(Self {
             paths: paths.clone(),
             owner_account_id,
@@ -7497,6 +7530,7 @@ async fn handle_overlay_event(
             let meeting_snapshot =
                 set_answer_instructions(daemon, instructions, &account_context).await?;
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+            send_active_session_overlay(daemon, Some(&meeting_snapshot)).await;
             push_system_card(
                 daemon,
                 CardKind::System,
@@ -11465,11 +11499,16 @@ async fn send_active_session_overlay(daemon: &Arc<Daemon>, meeting: Option<&Meet
             id: Some(meeting.id),
             code: meeting.session_code(),
             title: display_meeting_title(meeting),
+            answer_instructions: meeting
+                .answer_instructions
+                .clone()
+                .filter(|value| value.len() <= OVERLAY_MAX_INSTRUCTIONS),
         },
         None => OverlayCommand::SetActiveSession {
             id: None,
             code: String::new(),
             title: String::new(),
+            answer_instructions: None,
         },
     };
     if let Err(error) = send_overlay(daemon, command).await {
@@ -14377,6 +14416,7 @@ async fn handle_instructions_requested(daemon: &Arc<Daemon>, generation: u64) ->
     let account_context = AnswerAccountContext::capture(&daemon.paths)?;
     let meeting_snapshot = set_answer_instructions(daemon, instructions, &account_context).await?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    send_active_session_overlay(daemon, Some(&meeting_snapshot)).await;
     push_system_card(
         daemon,
         CardKind::System,
@@ -14682,6 +14722,7 @@ async fn answer_with_provider_runtime(
     let route_started_at = Instant::now();
     let outcome = match resolve_answer_route(
         &daemon.paths,
+        &daemon.answer_http_transport,
         &request,
         &answer_meeting,
         Some(&mut overlay_stream),
@@ -17279,6 +17320,7 @@ struct AnswerRouteOutcome {
 
 async fn resolve_answer_route(
     paths: &AppPaths,
+    answer_http_transport: &CredentialFreeHttpTransport,
     request: &AnswerRequest,
     meeting: &MeetingRecord,
     mut stream: Option<&mut OverlayAnswerStream>,
@@ -17377,6 +17419,7 @@ async fn resolve_answer_route(
             let stream_ref = stream.as_mut().map(|stream| &mut **stream);
             match call_bluey_managed_provider(
                 paths,
+                answer_http_transport,
                 request,
                 &step.provider,
                 &payload,
@@ -17434,7 +17477,7 @@ async fn resolve_answer_route(
         }
 
         let stream_ref = stream.as_mut().map(|stream| &mut **stream);
-        match call_chat_provider(&config, &payload, stream_ref).await {
+        match call_chat_provider(answer_http_transport, &config, &payload, stream_ref).await {
             Ok(answer) => {
                 attempts.push(
                     RouteAttemptMetadata::started(answer.provider.clone(), fallback_depth)
@@ -17479,14 +17522,18 @@ async fn resolve_answer_route(
 
 async fn call_bluey_managed_provider(
     paths: &AppPaths,
+    answer_http_transport: &CredentialFreeHttpTransport,
     request: &AnswerRequest,
     provider: &ProviderSelector,
     payload: &ProviderRequestPayload,
     mut stream: Option<&mut OverlayAnswerStream>,
     answer_account_context: &AnswerAccountContext,
 ) -> Result<LiveProviderAnswer> {
-    let account_context =
-        AccountCloudContext::snapshot(paths, request.metadata.correlation_id.as_deref())?;
+    let account_context = AccountCloudContext::snapshot_for_answer(
+        paths,
+        request.metadata.correlation_id.as_deref(),
+        answer_http_transport,
+    )?;
     account_context.ensure_answer_context(answer_account_context)?;
     if let Some(stream) = stream.as_deref_mut() {
         stream.require_managed_account_context();
@@ -18298,6 +18345,7 @@ fn llm_error_category(error: &cue_llm::LlmError) -> &'static str {
 }
 
 async fn call_chat_provider(
+    answer_http_transport: &CredentialFreeHttpTransport,
     config: &ProviderClientConfig,
     payload: &ProviderRequestPayload,
     stream: Option<&mut OverlayAnswerStream>,
@@ -18339,14 +18387,10 @@ async fn call_chat_provider(
         max_tokens: payload.max_output_tokens.unwrap_or(1_024),
     };
     let timeout_ms = payload.latency_timeout_ms.clamp(1_000, 120_000);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .build()
-        .context("failed to build provider HTTP client")?;
-
     let started_at = Instant::now();
-    let response = client
-        .post(endpoint)
+    let response = answer_http_transport
+        .request(reqwest::Method::POST, endpoint)
+        .timeout(Duration::from_millis(timeout_ms))
         .bearer_auth(api_key)
         .json(&request_body)
         .send()
@@ -24030,6 +24074,15 @@ async fn set_answer_instructions(
     instructions: Option<String>,
     account_context: &AnswerAccountContext,
 ) -> Result<MeetingRecord> {
+    let instructions = instructions
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    ensure!(
+        instructions
+            .as_ref()
+            .is_none_or(|value| value.len() <= OVERLAY_MAX_INSTRUCTIONS),
+        "answer instructions exceed the supported length"
+    );
     account_context.ensure_current(&daemon.paths)?;
     let mut meeting_guard = daemon.meeting.lock().await;
     if meeting_guard.is_none() {
@@ -25256,11 +25309,17 @@ pub fn validate_and_decode_overlay_line(
         }
     }
     if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
-        if s.len() > OVERLAY_MAX_TEXT {
+        let max =
+            if obj.get("type").and_then(|value| value.as_str()) == Some("instructions_updated") {
+                OVERLAY_MAX_INSTRUCTIONS
+            } else {
+                OVERLAY_MAX_TEXT
+            };
+        if s.len() > max {
             return Err(OverlayLineReject::FieldTooLong {
                 field: "text",
                 len: s.len(),
-                max: OVERLAY_MAX_TEXT,
+                max,
             });
         }
     }
@@ -26964,6 +27023,8 @@ mod tests {
             cloud_sync_flight: Mutex::new(()),
             balance_poll_task: Mutex::new(None),
             balance_watch: crate::cloud::balance::BalanceWatch::default(),
+            answer_http_transport: CredentialFreeHttpTransport::new()
+                .expect("test answer HTTP transport"),
             overlay_answer_active: Mutex::new(false),
             answer_generation: AtomicU64::new(0),
             active_answer_card: Mutex::new(None),
@@ -32866,6 +32927,8 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             cloud_sync_flight: Mutex::new(()),
             balance_poll_task: Mutex::new(None),
             balance_watch: crate::cloud::balance::BalanceWatch::default(),
+            answer_http_transport: CredentialFreeHttpTransport::new()
+                .expect("test answer HTTP transport"),
             overlay_answer_active: Mutex::new(false),
             answer_generation: AtomicU64::new(0),
             active_answer_card: Mutex::new(None),
@@ -33443,6 +33506,28 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
 
         match err {
             OverlayLineReject::FieldTooLong { field, .. } => assert_eq!(field, "text"),
+            other => panic!("unexpected rejection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_answer_style_event_uses_the_instruction_length_limit() {
+        let state = parking_lot::Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle);
+        let accepted = "x".repeat(OVERLAY_MAX_INSTRUCTIONS);
+        let accepted_line =
+            format!(r#"{{"type":"instructions_updated","token":"tok","text":"{accepted}"}}"#);
+        assert!(validate_and_decode_overlay_line(&accepted_line, "tok", &state).is_ok());
+
+        let rejected = "x".repeat(OVERLAY_MAX_INSTRUCTIONS + 1);
+        let rejected_line =
+            format!(r#"{{"type":"instructions_updated","token":"tok","text":"{rejected}"}}"#);
+        let error = validate_and_decode_overlay_line(&rejected_line, "tok", &state)
+            .expect_err("overlong answer style should be rejected");
+        match error {
+            OverlayLineReject::FieldTooLong { field, max, .. } => {
+                assert_eq!(field, "text");
+                assert_eq!(max, OVERLAY_MAX_INSTRUCTIONS);
+            }
             other => panic!("unexpected rejection: {other:?}"),
         }
     }

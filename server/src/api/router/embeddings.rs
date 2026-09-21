@@ -131,6 +131,7 @@ async fn embed_batch_inner(
             }),
         ));
     }
+    let request_id_log = cue_core::sanitize_interaction_id(&req.request_id);
     if req.inputs.is_empty() || req.inputs.iter().any(|input| input.trim().is_empty()) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -451,7 +452,7 @@ async fn embed_batch_inner(
             }
             Err(e) => {
                 if let Err(error) = attempt_guard.settle_conservative() {
-                    tracing::error!(request_id = %req.request_id, error = %error, "embed failed-attempt settlement pending reconciliation");
+                    tracing::error!(request_id = %request_id_log.as_deref().unwrap_or(""), error = %error, "embed failed-attempt settlement pending reconciliation");
                     return Err(provider_accounting_pending_error(
                         &state.pool,
                         &account.id,
@@ -470,7 +471,7 @@ async fn embed_batch_inner(
                         .await;
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        request_id = %req.request_id,
+                        request_id = %request_id_log.as_deref().unwrap_or(""),
                         provider = %provider,
                         model = %model,
                         key_fingerprint = %selected_key.fingerprint,
@@ -482,7 +483,7 @@ async fn embed_batch_inner(
                 }
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    request_id = %req.request_id,
+                    request_id = %request_id_log.as_deref().unwrap_or(""),
                     provider = %provider,
                     model = %model,
                     error = %e,
@@ -607,7 +608,7 @@ async fn embed_batch_inner(
         {
             tracing::error!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                request_id = %req.request_id,
+                request_id = %request_id_log.as_deref().unwrap_or(""),
                 error = %e,
                 "embed mark_complete failed AFTER customer billed"
             );

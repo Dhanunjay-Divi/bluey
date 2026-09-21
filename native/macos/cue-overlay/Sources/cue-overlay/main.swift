@@ -1707,7 +1707,11 @@ private enum OverlayCommand {
     case setAccountState(signedIn: Bool)
     case setContextItems([OverlayContextItem])
     case setSessions([OverlaySessionItem])
-    case setActiveSession(id: String?, code: String, title: String)
+    case setActiveSession(
+        id: String?,
+        code: String,
+        title: String,
+        answerInstructions: String?)
     case listeningStateChanged(String)
     case audioAutoStopCountdown(remainingSecs: Int, idleSecs: Int)
     case audioAutoStopCountdownCleared
@@ -1823,10 +1827,15 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         }.filter { !$0.id.isEmpty }
         return .setSessions(sessions)
     case "set_active_session":
+        let rawInstructions = obj["answer_instructions"] as? String
+        let answerInstructions = rawInstructions.flatMap { value in
+            value.utf8.count <= blueyMaximumAnswerStyleInstructionBytes ? value : nil
+        }
         return .setActiveSession(
             id: obj["id"] as? String,
             code: obj["code"] as? String ?? "",
-            title: obj["title"] as? String ?? "")
+            title: obj["title"] as? String ?? "",
+            answerInstructions: answerInstructions)
     case "listening_state_changed":
         return .listeningStateChanged(obj["state"] as? String ?? "idle")
     case "audio_auto_stop_countdown":
@@ -4725,6 +4734,9 @@ private final class FeedView: NSView {
 
         let signInURL = signInLike ? loginURL(from: card) : nil
         let signInCode = signInURL == nil ? nil : loginCode(from: card)
+        let signInPalette = signInURL == nil
+            ? nil
+            : blueySignInCardPalette(lightThemeEnabled: lightThemeEnabled)
         let rawBody = card.body.isEmpty && !card.done ? "Thinking..." : card.body
         let bodyText = signInURL == nil
             ? chatBody(for: card, rawBody: rawBody)
@@ -4768,20 +4780,28 @@ private final class FeedView: NSView {
         let actionButtons = [recoveryButton, copyButton, canvasButton].compactMap { $0 }
 
         let signInButton: NSButton? = signInURL.map { _ in
-            let button = NSButton(title: "Sign in", target: self, action: #selector(signInButtonClicked(_:)))
+            let button = NSButton(
+                title: blueySignInPrimaryActionTitle,
+                target: self,
+                action: #selector(signInButtonClicked(_:)))
             button.translatesAutoresizingMaskIntoConstraints = false
             styleSignInButton(button)
             return button
         }
-        let signInCodeView = signInCode.map { makeSignInCodeView($0) }
-        if signInURL != nil {
-            bubble.layer?.backgroundColor = NSColor(red: 0.020, green: 0.030, blue: 0.040, alpha: 0.98).cgColor
+        let signInFallbackButton = signInCode.flatMap { code in
+            signInPalette.map { BlueySignInFallbackButton(code: code, palette: $0) }
+        }
+        if let signInPalette {
+            bubble.layer?.backgroundColor = signInPalette.surface.cgColor
             bubble.layer?.borderWidth = 1
-            bubble.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
+            bubble.layer?.borderColor = signInPalette.border.cgColor
             metaLabel.isHidden = true
             statusLabel.isHidden = true
+            titleLabel.stringValue = blueySignInCardTitle
             titleLabel.font = NSFont.systemFont(ofSize: 15.5, weight: .bold)
+            titleLabel.textColor = signInPalette.primaryText
             titleLabel.alignment = .center
+            bodyLabel.textColor = signInPalette.secondaryText
             bodyLabel.preferredMaxLayoutWidth = 360
         }
         let sourceCard = !rightAligned
@@ -4812,8 +4832,8 @@ private final class FeedView: NSView {
         if let signInButton {
             bubble.addSubview(signInButton)
         }
-        if let signInCodeView {
-            bubble.addSubview(signInCodeView)
+        if let signInFallbackButton {
+            bubble.addSubview(signInFallbackButton)
         }
 
         let leading = bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8)
@@ -4883,14 +4903,15 @@ private final class FeedView: NSView {
             }
         }
         if let signInButton {
-            if let signInCodeView {
+            if let signInFallbackButton {
                 constraints.append(contentsOf: [
-                    bodyLabel.bottomAnchor.constraint(equalTo: signInCodeView.topAnchor, constant: -10),
-                    signInCodeView.centerXAnchor.constraint(equalTo: bubble.centerXAnchor),
-                    signInCodeView.leadingAnchor.constraint(greaterThanOrEqualTo: bubble.leadingAnchor, constant: 28),
-                    signInCodeView.trailingAnchor.constraint(lessThanOrEqualTo: bubble.trailingAnchor, constant: -28),
-                    signInCodeView.heightAnchor.constraint(equalToConstant: 34),
-                    signInCodeView.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12),
+                    bodyLabel.bottomAnchor.constraint(equalTo: signInFallbackButton.topAnchor, constant: -10),
+                    signInFallbackButton.centerXAnchor.constraint(equalTo: bubble.centerXAnchor),
+                    signInFallbackButton.leadingAnchor.constraint(greaterThanOrEqualTo: bubble.leadingAnchor, constant: 28),
+                    signInFallbackButton.trailingAnchor.constraint(lessThanOrEqualTo: bubble.trailingAnchor, constant: -28),
+                    signInFallbackButton.widthAnchor.constraint(equalToConstant: 156),
+                    signInFallbackButton.heightAnchor.constraint(equalToConstant: 30),
+                    signInFallbackButton.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12),
                 ])
             } else {
                 constraints.append(bodyLabel.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12))
@@ -5252,7 +5273,7 @@ private final class FeedView: NSView {
         button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
         button.font = NSFont.systemFont(ofSize: 12.5, weight: .bold)
         button.attributedTitle = NSAttributedString(
-            string: "Open browser",
+            string: blueySignInPrimaryActionTitle,
             attributes: [
                 .font: button.font ?? NSFont.systemFont(ofSize: 12.5, weight: .bold),
                 .foregroundColor: NSColor.black.withAlphaComponent(0.86),
@@ -5266,42 +5287,7 @@ private final class FeedView: NSView {
         }
         button.imageHugsTitle = true
         button.alignment = .center
-        button.toolTip = "Open the Bluey sign-in page"
-    }
-
-    private func makeSignInCodeView(_ code: String) -> NSView {
-        let stack = NSStackView()
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.distribution = .gravityAreas
-        stack.spacing = 9
-        stack.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
-        stack.wantsLayer = true
-        stack.layer?.cornerRadius = 15
-        stack.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.13).cgColor
-        stack.layer?.borderWidth = 1
-        stack.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.38).cgColor
-        stack.toolTip = "Use this fallback code only if the browser did not carry it automatically"
-
-        let label = NSTextField(labelWithString: "Fallback code")
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        label.textColor = dimTextColor
-        label.alignment = .right
-        label.setContentHuggingPriority(.required, for: .horizontal)
-
-        let codeLabel = NSTextField(labelWithString: code)
-        codeLabel.translatesAutoresizingMaskIntoConstraints = false
-        codeLabel.font = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .bold)
-        codeLabel.textColor = BlueyTheme.cyan
-        codeLabel.alignment = .left
-        codeLabel.isSelectable = true
-        codeLabel.setContentHuggingPriority(.required, for: .horizontal)
-
-        stack.addArrangedSubview(label)
-        stack.addArrangedSubview(codeLabel)
-        return stack
+        button.toolTip = "Continue Bluey sign-in in your browser"
     }
 
     @objc private func openURLButtonClicked(_ sender: NSButton) {
@@ -5646,20 +5632,7 @@ private final class FeedView: NSView {
     }
 
     private func signInBody(from text: String) -> String {
-        text.components(separatedBy: .newlines)
-            .filter { !isLoginMetadataLine($0) }
-            .joined(separator: "\n")
-            .replacingOccurrences(of: "knowledge base", with: "documents")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func isLoginMetadataLine(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = trimmed.lowercased()
-        return lower.hasPrefix("login_url:")
-            || lower.hasPrefix("code:")
-            || lower.hasPrefix("connect code:")
-            || lower.contains("desktop code ")
+        blueySignInVisibleBody(from: text)
     }
 
     private func loginCode(from card: RenderedCard) -> String? {
@@ -5668,6 +5641,7 @@ private final class FeedView: NSView {
             let lower = trimmed.lowercased()
             if lower.hasPrefix("code:")
                 || lower.hasPrefix("connect code:")
+                || lower.hasPrefix("fallback code:")
                 || lower.contains("desktop code ")
             {
                 if let code = extractLoginCode(from: trimmed) {
@@ -6476,6 +6450,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let answerStyleOverlay: NSView
     let answerStylePanel: NSView
     let answerStyleLabel: NSTextField
+    let answerStylePicker: BlueyAnswerStylePicker
     let answerStyleBox: NSTextField
     let answerStyleTypingIndicator: NSView
     let answerStyleCaretIndicator: NSView
@@ -6633,6 +6608,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private let resizeHitSize: CGFloat = 14
     private var backgroundOpacity: CGFloat = 0.94
     private var dropHighlightActive = false
+    private var savedAnswerStyleInstructions = ""
     private var lightThemeEnabled = UserDefaults.standard.bool(forKey: overlayLightThemeDefaultsKey)
     private let keyboardFocusRing = HeaderShieldView()
     private weak var keyboardFocusedControl: NSView?
@@ -6676,6 +6652,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleOverlay = ModalBlockerView()
         answerStylePanel = NSView()
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
+        answerStylePicker = BlueyAnswerStylePicker()
         answerStyleBox = ArrowCursorTextField()
         answerStyleTypingIndicator = NSView()
         answerStyleCaretIndicator = NSView()
@@ -6944,6 +6921,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         addSubview(answerStyleOverlay)
         answerStyleOverlay.addSubview(answerStylePanel)
         answerStylePanel.addSubview(answerStyleLabel)
+        answerStylePanel.addSubview(answerStylePicker)
         answerStylePanel.addSubview(answerStyleBox)
         answerStylePanel.addSubview(answerStyleTypingIndicator)
         answerStylePanel.addSubview(answerStyleCaretIndicator)
@@ -7092,7 +7070,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleLabel.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
             answerStyleLabel.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
 
-            answerStyleBox.topAnchor.constraint(equalTo: answerStyleLabel.bottomAnchor, constant: 12),
+            answerStylePicker.topAnchor.constraint(equalTo: answerStyleLabel.bottomAnchor, constant: 12),
+            answerStylePicker.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
+            answerStylePicker.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
+            answerStylePicker.heightAnchor.constraint(equalToConstant: 58),
+
+            answerStyleBox.topAnchor.constraint(equalTo: answerStylePicker.bottomAnchor, constant: 12),
             answerStyleBox.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
             answerStyleBox.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
             answerStyleBox.heightAnchor.constraint(equalToConstant: 48),
@@ -7312,6 +7295,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachButton.action = #selector(attachClicked)
         instructionsButton.target = self
         instructionsButton.action = #selector(instructionsClicked)
+        answerStylePicker.onSelectionChanged = { [weak self] preset in
+            self?.answerStylePresetChanged(preset)
+        }
         transcriptClearButton.target = self
         transcriptClearButton.action = #selector(clearTranscriptClicked)
 
@@ -7559,6 +7545,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .withAlphaComponent(lightThemeEnabled ? 0.58 : 0.30)
             .cgColor
         answerStyleLabel.textColor = themedTextColor
+        answerStylePicker.applyTheme(light: lightThemeEnabled)
         refreshAnswerStyleInputChrome()
         composerBar.layer?.backgroundColor = themedComposerColor.cgColor
         composerBar.layer?.borderColor = (lightThemeEnabled
@@ -8062,6 +8049,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if routeKeyboardOpacityAdjustment(event: event, hasCommandLikeModifier: hasCommandLikeModifier) {
             return true
         }
+        if routeKeyboardAnswerStyleAdjustment(
+            event: event,
+            hasCommandLikeModifier: hasCommandLikeModifier)
+        {
+            return true
+        }
 
         if (isReturn || isSpace),
            !hasCommandLikeModifier,
@@ -8103,6 +8096,34 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return false
         }
         emitLifecycle("keyboard_focus_adjusted", detail: "control=opacity value=\(Int((opacitySlider.doubleValue * 100.0).rounded()))")
+        return true
+    }
+
+    private func routeKeyboardAnswerStyleAdjustment(
+        event: NSEvent,
+        hasCommandLikeModifier: Bool
+    ) -> Bool {
+        guard !hasCommandLikeModifier,
+              let control = keyboardFocusedControl as? NSSegmentedControl,
+              isKeyboardFocusable(control)
+        else {
+            return false
+        }
+        let offset: Int
+        switch event.keyCode {
+        case 123, 126:
+            offset = -1
+        case 124, 125:
+            offset = 1
+        default:
+            return false
+        }
+        let maximum = max(0, control.segmentCount - 1)
+        control.selectedSegment = min(maximum, max(0, control.selectedSegment + offset))
+        control.sendAction(control.action, to: control.target)
+        emitLifecycle(
+            "keyboard_focus_adjusted",
+            detail: "control=tone_preset segment=\(control.selectedSegment)")
         return true
     }
 
@@ -8263,7 +8284,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func controlsInView(_ view: NSView) -> [NSView] {
         var result: [NSView] = []
         for subview in view.subviews {
-            if subview is NSButton || subview is NSPopUpButton {
+            if subview is NSButton || subview is NSPopUpButton || subview is NSSegmentedControl {
                 result.append(subview)
             } else if let textField = subview as? NSTextField,
                       textField.isEditable || textField.isSelectable {
@@ -8322,6 +8343,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             popup.performClick(nil)
             return true
         }
+        if let segmented = control as? NSSegmentedControl {
+            window?.makeFirstResponder(segmented)
+            segmented.sendAction(segmented.action, to: segmented.target)
+            return true
+        }
         if let button = control as? NSButton {
             button.performClick(nil)
             return true
@@ -8346,6 +8372,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return buttonIdentifier(button)
         }
         if control === answerStyleBox { return "tone_text" }
+        if control is NSSegmentedControl { return "tone_preset" }
         if let textField = control as? NSTextField {
             return textField.placeholderString ?? textField.stringValue
         }
@@ -8778,6 +8805,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         guard control === answerStyleBox else { return }
+        let bounded = blueyBoundAnswerStyleInstructions(answerStyleBox.stringValue)
+        if bounded != answerStyleBox.stringValue {
+            answerStyleBox.stringValue = bounded
+        }
         answerStyleCaretVisible = true
         applyAccentInsertionPoint(to: answerStyleBox)
         updateAnswerStyleCaretPosition()
@@ -10010,8 +10041,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
         answerStyleLabel.textColor = NSColor.white.withAlphaComponent(0.96)
         answerStyleLabel.alignment = .center
-        answerStyleLabel.stringValue = "How should Bluey answer?"
-        answerStyleBox.placeholderString = "Natural, concise, interview-ready..."
+        answerStyleLabel.stringValue = "Choose an answer style"
+        answerStyleBox.placeholderString = "Custom instructions for this session..."
         answerStyleBox.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
         answerStyleBox.isBezeled = false
         answerStyleBox.drawsBackground = true
@@ -10020,7 +10051,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleBox.textColor = NSColor.black.withAlphaComponent(0.96)
         answerStyleBox.alignment = .left
         answerStyleBox.placeholderAttributedString = NSAttributedString(
-            string: "Natural, concise, interview-ready...",
+            string: "Custom instructions for this session...",
             attributes: [.foregroundColor: NSColor.black.withAlphaComponent(0.60)])
         answerStyleBox.wantsLayer = true
         answerStyleBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.98).cgColor
@@ -10833,10 +10864,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func saveAnswerStyleClicked() {
-        let text = answerStyleBox.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = answerStylePicker.resolvedInstructions(
+            customInstructions: answerStyleBox.stringValue)
+        savedAnswerStyleInstructions = text
         emitInstructions(text: text)
         setHeaderSubtitle()
         dismissAnswerStyleEditor(animated: true)
+    }
+
+    private func answerStylePresetChanged(_ preset: BlueyAnswerStylePreset) {
+        let custom = preset == .custom
+        answerStyleBox.isEnabled = custom
+        answerStyleBox.alphaValue = custom ? 1.0 : 0.58
+        answerStyleSaveButton.title = preset == .standard ? "Use Default" : "Use \(preset.title)"
+        if custom {
+            window?.makeFirstResponder(answerStyleBox)
+            applyAccentInsertionPoint(to: answerStyleBox)
+            setAnswerStyleInputFocused(true)
+        } else {
+            window?.makeFirstResponder(answerStyleSaveButton)
+            setAnswerStyleInputFocused(false)
+        }
+        refreshKeyboardFocusRingStyle()
     }
 
     @discardableResult
@@ -11527,13 +11576,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     func openAnswerStyleEditor() {
         dismissCloseConfirm(animated: false)
         answerStyleOverlay.isHidden = false
+        answerStylePicker.select(matching: savedAnswerStyleInstructions)
+        answerStylePresetChanged(answerStylePicker.selectedPreset)
         answerStyleOverlay.alphaValue = 0
         updateBackgroundControlsEnabledForModalState()
-        window?.makeFirstResponder(answerStyleBox)
-        applyAccentInsertionPoint(to: answerStyleBox)
-        applyAnswerStyleEditorCursor()
-        setAnswerStyleInputFocused(true)
-        startAnswerStyleCaretBlink()
+        if answerStylePicker.selectedPreset == .custom {
+            window?.makeFirstResponder(answerStyleBox)
+            applyAccentInsertionPoint(to: answerStyleBox)
+            applyAnswerStyleEditorCursor()
+            setAnswerStyleInputFocused(true)
+            startAnswerStyleCaretBlink()
+        } else {
+            window?.makeFirstResponder(answerStyleSaveButton)
+        }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.12
             answerStyleOverlay.animator().alphaValue = 1
@@ -11790,7 +11845,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
-    func setActiveSession(id: String?, code: String, title: String) {
+    func setActiveSession(
+        id: String?,
+        code: String,
+        title: String,
+        answerInstructions: String?
+    ) {
         let nextSessionId = id?.trimmingCharacters(in: .whitespacesAndNewlines)
         if nextSessionId != activeSessionId {
             cardUpdateSequences.resetAll()
@@ -11799,6 +11859,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let cleanCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
         activeSessionCode = cleanCode.isEmpty ? activeSessionId.map(shortSessionCode) : cleanCode
         activeSessionTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        savedAnswerStyleInstructions = answerInstructions?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hydratedPreset = BlueyAnswerStylePreset.matching(
+            instructions: savedAnswerStyleInstructions)
+        answerStyleBox.stringValue = hydratedPreset == .custom
+            ? savedAnswerStyleInstructions
+            : ""
         refreshSessionHeaderSubtitle()
     }
 
@@ -17686,8 +17753,12 @@ private final class OverlayApp {
             expandedView?.setContextItems(items)
         case .setSessions(let sessions):
             expandedView?.setSessions(sessions)
-        case .setActiveSession(let id, let code, let title):
-            expandedView?.setActiveSession(id: id, code: code, title: title)
+        case .setActiveSession(let id, let code, let title, let answerInstructions):
+            expandedView?.setActiveSession(
+                id: id,
+                code: code,
+                title: title,
+                answerInstructions: answerInstructions)
         case .listeningStateChanged(let state):
             let runState = PillRunState(listeningState: state)
             setRunState(runState)
@@ -17995,6 +18066,43 @@ private func blueyTrustedRemoteInputEventTapCallback(
 #if BLUEY_AUTH_UI_POLICY_TESTS
 private func runAuthUIPolicyTests() {
     precondition(PillMetrics.size == NSSize(width: 112, height: 30))
+    for lightThemeEnabled in [false, true] {
+        let palette = blueySignInCardPalette(lightThemeEnabled: lightThemeEnabled)
+        precondition(palette.surface.alphaComponent == 1.0)
+        precondition(blueyContrastRatio(
+            foreground: palette.primaryText,
+            background: palette.surface) >= 4.5)
+        precondition(blueyContrastRatio(
+            foreground: palette.secondaryText,
+            background: palette.surface) >= 4.5)
+        precondition(blueyContrastRatio(
+            foreground: palette.successText,
+            background: palette.surface) >= 4.5)
+    }
+    let visibleSignInBody = blueySignInVisibleBody(from: """
+    The browser already has this desktop's connection code.
+    Fallback code: ABCD-EFGH
+    login_url: https://bluey.sh/login?desktop=1&user_code=ABCD-EFGH
+    """)
+    precondition(!visibleSignInBody.contains("ABCD-EFGH"))
+    precondition(visibleSignInBody.contains("browser already has"))
+    precondition(blueySignInCardTitle == "Sign in to Bluey")
+    precondition(blueySignInPrimaryActionTitle == "Continue in browser")
+    precondition(blueySignInCardTitle != blueySignInPrimaryActionTitle)
+    precondition(!blueySignInFallbackActionTitle.contains("ABCD-EFGH"))
+    precondition(BlueyAnswerStylePreset.matching(instructions: "") == .standard)
+    precondition(BlueyAnswerStylePreset.matching(
+        instructions: BlueyAnswerStylePreset.concise.instructions ?? "") == .concise)
+    precondition(BlueyAnswerStylePreset.matching(
+        instructions: BlueyAnswerStylePreset.star.instructions ?? "") == .star)
+    precondition(BlueyAnswerStylePreset.matching(
+        instructions: "Use a calm executive tone.") == .custom)
+    precondition(BlueyAnswerStylePreset.star.instructions?.contains("never invent") == true)
+    precondition(BlueyAnswerStylePreset.concise.instructions?.contains("speakable") == true)
+    let boundedStyle = blueyBoundAnswerStyleInstructions(
+        String(repeating: "é", count: blueyMaximumAnswerStyleInstructionBytes))
+    precondition(boundedStyle.utf8.count <= blueyMaximumAnswerStyleInstructionBytes)
+    precondition(!boundedStyle.isEmpty)
     precondition(!allowsAuthenticatedChromeUpdates(for: .unknown))
     precondition(!allowsAuthenticatedChromeUpdates(for: .signedOut))
     precondition(allowsAuthenticatedChromeUpdates(for: .signedIn))

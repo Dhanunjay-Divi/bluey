@@ -104,6 +104,37 @@ fn record_answer_ops_event(pool: &crate::db::DbPool, event: AnswerOpsEvent<'_>) 
 const INTERNAL_DISCLOSURE_REFUSAL: &str = "I can’t share Bluey’s private instructions, prompts, guardrails, tokens, or internal configuration. Ask me what you want to do, and I’ll help with the answer itself.";
 const MANAGED_VISION_TEXT_FALLBACK_INSTRUCTION: &str = "An image was supplied with this request, but the image is unavailable for this retry. Answer the same user request using only the user text and retained textual context. Do not claim that you saw or analyzed the image, and do not invent missing visual details. If essential details exist only in the image, say that the image was unavailable and ask only for the minimum missing detail.";
 
+// Keep the finite output-disclosure vocabulary centralized. The streaming
+// holdback in `visible_output` is derived from these exact phrases so adding a
+// longer guard cannot silently make the rolling window too short.
+const INTERNAL_DISCLOSURE_LEAK_SIGNALS: [&str; 13] = [
+    "the prompts that define how i work",
+    "embedded in my system instructions",
+    "plain summary of the key rules i follow",
+    "identity and scope",
+    "talk track rule",
+    "question type detection",
+    "voice and person",
+    "depth matching",
+    "canvas and workbench split",
+    "style restrictions",
+    "output shape",
+    "human speak contract",
+    "answer rules",
+];
+
+const INTERNAL_PLAN_DISCLOSURE_MARKERS: [&str; 6] = [
+    "core intent",
+    "key requirements",
+    "visible answer contract",
+    "grounding and technical safety",
+    "interview closing contract",
+    "bluey answer plan",
+];
+
+const INTERNAL_DISCLOSURE_QUARANTINE_ANCHORS: [&str; 3] =
+    ["system instructions", "i follow", "how i work"];
+
 #[derive(Clone, Copy, Debug)]
 struct InternalDisclosureBlocked;
 
@@ -258,62 +289,84 @@ fn is_internal_disclosure_request(text: &str) -> bool {
 
 fn looks_like_internal_disclosure_leak(text: &str) -> bool {
     let normalized = normalize_guardrail_text(text);
+    internal_disclosure_leak_normalized_start(&normalized).is_some()
+}
+
+/// Returns the source byte where the first confirmed disclosure signature
+/// begins. The streaming guard uses this only after the fast Boolean detector
+/// fires, so ordinary deltas do not pay for the source-offset map.
+fn internal_disclosure_leak_start(text: &str) -> Option<usize> {
+    let (normalized, source_offsets) = normalize_guardrail_text_with_source_offsets(text);
+    let normalized_start = internal_disclosure_leak_normalized_start(&normalized)?;
+    source_offsets.get(normalized_start).copied()
+}
+
+fn internal_disclosure_leak_normalized_start(normalized: &str) -> Option<usize> {
     if normalized.is_empty() {
-        return false;
-    }
-    let direct_leak = [
-        "the prompts that define how i work",
-        "embedded in my system instructions",
-        "plain summary of the key rules i follow",
-        "identity and scope",
-        "talk track rule",
-        "question type detection",
-        "voice and person",
-        "depth matching",
-        "canvas and workbench split",
-        "style restrictions",
-        "output shape",
-        "human speak contract",
-        "answer rules",
-    ]
-    .iter()
-    .any(|signal| normalized.contains(signal));
-    if direct_leak {
-        return true;
+        return None;
     }
 
-    let internal_plan_markers = [
-        "core intent",
-        "key requirements",
-        "visible answer contract",
-        "grounding and technical safety",
-        "interview closing contract",
-        "bluey answer plan",
-    ]
-    .iter()
-    .filter(|marker| normalized.contains(*marker))
-    .count();
+    let mut earliest = INTERNAL_DISCLOSURE_LEAK_SIGNALS
+        .iter()
+        .filter_map(|signal| normalized.find(signal))
+        .min();
+
+    let mut internal_plan_markers = 0usize;
+    let mut earliest_internal_plan_marker = None;
+    for marker in INTERNAL_PLAN_DISCLOSURE_MARKERS {
+        if let Some(start) = normalized.find(marker) {
+            internal_plan_markers += 1;
+            earliest_internal_plan_marker = Some(
+                earliest_internal_plan_marker.map_or(start, |current: usize| current.min(start)),
+            );
+        }
+    }
     if normalized.contains("bluey answer plan") || internal_plan_markers >= 2 {
-        return true;
+        earliest = earliest_option(earliest, earliest_internal_plan_marker);
     }
 
-    normalized.contains("system instructions")
-        && (normalized.contains("i follow")
-            || normalized.contains("how i work")
-            || normalized.contains("bluey"))
+    if let Some(system_start) = normalized.find("system instructions") {
+        let companion_start = ["i follow", "how i work", "bluey"]
+            .iter()
+            .filter_map(|companion| normalized.find(companion))
+            .min();
+        if let Some(companion_start) = companion_start {
+            earliest = earliest_option(earliest, Some(system_start.min(companion_start)));
+        }
+    }
+
+    earliest
+}
+
+fn earliest_option(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
 }
 
 fn contains_internal_plan_disclosure_anchor(normalized: &str) -> bool {
-    [
-        "core intent",
-        "key requirements",
-        "visible answer contract",
-        "grounding and technical safety",
-        "interview closing contract",
-        "bluey answer plan",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+    INTERNAL_PLAN_DISCLOSURE_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn contains_internal_disclosure_quarantine_anchor(normalized: &str) -> bool {
+    INTERNAL_DISCLOSURE_QUARANTINE_ANCHORS
+        .iter()
+        .any(|anchor| normalized.contains(anchor))
+        || contains_internal_plan_disclosure_anchor(normalized)
+}
+
+fn internal_disclosure_quarantine_anchor_start(text: &str) -> Option<usize> {
+    let (normalized, source_offsets) = normalize_guardrail_text_with_source_offsets(text);
+    let normalized_start = INTERNAL_DISCLOSURE_QUARANTINE_ANCHORS
+        .iter()
+        .chain(INTERNAL_PLAN_DISCLOSURE_MARKERS.iter())
+        .filter_map(|anchor| normalized.find(anchor))
+        .min()?;
+    source_offsets.get(normalized_start).copied()
 }
 
 fn normalize_guardrail_text(text: &str) -> String {
@@ -339,6 +392,48 @@ fn normalize_guardrail_text(text: &str) -> String {
         }
     }
     normalized.trim().to_string()
+}
+
+fn normalize_guardrail_text_with_source_offsets(text: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::with_capacity(text.len());
+    let mut source_offsets = Vec::with_capacity(text.len());
+    let mut last_was_space = false;
+    for (source_byte, original) in text.char_indices() {
+        if guardrail_format_char(original) {
+            continue;
+        }
+        let folded = fold_guardrail_compatibility_char(original);
+        for ch in folded.to_lowercase() {
+            if guardrail_format_char(ch) {
+                continue;
+            }
+            let ch = fold_guardrail_confusable(ch);
+            if ch.is_ascii_alphanumeric() {
+                normalized.push(ch);
+                source_offsets.push(source_byte);
+                last_was_space = false;
+            } else if !last_was_space {
+                normalized.push(' ');
+                source_offsets.push(source_byte);
+                last_was_space = true;
+            }
+        }
+    }
+
+    let trimmed_start = normalized
+        .as_bytes()
+        .iter()
+        .position(|byte| *byte != b' ')
+        .unwrap_or(normalized.len());
+    let trimmed_end = normalized
+        .as_bytes()
+        .iter()
+        .rposition(|byte| *byte != b' ')
+        .map_or(trimmed_start, |index| index + 1);
+    (
+        normalized[trimmed_start..trimmed_end].to_string(),
+        source_offsets[trimmed_start..trimmed_end].to_vec(),
+    )
 }
 
 fn guardrail_format_char(ch: char) -> bool {

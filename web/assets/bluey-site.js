@@ -47,6 +47,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let latestAccountForBilling = null;
     let confirmActionResolve = null;
     let lastLinkedComputerCount = 0;
+    let pendingDeviceMemoryRecord = null;
+    let pendingDeviceConfirmationMemory = '';
+    let pendingDeviceApprovalMemory = null;
+    let desktopDeepLinkConfirmedMemory = false;
+    let desktopDeepLinkStartedMemory = false;
     let accountBalancePollTimer = null;
     const AUTO_RELOAD_MIN_CENTS = 1500;
     const AUTO_RELOAD_MAX_CENTS = 50000;
@@ -70,6 +75,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const DEVICE_LINK_TTL_MS = 10 * 60 * 1000;
     const DEVICE_APPROVAL_WAIT_MS = 45 * 1000;
     const DEVICE_LINK_STORAGE_KEY = 'bluey_pending_device_code';
+    const DESKTOP_DEEP_LINK_CONFIRM_KEY = 'bluey_desktop_deep_link_confirmed';
+    const DESKTOP_DEEP_LINK_STARTED_KEY = 'bluey_desktop_deep_link_started';
     const ACCESS_TOKEN_KEY = 'bluey_access_token';
     const REFRESH_TOKEN_KEY = 'bluey_refresh_token';
     const AUTH_PERSISTENCE_KEY = 'bluey_auth_persistence';
@@ -335,10 +342,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
-    function rememberPendingDeviceCode(code) {
-      if (!code) return;
+    function rememberPendingDeviceCode(value) {
+      const code = normalizeDeviceCode(value);
+      if (!code) return false;
+      let savedAt = pendingDeviceMemoryRecord?.code === code
+        ? pendingDeviceMemoryRecord.savedAt
+        : Date.now();
       try {
-        let savedAt = Date.now();
         const raw = sessionStorage.getItem(DEVICE_LINK_STORAGE_KEY);
         if (raw) {
           const parsed = JSON.parse(raw);
@@ -348,30 +358,43 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             savedAt = existingSavedAt;
           }
         }
+      } catch {
+        // The in-memory record keeps this tab functional without web storage.
+      }
+      pendingDeviceMemoryRecord = { code, savedAt };
+      try {
         sessionStorage.setItem(DEVICE_LINK_STORAGE_KEY, JSON.stringify({
           code,
           saved_at: savedAt,
         }));
+        return true;
       } catch {
-        // Browser storage can be disabled; the query-param path still works.
+        return false;
       }
     }
 
     function storedPendingDeviceRecord() {
+      const memory = pendingDeviceMemoryRecord;
+      const memoryIsFresh = Boolean(
+        memory?.code
+          && memory.savedAt
+          && Date.now() - memory.savedAt <= DEVICE_LINK_TTL_MS,
+      );
+      if (!memoryIsFresh) pendingDeviceMemoryRecord = null;
       try {
         const raw = sessionStorage.getItem(DEVICE_LINK_STORAGE_KEY);
-        if (!raw) return null;
+        if (!raw) return memoryIsFresh ? memory : null;
         const parsed = JSON.parse(raw);
         const code = normalizeDeviceCode(parsed?.code);
         const savedAt = Number(parsed?.saved_at || 0);
         if (!code || !savedAt || Date.now() - savedAt > DEVICE_LINK_TTL_MS) {
           sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
-          return null;
+          return memoryIsFresh ? memory : null;
         }
-        return { code, savedAt };
+        pendingDeviceMemoryRecord = { code, savedAt };
+        return pendingDeviceMemoryRecord;
       } catch {
-        sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
-        return null;
+        return memoryIsFresh ? memory : null;
       }
     }
 
@@ -390,8 +413,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function markPendingDeviceApproved(code) {
       const normalized = normalizeDeviceCode(code);
       if (!normalized) return;
+      const approvedAt = Date.now();
+      pendingDeviceApprovalMemory = { code: normalized, approvedAt };
       try {
-        sessionStorage.setItem(deviceApprovalStorageKey(normalized), String(Date.now()));
+        sessionStorage.setItem(deviceApprovalStorageKey(normalized), String(approvedAt));
       } catch {
         // Storage is optional; the server-side approval is the source of truth.
       }
@@ -400,13 +425,93 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function pendingDeviceApprovedAt(code) {
       const normalized = normalizeDeviceCode(code);
       if (!normalized) return 0;
+      const memoryApprovedAt = pendingDeviceApprovalMemory?.code === normalized
+        ? Number(pendingDeviceApprovalMemory.approvedAt || 0)
+        : 0;
       try {
         const raw = sessionStorage.getItem(deviceApprovalStorageKey(normalized));
-        if (!raw || raw === '1') return 0;
+        if (!raw || raw === '1') return memoryApprovedAt;
         const value = Number(raw);
-        return Number.isFinite(value) && value > 0 ? value : 0;
+        return Number.isFinite(value) && value > 0 ? value : memoryApprovedAt;
       } catch {
-        return 0;
+        return memoryApprovedAt;
+      }
+    }
+
+    function markPendingDeviceConfirmed(code) {
+      const normalized = normalizeDeviceCode(code);
+      if (!normalized) return;
+      pendingDeviceConfirmationMemory = normalized;
+      try {
+        sessionStorage.setItem(deviceConfirmStorageKey(normalized), '1');
+      } catch {
+        // An explicit confirmation remains valid for this tab without storage.
+      }
+    }
+
+    function isPendingDeviceConfirmed(code) {
+      const normalized = normalizeDeviceCode(code);
+      if (!normalized) return false;
+      if (pendingDeviceConfirmationMemory === normalized) return true;
+      try {
+        return sessionStorage.getItem(deviceConfirmStorageKey(normalized)) === '1';
+      } catch {
+        return false;
+      }
+    }
+
+    function markDesktopDeepLinkConfirmed() {
+      desktopDeepLinkConfirmedMemory = true;
+      try {
+        sessionStorage.setItem(DESKTOP_DEEP_LINK_CONFIRM_KEY, '1');
+      } catch {
+        // The explicit click remains authoritative for this tab without storage.
+      }
+    }
+
+    function isDesktopDeepLinkConfirmed() {
+      if (desktopDeepLinkConfirmedMemory) return true;
+      try {
+        return sessionStorage.getItem(DESKTOP_DEEP_LINK_CONFIRM_KEY) === '1';
+      } catch {
+        return false;
+      }
+    }
+
+    function markDesktopDeepLinkStarted() {
+      desktopDeepLinkStartedMemory = true;
+      try {
+        sessionStorage.setItem(DESKTOP_DEEP_LINK_STARTED_KEY, '1');
+      } catch {
+        // The in-memory guard prevents duplicate launches in this tab.
+      }
+    }
+
+    function hasDesktopDeepLinkStarted() {
+      if (desktopDeepLinkStartedMemory) return true;
+      try {
+        return sessionStorage.getItem(DESKTOP_DEEP_LINK_STARTED_KEY) === '1';
+      } catch {
+        return false;
+      }
+    }
+
+    function clearDesktopDeepLinkStarted() {
+      desktopDeepLinkStartedMemory = false;
+      try {
+        sessionStorage.removeItem(DESKTOP_DEEP_LINK_STARTED_KEY);
+      } catch {
+        // In-memory state is already cleared.
+      }
+    }
+
+    function clearDesktopDeepLinkState() {
+      desktopDeepLinkConfirmedMemory = false;
+      clearDesktopDeepLinkStarted();
+      try {
+        sessionStorage.removeItem(DESKTOP_DEEP_LINK_CONFIRM_KEY);
+      } catch {
+        // In-memory state is already cleared.
       }
     }
 
@@ -417,6 +522,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function clearPendingDeviceCode(code = '') {
       const normalized = normalizeDeviceCode(code) || storedPendingDeviceCode();
+      if (!normalized || pendingDeviceMemoryRecord?.code === normalized) {
+        pendingDeviceMemoryRecord = null;
+      }
+      if (!normalized || pendingDeviceConfirmationMemory === normalized) {
+        pendingDeviceConfirmationMemory = '';
+      }
+      if (!normalized || pendingDeviceApprovalMemory?.code === normalized) {
+        pendingDeviceApprovalMemory = null;
+      }
       try {
         sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
         if (normalized) {
@@ -460,6 +574,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function clearAccountToken() {
       clearPendingDeviceCode();
+      clearDesktopDeepLinkState();
       resetBillingCardState();
       localStorage.removeItem(ACCESS_TOKEN_KEY);
       localStorage.removeItem(REFRESH_TOKEN_KEY);
@@ -679,66 +794,32 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function initProductJoinForm() {
-      document.querySelectorAll('[data-connect-code-form], #productJoinForm').forEach((form) => {
-        if (!form || form.dataset.joinReady === '1') return;
-        form.dataset.joinReady = '1';
-        form.addEventListener('submit', (event) => {
-          const input = form.querySelector('input[name="user_code"]');
-          const code = normalizeDeviceCode(input?.value || '');
-          if (!code) {
-            event.preventDefault();
-            input?.focus();
-            return;
+      const form = document.getElementById('productJoinForm');
+      if (!form || form.dataset.joinReady === '1') return;
+      form.dataset.joinReady = '1';
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        const input = form.querySelector('input[name="user_code"]');
+        const status = document.getElementById('productConnectStatus');
+        const code = normalizeDeviceCode(input?.value || '');
+        if (!code) {
+          if (status) {
+            status.textContent = 'Enter the fallback code shown by Bluey.';
+            status.dataset.tone = 'error';
           }
-          input.value = code;
-          rememberPendingDeviceCode(code);
-          if (accountToken()) {
-            event.preventDefault();
-            approveProductConnectCode(code, form, form.dataset.statusTarget || '');
-          }
-        });
-      });
-    }
-
-    function connectCodeStatus(targetId, text, tone = '') {
-      const el = targetId ? document.getElementById(targetId) : null;
-      if (el) {
-        el.textContent = text || '';
-        el.dataset.tone = tone || '';
-        return;
-      }
-      if (isAccountRoute) {
-        accountMessage(text, false, tone);
-      }
-    }
-
-    async function approveProductConnectCode(code, form, statusTargetId = '') {
-      const button = form?.querySelector('button[type="submit"]');
-      const previousText = button?.textContent || 'Connect';
-      if (button) {
-        button.disabled = true;
-        button.textContent = 'Connecting...';
-      }
-      connectCodeStatus(statusTargetId, 'Connecting this account to Bluey desktop...');
-      try {
-        await apiJson('/auth/device/approve', {
-          method: 'POST',
-          body: JSON.stringify({ user_code: code }),
-        });
-        markPendingDeviceApproved(code);
-        connectCodeStatus(statusTargetId, 'Connected. Return to Bluey desktop; it will finish automatically.', 'success');
-      } catch (error) {
-        if (!accountToken()) {
-          window.location.href = `/login?user_code=${encodeURIComponent(code)}`;
+          input?.focus();
           return;
         }
-        connectCodeStatus(statusTargetId, `Could not connect: ${error.message}`, 'error');
-      } finally {
-        if (button) {
-          button.disabled = false;
-          button.textContent = previousText;
+        rememberPendingDeviceCode(code);
+        if (status) {
+          status.textContent = 'Continuing securely in this browser...';
+          status.dataset.tone = '';
         }
-      }
+        const route = accountToken() ? '/account' : '/login';
+        const base = window.location.protocol === 'file:' ? filePreviewHref(route) : route;
+        const separator = base.includes('?') ? '&' : '?';
+        window.location.href = `${base}${separator}user_code=${encodeURIComponent(code)}`;
+      });
     }
 
     async function refreshAccountToken() {
@@ -1386,20 +1467,28 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.replaceChildren();
       }
 
-      const renderCodeEntry = (el) => {
-        el.hidden = false;
-        el.classList.add('is-code-entry');
-        const shell = el.closest('.device-connect-section, .account-desktop-connect-section');
-        shell?.classList.add('is-action-needed');
-        if (shell instanceof HTMLElement) shell.hidden = false;
-        el.replaceChildren();
-        const title = document.createElement('strong');
-        title.textContent = 'Connect Bluey desktop';
+      const makeTroubleshooting = ({ carriedCode = '', allowEntry = false } = {}) => {
+        const details = document.createElement('details');
+        details.className = 'device-troubleshooting';
+        const summary = document.createElement('summary');
+        summary.textContent = carriedCode ? 'Having trouble?' : 'Use a fallback code';
         const body = document.createElement('span');
         body.className = 'device-code-helper';
+        if (carriedCode) {
+          body.textContent = 'If you need to continue manually, use fallback code ';
+          const codeValue = document.createElement('code');
+          codeValue.textContent = carriedCode;
+          body.append(codeValue, '.');
+          details.append(summary, body);
+          return details;
+        }
+
         body.textContent = accountToken()
-          ? 'Only use this fallback when Bluey could not open the browser with its connection code.'
-          : 'Only use this fallback when Bluey could not carry its connection code into this page.';
+          ? 'Only use this when Bluey could not open the browser with its connection code.'
+          : 'Only use this when Bluey could not carry its connection code into this page.';
+        details.append(summary, body);
+        if (!allowEntry) return details;
+
         const form = document.createElement('form');
         form.className = 'device-code-form';
         form.noValidate = true;
@@ -1410,17 +1499,19 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         input.autocomplete = 'one-time-code';
         input.spellcheck = false;
         input.inputMode = 'text';
+        input.setAttribute('aria-label', 'Bluey fallback connection code');
         const button = document.createElement('button');
         button.type = 'submit';
-        button.className = 'account-button secondary compact device-primary-action';
-        button.textContent = 'Continue';
+        button.className = 'account-button secondary compact';
+        button.textContent = 'Continue in browser';
         const status = document.createElement('span');
         status.className = 'device-code-status';
+        status.setAttribute('aria-live', 'polite');
         form.addEventListener('submit', (event) => {
           event.preventDefault();
           const nextCode = normalizeDeviceCode(input.value);
           if (!nextCode) {
-            status.textContent = 'Enter the code shown in the Bluey host overlay.';
+            status.textContent = 'Enter the fallback code shown by Bluey.';
             input.focus();
             return;
           }
@@ -1429,13 +1520,66 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           renderDeviceLinkHint();
         });
         form.append(input, button);
-        el.append(title, form, body, status);
+        details.append(form, status);
+        return details;
+      };
+
+      const renderDeepLinkConfirmation = (el) => {
+        el.hidden = false;
+        el.classList.add('is-awaiting-action');
+        const shell = el.closest('.device-connect-section, .account-desktop-connect-section');
+        shell?.classList.add('is-action-needed');
+        if (shell instanceof HTMLElement) shell.hidden = false;
+        const title = document.createElement('strong');
+        title.textContent = 'Connect this Bluey?';
+        const body = document.createElement('span');
+        body.textContent = 'Confirm once to finish signing in to the Bluey app that opened this page.';
+        const actionRow = document.createElement('div');
+        actionRow.className = 'device-action-row';
+        const cue = document.createElement('span');
+        cue.className = 'device-action-cue';
+        cue.textContent = 'One secure confirmation';
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'account-button secondary compact device-primary-action';
+        button.textContent = 'Connect this Bluey';
+        button.addEventListener('click', () => {
+          markDesktopDeepLinkConfirmed();
+          clearDesktopDeepLinkStarted();
+          button.disabled = true;
+          button.textContent = 'Opening Bluey...';
+          openDesktopDeepLinkIfNeeded()
+            .then((opened) => {
+              if (opened) return;
+              button.disabled = false;
+              button.textContent = 'Connect this Bluey';
+            })
+            .catch((error) => {
+              button.disabled = false;
+              button.textContent = 'Connect this Bluey';
+              accountMessage(`Could not open Bluey: ${error.message}`);
+            });
+        });
+        actionRow.append(cue, button);
+        el.replaceChildren(title, body, actionRow, makeTroubleshooting({ allowEntry: true }));
+      };
+
+      const renderCodeEntry = (el) => {
+        el.hidden = false;
+        const shell = el.closest('.device-connect-section, .account-desktop-connect-section');
+        if (shell instanceof HTMLElement) shell.hidden = false;
+        el.replaceChildren();
+        el.append(makeTroubleshooting({ allowEntry: true }));
       };
 
       if (!code) {
-        if (accountToken() && lastLinkedComputerCount === 0) {
+        if (accountToken()) {
           const entryTarget = topHint || dashboardHint;
-          if (entryTarget) renderCodeEntry(entryTarget);
+          if (entryTarget && currentPath === '/link') {
+            renderDeepLinkConfirmation(entryTarget);
+          } else if (entryTarget) {
+            renderCodeEntry(entryTarget);
+          }
         }
         return;
       }
@@ -1447,7 +1591,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.replaceChildren();
         const title = document.createElement('strong');
         const approved = isPendingDeviceApprovalFresh(code);
-        title.textContent = approved ? 'This Bluey is connected' : 'Connect this Bluey?';
+        if (approved) {
+          title.textContent = 'This Bluey is connected';
+        } else if (accountToken()) {
+          title.textContent = 'Connect this Bluey?';
+        } else {
+          title.textContent = 'Continue in browser';
+        }
         const body = document.createElement('span');
         if (approved) {
           body.textContent = 'You can return to Bluey now. This browser tab can be closed.';
@@ -1457,15 +1607,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.classList.add('is-awaiting-action');
         shell?.classList.add('is-action-needed');
         if (accountToken()) {
-          body.textContent = `Confirm once to connect the Bluey app that opened this page to ${currentAccountEmail || 'this account'}. You do not need to re-enter a code.`;
+          const accountLabel = currentAccountEmail || 'this account';
+          body.textContent = `Confirm once to connect the Bluey app that opened this page to ${accountLabel}. `
+            + 'You do not need to re-enter a code.';
         } else {
-          body.textContent = 'Bluey securely carried its connection code into this page. Sign in or create an account, then confirm this desktop once.';
+          body.textContent = 'Bluey securely carried its connection code into this page. '
+            + 'Sign in or create an account, then confirm this desktop once.';
         }
         el.append(title, body);
-        const fallback = document.createElement('span');
-        fallback.className = 'device-code-helper';
-        fallback.textContent = `Fallback code: ${code}`;
-        el.append(fallback);
         if (accountToken()) {
           const actionRow = document.createElement('div');
           actionRow.className = 'device-action-row';
@@ -1476,12 +1625,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           button.type = 'button';
           button.className = 'account-button secondary compact device-primary-action';
           button.textContent = 'Connect this Bluey';
-          button.setAttribute('aria-label', `Connect Bluey desktop using code ${code}`);
+          button.setAttribute('aria-label', 'Connect this Bluey desktop');
           button.addEventListener('click', () => {
             const previousCount = lastLinkedComputerCount;
             button.disabled = true;
             button.textContent = 'Connecting...';
-            sessionStorage.setItem(deviceConfirmStorageKey(code), '1');
+            markPendingDeviceConfirmed(code);
             approvePendingDevice()
               .then(async () => {
                 renderDeviceLinkHint();
@@ -1496,21 +1645,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           actionRow.append(cue, button);
           el.append(actionRow);
         }
+        el.append(makeTroubleshooting({ carriedCode: code }));
       };
       const visibleTargets = accountToken()
         ? [topHint || dashboardHint].filter(Boolean)
         : [authHint].filter(Boolean);
       for (const el of visibleTargets) renderInto(el);
-    }
-
-    function focusDesktopConnectCard() {
-      renderDeviceLinkHint();
-      const hint = document.getElementById('accountTopDeviceLinkHint')
-        || document.getElementById('dashboardDeviceLinkHint');
-      if (!hint || hint.hidden) return;
-      hint.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      const input = hint.querySelector('input[name="user_code"]');
-      if (input) input.focus();
     }
 
     async function approvePendingDevice() {
@@ -1522,7 +1662,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         renderDeviceLinkHint();
         return false;
       }
-      if (sessionStorage.getItem(deviceConfirmStorageKey(code)) !== '1') {
+      if (!isPendingDeviceConfirmed(code)) {
         accountMessage('Press Connect this Bluey to finish securely.');
         return false;
       }
@@ -1538,17 +1678,21 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     async function openDesktopDeepLinkIfNeeded() {
       if (currentPath !== '/link' || pendingDeviceCode() || !accountToken()) return false;
-      if (sessionStorage.getItem('bluey_desktop_deep_link_started') === '1') return false;
+      if (!isDesktopDeepLinkConfirmed()) {
+        accountMessage('Press Connect this Bluey to finish securely.');
+        return false;
+      }
+      if (hasDesktopDeepLinkStarted()) return false;
       accountMessage('Opening Bluey desktop...');
       const link = await apiJson('/auth/link/mint', {
         method: 'POST',
         body: JSON.stringify({}),
       });
-      sessionStorage.setItem('bluey_desktop_deep_link_started', '1');
       if (!link?.deep_link_url) {
         accountMessage('Bluey desktop link is unavailable right now. The web dashboard is ready.');
         return false;
       }
+      markDesktopDeepLinkStarted();
       window.location.href = link.deep_link_url;
       accountMessage('Bluey should open now. If it does not, make sure the desktop app is installed, then run bluey on.');
       return true;
@@ -3312,7 +3456,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const pending = storedPendingDeviceRecord();
       if (computers.length > 0 && pending?.code) {
         const approved = isPendingDeviceApprovalFresh(pending.code);
-        const confirmed = sessionStorage.getItem(deviceConfirmStorageKey(pending.code)) === '1';
+        const confirmed = isPendingDeviceConfirmed(pending.code);
         const staleUnconfirmed = !confirmed && Date.now() - pending.savedAt > 30 * 1000;
         if (approved || staleUnconfirmed) {
           clearPendingDeviceCode(pending.code);
@@ -3336,7 +3480,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!computers.length) {
         const empty = document.createElement('div');
         empty.className = 'device-empty';
-        empty.textContent = message || 'No Bluey desktop connected yet. Open the host overlay and enter its code above.';
+        empty.textContent = message
+          || 'No Bluey desktop connected yet. Open Bluey and continue in the browser it opens. '
+          + 'Use the fallback above only if the browser did not open.';
         list.append(empty);
         return;
       }
@@ -3916,20 +4062,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           : '');
         startAccountBalancePolling();
         openAccountActionFromHash();
-        try {
-          const code = pendingDeviceCode();
-          const alreadyApproved = Boolean(code && isPendingDeviceApprovalFresh(code));
-          const linkedDevicesResult = await linkedDevicesPromise;
-          const previousCount = linkedComputersFromPayload(linkedDevicesResult).length;
-          const approved = await approvePendingDevice();
-          if (approved && (!alreadyApproved || previousCount === 0)) {
-            await waitForLinkedDesktop({ previousCount });
-          } else if (!approved) {
-            await openDesktopDeepLinkIfNeeded();
-          }
-        } catch {
-          accountMessage('Bluey signed in. If your desktop is waiting, use Connect this Bluey below.');
-        }
+        await linkedDevicesPromise;
       } finally {
         if (refreshButton) refreshButton.disabled = false;
       }

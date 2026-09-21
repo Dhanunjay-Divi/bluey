@@ -451,8 +451,9 @@ const MIGRATIONS: &[&str] = &[
     // 0011 — auth_link_codes: one-time codes for browser→app deep-link
     // handoff (Onboarding Option A). Codex Stage 18.
     //
-    // Stores access+refresh tokens at rest (sha256-hashed PK).
-    // 5-minute expiry. Single-use via atomic UPDATE...RETURNING.
+    // The token columns are retained for schema compatibility but new rows
+    // store empty strings. Credentials are issued only after one-time grant
+    // exchange. 5-minute expiry. Single-use via atomic UPDATE...RETURNING.
     r#"
     CREATE TABLE IF NOT EXISTS auth_link_codes (
         code_hash      TEXT PRIMARY KEY,
@@ -1658,6 +1659,16 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
+    // Older builds briefly stored live credentials inside the one-time grant
+    // row. New exchanges mint credentials after grant consumption, so scrub
+    // every legacy value at startup. This is intentionally idempotent.
+    conn.execute(
+        "UPDATE auth_link_codes
+            SET access_token = '', refresh_token = ''
+          WHERE access_token <> '' OR refresh_token <> ''",
+        [],
+    )
+    .context("scrub legacy auth link credentials")?;
     // Keep historical SQLite migrations immutable. Additive columns used by
     // the global-candidate cold-storage lifecycle are applied after replay.
     ensure_column(
@@ -2211,6 +2222,17 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
             .with_context(|| format!("record postgres migration {version}"))?;
         }
     }
+
+    // See the SQLite migration path above. Keep this repair outside the
+    // version ledger so every startup also scrubs rows written during a
+    // rolling upgrade by an older server process.
+    conn.execute(
+        "UPDATE auth_link_codes
+            SET access_token = '', refresh_token = ''
+          WHERE access_token <> '' OR refresh_token <> ''",
+        &[],
+    )
+    .context("scrub legacy postgres auth link credentials")?;
 
     conn.batch_execute(POSTGRES_JOBS_SCHEMA)
         .context("apply postgres Jobs schema")?;

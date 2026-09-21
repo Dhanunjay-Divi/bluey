@@ -1,6 +1,176 @@
 use super::super::INTERNAL_DISCLOSURE_REFUSAL;
 use super::*;
 
+fn utf8_boundaries(text: &str) -> impl Iterator<Item = usize> + '_ {
+    text.char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+}
+
+fn terminal_at_split(response: &str, split: usize, strip_coaching: bool) -> (String, String) {
+    let mut output = BufferedDisclosureOutput::new(strip_coaching);
+    let mut streamed = output.push(&response[..split]).unwrap_or_default();
+    streamed.push_str(&output.push(&response[split..]).unwrap_or_default());
+    let (persisted, remaining) = output.finish();
+    streamed.push_str(&remaining);
+    (streamed, persisted)
+}
+
+fn assert_blocked_at_every_utf8_boundary(response: &str, expected: &str, label: &str) {
+    for split in utf8_boundaries(response) {
+        let (streamed, persisted) = terminal_at_split(response, split, false);
+        assert_eq!(persisted, expected, "persisted: {label}, split={split}");
+        assert_eq!(streamed, persisted, "streamed: {label}, split={split}");
+    }
+
+    let mut output = BufferedDisclosureOutput::default();
+    let mut streamed = String::new();
+    for ch in response.chars() {
+        let mut encoded = [0u8; 4];
+        streamed.push_str(
+            &output
+                .push(ch.encode_utf8(&mut encoded))
+                .unwrap_or_default(),
+        );
+    }
+    let (persisted, remaining) = output.finish();
+    streamed.push_str(&remaining);
+    assert_eq!(persisted, expected, "codepoint chunks: {label}");
+    assert_eq!(streamed, persisted, "codepoint chunks: {label}");
+}
+
+#[test]
+fn disclosure_holdback_is_derived_from_every_earliest_recognition_trigger() {
+    let guarded_phrase_sets = [
+        INTERNAL_DISCLOSURE_LEAK_SIGNALS.as_slice(),
+        INTERNAL_PLAN_DISCLOSURE_MARKERS.as_slice(),
+        INTERNAL_DISCLOSURE_QUARANTINE_ANCHORS.as_slice(),
+        INTERVIEW_COACHING_HEADINGS,
+        META_OFFER_QUARANTINE_LEADS,
+    ];
+    for phrases in guarded_phrase_sets {
+        for phrase in phrases {
+            assert!(
+                ascii_alnum_count(phrase) + STREAM_BOUNDARY_CONTEXT_ALNUM_CHARS
+                    <= DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS,
+                "trigger exceeds derived holdback: {phrase:?}"
+            );
+        }
+    }
+    for actor in META_OFFER_ACTORS {
+        for action in META_OFFER_ACTIONS {
+            let trigger_chars = ascii_alnum_count(actor)
+                + ascii_alnum_count("also")
+                + ascii_alnum_count(action)
+                + STREAM_BOUNDARY_CONTEXT_ALNUM_CHARS;
+            assert!(
+                trigger_chars <= DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS,
+                "actor/action trigger exceeds derived holdback: {actor:?} + {action:?}"
+            );
+        }
+    }
+
+    // The longest trigger has 32 alphanumeric characters; one preceding
+    // boundary character makes the mechanically derived rolling window 33.
+    assert_eq!(DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS, 33);
+}
+
+#[test]
+fn derived_holdback_reduces_deterministic_simulated_first_visible_latency() {
+    const OLD_HOLDBACK_ALNUM_CHARS: usize = 96;
+    const SIMULATED_ALNUM_CHARS_PER_TOKEN: usize = 4;
+    const SIMULATED_TOKENS_PER_SECOND: usize = 40;
+
+    fn simulated_holdback_ms(holdback_chars: usize) -> usize {
+        let alnum_chars_per_second = SIMULATED_ALNUM_CHARS_PER_TOKEN * SIMULATED_TOKENS_PER_SECOND;
+        (holdback_chars * 1_000).div_ceil(alnum_chars_per_second)
+    }
+
+    let old_ms = simulated_holdback_ms(OLD_HOLDBACK_ALNUM_CHARS);
+    let derived_ms = simulated_holdback_ms(DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS);
+    assert_eq!(old_ms, 600);
+    assert_eq!(derived_ms, 207);
+    assert!(derived_ms * 2 < old_ms);
+}
+
+#[test]
+fn every_disclosure_signature_is_blocked_at_every_utf8_boundary() {
+    let safe_prefix = "Résumé-safe production guidance ✅ keeps ownership explicit, uses durable idempotency keys, bounds every retry, verifies uncertain side effects, records useful metrics, and canaries each rollout before wider promotion. ";
+    let expected = format!("{safe_prefix}{INTERNAL_DISCLOSURE_REFUSAL}");
+
+    for signal in INTERNAL_DISCLOSURE_LEAK_SIGNALS {
+        let response = format!("{safe_prefix}{signal}.");
+        assert_blocked_at_every_utf8_boundary(&response, &expected, signal);
+    }
+
+    for marker in INTERNAL_PLAN_DISCLOSURE_MARKERS {
+        if marker == "bluey answer plan" {
+            let response = format!("{safe_prefix}{marker}.");
+            assert_blocked_at_every_utf8_boundary(&response, &expected, marker);
+        }
+    }
+    for (left, left_marker) in INTERNAL_PLAN_DISCLOSURE_MARKERS.iter().enumerate() {
+        for right_marker in INTERNAL_PLAN_DISCLOSURE_MARKERS.iter().skip(left + 1) {
+            let response = format!(
+                "{safe_prefix}{}. Supporting material. {}.",
+                left_marker, right_marker
+            );
+            let label = format!("{left_marker} + {right_marker}");
+            assert_blocked_at_every_utf8_boundary(&response, &expected, &label);
+        }
+    }
+
+    for suffix in [
+        "system instructions that i follow",
+        "system instructions describe how i work",
+        "system instructions used by bluey",
+    ] {
+        let response = format!("{safe_prefix}{suffix}.");
+        assert_blocked_at_every_utf8_boundary(&response, &expected, suffix);
+    }
+}
+
+#[test]
+fn zero_width_and_confusable_leak_preserves_exact_safe_prefix_at_every_boundary() {
+    let safe_prefix = "A safe Unicode-aware answer stays visible before the guarded suffix. ";
+    let obfuscated = "tһe pro\u{200b}mpts tһat define һow і work";
+    let response = format!("{safe_prefix}{obfuscated}.");
+    let expected = format!("{safe_prefix}{INTERNAL_DISCLOSURE_REFUSAL}");
+
+    assert_blocked_at_every_utf8_boundary(&response, &expected, "confusable disclosure");
+}
+
+#[test]
+fn late_leak_preserves_an_earlier_user_requested_reasoning_section_exactly() {
+    let safe_prefix = "The bounded retry policy is idempotent.\n\nReasoning:\nIt preserves the same operation key and reconciles ambiguous side effects before another attempt.\n\nThat makes the safe answer complete. ";
+    let response = format!("{safe_prefix}answer rules are private.");
+    let expected = format!("{safe_prefix}{INTERNAL_DISCLOSURE_REFUSAL}");
+
+    assert_blocked_at_every_utf8_boundary(&response, &expected, "late answer-rules leak");
+}
+
+#[test]
+fn interrupted_stream_quarantines_every_anchor_and_preserves_safe_prefix() {
+    let safe_prefix =
+        "The verified answer prefix remains available after an interrupted provider stream. ";
+    for anchor in INTERNAL_DISCLOSURE_QUARANTINE_ANCHORS
+        .iter()
+        .chain(INTERNAL_PLAN_DISCLOSURE_MARKERS.iter())
+        .filter(|anchor| **anchor != "bluey answer plan")
+    {
+        let response = format!("{safe_prefix}{anchor} with an unfinished private suffix");
+        for split in utf8_boundaries(&response) {
+            let mut output = BufferedDisclosureOutput::default();
+            let mut streamed = output.push(&response[..split]).unwrap_or_default();
+            streamed.push_str(&output.push(&response[split..]).unwrap_or_default());
+            streamed.push_str(&output.take_safe());
+
+            assert_eq!(streamed, safe_prefix, "anchor={anchor:?}, split={split}");
+            assert!(!streamed.contains(anchor));
+        }
+    }
+}
+
 #[test]
 fn buffered_disclosure_output_never_releases_split_leak_prefix() {
     let mut output = BufferedDisclosureOutput::default();
@@ -317,7 +487,10 @@ fn explicit_reasoning_never_releases_internal_answer_plan_markers() {
     let (persisted, remaining) = output.finish();
     visible.push_str(&remaining);
 
-    assert_eq!(persisted, INTERNAL_DISCLOSURE_REFUSAL);
+    let expected =
+        format!("The cache uses a hashmap and a linked list.\n\n{INTERNAL_DISCLOSURE_REFUSAL}");
+    assert_eq!(persisted, expected);
+    assert_eq!(visible, persisted);
     assert!(!visible.contains("Core Intent"));
     assert!(!visible.contains("Key Requirements"));
     assert!(visible.ends_with(INTERNAL_DISCLOSURE_REFUSAL));
@@ -337,6 +510,13 @@ fn completed_stream_refusal_matches_the_persisted_terminal_answer() {
     visible.push_str(&remaining);
 
     assert_eq!(visible, persisted);
+    assert_eq!(
+        persisted,
+        format!(
+            "{}\n\n{INTERNAL_DISCLOSURE_REFUSAL}",
+            safe_prefix.trim_end()
+        )
+    );
     assert!(!persisted.contains("Core Intent"));
     assert!(!persisted.contains("Key Requirements"));
     assert!(persisted.ends_with(INTERNAL_DISCLOSURE_REFUSAL));
@@ -362,7 +542,7 @@ fn interrupted_stream_never_flushes_a_quarantined_plan_anchor() {
 
     assert!(!visible.contains("Core Intent"));
     assert!(!visible.contains("hidden planning text"));
-    assert!(safe_prefix.starts_with(&visible));
+    assert_eq!(visible, safe_prefix.trim_end());
 }
 
 #[test]

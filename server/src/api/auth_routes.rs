@@ -1717,43 +1717,11 @@ pub async fn link_mint(
     State(state): State<AppState>,
     Extension(crate::auth::AuthedAccount(account)): Extension<crate::auth::AuthedAccount>,
 ) -> Result<Json<LinkMintResponse>, (StatusCode, Json<ApiError>)> {
-    use crate::auth::jwt;
     use crate::db::link_codes;
 
-    // Mint fresh tokens specifically for this device so the browser
-    // session and the device do not share refresh tokens.
-    let access = jwt::issue(
-        &state.config.jwt_secret,
-        &account.id,
-        jwt::TokenKind::Access,
-    )
-    .map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("issue access: {e}"),
-        )
-    })?;
-    let refresh_raw = jwt::issue(
-        &state.config.jwt_secret,
-        &account.id,
-        jwt::TokenKind::Refresh,
-    )
-    .map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("issue refresh: {e}"),
-        )
-    })?;
-    refresh_tokens::store(&state.pool, &refresh_raw, &account.id, Some("device-link")).map_err(
-        |e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("store refresh: {e}"),
-            )
-        },
-    )?;
-
-    let code = link_codes::mint(&state.pool, &account.id, &access, &refresh_raw)
+    // This is an authorization grant, not a credential envelope. Fresh
+    // device credentials are issued only after the one-time exchange.
+    let code = link_codes::mint(&state.pool, &account.id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("mint: {e}")))?;
 
     let deep_link = format!("bluey://link?code={code}");
@@ -1783,7 +1751,7 @@ pub async fn link_exchange(
     use crate::db::accounts::Account;
     use crate::db::link_codes;
 
-    let (account_id, access, refresh) = link_codes::exchange(&state.pool, &req.code)
+    let account_id = link_codes::exchange(&state.pool, &req.code)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("exchange: {e}")))?
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid or expired link code"))?;
 
@@ -1794,18 +1762,12 @@ pub async fn link_exchange(
         return Err(err(StatusCode::UNAUTHORIZED, "temporary account expired"));
     }
 
+    let auth = auth_response_with_label(&state, &account, Some("device-link"), None)?;
+
     Ok(Json(LinkExchangeResponse {
-        access_token: access,
-        refresh_token: refresh,
-        account: AuthAccountSummary {
-            id: account.id,
-            email: account.email,
-            balance_cents: account.balance_cents,
-            trial_seconds_remaining: account.trial_seconds_remaining,
-            is_temporary: account.is_temporary,
-            temporary_expires_at: account.temporary_expires_at,
-            is_admin: account.is_admin,
-        },
+        access_token: auth.access_token,
+        refresh_token: auth.refresh_token,
+        account: auth.account,
     }))
 }
 

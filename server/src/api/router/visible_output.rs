@@ -5,15 +5,128 @@
 //! the same terminal answer.
 
 use super::{
-    contains_internal_plan_disclosure_anchor, extract_search_question,
-    fold_guardrail_compatibility_char, fold_guardrail_confusable,
-    looks_like_internal_disclosure_leak, normalize_guardrail_text, INTERNAL_DISCLOSURE_REFUSAL,
+    contains_internal_disclosure_quarantine_anchor, extract_search_question,
+    fold_guardrail_compatibility_char, fold_guardrail_confusable, internal_disclosure_leak_start,
+    internal_disclosure_quarantine_anchor_start, looks_like_internal_disclosure_leak,
+    normalize_guardrail_text, INTERNAL_DISCLOSURE_LEAK_SIGNALS,
+    INTERNAL_DISCLOSURE_QUARANTINE_ANCHORS, INTERNAL_DISCLOSURE_REFUSAL,
+    INTERNAL_PLAN_DISCLOSURE_MARKERS,
 };
 
-const DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS: usize = 96;
+const INTERVIEW_COACHING_HEADINGS: &[&str] =
+    &["why this works", "why it works", "reasoning", "rationale"];
+
+const META_OFFER_ACTORS: &[&str] = &[
+    "i can", "i could", "i will", "we can", "we could", "we will",
+];
+
+const META_OFFER_ACTIONS: &[&str] = &[
+    "turn", "rewrite", "shorten", "expand", "give", "provide", "show", "explain", "draft", "adapt",
+    "walk", "help", "make", "convert", "tailor", "sketch", "create", "share", "generate",
+    "outline", "produce", "prepare", "format", "send", "map",
+];
+
+// These are every fixed prefix that can make
+// `terminal_meta_offer_needs_quarantine` retain a suffix before the complete
+// terminal offer is known. Actor-shaped offers are handled separately because
+// they require an action before they become a potential offer.
+const META_OFFER_QUARANTINE_LEADS: &[&str] = &[
+    "if you want",
+    "if you would like",
+    "if you'd like",
+    "if helpful",
+    "if it helps",
+    "if it would help",
+    "i'm happy to",
+    "i am happy to",
+    "we're happy to",
+    "we are happy to",
+    "happy to",
+    "would you like",
+    "let me know if",
+    "tell me if",
+];
+
+const STREAM_BOUNDARY_CONTEXT_ALNUM_CHARS: usize = 1;
+
+const fn ascii_alnum_count(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    let mut count = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if (byte >= b'0' && byte <= b'9')
+            || (byte >= b'A' && byte <= b'Z')
+            || (byte >= b'a' && byte <= b'z')
+        {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
+}
+
+const fn max_ascii_alnum_count(phrases: &[&str]) -> usize {
+    let mut index = 0usize;
+    let mut maximum = 0usize;
+    while index < phrases.len() {
+        let count = ascii_alnum_count(phrases[index]);
+        if count > maximum {
+            maximum = count;
+        }
+        index += 1;
+    }
+    maximum
+}
+
+const fn max_usize(left: usize, right: usize) -> usize {
+    if left > right {
+        left
+    } else {
+        right
+    }
+}
+
+/// The rolling window is one alphanumeric character longer than every finite
+/// earliest-recognition trigger. That extra character keeps the safe side of a
+/// Markdown/sentence boundary private until a coaching appendix or meta-offer
+/// is classified, so stripping cannot invalidate bytes already delivered.
+const fn disclosure_stream_holdback_alnum_chars() -> usize {
+    let disclosure = max_ascii_alnum_count(&INTERNAL_DISCLOSURE_LEAK_SIGNALS);
+    let plan_anchor = max_ascii_alnum_count(&INTERNAL_PLAN_DISCLOSURE_MARKERS);
+    let quarantine_anchor = max_ascii_alnum_count(&INTERNAL_DISCLOSURE_QUARANTINE_ANCHORS);
+    let coaching_heading = max_ascii_alnum_count(INTERVIEW_COACHING_HEADINGS);
+    let meta_offer_lead = max_ascii_alnum_count(META_OFFER_QUARANTINE_LEADS);
+    let actor_offer = max_ascii_alnum_count(META_OFFER_ACTORS)
+        + ascii_alnum_count("also")
+        + max_ascii_alnum_count(META_OFFER_ACTIONS);
+
+    max_usize(
+        max_usize(
+            max_usize(disclosure, plan_anchor),
+            max_usize(quarantine_anchor, coaching_heading),
+        ),
+        max_usize(meta_offer_lead, actor_offer),
+    ) + STREAM_BOUNDARY_CONTEXT_ALNUM_CHARS
+}
+
+const DISCLOSURE_STREAM_HOLDBACK_ALNUM_CHARS: usize = disclosure_stream_holdback_alnum_chars();
 
 fn sanitize_visible_answer_text(text: &str) -> String {
     text.replace(" \u{2014} ", ", ").replace('\u{2014}', ", ")
+}
+
+fn confirmed_safe_prefix_bytes(text: &str, disclosure_start: usize) -> usize {
+    let prefix = &text[..disclosure_start];
+    unsolicited_coaching_appendix_start(prefix, true)
+        .filter(|appendix_start| {
+            let normalized = normalize_guardrail_text(&prefix[*appendix_start..]);
+            INTERVIEW_COACHING_HEADINGS
+                .iter()
+                .any(|heading| normalized == *heading)
+        })
+        .map(|appendix_start| prefix[..appendix_start].trim_end().len())
+        .unwrap_or(disclosure_start)
 }
 
 pub(super) struct BufferedDisclosureOutput {
@@ -21,6 +134,7 @@ pub(super) struct BufferedDisclosureOutput {
     pending: String,
     delivered_chars: usize,
     blocked: bool,
+    blocked_safe_prefix_bytes: Option<usize>,
     strip_interview_coaching_appendix: bool,
     coaching_appendix_stripped: bool,
 }
@@ -38,6 +152,7 @@ impl BufferedDisclosureOutput {
             pending: String::new(),
             delivered_chars: 0,
             blocked: false,
+            blocked_safe_prefix_bytes: None,
             strip_interview_coaching_appendix,
             coaching_appendix_stripped: false,
         }
@@ -55,8 +170,7 @@ impl BufferedDisclosureOutput {
         self.text.push_str(&sanitized);
         self.pending.push_str(&sanitized);
 
-        if self.blocked || looks_like_internal_disclosure_leak(&self.text) {
-            self.blocked = true;
+        if self.block_if_disclosure_leak() {
             return None;
         }
 
@@ -66,11 +180,7 @@ impl BufferedDisclosureOutput {
         // Once one appears, retain the remaining response until completion so
         // a later anchor cannot turn already-delivered text into a leak.
         let normalized = normalize_guardrail_text(&self.text);
-        if normalized.contains("system instructions")
-            || normalized.contains("i follow")
-            || normalized.contains("how i work")
-            || contains_internal_plan_disclosure_anchor(&normalized)
-        {
+        if contains_internal_disclosure_quarantine_anchor(&normalized) {
             return None;
         }
         // Once an offer-shaped sentence begins, quarantine the not-yet-
@@ -106,17 +216,35 @@ impl BufferedDisclosureOutput {
 
     /// Returns only the not-yet-delivered suffix for interrupted streams.
     pub(super) fn take_safe(&mut self) -> String {
-        if self.blocked || looks_like_internal_disclosure_leak(&self.text) {
-            self.blocked = true;
+        if self.block_if_disclosure_leak() {
             self.pending.clear();
             self.refusal_terminal().1
-        } else if contains_internal_plan_disclosure_anchor(&normalize_guardrail_text(&self.text)) {
+        } else if contains_internal_disclosure_quarantine_anchor(&normalize_guardrail_text(
+            &self.text,
+        )) {
             // A single marker is quarantined rather than classified as a leak
             // to avoid false positives. If the provider stream dies before a
             // second marker confirms the signature, keep that uncertain suffix
-            // private and preserve only the safe prefix already delivered.
+            // private while returning every preceding safe byte.
+            let detected_safe_prefix_chars =
+                internal_disclosure_quarantine_anchor_start(&self.text)
+                    .map(|bytes| confirmed_safe_prefix_bytes(&self.text, bytes))
+                    .map(|bytes| self.text[..bytes].chars().count());
+            debug_assert!(
+                detected_safe_prefix_chars.is_none_or(|chars| chars >= self.delivered_chars),
+                "internal disclosure anchor escaped the streaming holdback"
+            );
+            let safe_prefix_chars = detected_safe_prefix_chars
+                .filter(|chars| *chars >= self.delivered_chars)
+                .unwrap_or(self.delivered_chars);
+            let safe_delta = self
+                .text
+                .chars()
+                .skip(self.delivered_chars)
+                .take(safe_prefix_chars - self.delivered_chars)
+                .collect();
             self.pending.clear();
-            String::new()
+            safe_delta
         } else {
             self.strip_terminal_interview_coaching_appendix(true);
             std::mem::take(&mut self.pending)
@@ -126,32 +254,59 @@ impl BufferedDisclosureOutput {
     /// Returns the complete safe answer for persistence plus the suffix that
     /// still needs to be emitted to the streaming client.
     pub(super) fn finish(mut self) -> (String, String) {
-        if self.blocked || looks_like_internal_disclosure_leak(&self.text) {
+        if self.block_if_disclosure_leak() {
             return self.refusal_terminal();
         }
         self.strip_terminal_interview_coaching_appendix(true);
         (self.text, std::mem::take(&mut self.pending))
     }
 
-    /// Builds one terminal answer from the prefix that has already reached the
-    /// client plus a refusal suffix. This keeps the streamed text identical to
-    /// the persisted/idempotent terminal response even when a provider starts
-    /// with benign content and discloses an internal answer plan later.
+    fn block_if_disclosure_leak(&mut self) -> bool {
+        if self.blocked {
+            return true;
+        }
+        if !looks_like_internal_disclosure_leak(&self.text) {
+            return false;
+        }
+
+        self.blocked = true;
+        self.blocked_safe_prefix_bytes = internal_disclosure_leak_start(&self.text)
+            .map(|disclosure_start| confirmed_safe_prefix_bytes(&self.text, disclosure_start))
+            .filter(|safe_prefix_bytes| {
+                let safe_prefix_chars = self.text[..*safe_prefix_bytes].chars().count();
+                let guard_held_the_complete_leak = safe_prefix_chars >= self.delivered_chars;
+                debug_assert!(
+                    guard_held_the_complete_leak,
+                    "internal disclosure signature escaped the streaming holdback"
+                );
+                guard_held_the_complete_leak
+            });
+        true
+    }
+
+    /// Builds one terminal answer from every confirmed-safe byte before the
+    /// leak plus a refusal. The returned delta starts exactly after the prefix
+    /// already delivered, keeping streamed and persisted responses identical.
     fn refusal_terminal(&self) -> (String, String) {
-        let mut delivered_prefix: String = self.text.chars().take(self.delivered_chars).collect();
-        let separator = if delivered_prefix.is_empty()
-            || delivered_prefix
-                .chars()
-                .last()
-                .is_some_and(char::is_whitespace)
-        {
-            ""
-        } else {
-            "\n\n"
-        };
-        let suffix = format!("{separator}{INTERNAL_DISCLOSURE_REFUSAL}");
-        delivered_prefix.push_str(&suffix);
-        (delivered_prefix, suffix)
+        let safe_prefix_bytes = self.blocked_safe_prefix_bytes.or_else(|| {
+            internal_disclosure_leak_start(&self.text)
+                .map(|start| confirmed_safe_prefix_bytes(&self.text, start))
+        });
+        let safe_prefix_chars = safe_prefix_bytes
+            .map(|bytes| self.text[..bytes].chars().count())
+            .filter(|chars| *chars >= self.delivered_chars)
+            .unwrap_or(self.delivered_chars);
+        let mut terminal: String = self.text.chars().take(safe_prefix_chars).collect();
+        let separator =
+            if terminal.is_empty() || terminal.chars().last().is_some_and(char::is_whitespace) {
+                ""
+            } else {
+                "\n\n"
+            };
+        terminal.push_str(separator);
+        terminal.push_str(INTERNAL_DISCLOSURE_REFUSAL);
+        let suffix = terminal.chars().skip(self.delivered_chars).collect();
+        (terminal, suffix)
     }
 
     /// Drops an unsolicited, terminal coaching section before it reaches the
@@ -195,9 +350,6 @@ impl BufferedDisclosureOutput {
         self.coaching_appendix_stripped = true;
     }
 }
-
-const INTERVIEW_COACHING_HEADINGS: [&str; 4] =
-    ["why this works", "why it works", "reasoning", "rationale"];
 
 /// Returns the start of a narrow coaching appendix or closing meta-offer
 /// outside a fenced code block. Ordinary prose such as "This works because..."
@@ -508,13 +660,9 @@ fn strip_offer_action(text: &str) -> Option<&str> {
     if let Some(rest) = strip_phrase(text, "also") {
         text = rest.trim_start();
     }
-    [
-        "turn", "rewrite", "shorten", "expand", "give", "provide", "show", "explain", "draft",
-        "adapt", "walk", "help", "make", "convert", "tailor", "sketch", "create", "share",
-        "generate", "outline", "produce", "prepare", "format", "send", "map",
-    ]
-    .iter()
-    .find_map(|action| strip_phrase(text, action))
+    META_OFFER_ACTIONS
+        .iter()
+        .find_map(|action| strip_phrase(text, action))
 }
 
 fn is_terminal_meta_offer(candidate: &str) -> bool {
@@ -530,39 +678,17 @@ fn is_potential_terminal_meta_offer(candidate: &str) -> bool {
         return true;
     }
 
-    let direct_offer_action = [
-        "i can", "i could", "i will", "we can", "we could", "we will",
-    ]
-    .iter()
-    .find_map(|actor| strip_phrase(candidate, actor))
-    .map(str::trim_start)
-    .and_then(|rest| {
-        strip_phrase(rest, "also")
-            .map(str::trim_start)
-            .or(Some(rest))
-    })
-    .and_then(strip_offer_action)
-    .is_some();
+    let direct_offer_action = META_OFFER_ACTORS
+        .iter()
+        .find_map(|actor| strip_phrase(candidate, actor))
+        .map(str::trim_start)
+        .and_then(strip_offer_action)
+        .is_some();
 
     direct_offer_action
-        || [
-            "if you want",
-            "if you would like",
-            "if you'd like",
-            "if helpful",
-            "if it helps",
-            "if it would help",
-            "i'm happy to",
-            "i am happy to",
-            "we're happy to",
-            "we are happy to",
-            "happy to",
-            "would you like",
-            "let me know if",
-            "tell me if",
-        ]
-        .iter()
-        .any(|lead| strip_phrase(candidate, lead).is_some())
+        || META_OFFER_QUARANTINE_LEADS
+            .iter()
+            .any(|lead| strip_phrase(candidate, lead).is_some())
 }
 
 fn conditional_meta_offer(candidate: &str) -> bool {
@@ -581,9 +707,7 @@ fn conditional_meta_offer(candidate: &str) -> bool {
         if let Some(without_comma) = rest.strip_prefix(',') {
             rest = without_comma.trim_start();
         }
-        for actor in [
-            "i can", "i could", "i will", "we can", "we could", "we will",
-        ] {
+        for actor in META_OFFER_ACTORS {
             if strip_phrase(rest, actor)
                 .and_then(strip_offer_action)
                 .is_some()
@@ -596,11 +720,10 @@ fn conditional_meta_offer(candidate: &str) -> bool {
 }
 
 fn direct_answer_transform_offer(candidate: &str) -> bool {
-    let Some(mut action) = [
-        "i can", "i could", "i will", "we can", "we could", "we will",
-    ]
-    .iter()
-    .find_map(|actor| strip_phrase(candidate, actor)) else {
+    let Some(mut action) = META_OFFER_ACTORS
+        .iter()
+        .find_map(|actor| strip_phrase(candidate, actor))
+    else {
         return false;
     };
     action = action.trim_start();

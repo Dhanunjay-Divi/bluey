@@ -232,6 +232,7 @@ impl DaemonRequest {
             | Self::CloudLogin
             | Self::CloudLogout
             | Self::CloudLogoutBound { .. }
+            | Self::SupportDiagnosticsBindConsentRevision { .. }
             | Self::CloudPrepareAccountDeletion { .. }
             | Self::CloudAbortAccountDeletion { .. }
             | Self::CloudPurgeDeletedAccount { .. }
@@ -1042,7 +1043,7 @@ mod tests {
         );
         assert_eq!(
             DaemonRequest::Shutdown
-                .with_trace_id("shutdown-test")
+                .with_trace_id("550e8400-e29b-41d4-a716-446655440005")
                 .ipc_authorization(),
             IpcAuthorization::Shutdown
         );
@@ -1153,6 +1154,10 @@ mod tests {
                 fence: fence.clone(),
             },
             DaemonRequest::CloudLogoutBound {
+                fence: fence.clone(),
+            },
+            DaemonRequest::SupportDiagnosticsBindConsentRevision {
+                server_revision: 17,
                 fence: fence.clone(),
             },
             DaemonRequest::SessionsMoveLocalToCurrentAccountBound {

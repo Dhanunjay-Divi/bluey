@@ -44,6 +44,10 @@ pub struct Claims {
     pub iat: i64,
     pub exp: i64,
     pub kind: String,
+    /// Per-token nonce. Optional while access/refresh tokens issued by older
+    /// Bluey versions remain valid during a rolling upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 impl Claims {
@@ -55,6 +59,7 @@ impl Claims {
             iat: now.timestamp(),
             exp: exp.timestamp(),
             kind: kind.as_str().to_string(),
+            jti: Some(uuid::Uuid::new_v4().to_string()),
         }
     }
 
@@ -116,8 +121,50 @@ mod tests {
         let token = issue(TEST_SECRET, "acct-2", TokenKind::Refresh).unwrap();
         let claims = verify(TEST_SECRET, &token).unwrap();
         assert_eq!(claims.kind, "refresh");
+        assert!(claims
+            .jti
+            .as_deref()
+            .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()));
         let now = Utc::now().timestamp();
         assert!(claims.exp - now > ACCESS_TTL_SECS); // longer than access
+    }
+
+    #[test]
+    fn independently_issued_tokens_are_unique_within_the_same_second() {
+        let first = issue(TEST_SECRET, "acct-unique", TokenKind::Refresh).unwrap();
+        let second = issue(TEST_SECRET, "acct-unique", TokenKind::Refresh).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(
+            verify(TEST_SECRET, &first).unwrap().jti,
+            verify(TEST_SECRET, &second).unwrap().jti
+        );
+    }
+
+    #[test]
+    fn verify_accepts_tokens_issued_before_jti_was_added() {
+        #[derive(Serialize)]
+        struct LegacyClaims<'a> {
+            sub: &'a str,
+            iat: i64,
+            exp: i64,
+            kind: &'a str,
+        }
+
+        let now = Utc::now().timestamp();
+        let token = encode(
+            &Header::default(),
+            &LegacyClaims {
+                sub: "acct-legacy",
+                iat: now,
+                exp: now + ACCESS_TTL_SECS,
+                kind: "access",
+            },
+            &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+        )
+        .unwrap();
+        let claims = verify(TEST_SECRET, &token).unwrap();
+        assert_eq!(claims.sub, "acct-legacy");
+        assert_eq!(claims.jti, None);
     }
 
     #[test]

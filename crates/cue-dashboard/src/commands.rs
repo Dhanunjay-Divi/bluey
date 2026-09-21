@@ -1362,9 +1362,32 @@ fn is_safe_frontend_command(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+const DEFAULT_SIGNIN_URL: &str = "https://bluey.sh/link";
+
+fn resolve_signin_url(configured: Option<String>) -> String {
+    configured.unwrap_or_else(|| DEFAULT_SIGNIN_URL.to_string())
+}
+
 #[tauri::command]
 pub fn get_signin_url() -> String {
-    std::env::var("BLUEY_SIGNIN_URL").unwrap_or_else(|_| "https://bluey.sh/login".to_string())
+    resolve_signin_url(std::env::var("BLUEY_SIGNIN_URL").ok())
+}
+
+#[cfg(test)]
+mod signin_url_tests {
+    use super::{resolve_signin_url, DEFAULT_SIGNIN_URL};
+
+    #[test]
+    fn default_signin_url_uses_the_desktop_link_handoff() {
+        assert_eq!(resolve_signin_url(None), "https://bluey.sh/link");
+        assert_eq!(DEFAULT_SIGNIN_URL, "https://bluey.sh/link");
+    }
+
+    #[test]
+    fn configured_signin_url_remains_authoritative() {
+        let configured = "https://staging.bluey.example/link?source=dashboard".to_string();
+        assert_eq!(resolve_signin_url(Some(configured.clone())), configured);
+    }
 }
 
 #[tauri::command]

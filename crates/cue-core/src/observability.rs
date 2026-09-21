@@ -61,7 +61,7 @@ impl ObserveFields {
     }
 
     pub fn trace_id(mut self, trace_id: impl Into<String>) -> Self {
-        self.trace_id = Some(trace_id.into());
+        self.trace_id = sanitize_interaction_id(&trace_id.into());
         self
     }
 
@@ -317,8 +317,9 @@ mod tests {
 
     #[test]
     fn observe_fields_builder_sets_standard_values() {
+        const TRACE_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
         let fields = ObserveFields::new("cue-daemon")
-            .trace_id("trace")
+            .trace_id(TRACE_ID)
             .request_id("request")
             .interaction_id("550e8400-e29b-41d4-a716-446655440000")
             .account_id("acct_123")
@@ -327,7 +328,7 @@ mod tests {
             .provider("bluey-managed")
             .model("auto");
         assert_eq!(fields.component, "cue-daemon");
-        assert_eq!(fields.trace_id_value(), "trace");
+        assert_eq!(fields.trace_id_value(), TRACE_ID);
         assert_eq!(fields.request_id_value(), "request");
         assert_eq!(
             fields.interaction_id_value(),
@@ -345,7 +346,7 @@ mod tests {
         crate::observe!(
             tracing::Level::INFO,
             ObserveFields::new("cue-core")
-                .trace_id("trace")
+                .trace_id("550e8400-e29b-41d4-a716-446655440001")
                 .request_id("request")
                 .interaction_id("550e8400-e29b-41d4-a716-446655440000")
                 .status("ok"),

@@ -803,6 +803,42 @@ async fn stream_preflight_skips_empty_deltas_before_real_output() {
 }
 
 #[test]
+fn first_safe_visible_latency_ignores_status_whitespace_and_records_once() {
+    let mut recorded = false;
+    assert!(!mark_first_non_whitespace_safe_delta(&mut recorded, ""));
+    assert!(!mark_first_non_whitespace_safe_delta(
+        &mut recorded,
+        " \n\t"
+    ));
+    assert!(!recorded);
+
+    assert!(mark_first_non_whitespace_safe_delta(
+        &mut recorded,
+        " first safe answer"
+    ));
+    assert!(recorded);
+    assert!(!mark_first_non_whitespace_safe_delta(
+        &mut recorded,
+        "later answer delta"
+    ));
+}
+
+#[test]
+fn latency_metric_request_id_rejects_free_form_client_values() {
+    assert_eq!(
+        latency_metric_request_id(" 550E8400-E29B-41D4-A716-446655440000 "),
+        Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+    );
+    for invalid in [
+        "user@example.com",
+        "request-id-without-a-uuid",
+        "550e8400-e29b-41d4-a716-446655440000\nprivate-note",
+    ] {
+        assert_eq!(latency_metric_request_id(invalid), None, "{invalid:?}");
+    }
+}
+
+#[test]
 fn first_token_deadline_is_lane_specific() {
     let _guard = FIRST_TOKEN_ENV_LOCK.lock().unwrap();
     for name in [

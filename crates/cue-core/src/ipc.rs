@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    sanitize_observability_id, ActionItem, AiRuntimeStatus, AnswerContextRole, AnswerRequest,
+    sanitize_interaction_id, ActionItem, AiRuntimeStatus, AnswerContextRole, AnswerRequest,
     AnswerResponse, AnswerStreamEvent, AudioPipelineStatus, CloudSyncStatus, ContextArtifact,
     CueCard, DaemonState, MeetingRecap, MemoryHit, OverlayPosition, Speaker,
 };
@@ -249,6 +249,12 @@ pub enum DaemonRequest {
     CloudLogoutBound {
         fence: DaemonMutationFence,
     },
+    /// Bind the local diagnostics epoch to the exact server consent receipt
+    /// before the dashboard enables upload for that account.
+    SupportDiagnosticsBindConsentRevision {
+        server_revision: i64,
+        fence: DaemonMutationFence,
+    },
     /// Durably fence local account-owned writes before the dashboard asks the
     /// server to perform permanent account deletion.
     CloudPrepareAccountDeletion {
@@ -290,10 +296,9 @@ pub enum DaemonRequest {
 
 impl DaemonRequest {
     pub fn with_trace_id(self, trace_id: impl Into<String>) -> Self {
-        let trace_id = trace_id.into();
-        if sanitize_observability_id(&trace_id).is_none() {
+        let Some(trace_id) = sanitize_interaction_id(&trace_id.into()) else {
             return self;
-        }
+        };
         Self::WithTrace {
             trace_id,
             request: Box::new(self),
@@ -304,7 +309,7 @@ impl DaemonRequest {
         match self {
             Self::WithTrace { trace_id, request } => {
                 let (request, inner_trace_id) = request.into_trace_parts();
-                let trace_id = sanitize_observability_id(&trace_id).or(inner_trace_id);
+                let trace_id = sanitize_interaction_id(&trace_id).or(inner_trace_id);
                 (request, trace_id)
             }
             request => (request, None),
@@ -377,31 +382,76 @@ mod tests {
 
     #[test]
     fn with_trace_round_trips_and_unwraps() {
-        let request = DaemonRequest::Status.with_trace_id("trace-123");
+        const TRACE_ID: &str = "550e8400-e29b-41d4-a716-446655440001";
+        let request = DaemonRequest::Status.with_trace_id(TRACE_ID);
         let json = serde_json::to_string(&request).expect("serialize");
         assert!(json.contains("\"type\":\"with_trace\""));
-        assert!(json.contains("\"trace_id\":\"trace-123\""));
+        assert!(json.contains(TRACE_ID));
 
         let decoded: DaemonRequest = serde_json::from_str(&json).expect("decode");
         let (inner, trace_id) = decoded.into_trace_parts();
-        assert_eq!(trace_id.as_deref(), Some("trace-123"));
+        assert_eq!(trace_id.as_deref(), Some(TRACE_ID));
         assert!(matches!(inner, DaemonRequest::Status));
     }
 
     #[test]
     fn invalid_trace_wrapper_falls_back_to_inner_trace() {
+        const INNER_TRACE_ID: &str = "550e8400-e29b-41d4-a716-446655440002";
         let request = DaemonRequest::WithTrace {
             trace_id: "bad\ntrace".to_string(),
-            request: Box::new(DaemonRequest::Ping.with_trace_id("inner.trace")),
+            request: Box::new(DaemonRequest::Ping.with_trace_id(INNER_TRACE_ID)),
         };
         let (inner, trace_id) = request.into_trace_parts();
-        assert_eq!(trace_id.as_deref(), Some("inner.trace"));
+        assert_eq!(trace_id.as_deref(), Some(INNER_TRACE_ID));
         assert!(matches!(inner, DaemonRequest::Ping));
     }
 
     #[test]
+    fn free_form_trace_wrapper_is_rejected() {
+        let request = DaemonRequest::Status.with_trace_id("person@example.com");
+        let (inner, trace_id) = request.into_trace_parts();
+        assert!(matches!(inner, DaemonRequest::Status));
+        assert_eq!(trace_id, None);
+    }
+
+    #[test]
     fn shutdown_is_detected_inside_trace_envelope() {
-        assert!(DaemonRequest::Shutdown.with_trace_id("trace").is_shutdown());
+        assert!(DaemonRequest::Shutdown
+            .with_trace_id("550e8400-e29b-41d4-a716-446655440004")
+            .is_shutdown());
+    }
+
+    #[test]
+    fn support_diagnostic_consent_binding_round_trips_only_receipt_authority() {
+        let request = DaemonRequest::SupportDiagnosticsBindConsentRevision {
+            server_revision: 17,
+            fence: DaemonMutationFence {
+                owner_account_id: Some("account-a".to_string()),
+                credential_generation: Some(3),
+                meeting_id: None,
+                audio_session_id: None,
+                capture_generation: None,
+            },
+        };
+        let encoded = serde_json::to_string(&request).expect("serialize consent binding");
+        assert!(!encoded.contains("transcript"));
+        assert!(!encoded.contains("answer"));
+        assert!(!encoded.contains("prompt"));
+        let decoded: DaemonRequest =
+            serde_json::from_str(&encoded).expect("decode consent binding");
+        assert!(matches!(
+            decoded,
+            DaemonRequest::SupportDiagnosticsBindConsentRevision {
+                server_revision: 17,
+                fence: DaemonMutationFence {
+                    owner_account_id: Some(owner_account_id),
+                    credential_generation: Some(3),
+                    meeting_id: None,
+                    audio_session_id: None,
+                    capture_generation: None,
+                },
+            } if owner_account_id == "account-a"
+        ));
     }
 
     #[test]

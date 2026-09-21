@@ -4342,6 +4342,55 @@ async fn auth_link_mint_then_exchange_roundtrip() {
         .unwrap()
         .starts_with("bluey://link?code="));
 
+    let stored_before_exchange: (String, String, Option<String>) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT access_token, refresh_token, consumed_at
+               FROM auth_link_codes",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_before_exchange.0, "");
+    assert_eq!(stored_before_exchange.1, "");
+    assert_eq!(stored_before_exchange.2, None);
+
+    let req = Request::post("/auth/link/exchange")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"code": &code})).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let exchanged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_access = exchanged["access_token"].as_str().unwrap();
+    let device_refresh = exchanged["refresh_token"].as_str().unwrap();
+    assert!(!device_access.is_empty());
+    assert!(!device_refresh.is_empty());
+    assert_eq!(exchanged["account"]["email"], "link@example.com");
+
+    let req = Request::get("/account/me")
+        .header("authorization", format!("Bearer {device_access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::post("/auth/refresh")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"refresh_token": device_refresh})).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
     let req = Request::post("/auth/link/exchange")
         .header("content-type", "application/json")
         .body(Body::from(
@@ -4349,7 +4398,22 @@ async fn auth_link_mint_then_exchange_roundtrip() {
         ))
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let stored_after_exchange: (String, String, Option<String>) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT access_token, refresh_token, consumed_at
+               FROM auth_link_codes",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_after_exchange.0, "");
+    assert_eq!(stored_after_exchange.1, "");
+    assert!(stored_after_exchange.2.is_some());
 }
 
 #[tokio::test]

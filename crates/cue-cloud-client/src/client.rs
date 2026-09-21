@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use reqwest::{header, Client, Method, Response, StatusCode};
+use reqwest::{header, Client, Method, RequestBuilder, Response, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use cue_core::{
@@ -106,12 +106,44 @@ impl Default for ClientConfig {
     }
 }
 
-/// Cloud client. Holds an HTTP client, the configured base URL, and a
-/// pluggable token store. Cheap to clone (Arc internally).
+/// Cloneable HTTP connection pool with no default credentials or identity
+/// headers.
+///
+/// Authentication, request, trace, and interaction headers must be attached to
+/// each request by the caller. Keeping those values out of the transport makes
+/// it safe for account-bound [`CloudClient`] instances and direct provider
+/// calls to reuse the same DNS/TLS/connection pool without sharing authority.
+#[derive(Clone)]
+pub struct CredentialFreeHttpTransport {
+    http: Arc<Client>,
+}
+
+impl CredentialFreeHttpTransport {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            http: Arc::new(Client::builder().build()?),
+        })
+    }
+
+    /// Start one request without attaching credentials or Bluey identity
+    /// headers. Callers must add every request-scoped header explicitly.
+    pub fn request(&self, method: Method, url: &str) -> RequestBuilder {
+        self.http.request(method, url)
+    }
+
+    #[cfg(test)]
+    fn shares_connection_pool_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.http, &other.http)
+    }
+}
+
+/// Cloud client. Holds a reusable HTTP transport, the configured base URL, and
+/// a pluggable token store. Cheap to clone (Arc internally).
 #[derive(Clone)]
 pub struct CloudClient {
     pub config: ClientConfig,
-    http: Client,
+    transport: CredentialFreeHttpTransport,
+    user_agent: header::HeaderValue,
     tokens: Arc<dyn TokenStore>,
     cached: Arc<Mutex<CachedCredentials>>,
     interaction_id: Option<String>,
@@ -144,10 +176,23 @@ impl CachedCredentials {
 
 impl CloudClient {
     pub fn new(config: ClientConfig, tokens: Arc<dyn TokenStore>) -> Result<Self> {
-        let http = Client::builder()
-            .user_agent(&config.user_agent)
-            .timeout(config.timeout)
-            .build()?;
+        Self::with_transport(config, tokens, CredentialFreeHttpTransport::new()?)
+    }
+
+    /// Build an account-bound client on a reusable credential-free transport.
+    ///
+    /// The transport owns only the connection pool. This client continues to
+    /// own its token store, credential generation fence, trace id, and
+    /// interaction id, and attaches them independently on every request.
+    pub fn with_transport(
+        config: ClientConfig,
+        tokens: Arc<dyn TokenStore>,
+        transport: CredentialFreeHttpTransport,
+    ) -> Result<Self> {
+        let user_agent = config
+            .user_agent
+            .parse::<header::HeaderValue>()
+            .map_err(|_| Error::Other("invalid cloud client user agent".to_string()))?;
         let snapshot = tokens.load_snapshot()?;
         let cached = Arc::new(Mutex::new(CachedCredentials {
             generation: 0,
@@ -158,7 +203,8 @@ impl CloudClient {
         }));
         Ok(Self {
             config,
-            http,
+            transport,
+            user_agent,
             tokens,
             cached,
             interaction_id: None,
@@ -656,9 +702,12 @@ impl CloudClient {
     }
 
     fn request_builder(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        let url = self.url(path);
         let mut req = self
-            .http
-            .request(method, self.url(path))
+            .transport
+            .request(method, &url)
+            .header(header::USER_AGENT, self.user_agent.clone())
+            .timeout(self.config.timeout)
             .header(BLUEY_REQUEST_ID_HEADER, new_request_id());
         if let Some(trace_id) = self.current_trace_id() {
             req = req.header(BLUEY_TRACE_ID_HEADER, trace_id);
@@ -1039,6 +1088,141 @@ mod tests {
         };
         let store = Arc::new(MemoryStore::new());
         CloudClient::new(config, store).unwrap()
+    }
+
+    #[tokio::test]
+    async fn shared_transport_reuses_pool_without_crossing_account_headers() {
+        const INTERACTION_B: &str = "550e8400-e29b-41d4-a716-446655440002";
+        const TRACE_B: &str = "550e8400-e29b-41d4-a716-446655440003";
+
+        let server = MockServer::start().await;
+        for request_path in ["/account/a", "/account/b", "/public"] {
+            Mock::given(method(if request_path == "/public" {
+                "GET"
+            } else {
+                "POST"
+            }))
+            .and(path(request_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        }
+
+        let transport = CredentialFreeHttpTransport::new().unwrap();
+        let store_a = Arc::new(MemoryStore::new());
+        store_a
+            .save(&Tokens {
+                access: "access-a".into(),
+                refresh: "refresh-a".into(),
+                email: "a@example.test".into(),
+            })
+            .unwrap();
+        let store_b = Arc::new(MemoryStore::new());
+        store_b
+            .save(&Tokens {
+                access: "access-b".into(),
+                refresh: "refresh-b".into(),
+                email: "b@example.test".into(),
+            })
+            .unwrap();
+
+        let client_a = CloudClient::with_transport(
+            ClientConfig {
+                base_url: server.uri(),
+                user_agent: "account-a-client".into(),
+                timeout: Duration::from_secs(10),
+                trace_id: Some(TEST_TRACE_ID.into()),
+            },
+            store_a,
+            transport.clone(),
+        )
+        .unwrap()
+        .with_interaction_id(TEST_INTERACTION_ID);
+        let client_b = CloudClient::with_transport(
+            ClientConfig {
+                base_url: server.uri(),
+                user_agent: "account-b-client".into(),
+                timeout: Duration::from_secs(10),
+                trace_id: Some(TRACE_B.into()),
+            },
+            store_b,
+            transport.clone(),
+        )
+        .unwrap()
+        .with_interaction_id(INTERACTION_B);
+
+        assert!(transport.shares_connection_pool_with(&client_a.transport));
+        assert!(client_a
+            .transport
+            .shares_connection_pool_with(&client_b.transport));
+
+        let _: serde_json::Value = client_a
+            .auth_post("/account/a", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let _: serde_json::Value = client_b
+            .auth_post("/account/b", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let _: serde_json::Value = client_a.public_get("/public").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let request_a = requests
+            .iter()
+            .find(|request| request.url.path() == "/account/a")
+            .unwrap();
+        let request_b = requests
+            .iter()
+            .find(|request| request.url.path() == "/account/b")
+            .unwrap();
+        let public_request = requests
+            .iter()
+            .find(|request| request.url.path() == "/public")
+            .unwrap();
+
+        assert_eq!(
+            request_a.headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer access-a"
+        );
+        assert_eq!(
+            request_a
+                .headers
+                .get_all(header::AUTHORIZATION)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(
+            request_b.headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer access-b"
+        );
+        assert_eq!(
+            request_b
+                .headers
+                .get_all(header::AUTHORIZATION)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(
+            request_a.headers.get(BLUEY_TRACE_ID_HEADER).unwrap(),
+            TEST_TRACE_ID
+        );
+        assert_eq!(
+            request_b.headers.get(BLUEY_TRACE_ID_HEADER).unwrap(),
+            TRACE_B
+        );
+        assert_eq!(
+            request_a.headers.get(BLUEY_INTERACTION_ID_HEADER).unwrap(),
+            TEST_INTERACTION_ID
+        );
+        assert_eq!(
+            request_b.headers.get(BLUEY_INTERACTION_ID_HEADER).unwrap(),
+            INTERACTION_B
+        );
+        assert!(!public_request.headers.contains_key(header::AUTHORIZATION));
     }
 
     async fn wait_for_request(server: &MockServer, request_path: &str) {

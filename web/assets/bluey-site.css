@@ -670,77 +670,6 @@
       box-shadow: 0 14px 30px rgba(0, 0, 0, .30), 0 0 18px rgba(99, 216, 255, .18), inset 0 1px 0 rgba(255, 255, 255, .44);
     }
 
-    #productSite .nav-connect,
-    #downloadApp .nav-connect,
-    #policyApp .nav-connect {
-      display: inline-flex;
-      align-items: center;
-      gap: .4rem;
-      margin: 0;
-    }
-
-    #productSite .nav-connect input,
-    #downloadApp .nav-connect input,
-    #policyApp .nav-connect input {
-      width: 88px;
-      height: 32px;
-      padding: .34rem .58rem;
-      border: 1px solid rgba(99, 216, 255, .28);
-      border-radius: 6px;
-      background: #111;
-      color: #e0e0e0;
-      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-      font-size: .8rem;
-      font-weight: 650;
-      outline: 0;
-      transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
-    }
-
-    #productSite .nav-connect input::placeholder,
-    #downloadApp .nav-connect input::placeholder,
-    #policyApp .nav-connect input::placeholder {
-      color: #444;
-      font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
-      font-weight: 600;
-    }
-
-    #productSite .nav-connect input:focus,
-    #downloadApp .nav-connect input:focus,
-    #policyApp .nav-connect input:focus {
-      border-color: rgba(99, 216, 255, .78);
-      box-shadow: 0 0 0 2px rgba(99, 216, 255, .16);
-    }
-
-    #productSite .nav-connect button,
-    #downloadApp .nav-connect button,
-    #policyApp .nav-connect button {
-      height: 32px;
-      padding: .34rem .7rem;
-      border: 1px solid rgba(99, 216, 255, .28);
-      border-radius: 6px;
-      background: rgba(99, 216, 255, .12);
-      color: var(--bluey-accent);
-      cursor: pointer;
-      font: inherit;
-      font-size: .8rem;
-      font-weight: 700;
-      transition: border-color .18s ease, background .18s ease, color .18s ease, opacity .18s ease;
-    }
-
-    #productSite .nav-connect button:hover,
-    #downloadApp .nav-connect button:hover,
-    #policyApp .nav-connect button:hover {
-      border-color: rgba(99, 216, 255, .72);
-      background: rgba(99, 216, 255, .18);
-    }
-
-    #productSite .nav-connect button:disabled,
-    #downloadApp .nav-connect button:disabled,
-    #policyApp .nav-connect button:disabled {
-      cursor: wait;
-      opacity: .62;
-    }
-
     #productSite .account-profile {
       position: relative;
       display: inline-flex;
@@ -1059,28 +988,6 @@
       color: #087ca6;
       border-color: #bfe6f4;
       background: #ebf9ff;
-    }
-
-    html[data-bluey-theme="light"] #productSite .nav-connect input,
-    html[data-bluey-theme="light"] #downloadApp .nav-connect input,
-    html[data-bluey-theme="light"] #policyApp .nav-connect input {
-      border-color: #d8e8f0;
-      background: #ffffff;
-      color: #102130;
-    }
-
-    html[data-bluey-theme="light"] #productSite .nav-connect input::placeholder,
-    html[data-bluey-theme="light"] #downloadApp .nav-connect input::placeholder,
-    html[data-bluey-theme="light"] #policyApp .nav-connect input::placeholder {
-      color: #8da1ad;
-    }
-
-    html[data-bluey-theme="light"] #productSite .nav-connect button,
-    html[data-bluey-theme="light"] #downloadApp .nav-connect button,
-    html[data-bluey-theme="light"] #policyApp .nav-connect button {
-      border-color: #bfe6f4;
-      background: #ebf9ff;
-      color: #087ca6;
     }
 
     html[data-bluey-theme="light"] #productSite .profile-button {
@@ -1954,10 +1861,6 @@
 
       #productSite .pricing {
         grid-template-columns: 1fr;
-      }
-
-      #productSite .nav-connect {
-        display: none !important;
       }
 
       .trial-actions {
@@ -4769,68 +4672,6 @@
       background: transparent;
     }
 
-    #accountApp .account-top-connect {
-      display: inline-flex;
-      align-items: center;
-      gap: .4rem;
-      margin-left: 0;
-    }
-
-    #accountApp .account-top-connect input {
-      width: 88px;
-      height: 32px;
-      padding: .35rem .6rem;
-      border: 1px solid rgba(99, 216, 255, .28);
-      border-radius: 6px;
-      background: #111;
-      color: #e0e0e0;
-      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-      font-size: .8rem;
-      font-weight: 600;
-      letter-spacing: .1em;
-      outline: 0;
-      text-transform: uppercase;
-      transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
-    }
-
-    #accountApp .account-top-connect input::placeholder {
-      color: #444;
-      font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
-      letter-spacing: 0;
-      text-transform: none;
-    }
-
-    #accountApp .account-top-connect input:focus {
-      border-color: rgba(99, 216, 255, .80);
-      background: #111;
-      box-shadow: 0 0 0 2px rgba(99, 216, 255, .16);
-    }
-
-    #accountApp .account-top-connect button {
-      height: 32px;
-      padding: .35rem .7rem;
-      border: 1px solid rgba(99, 216, 255, .28);
-      border-radius: 6px;
-      background: rgba(99, 216, 255, .12);
-      color: var(--bluey-accent);
-      cursor: pointer;
-      font: inherit;
-      font-size: .8rem;
-      font-weight: 650;
-      transition: border-color .18s ease, background .18s ease, color .18s ease, opacity .18s ease;
-    }
-
-    #accountApp .account-top-connect button:hover {
-      border-color: rgba(99, 216, 255, .72);
-      background: rgba(99, 216, 255, .18);
-      color: var(--bluey-accent);
-    }
-
-    #accountApp .account-top-connect button:disabled {
-      cursor: wait;
-      opacity: .62;
-    }
-
     #accountApp .account-top .nav-cta {
       min-height: 34px;
       padding: 0 .95rem;
@@ -4976,9 +4817,6 @@
         justify-content: center;
       }
 
-      #accountApp .account-top-connect {
-        display: none !important;
-      }
     }
 
     /* Bluey auth/legal polish keeps Pinky's structure while staying Bluey blue. */
@@ -5561,22 +5399,6 @@
     html[data-bluey-theme="light"] #accountApp .auth-link-button,
     html[data-bluey-theme="light"] #accountApp.is-guest .account-note a,
     html[data-bluey-theme="light"] #accountApp .auth-card-links a:hover {
-      color: #087ca6;
-    }
-
-    html[data-bluey-theme="light"] #accountApp .account-top-connect input {
-      border-color: #d8e8f0;
-      background: #ffffff;
-      color: #102130;
-    }
-
-    html[data-bluey-theme="light"] #accountApp .account-top-connect input::placeholder {
-      color: #8da1ad;
-    }
-
-    html[data-bluey-theme="light"] #accountApp .account-top-connect button {
-      border-color: #bfe6f4;
-      background: #ebf9ff;
       color: #087ca6;
     }
 
@@ -6847,39 +6669,6 @@
       padding: 0 1.1rem;
       border-radius: 6px;
       font-weight: 700;
-    }
-
-    #productSite .nav-connect,
-    #accountApp .account-top-connect,
-    #downloadApp .nav-connect,
-    #policyApp .nav-connect {
-      gap: .4rem;
-    }
-
-    #productSite .nav-connect input,
-    #accountApp .account-top-connect input,
-    #downloadApp .nav-connect input,
-    #policyApp .nav-connect input {
-      width: 90px;
-      height: 32px;
-      padding: .35rem .6rem;
-      border-radius: 6px;
-      font-size: .8rem;
-      font-weight: 650;
-      letter-spacing: 0;
-      text-transform: none;
-    }
-
-    #productSite .nav-connect button,
-    #accountApp .account-top-connect button,
-    #downloadApp .nav-connect button,
-    #policyApp .nav-connect button {
-      height: 32px;
-      min-width: 76px;
-      padding: .35rem .7rem;
-      border-radius: 6px;
-      font-size: .8rem;
-      font-weight: 750;
     }
 
     #productSite .profile-button,
@@ -8577,6 +8366,7 @@
     }
 
     #productSite .hero-connect .join-bar {
+      max-width: 430px;
       margin-top: .65rem;
     }
 
@@ -9126,5 +8916,114 @@
     @media (max-width: 360px) {
       #productSite .nav-links > a[href="/download"] {
         display: none;
+      }
+    }
+
+    /* Device linking keeps the normal carried-code path primary. */
+    #accountApp .device-troubleshooting {
+      grid-column: 1 / -1;
+      width: 100%;
+      margin: 0;
+      color: #8fa3ad;
+      font-size: .76rem;
+      line-height: 1.4;
+    }
+
+    #accountApp .device-troubleshooting summary {
+      width: fit-content;
+      cursor: pointer;
+      color: #91a8b3;
+      font-weight: 700;
+    }
+
+    #accountApp .device-troubleshooting summary:hover,
+    #accountApp .device-troubleshooting[open] summary {
+      color: var(--bluey-accent);
+    }
+
+    #accountApp .device-troubleshooting summary:focus-visible {
+      border-radius: 4px;
+      outline: 2px solid rgba(99, 216, 255, .72);
+      outline-offset: 3px;
+    }
+
+    #accountApp .device-troubleshooting .device-code-helper,
+    #accountApp .device-troubleshooting .device-code-form,
+    #accountApp .device-troubleshooting .device-code-status {
+      grid-column: 1 / -1;
+      grid-row: auto;
+    }
+
+    #accountApp .device-troubleshooting .device-code-helper {
+      display: block;
+      margin-top: .48rem;
+      color: #8fa3ad;
+    }
+
+    #accountApp .device-troubleshooting .device-code-form {
+      max-width: 430px;
+      margin-top: .55rem;
+    }
+
+    #accountApp .device-troubleshooting .device-code-status {
+      display: block;
+      min-height: 0;
+      margin-top: .35rem;
+      text-align: left;
+    }
+
+    #accountApp .device-troubleshooting:not([open]) > :not(summary),
+    #productSite .hero-connect:not([open]) > :not(summary) {
+      display: none;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .device-troubleshooting,
+    html[data-bluey-theme="light"] #accountApp .device-troubleshooting .device-code-helper,
+    html[data-bluey-theme="light"] #accountApp .device-troubleshooting summary {
+      color: #536f7e;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .device-troubleshooting summary:hover,
+    html[data-bluey-theme="light"] #accountApp .device-troubleshooting[open] summary {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #accountApp.is-guest .device-link-hint,
+    html[data-bluey-theme="light"] #accountApp .account-desktop-connect-section {
+      border-color: #cfe3ed;
+      background: #ffffff;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .device-link-hint strong,
+    html[data-bluey-theme="light"] #accountApp .account-top-device-link-hint strong,
+    html[data-bluey-theme="light"] #accountApp .dashboard-device-link-hint strong {
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .device-link-hint > span {
+      color: #536f7e;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .device-code-form input {
+      border-color: #cfe3ed;
+      background: #ffffff;
+      color: #102130;
+    }
+
+    html[data-bluey-theme="light"] #accountApp .device-code-form input::placeholder {
+      color: #718897;
+    }
+
+    @media (max-width: 520px) {
+      #accountApp .device-troubleshooting .device-code-form {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .device-troubleshooting .device-code-form .account-button {
+        width: 100%;
+      }
+
+      #productSite .hero-connect .join-bar {
+        flex-direction: column;
       }
     }

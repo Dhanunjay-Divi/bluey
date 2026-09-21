@@ -1,4 +1,38 @@
 
+fn mark_first_non_whitespace_safe_delta(recorded: &mut bool, delta: &str) -> bool {
+    if *recorded || !delta.chars().any(|ch| !ch.is_whitespace()) {
+        return false;
+    }
+    *recorded = true;
+    true
+}
+
+fn latency_metric_request_id(request_id: &str) -> Option<String> {
+    cue_core::sanitize_interaction_id(request_id)
+}
+
+fn completion_delta_event_with_latency(
+    delta: &str,
+    first_safe_visible_delta_recorded: &mut bool,
+    request_started: Instant,
+    interaction_id: Option<&str>,
+    request_id: &str,
+    trace_id: &str,
+) -> Event {
+    if mark_first_non_whitespace_safe_delta(first_safe_visible_delta_recorded, delta) {
+        let request_id = latency_metric_request_id(request_id);
+        tracing::info!(
+            event_name = "first_safe_visible_delta",
+            interaction_id = %interaction_id.unwrap_or(""),
+            request_id = %request_id.as_deref().unwrap_or(""),
+            trace_id = %trace_id,
+            duration_ms = request_started.elapsed().as_millis() as u64,
+            "answer latency milestone"
+        );
+    }
+    completion_delta_event(delta)
+}
+
 #[allow(clippy::result_large_err)]
 pub async fn complete(
     State(state): State<AppState>,
@@ -46,9 +80,20 @@ pub async fn complete_stream(
     Extension(crate::api::middleware::request_id::TraceId(trace_id)): Extension<
         crate::api::middleware::request_id::TraceId,
     >,
+    Extension(crate::api::middleware::request_id::InteractionId(interaction_id)): Extension<
+        crate::api::middleware::request_id::InteractionId,
+    >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
-    match tokio::spawn(complete_stream_inner(state, account, req, trace_id)).await {
+    match tokio::spawn(complete_stream_inner(
+        state,
+        account,
+        req,
+        trace_id,
+        interaction_id,
+    ))
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             tracing::error!(error = %error, "detached managed streaming setup task failed");
@@ -70,6 +115,7 @@ async fn complete_stream_inner(
     account: Account,
     req: CompleteRequest,
     trace_id: String,
+    interaction_id: Option<String>,
 ) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
     let request_started = Instant::now();
     reconcile_expired_llm_usage(&state.pool, &account.id).map_err(|error| *error)?;
@@ -86,6 +132,10 @@ async fn complete_stream_inner(
             }),
         ));
     }
+    // `CompleteRequest::request_id` is a client-supplied idempotency key and
+    // only has a non-empty contract. Never copy a free-form value into the
+    // cross-system latency series; retain it only when it is a canonical UUID.
+    let latency_request_id = latency_metric_request_id(&req.request_id);
     let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(
         &req,
         ManagedSystemAuthority::ExternalClientContract,
@@ -846,6 +896,14 @@ async fn complete_stream_inner(
                                     request_started.elapsed().as_millis() as i64;
                                 let first_event_kind = "delta";
                                 tracing::info!(
+                                    event_name = "raw_provider_first_delta",
+                                    interaction_id = %interaction_id.as_deref().unwrap_or(""),
+                                    request_id = %latency_request_id.as_deref().unwrap_or(""),
+                                    trace_id = %trace_id,
+                                    duration_ms = request_to_first_event_ms,
+                                    "answer latency milestone"
+                                );
+                                tracing::info!(
                                     account_id_hash = %account_id_hash,
                                     request_id = %req.request_id,
                                     request_ref = %request_ref_log,
@@ -1324,6 +1382,7 @@ async fn complete_stream_inner(
         let mut canvas_visible = CanvasSpokenStream::default();
         let mut strict_lru_gate = StrictLruCodeStreamGate::new(strict_lru_code_stream);
         let mut final_tokens: Option<(i64, i64)> = None;
+        let mut first_safe_visible_delta_recorded = false;
 
         for status_event in stream_status_events {
             yield Ok(status_event);
@@ -1419,7 +1478,14 @@ async fn complete_stream_inner(
                             },
                         );
                         if let Some(visible_partial) = visible_partial {
-                            yield Ok(completion_delta_event(&visible_partial));
+                            yield Ok(completion_delta_event_with_latency(
+                                &visible_partial,
+                                &mut first_safe_visible_delta_recorded,
+                                request_started,
+                                interaction_id.as_deref(),
+                                &req.request_id,
+                                &trace_id,
+                            ));
                         }
                         yield Ok(Event::default().event("error").data(
                             serde_json::json!({
@@ -1480,7 +1546,14 @@ async fn complete_stream_inner(
                             strict_lru_gate.push(&safe_delta)
                         };
                         if let Some(visible_delta) = visible_delta {
-                            yield Ok(completion_delta_event(&visible_delta));
+                            yield Ok(completion_delta_event_with_latency(
+                                &visible_delta,
+                                &mut first_safe_visible_delta_recorded,
+                                request_started,
+                                interaction_id.as_deref(),
+                                &req.request_id,
+                                &trace_id,
+                            ));
                         }
                     }
                 }
@@ -1646,7 +1719,14 @@ async fn complete_stream_inner(
                         },
                     );
                     if let Some(visible_partial) = visible_partial {
-                        yield Ok(completion_delta_event(&visible_partial));
+                        yield Ok(completion_delta_event_with_latency(
+                            &visible_partial,
+                            &mut first_safe_visible_delta_recorded,
+                            request_started,
+                            interaction_id.as_deref(),
+                            &req.request_id,
+                            &trace_id,
+                        ));
                     }
                     let payload = if let Some(retry_after_secs) = retry_after_secs {
                         serde_json::json!({
@@ -1752,7 +1832,14 @@ async fn complete_stream_inner(
                 },
             );
             if let Some(visible_partial) = visible_partial {
-                yield Ok(completion_delta_event(&visible_partial));
+                yield Ok(completion_delta_event_with_latency(
+                    &visible_partial,
+                    &mut first_safe_visible_delta_recorded,
+                    request_started,
+                    interaction_id.as_deref(),
+                    &req.request_id,
+                    &trace_id,
+                ));
             }
             yield Ok(Event::default().event("error").data(
                 serde_json::json!({
@@ -1788,7 +1875,14 @@ async fn complete_stream_inner(
                     strict_lru_gate.push(&safe_delta)
                 };
                 if let Some(visible_delta) = visible_delta {
-                    yield Ok(completion_delta_event(&visible_delta));
+                    yield Ok(completion_delta_event_with_latency(
+                        &visible_delta,
+                        &mut first_safe_visible_delta_recorded,
+                        request_started,
+                        interaction_id.as_deref(),
+                        &req.request_id,
+                        &trace_id,
+                    ));
                 }
             }
         }
@@ -1818,7 +1912,14 @@ async fn complete_stream_inner(
                 );
             }
             if let Some(visible_final_delta) = visible_final_delta.as_deref() {
-                yield Ok(completion_delta_event(visible_final_delta));
+                yield Ok(completion_delta_event_with_latency(
+                    visible_final_delta,
+                    &mut first_safe_visible_delta_recorded,
+                    request_started,
+                    interaction_id.as_deref(),
+                    &req.request_id,
+                    &trace_id,
+                ));
             }
             let delivered_delta = already_delivered
                 || visible_final_delta
@@ -1879,10 +1980,24 @@ async fn complete_stream_inner(
             return;
         }
         if let Some(visible_final_delta) = visible_final_delta {
-            yield Ok(completion_delta_event(&visible_final_delta));
+            yield Ok(completion_delta_event_with_latency(
+                &visible_final_delta,
+                &mut first_safe_visible_delta_recorded,
+                request_started,
+                interaction_id.as_deref(),
+                &req.request_id,
+                &trace_id,
+            ));
         }
         if let Some(held_code) = strict_lru_gate.release_after_quality_pass() {
-            yield Ok(completion_delta_event(&held_code));
+            yield Ok(completion_delta_event_with_latency(
+                &held_code,
+                &mut first_safe_visible_delta_recorded,
+                request_started,
+                interaction_id.as_deref(),
+                &req.request_id,
+                &trace_id,
+            ));
         }
         let artifact = response_artifact_for_plan(&text, &answer_plan);
         if code_artifact_missing_for_plan(&answer_plan, artifact.as_ref()) {
@@ -2137,7 +2252,14 @@ async fn complete_stream_inner(
         if split_canvas_stream {
             let visible_tail = canvas_visible.finish(&canvas_overlay_text(&text));
             if !visible_tail.trim().is_empty() {
-                yield Ok(completion_delta_event(&visible_tail));
+                yield Ok(completion_delta_event_with_latency(
+                    &visible_tail,
+                    &mut first_safe_visible_delta_recorded,
+                    request_started,
+                    interaction_id.as_deref(),
+                    &req.request_id,
+                    &trace_id,
+                ));
             }
         }
 

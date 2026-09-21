@@ -50,6 +50,8 @@
 #include "ask_event_protocol.h"
 #include "json_type_extract.h"
 #include "ndjson_stream.h"
+#include "overlay_account_state.h"
+#include "overlay_layout.h"
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
@@ -60,6 +62,7 @@
 #endif
 
 static HWND g_hwnd;
+static HWND g_pill_hit_hwnd;
 static HWND g_ask_edit;
 static HWND g_send_button;
 static HWND g_record_button;
@@ -75,6 +78,7 @@ static HWND g_recap_button;
 static HWND g_note_button;
 static HWND g_theme_button;
 static HWND g_shortcuts_button;
+static HWND g_sign_in_button;
 static HWND g_close_button;
 static HWND g_tooltip;
 static HWND g_meeting_banner;
@@ -144,6 +148,10 @@ static int g_audio_auto_stop_remaining_secs = -1;
 static int g_audio_auto_stop_idle_secs = 0;
 static bool g_light_theme = false;
 static double g_opacity = 0.92;
+static unsigned g_current_dpi = BLUEY_DEFAULT_DPI;
+static BlueyOverlayAccountState g_account_state = BLUEY_OVERLAY_ACCOUNT_UNKNOWN;
+static bool g_shortcut_coachmark_visible = false;
+static bool g_shortcut_coachmark_shown = false;
 static const int BLUEY_LIGHT_ACCENT_R = 0;
 static const int BLUEY_LIGHT_ACCENT_G = 98;
 static const int BLUEY_LIGHT_ACCENT_B = 154;
@@ -191,6 +199,11 @@ static void cancel_auto_send_timer(const char *origin);
 static void schedule_auto_send_after_caption_settled(void);
 static void show_full_overlay(bool emit_event);
 static void hide_overlay_completely(bool emit_event);
+static void apply_account_control_state(void);
+static void request_sign_in_from_gate(const char *action);
+static void sync_pill_hit_window(void);
+static void hide_pill_hit_window(void);
+static void dismiss_shortcut_coachmark(const char *reason);
 static void update_paste_answer_button(void);
 static void invoke_button_command(int id, HWND control);
 static void focus_ask_input(void);
@@ -483,6 +496,7 @@ static void update_recovery_action_from_current_card(void) {
 #define ID_THEME_BUTTON 1012
 #define ID_SHORTCUTS_BUTTON 1016
 #define ID_ANSWER_DETAIL_BUTTON 1017
+#define ID_SIGN_IN_BUTTON 1018
 #define ID_MEETING_START_BUTTON 1101
 #define ID_MEETING_SNOOZE_BUTTON 1102
 #define ID_MEETING_DISMISS_BUTTON 1103
@@ -501,6 +515,7 @@ static void update_recovery_action_from_current_card(void) {
 #define ID_MANUAL_SEND_TIMER 3002
 #define ID_MEETING_BANNER_TIMER 3003
 #define ID_RENDER_ACK_RETRY_TIMER 3004
+#define ID_SHORTCUT_COACHMARK_TIMER 3005
 #define WM_BLUEY_MEETING_EVIDENCE (WM_APP + 41)
 #define WM_BLUEY_MEETING_DETECTION_DISABLED (WM_APP + 42)
 #define AUTOSEND_CAPTION_SETTLE_DELAY_MS 300
@@ -509,14 +524,84 @@ static void update_recovery_action_from_current_card(void) {
 #define MANUAL_CAPTION_SETTLE_MAX_MS 2000
 #define BLUEY_GLOBAL_HOTKEY_MODS (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT)
 
-/* Stealth: hide overlay from screen recording, screenshots, and screen-share.
- * WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+ / build 19041) makes the window
- * invisible to all capture APIs (OBS, Teams screen-share, Win+Shift+S, etc.).
- * Fallback: WDA_MONITOR renders the window as black in captures on older builds
- * (still hidden from casual observation but not fully invisible). */
+/* Exclude Bluey-owned windows from supported Windows capture paths. This is a
+ * privacy boundary, not a promise of invisibility against every capture tool. */
 static void apply_capture_exclusion(HWND hwnd) {
     if (!SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
         SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
+    }
+}
+
+typedef BOOL (WINAPI *BlueySetProcessDpiAwarenessContextFn)(HANDLE);
+typedef BOOL (WINAPI *BlueySetProcessDpiAwareFn)(void);
+typedef UINT (WINAPI *BlueyGetDpiForWindowFn)(HWND);
+typedef UINT (WINAPI *BlueyGetDpiForSystemFn)(void);
+
+static void enable_per_monitor_v2_dpi_awareness(void) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (!user32) return;
+
+    BlueySetProcessDpiAwarenessContextFn set_context =
+        (BlueySetProcessDpiAwarenessContextFn)(void *)GetProcAddress(
+            user32,
+            "SetProcessDpiAwarenessContext");
+    if (set_context && set_context((HANDLE)(INT_PTR)-4)) return;
+
+    BlueySetProcessDpiAwareFn set_legacy =
+        (BlueySetProcessDpiAwareFn)(void *)GetProcAddress(
+            user32,
+            "SetProcessDPIAware");
+    if (set_legacy) set_legacy();
+}
+
+static unsigned system_dpi(void) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        BlueyGetDpiForSystemFn get_dpi =
+            (BlueyGetDpiForSystemFn)(void *)GetProcAddress(user32, "GetDpiForSystem");
+        if (get_dpi) {
+            UINT dpi = get_dpi();
+            if (dpi != 0) return dpi;
+        }
+    }
+
+    HDC screen = GetDC(NULL);
+    if (!screen) return BLUEY_DEFAULT_DPI;
+    int dpi = GetDeviceCaps(screen, LOGPIXELSX);
+    ReleaseDC(NULL, screen);
+    return dpi > 0 ? (unsigned)dpi : BLUEY_DEFAULT_DPI;
+}
+
+static unsigned dpi_for_window(HWND hwnd) {
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32 && hwnd) {
+        BlueyGetDpiForWindowFn get_dpi =
+            (BlueyGetDpiForWindowFn)(void *)GetProcAddress(user32, "GetDpiForWindow");
+        if (get_dpi) {
+            UINT dpi = get_dpi(hwnd);
+            if (dpi != 0) return dpi;
+        }
+    }
+    return system_dpi();
+}
+
+static int scaled_px(int logical_px) {
+    return bluey_scale_logical_px(logical_px, g_current_dpi);
+}
+
+static void apply_collapsed_window_region(HWND hwnd) {
+    if (!hwnd) return;
+    BlueyPillLayout layout = bluey_pill_layout(g_current_dpi);
+    int radius = layout.visible_height_px;
+    HRGN region = CreateRoundRectRgn(
+        0,
+        0,
+        layout.visible_width_px + 1,
+        layout.visible_height_px + 1,
+        radius,
+        radius);
+    if (region && SetWindowRgn(hwnd, region, TRUE) == 0) {
+        DeleteObject(region);
     }
 }
 
@@ -2352,7 +2437,12 @@ static void update_transcript_clear_button(void) {
     if (!g_transcript_clear_button) return;
     ShowWindow(
         g_transcript_clear_button,
-        (!g_collapsed && has_transcript_context()) ? SW_SHOW : SW_HIDE
+        (!g_collapsed
+            && g_visible
+            && !bluey_account_is_signed_out(g_account_state)
+            && has_transcript_context())
+            ? SW_SHOW
+            : SW_HIDE
     );
 }
 
@@ -2510,6 +2600,7 @@ static void set_controls_visible(bool visible) {
         ShowWindow(g_transcript_clear_button, SW_HIDE);
         if (g_paste_answer_button) ShowWindow(g_paste_answer_button, SW_HIDE);
     }
+    apply_account_control_state();
 }
 
 static int clamp_int(int value, int min_value, int max_value) {
@@ -2607,6 +2698,44 @@ static bool load_overlay_rect(const wchar_t *name, RECT *rect) {
         && rect_is_valid(*rect);
 }
 
+static void save_overlay_dword(const wchar_t *name, DWORD value) {
+    HKEY key;
+    if (RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Bluey\\Overlay",
+            0,
+            NULL,
+            0,
+            KEY_SET_VALUE,
+            NULL,
+            &key,
+            NULL) != ERROR_SUCCESS) {
+        return;
+    }
+    RegSetValueExW(key, name, 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
+    RegCloseKey(key);
+}
+
+static bool load_overlay_dword(const wchar_t *name, DWORD *value) {
+    if (!value) return false;
+    HKEY key;
+    if (RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Bluey\\Overlay",
+            0,
+            KEY_QUERY_VALUE,
+            &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD type = 0;
+    DWORD size = sizeof(*value);
+    LONG status = RegQueryValueExW(key, name, NULL, &type, (BYTE *)value, &size);
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS
+        && type == REG_DWORD
+        && size == sizeof(*value);
+}
+
 static void load_overlay_placement(void) {
     RECT loaded;
     if (load_overlay_rect(L"expanded_rect", &loaded)) {
@@ -2615,6 +2744,116 @@ static void load_overlay_placement(void) {
     if (load_overlay_rect(L"collapsed_rect", &loaded)) {
         g_collapsed_rect = clamp_rect_to_work_area(loaded, 8);
     }
+    DWORD coachmark_shown = 0;
+    g_shortcut_coachmark_shown = load_overlay_dword(
+        L"shortcut_coachmark_shown_v1",
+        &coachmark_shown) && coachmark_shown == 1;
+}
+
+static void apply_account_control_state(void) {
+    bool panel_visible = g_visible && !g_collapsed;
+    bool signed_out = bluey_account_is_signed_out(g_account_state);
+    HWND authenticated_controls[] = {
+        g_ask_edit,
+        g_send_button,
+        g_record_button,
+        g_auto_send_combo,
+        g_answer_detail_combo,
+        g_transcript_clear_button,
+        g_paste_answer_button,
+        g_session_button,
+        g_page_button,
+        g_attach_button,
+        g_recap_button,
+        g_note_button,
+    };
+    for (size_t index = 0;
+         index < sizeof(authenticated_controls) / sizeof(authenticated_controls[0]);
+         index++) {
+        HWND control = authenticated_controls[index];
+        if (!control) continue;
+        EnableWindow(control, signed_out ? FALSE : TRUE);
+        if (signed_out) ShowWindow(control, SW_HIDE);
+    }
+    if (!signed_out && panel_visible) {
+        HWND normally_visible[] = {
+            g_ask_edit,
+            g_send_button,
+            g_record_button,
+            g_auto_send_combo,
+            g_answer_detail_combo,
+            g_session_button,
+            g_page_button,
+            g_attach_button,
+            g_recap_button,
+            g_note_button,
+        };
+        for (size_t index = 0;
+             index < sizeof(normally_visible) / sizeof(normally_visible[0]);
+             index++) {
+            if (normally_visible[index]) ShowWindow(normally_visible[index], SW_SHOW);
+        }
+        update_transcript_clear_button();
+        update_paste_answer_button();
+    }
+    if (g_sign_in_button) {
+        ShowWindow(
+            g_sign_in_button,
+            panel_visible && signed_out ? SW_SHOW : SW_HIDE);
+        EnableWindow(g_sign_in_button, panel_visible && signed_out ? TRUE : FALSE);
+    }
+}
+
+static void request_sign_in_from_gate(const char *action) {
+    if (!bluey_account_is_signed_out(g_account_state)) return;
+    if (g_collapsed || !g_visible) show_full_overlay(false);
+    g_interactive_mode = true;
+    apply_account_control_state();
+    if (!emit_simple_event(BLUEY_SIGN_IN_REQUEST_EVENT)) {
+        MessageBeep(MB_ICONWARNING);
+        return;
+    }
+    char detail[160];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "action=%s platform=windows",
+        action ? action : "unknown");
+    emit_lifecycle_event("auth_gate_action", "signin_requested", detail);
+    wcscpy_s(g_session_banner, 256, L"Opening sign in in your browser...");
+    g_session_banner_tick = GetTickCount64();
+    if (g_sign_in_button) SetFocus(g_sign_in_button);
+    InvalidateRect(g_hwnd, NULL, TRUE);
+}
+
+static void dismiss_shortcut_coachmark(const char *reason) {
+    if (!g_shortcut_coachmark_visible) return;
+    g_shortcut_coachmark_visible = false;
+    if (g_hwnd) {
+        KillTimer(g_hwnd, ID_SHORTCUT_COACHMARK_TIMER);
+        InvalidateRect(g_hwnd, NULL, TRUE);
+    }
+    char detail[128];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "platform=windows reason=%s",
+        reason ? reason : "dismissed");
+    emit_lifecycle_event("shortcuts_coachmark_dismissed", "ok", detail);
+}
+
+static void present_shortcut_coachmark(void) {
+    if (!g_hwnd || g_shortcut_coachmark_shown || g_shortcut_coachmark_visible) return;
+    if (g_collapsed || !g_visible) show_full_overlay(false);
+    g_shortcut_coachmark_visible = true;
+    g_shortcut_coachmark_shown = true;
+    save_overlay_dword(L"shortcut_coachmark_shown_v1", 1);
+    SetTimer(g_hwnd, ID_SHORTCUT_COACHMARK_TIMER, 6500, NULL);
+    emit_lifecycle_event(
+        "shortcuts_coachmark_shown",
+        "ok",
+        "platform=windows source=sign_in");
+    InvalidateRect(g_hwnd, NULL, TRUE);
 }
 
 static void show_full_overlay(bool emit_event) {

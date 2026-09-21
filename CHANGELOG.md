@@ -5,6 +5,12 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+### Recovery checkpoint (not release-ready)
+
+- Preserved partial Phase 625 desktop UI/latency source after the temporary
+  checkout disappeared. Recovery, review, and release gates remain open; see
+  `docs/work/HANDOFF-PHASE-625-RECOVERY-20260921.md` before continuing.
+
 ### Added
 
 - Added an opt-in, account-scoped, metadata-only diagnostic spine that

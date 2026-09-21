@@ -215,6 +215,7 @@ pub async fn transcribe(
             }),
         ));
     }
+    let request_id_log = cue_core::sanitize_interaction_id(&q.request_id);
     if body.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -414,7 +415,7 @@ pub async fn transcribe(
                 Err(denied) => {
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        request_id = %q.request_id,
+                        request_id = %request_id_log.as_deref().unwrap_or(""),
                         provider = %route.provider,
                         model = %route.model,
                         retry_after_secs = denied.retry_after_secs,
@@ -434,7 +435,7 @@ pub async fn transcribe(
             {
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    request_id = %q.request_id,
+                    request_id = %request_id_log.as_deref().unwrap_or(""),
                     provider = %route.provider,
                     model = %route.model,
                     retry_after_secs = denied.retry_after_secs,
@@ -542,7 +543,7 @@ pub async fn transcribe(
                 }
                 Err(e) => {
                     if let Err(error) = attempt_guard.settle_conservative() {
-                        tracing::error!(request_id = %q.request_id, error = %error, "STT failed-attempt settlement pending reconciliation");
+                        tracing::error!(request_id = %request_id_log.as_deref().unwrap_or(""), error = %error, "STT failed-attempt settlement pending reconciliation");
                         return Err(provider_accounting_pending_error(
                             &state.pool,
                             &account.id,
@@ -561,7 +562,7 @@ pub async fn transcribe(
                             .await;
                         tracing::warn!(
                             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                            request_id = %q.request_id,
+                            request_id = %request_id_log.as_deref().unwrap_or(""),
                             provider = %route.provider,
                             model = %route.model,
                             key_fingerprint = %selected_key.fingerprint,
@@ -578,7 +579,7 @@ pub async fn transcribe(
                     }
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        request_id = %q.request_id,
+                        request_id = %request_id_log.as_deref().unwrap_or(""),
                         provider = %route.provider,
                         model = %route.model,
                         error = %e,
@@ -614,7 +615,7 @@ pub async fn transcribe(
             if let Some(e) = last_error {
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    request_id = %q.request_id,
+                    request_id = %request_id_log.as_deref().unwrap_or(""),
                     error = %e,
                     "all transcribe routes failed"
                 );
@@ -704,7 +705,7 @@ pub async fn transcribe(
         if let Err(e) = idempotency::mark_complete(&state.pool, &account.id, &q.request_id, &json) {
             tracing::error!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                request_id = %q.request_id,
+                request_id = %request_id_log.as_deref().unwrap_or(""),
                 error = %e,
                 "transcribe mark_complete failed AFTER customer billed"
             );

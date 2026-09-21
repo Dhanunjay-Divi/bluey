@@ -32,7 +32,7 @@ pub mod tokens;
 pub mod types;
 
 pub use auth::{DeviceFlow, DeviceFlowState};
-pub use client::CloudClient;
+pub use client::{CloudClient, CredentialFreeHttpTransport};
 pub use error::Error;
 pub use tokens::{
     save_account_profile_and_tokens, save_account_profile_and_tokens_if_generation,

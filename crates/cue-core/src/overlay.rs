@@ -159,6 +159,8 @@ pub enum OverlayCommand {
         id: Option<uuid::Uuid>,
         code: String,
         title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer_instructions: Option<String>,
     },
     ListeningStateChanged {
         state: ListeningState,
@@ -416,12 +418,13 @@ mod tests {
             id: Some(id),
             code: "00000000".to_string(),
             title: "New recording".to_string(),
+            answer_instructions: Some("Keep answers concise.".to_string()),
         })
         .expect("serialize active session command");
 
         assert_eq!(
             json,
-            r#"{"type":"set_active_session","id":"00000000-0000-0000-0000-000000000000","code":"00000000","title":"New recording"}"#
+            r#"{"type":"set_active_session","id":"00000000-0000-0000-0000-000000000000","code":"00000000","title":"New recording","answer_instructions":"Keep answers concise."}"#
         );
     }
 

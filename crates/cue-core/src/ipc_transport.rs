@@ -975,7 +975,7 @@ mod tests {
     fn legacy_upgrade_boundary_is_lifecycle_only() {
         assert!(legacy_lifecycle_request(&DaemonRequest::Status));
         assert!(legacy_lifecycle_request(
-            &DaemonRequest::Shutdown.with_trace_id("upgrade")
+            &DaemonRequest::Shutdown.with_trace_id("550e8400-e29b-41d4-a716-446655440006")
         ));
         assert!(!legacy_lifecycle_request(&DaemonRequest::ContextList));
         assert!(!legacy_lifecycle_request(&DaemonRequest::OverlayShow));
@@ -1224,6 +1224,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn capability_free_upgrade_bridge_sends_only_legacy_lifecycle_requests() {
+        const TRACE_ID: &str = "550e8400-e29b-41d4-a716-446655440003";
         let paths = test_paths("ipc-client-legacy");
         paths.ensure().expect("paths");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1237,7 +1238,7 @@ mod tests {
             let request: DaemonRequest = serde_json::from_slice(&frame).unwrap();
             let (request, trace_id) = request.into_trace_parts();
             assert!(matches!(request, DaemonRequest::Status));
-            assert_eq!(trace_id.as_deref(), Some("upgrade-status"));
+            assert_eq!(trace_id.as_deref(), Some(TRACE_ID));
 
             let ok = serialize_bounded_frame(&DaemonResponse::Ok, IPC_MAX_RESPONSE_BYTES).unwrap();
             write_frame(&mut stream, &ok, Duration::from_secs(1))
@@ -1248,7 +1249,7 @@ mod tests {
         let response = request_daemon_with_timeout(
             &paths,
             Some(&address.to_string()),
-            DaemonRequest::Status.with_trace_id("upgrade-status"),
+            DaemonRequest::Status.with_trace_id(TRACE_ID),
             Duration::from_secs(2),
         )
         .await
