@@ -2,11 +2,19 @@
 
 **Status: partial recovery checkpoint; NOT mergeable or deployable.**
 
+**September 21 publication update:** the owner authorized making the branch
+retrievable for the next developer, not resuming implementation. Read
+[START-HERE-NEXT-AGENT.md](../../START-HERE-NEXT-AGENT.md) for fetch instructions
+and private-evidence prerequisites. The formerly uncommitted 36-line Windows
+edit is now preserved unchanged in **`2e1d6976`**, still unverified and outside
+the replay journal. This supersedes the local-only/uncommitted state in the
+historical stop snapshot below. Jobs, mainline, and deployments remain untouched.
+
 **Owner stop instruction (latest):** stop spending credits and hand this work
 to the next developer. All three supporting agents were interrupted. Do not
 resume automatically. Bluey Jobs is outside scope and was not modified.
 
-**Final local state:** committed recovery source is `512a94b1`; handoff tip
+**Historical stop snapshot:** committed recovery source is `512a94b1`; handoff tip
 before this stop note was `01bb3823`. The branch is local only (no remote branch
 was published). One additional **uncommitted** edit remains in
 `native/windows/cue-overlay/main.c` from the briefly resumed predecessor
@@ -28,7 +36,7 @@ resuming recovery. Future owners below are **unassigned**; no agent was restarte
 
 | Work item | Next owner | Exact starting scope | Completion evidence |
 |---|---|---|---|
-| Recovery blocker | Unassigned recovery agent | Inspect the uncommitted `native/windows/cue-overlay/main.c` diff, then the exact predecessor evidence under “Next-agent start here” | Complete verified predecessor, hashes, journal entry; one blocked patch replayed safely |
+| Recovery blocker | Unassigned recovery agent | Inspect `2e1d6976` for the unverified `native/windows/cue-overlay/main.c` WIP, then the exact predecessor evidence under “Next-agent start here” | Complete verified predecessor, hashes, journal entry; one blocked patch replayed safely |
 | Remaining source | Unassigned recovery agent, after blocker | Remaining snapshots, chronological mutations, formatter checkpoints, and generated test split below | Complete source inventory reconciled to successful evidence; explicit unknowns |
 | Correctness fixes | Unassigned implementation agent, after recovery | Seven “Last unresolved correctness findings” plus six parent PR P1s | Focused regressions and linked FIX records for every finding |
 | Validation/review | Unassigned reviewer, after fixes | Reconstructed root/server/dashboard/web/native surfaces and launcher | Fresh gates, independent review, platform limitations; update IMPL/REVIEW/round |

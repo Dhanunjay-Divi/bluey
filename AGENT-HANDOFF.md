@@ -8,6 +8,10 @@ Entry-point routing updated: 2026-09-21. Historical snapshot below: 2026-06-02.
 
 ## Current recovery handoff
 
+To retrieve this branch on another checkout, use
+[START-HERE-NEXT-AGENT.md](START-HERE-NEXT-AGENT.md). It distinguishes the
+published source checkpoint from private recovery evidence that is not in Git.
+
 For `feat/phase-625-recovery-mainline`, start with
 [Phase 625 recovery](docs/work/HANDOFF-PHASE-625-RECOVERY-20260921.md).
 Recovery is partial, stopped by the owner, and **not mergeable or deployable**.

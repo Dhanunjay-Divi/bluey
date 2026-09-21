@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Recovery checkpoint (not release-ready)
 
+- Added a retrievable next-developer starting point and preserved the remaining
+  Windows predecessor edit as an explicitly unverified WIP checkpoint. Raw
+  recovery evidence remains private; this does not complete or release Phase 625.
 - Added a portable branch-local `bluey-ops` skill, round ownership/handoff
   checklist, and linked agent/work/PR templates. Recovery remains stopped and
   incomplete; this documentation update does not certify or deploy product code.

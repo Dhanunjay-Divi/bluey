@@ -49,6 +49,19 @@ Product tests were not rerun for this documentation-only change.
 
 ### Recovery follow-ups
 
+Publication-only follow-up: the owner requested a retrievable handoff. Preserved
+the existing 36-line Windows edit unchanged as WIP commit `2e1d6976`; it remains
+unverified and outside the replay journal. Added `START-HERE-NEXT-AGENT.md` with
+fetch/read order, complete-handoff routing, and the private-evidence dependency.
+No implementation resumed and no product tests, merge, or deployment were run.
+
+Before publication, the existing privacy-gate classifiers scanned new content
+across all nine outgoing commits (65 changed file revisions through `2e1d6976`)
+and found no new credential/path findings. The broader release-hygiene heuristic
+still rejects dev-flag strings in skill/onboarding prose and existing dashboard
+test fixtures; it was not recorded as a passing release gate. Documentation
+coverage and whitespace checks passed. Raw journals/corpus remain outside Git.
+
 The temporary checkout was missing and original mutation records do not cover
 all of its dirty source. Recovery stops at a missing Windows account-state
 predecessor. The handoff documents exact next source evidence, unresolved
