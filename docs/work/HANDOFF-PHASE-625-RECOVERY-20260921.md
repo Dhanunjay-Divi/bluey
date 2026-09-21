@@ -118,9 +118,12 @@ For the recovered final tree:
 3. Obtain an independent final review of every changed area and update the
    implementation/review/FIX records with actual counts and limitations.
 4. Commit recovered changes in logical units; push the feature branch and open
-   a stacked PR. Attach every created/updated PR to this Codex task.
-5. Merge PR #38 and the recovery PR only after required CI passes and the
-   checked-in review verdict is resolved. Do not label zero-step failures passes.
+   a consolidated successor PR targeting `main`, retaining the three PR #38
+   parent commits plus their reviewed corrections. Attach the PR to this task.
+5. Merge the successor only after required CI passes and review is resolved;
+   then close PR #38 as superseded with the exact successor reference. Do not
+   merge the known-defective parent separately just to flatten the branch stack.
+   Do not label zero-step failures passes.
 
 The August 31 GitHub runs reported an Actions budget block. That was historical,
 not proof that the block remained active on September 21. A fresh API check
