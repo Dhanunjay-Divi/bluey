@@ -1,4 +1,3 @@
-
 #[allow(clippy::result_large_err)]
 pub async fn complete(
     State(state): State<AppState>,
@@ -48,8 +47,17 @@ pub async fn complete_stream(
     >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
-    match tokio::spawn(complete_stream_inner(state, account, req, trace_id)).await {
-        Ok(result) => result,
+    match tokio::spawn(complete_stream_inner(
+        state,
+        account,
+        req,
+        trace_id,
+        ManagedSystemAuthority::ExternalClientContract,
+        ManagedStreamPolicy::standalone(),
+    ))
+    .await
+    {
+        Ok(result) => result.map(router_sse),
         Err(error) => {
             tracing::error!(error = %error, "detached managed streaming setup task failed");
             Err((
@@ -64,19 +72,106 @@ pub async fn complete_stream(
     }
 }
 
+pub(crate) type ManagedDispatchFence = std::sync::Arc<dyn Fn() -> bool + Send + Sync + 'static>;
+
+#[derive(Clone, Default)]
+pub(crate) struct ManagedSettlementSignal(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ManagedSettlementSignal {
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn mark_terminal(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Server-owned controls for trusted callers that reuse the managed stream.
+/// Standalone HTTP behavior remains unchanged. Delegated adapters can disable
+/// implicit context providers and fence provider dispatch without accepting
+/// those controls from an untrusted client DTO.
+#[derive(Clone)]
+pub(crate) struct ManagedStreamPolicy {
+    allow_memory: bool,
+    allow_web_search: bool,
+    dispatch_fence: Option<ManagedDispatchFence>,
+    settlement_signal: Option<ManagedSettlementSignal>,
+}
+
+impl ManagedStreamPolicy {
+    fn standalone() -> Self {
+        Self {
+            allow_memory: true,
+            allow_web_search: true,
+            dispatch_fence: None,
+            settlement_signal: None,
+        }
+    }
+
+    pub(crate) fn delegated_text(
+        dispatch_fence: ManagedDispatchFence,
+        settlement_signal: ManagedSettlementSignal,
+    ) -> Self {
+        Self {
+            allow_memory: false,
+            allow_web_search: false,
+            dispatch_fence: Some(dispatch_fence),
+            settlement_signal: Some(settlement_signal),
+        }
+    }
+
+    fn dispatch_allowed(&self) -> bool {
+        self.dispatch_fence
+            .as_ref()
+            .map(|fence| fence())
+            .unwrap_or(true)
+    }
+
+    fn mark_accounting_terminal(&self) {
+        if let Some(signal) = &self.settlement_signal {
+            signal.mark_terminal();
+        }
+    }
+
+    fn mark_accounting_terminal_if(&self, accounting_terminal: bool) {
+        if accounting_terminal {
+            self.mark_accounting_terminal();
+        }
+    }
+}
+
+fn managed_dispatch_cancelled_error() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ApiError {
+            error: "The delegated request was cancelled before provider dispatch.".into(),
+            reason: Some("integration_cancelled".into()),
+            ..Default::default()
+        }),
+    )
+}
+
 #[allow(clippy::result_large_err)]
 async fn complete_stream_inner(
     state: AppState,
     account: Account,
     req: CompleteRequest,
     trace_id: String,
-) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
+    system_authority: ManagedSystemAuthority,
+    stream_policy: ManagedStreamPolicy,
+) -> Result<RouterSseStream, (StatusCode, Json<ApiError>)> {
     let request_started = Instant::now();
-    reconcile_expired_llm_usage(&state.pool, &account.id).map_err(|error| *error)?;
+    if let Err(error) = reconcile_expired_llm_usage(&state.pool, &account.id) {
+        stream_policy.mark_accounting_terminal();
+        return Err(*error);
+    }
     if let Some(err) = billing_restricted_error(&account) {
+        stream_policy.mark_accounting_terminal();
         return Err(err);
     }
     if req.request_id.trim().is_empty() {
+        stream_policy.mark_accounting_terminal();
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError {
@@ -86,11 +181,14 @@ async fn complete_stream_inner(
             }),
         ));
     }
-    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(
-        &req,
-        ManagedSystemAuthority::ExternalClientContract,
-    )
-    .map_err(InternalDisclosureBlocked::into_api_error)?;
+    let trusted_envelope =
+        match TrustedInternalEnvelope::validate_direct_request(&req, system_authority) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                stream_policy.mark_accounting_terminal();
+                return Err(error.into_api_error());
+            }
+        };
 
     validate_complete_images(&req.image_data_urls)
         .map_err(|error| image_validation_error(error.error, error.reason.unwrap_or_default()))?;
@@ -105,6 +203,7 @@ async fn complete_stream_inner(
         "vision".to_string()
     };
     if requested_effective_lane == "local" {
+        stream_policy.mark_accounting_terminal();
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError {
@@ -170,9 +269,8 @@ async fn complete_stream_inner(
                 "managed chat idempotency replayed completed response"
             );
             let events = response_to_sse_events(cached);
-            return Ok(router_sse(Box::pin(stream::iter(
-                events.into_iter().map(Ok),
-            ))));
+            stream_policy.mark_accounting_terminal();
+            return Ok(Box::pin(stream::iter(events.into_iter().map(Ok))));
         }
         idempotency::ReserveOutcome::InProgress => {
             tracing::warn!(
@@ -219,6 +317,7 @@ async fn complete_stream_inner(
 
     if let Some(err) = account_not_active_error(&state.pool, &account.id) {
         let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+        stream_policy.mark_accounting_terminal();
         tracing::warn!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
@@ -243,15 +342,25 @@ async fn complete_stream_inner(
             "behavioral story stopped before provider dispatch because verified facts were incomplete"
         );
         let events = response_to_sse_events(response);
-        return Ok(router_sse(Box::pin(stream::iter(
-            events.into_iter().map(Ok),
-        ))));
+        stream_policy.mark_accounting_terminal();
+        return Ok(Box::pin(stream::iter(events.into_iter().map(Ok))));
     }
     let story_provider_user =
         behavioral_provider_user(&req, &preliminary_answer_plan, &story_grounding);
-    check_account_llm_or_short_wait(&state, &account.id, &req.request_id, &session_ref_log, true)
-        .await?;
+    if let Err(error) = check_account_llm_or_short_wait(
+        &state,
+        &account.id,
+        &req.request_id,
+        &session_ref_log,
+        true,
+    )
+    .await
+    {
+        stream_policy.mark_accounting_terminal();
+        return Err(error);
+    }
     let should_lookup_memory = story_provider_user.is_none()
+        && stream_policy.allow_memory
         && answer_plan_allows_memory_lookup(&preliminary_answer_plan)
         && should_lookup_completion_memory(&req, &requested_effective_lane);
     let memory_started = Instant::now();
@@ -310,9 +419,8 @@ async fn complete_stream_inner(
             "resolved behavioral story stopped before provider dispatch because user facts were incomplete"
         );
         let events = response_to_sse_events(response);
-        return Ok(router_sse(Box::pin(stream::iter(
-            events.into_iter().map(Ok),
-        ))));
+        stream_policy.mark_accounting_terminal();
+        return Ok(Box::pin(stream::iter(events.into_iter().map(Ok))));
     }
     let resolved_story_provider_user =
         behavioral_provider_user(&req, &answer_plan, &resolved_story_grounding)
@@ -354,15 +462,19 @@ async fn complete_stream_inner(
         "managed chat answer plan resolved"
     );
     let web_search_started = Instant::now();
-    let web_search = completion_web_search_budgeted(
-        &state.pool,
-        state.config.upstream_spend_guard,
-        &account,
-        &req.request_id,
-        &req.user,
-        &answer_plan,
-    )
-    .await;
+    let web_search = if stream_policy.allow_web_search {
+        completion_web_search_budgeted(
+            &state.pool,
+            state.config.upstream_spend_guard,
+            &account,
+            &req.request_id,
+            &req.user,
+            &answer_plan,
+        )
+        .await
+    } else {
+        WebSearchOutcome::default()
+    };
     if web_search.provider_accounting_pending {
         return Err(provider_accounting_pending_error(
             &state.pool,
@@ -495,6 +607,7 @@ async fn complete_stream_inner(
     );
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        stream_policy.mark_accounting_terminal();
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
@@ -534,6 +647,12 @@ async fn complete_stream_inner(
         &format!("router:{}:llm", req.request_id),
     ) {
         return Err(err);
+    }
+
+    if !stream_policy.dispatch_allowed() {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        stream_policy.mark_accounting_terminal();
+        return Err(managed_dispatch_cancelled_error());
     }
 
     let usage_reservation =
@@ -666,6 +785,17 @@ async fn complete_stream_inner(
             route_cursor += 1;
             let route = &active_routes[idx];
             let route_index = route_index_offset + idx;
+            if !stream_policy.dispatch_allowed() {
+                let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+                let released = release_llm_usage(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    "cancelled_before_dispatch",
+                );
+                stream_policy.mark_accounting_terminal_if(released);
+                return Err(managed_dispatch_cancelled_error());
+            }
             let key_candidates = state.config.upstream.key_candidates(
                 route.provider,
                 &format!(
@@ -744,12 +874,13 @@ async fn complete_stream_inner(
                         break;
                     }
                     Ok(provider_cost_guard::Admission::GlobalLimit) => {
-                        release_llm_usage(
+                        let released = release_llm_usage(
                             &state.pool,
                             &account.id,
                             &req.request_id,
                             "upstream_spend_guard",
                         );
+                        stream_policy.mark_accounting_terminal_if(released);
                         return Err(release_and_upstream_spend_guard_error(
                             &state.pool,
                             &account.id,
@@ -764,6 +895,29 @@ async fn complete_stream_inner(
                         break;
                     }
                 };
+                if !stream_policy.dispatch_allowed() {
+                    if let Err(error) = attempt_guard.settle_not_dispatched() {
+                        tracing::error!(
+                            request_id = %req.request_id,
+                            error = %error,
+                            "cancelled pre-dispatch provider hold settlement is pending"
+                        );
+                        return Err(provider_accounting_pending_error(
+                            &state.pool,
+                            &account.id,
+                            &req.request_id,
+                        ));
+                    }
+                    let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+                    let released = release_llm_usage(
+                        &state.pool,
+                        &account.id,
+                        &req.request_id,
+                        "cancelled_before_dispatch",
+                    );
+                    stream_policy.mark_accounting_terminal_if(released);
+                    return Err(managed_dispatch_cancelled_error());
+                }
                 let dispatch = routing::complete_stream_with_key(
                     &selected_key.secret,
                     route.provider,
@@ -1208,12 +1362,13 @@ async fn complete_stream_inner(
     let (selected_route, streaming) = match (selected_route, selected_stream) {
         (Some(route), Some(streaming)) => (route, streaming),
         _ => {
-            release_llm_usage(
+            let released = release_llm_usage(
                 &state.pool,
                 &account.id,
                 &req.request_id,
                 "provider_dispatch_failed",
             );
+            stream_policy.mark_accounting_terminal_if(released);
             if last_failure_was_capacity {
                 let denied = last_capacity.expect("capacity flag set with no capacity denial");
                 tracing::warn!(
@@ -1379,13 +1534,14 @@ async fn complete_stream_inner(
                             ));
                             return;
                         }
-                        fail_stream_llm_usage(
+                        let released = fail_stream_llm_usage(
                             &state.pool,
                             &account.id,
                             &req.request_id,
                             delivered_delta,
                             "stream_idle_timeout",
                         );
+                        stream_policy.mark_accounting_terminal_if(released);
                         tracing::warn!(
                             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                             request_id = %req.request_id,
@@ -1452,12 +1608,13 @@ async fn complete_stream_inner(
                     return;
                 }
                 let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-                release_llm_usage(
+                let released = release_llm_usage(
                     &state.pool,
                     &account.id,
                     &req.request_id,
                     "account_inactive",
                 );
+                stream_policy.mark_accounting_terminal_if(released);
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     request_id = %req.request_id,
@@ -1599,13 +1756,14 @@ async fn complete_stream_inner(
                         ));
                         return;
                     }
-                    fail_stream_llm_usage(
+                    let released = fail_stream_llm_usage(
                         &state.pool,
                         &account.id,
                         &req.request_id,
                         delivered_delta,
                         failure_reason,
                     );
+                    stream_policy.mark_accounting_terminal_if(released);
                     let retry_after_secs = routing::upstream_retry_after(&e);
                     let terminal_reason = routing::upstream_terminal_reason(&e);
                     tracing::warn!(
@@ -1716,13 +1874,14 @@ async fn complete_stream_inner(
                 ));
                 return;
             }
-            fail_stream_llm_usage(
+            let released = fail_stream_llm_usage(
                 &state.pool,
                 &account.id,
                 &req.request_id,
                 delivered_delta,
                 "upstream_stream_incomplete",
             );
+            stream_policy.mark_accounting_terminal_if(released);
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
@@ -1765,12 +1924,13 @@ async fn complete_stream_inner(
         };
         if let Some(payload) = live_account_error_payload(live_account_state(&state.pool, &account.id)) {
             let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-            release_llm_usage(
+            let released = release_llm_usage(
                 &state.pool,
                 &account.id,
                 &req.request_id,
                 "account_inactive",
             );
+            stream_policy.mark_accounting_terminal_if(released);
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
@@ -1824,13 +1984,14 @@ async fn complete_stream_inner(
                 || visible_final_delta
                     .as_deref()
                     .is_some_and(|value| !value.trim().is_empty());
-            fail_stream_llm_usage(
+            let released = fail_stream_llm_usage(
                 &state.pool,
                 &account.id,
                 &req.request_id,
                 delivered_delta,
                 reason,
             );
+            stream_policy.mark_accounting_terminal_if(released);
             tracing::warn!(
                 account_id_hash = %account_id_hash,
                 request_id = %req.request_id,
@@ -1988,6 +2149,7 @@ async fn complete_stream_inner(
             }
         };
         let charged_customer_cost = settled_usage.charged_customer_cents;
+        stream_policy.mark_accounting_terminal();
         let charged_llm_customer_cost = if on_trial {
             0
         } else {
@@ -2146,7 +2308,26 @@ async fn complete_stream_inner(
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Ok(router_sse(detach_router_stream(Box::pin(event_stream))))
+    Ok(detach_router_stream(Box::pin(event_stream)))
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn complete_stream_for_account(
+    state: AppState,
+    account: Account,
+    req: CompleteRequest,
+    trace_id: String,
+    policy: ManagedStreamPolicy,
+) -> Result<RouterSseStream, (StatusCode, Json<ApiError>)> {
+    complete_stream_inner(
+        state,
+        account,
+        req,
+        trace_id,
+        ManagedSystemAuthority::TrustedServerSystem,
+        policy,
+    )
+    .await
 }
 
 #[allow(clippy::result_large_err)]

@@ -36,7 +36,8 @@ use cue_core::short_observability_ref;
 mod interview_contracts;
 mod sse;
 mod visible_output;
-use sse::{response_to_sse_events, router_sse, RouterSseStream};
+use sse::response_to_sse_events;
+pub(crate) use sse::{router_sse, RouterSseStream};
 use visible_output::{explicitly_requests_reasoning_section, BufferedDisclosureOutput};
 
 fn log_session_id(session_id: Option<&str>) -> &str {
@@ -884,26 +885,32 @@ fn release_llm_usage(
     account_id: &str,
     request_id: &str,
     reason: &'static str,
-) {
+) -> bool {
     match usage_reservations::release(pool, account_id, request_id, reason, managed_usage_now_ms())
     {
-        Ok(released) => tracing::info!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            request_id,
-            refunded_cents = released.refunded_cents,
-            refunded_trial_seconds = released.refunded_trial_seconds,
-            reason,
-            "managed usage reservation released"
-        ),
+        Ok(released) => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                request_id,
+                refunded_cents = released.refunded_cents,
+                refunded_trial_seconds = released.refunded_trial_seconds,
+                reason,
+                "managed usage reservation released"
+            );
+            true
+        }
         Err(usage_reservations::UsageReservationError::AlreadyReleased)
-        | Err(usage_reservations::UsageReservationError::NotFound) => {}
-        Err(error) => tracing::error!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
-            request_id,
-            reason,
-            error = %error,
-            "failed to release managed usage reservation"
-        ),
+        | Err(usage_reservations::UsageReservationError::NotFound) => true,
+        Err(error) => {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                request_id,
+                reason,
+                error = %error,
+                "failed to release managed usage reservation"
+            );
+            false
+        }
     }
 }
 
@@ -913,11 +920,11 @@ fn fail_stream_llm_usage(
     request_id: &str,
     delivered_delta: bool,
     reason: &'static str,
-) {
+) -> bool {
     if delivered_delta {
         let _ = idempotency::mark_failed(pool, account_id, request_id);
     }
-    release_llm_usage(pool, account_id, request_id, reason);
+    release_llm_usage(pool, account_id, request_id, reason)
 }
 
 async fn settle_llm_usage_with_retry(

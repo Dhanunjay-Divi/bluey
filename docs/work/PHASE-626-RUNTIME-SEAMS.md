@@ -2,9 +2,11 @@
 
 Date: 2026-10-09. Preflight: `$bluey-ops`, `$pinky-ops`,
 `$pinky-bluey-integration-ops`. Evidence source is Bluey `c4f12c5c`;
-this document is a map, not an implementation or acceptance receipt.
+the audit sections below describe the pre-implementation checkpoint, not the
+current runtime. See Current continuation and the runtime implementation/review
+records for subsequent code and validation. This map is not live acceptance.
 
-## Reuse the owned managed stream, not a service wallet
+## Historical audit: reuse the owned managed stream, not a service wallet
 
 `server/src/auth/middleware.rs:20` resolves a Bluey JWT to `AuthedAccount`.
 `server/src/api/router/streaming_completion.rs:43` consumes that typed account;
@@ -19,7 +21,7 @@ system/route/token/context policy server-side and preserve external-field
 disclosure checks. Do not accept raw `system`, internal lane, provider keys or
 arbitrary Bluey history identifiers from the browser.
 
-## Accounting already exists; cancellation does not
+## Historical audit: existing accounting and missing cancellation
 
 - Durable request identity: `server/src/db/idempotency.rs:33` and account-scoped
   reservation/replay paths; do not replace them with in-memory frontend retries.
@@ -43,7 +45,7 @@ Stop must invalidate visible output immediately; provider cancellation may be
 best-effort, but durable accounting must classify completion/cancellation/unknown
 outcome. Never abandon provider holds to make a button appear instant.
 
-## Remaining authorization contract
+## Historical audit: remaining authorization contract
 
 Add a separately scoped, default-off exact delegated ask path only after its
 bounded DTO and durable lifecycle are reviewed. Current `ai:session` tokens
@@ -61,7 +63,30 @@ retention/export/deletion and source policy.
 
 ## Coordination and completion
 
-Pinky's 2026-10-09 response retains runtime hold: current hardening base is
+### Current continuation (supersedes the historical blanket hold below)
+
+The owner instructed independent runtime integration to continue on clean
+feature branches, not to wait for unrelated Pinky hardening. Pinky now uses
+`codex/bluey-integration-runtime-20261009`, based on clean production-source
+`4e0e4e793dbf021cc0cec6ed16aea13f338379b2`; the nine additive preparation commits
+were cherry-picked without copying the dirty R1014 tree. Only actual shared-file
+or contract conflicts need coordination. Existing product environments and Jobs
+are excluded. This is source selection, not signed-release acceptance.
+
+The dedicated integration VM has isolated OS users/data roots and independently
+generated signing secrets. Three new Cloudflare records point exclusively to
+that VM. TLS checks return HTTP 503 from a deliberate preparation-only Caddy
+configuration. No application binary or customer data is deployed yet.
+
+Runtime implementation is underway: delegated owned ask/status/cancel routes,
+managed-core accounting fences, Pinky authenticated UI/native bridge, compact
+Mac/Windows panels and Default/Short/STAR controls. Independent review found
+real concurrency/cancellation and frontend-contract defects; repairs/regressions
+are in progress. Do not label source readiness as completed live integration.
+Provider-key input, final runtime tests, native physical QA and exact-artifact
+deployment remain open. The parent owns the next validation/deploy steps.
+
+Historical earlier Pinky response retained runtime hold: its hardening base was
 `c75808f3113c1cfb54cab31dc6e7c67d13cb5a4d` plus uncommitted changes and failed/
 unobserved physical gates. New isolated modules/preview work may continue;
 existing native/media/auth/API/billing/template/workflow seams may not be wired

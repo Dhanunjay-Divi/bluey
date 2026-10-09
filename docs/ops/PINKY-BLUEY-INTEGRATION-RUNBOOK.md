@@ -31,17 +31,29 @@ work; its source pointer and overlap agreement must be recorded before porting.
 | Gate | Observed state | Remaining work |
 | --- | --- | --- |
 | I0 offline profile | 16 tests and independent review passed | connect to a reviewed deploy controller later |
-| Dedicated host | Active; strict SSH identity check passed | bootstrap isolated users/services/resources |
-| Runtime base | stable default is preparation-only | get accepted Pinky commit and modern guard closure |
-| DNS/TLS/application | not configured or deployed | exact origins, TLS, dedicated resources and config |
-| Identity/AI/billing | default-off foundation passed focused tests/strict Clippy; 909-test broad regression passed before lint-only fixes | remaining I2–I5 PostgreSQL, entitlement, dispatch, consent and accounting gates |
-| Native/UI | no current live integration acceptance | Mac + Windows evidence; I6 |
+| Dedicated host | approved $7 host, strict SSH, isolated users/roots and independent secrets ready | exact local-build application activation |
+| Runtime base | Pinky clean production-source `4e0e4e79` plus additive preparation; new runtime branch | runtime commit and native gates; no dirty hardening import |
+| DNS/TLS/application | three isolated hostnames, TLS verified; deliberate HTTP503 only | deploy reviewed artifacts, authenticated E2E |
+| Identity/AI/billing | Bluey 922 tests, then 33 focused + strict all-target Clippy; targeted Pinky runtime passed before final native Stop fix | final Pinky Stop regressions; real provider and PostgreSQL execution |
+| Native/UI | Mac arm64/x86_64 compile; Node32/32; Windows repair under native test | physical/native/real-stream evidence; I6 |
 | Promotion | not approved | I7 exact-artifact handoff and owner approval |
 
 A VM being Active is not an application launch. A profile PASS is not proof
 of secret independence, SSO, billing, health, signing or deployment authority.
 
-Current source/validation detail:
+Current runtime source/validation detail:
+[`IMPL-PHASE-626-ASSIST-RUNTIME.md`](../work/IMPL-PHASE-626-ASSIST-RUNTIME.md) and
+[`REVIEW-PHASE-626-ASSIST-RUNTIME.md`](../work/REVIEW-PHASE-626-ASSIST-RUNTIME.md).
+Pinky's branch is `codex/bluey-integration-runtime-20261009`, based on clean
+`4e0e4e793dbf021cc0cec6ed16aea13f338379b2` plus additive preparation commits.
+Pinky owns the visible compact panel and authenticated same-origin API; Bluey
+reuses its managed stream/accounting core with exact external-account authority.
+Synthetic credit is confined to two generated, non-admin test identities.
+No real billing, remote relay/media, customer data or Jobs activation is included
+in the first text slice. A dedicated provider credential/input remains needed
+for real model tests; no production environment file is copied.
+
+Historical foundation source/validation detail follows (not current runtime):
 [`IMPL-PHASE-626-DELEGATION.md`](../work/IMPL-PHASE-626-DELEGATION.md) and
 [`REVIEW-PHASE-626-DELEGATION.md`](../work/REVIEW-PHASE-626-DELEGATION.md).
 The lifecycle foundation cannot dispatch models or charge users. Its context

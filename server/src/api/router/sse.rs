@@ -2,12 +2,12 @@
 
 use super::*;
 
-pub(super) type RouterSseStream =
+pub(crate) type RouterSseStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
 
 const ROUTER_SSE_KEEP_ALIVE_SECS: u64 = 15;
 
-pub(super) fn router_sse(stream: RouterSseStream) -> Sse<RouterSseStream> {
+pub(crate) fn router_sse(stream: RouterSseStream) -> Sse<RouterSseStream> {
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(std::time::Duration::from_secs(ROUTER_SSE_KEEP_ALIVE_SECS))

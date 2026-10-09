@@ -7,6 +7,11 @@ under `docs/release/`.
 
 ### Added
 
+- Added default-off Pinky-owned managed Assist streaming, durable exact-owner
+  admission/cancellation/status and allowlisted synthetic preprod credit;
+  trusted response styles reuse Bluey's model/accounting core. Production
+  promotion remains gated on live/native verification.
+
 - Documented the remaining Pinky/Bluey streaming, cancellation, accounting and
   consent seams, plus the active runtime-base hold; isolated preview and
   lifecycle-client preparation are not a completed or deployed integration.

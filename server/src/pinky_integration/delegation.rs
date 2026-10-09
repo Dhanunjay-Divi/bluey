@@ -136,7 +136,7 @@ fn validate_claims(
     if claims.iss != config.issuer
         || claims.aud != config.audience
         || claims.env != config.environment
-        || claims.scope != "ai:session"
+        || request_scope(&claims.method, &claims.path) != Some(claims.scope.as_str())
         || !is_safe_subject(&claims.sub)
         || !is_canonical_uuid(&claims.jti)
         || claims.method != method
@@ -209,11 +209,20 @@ fn is_lower_hex_digest(value: &str) -> bool {
 }
 
 fn is_allowed_request(method: &str, path: &str) -> bool {
-    method == "POST"
-        && matches!(
-            path,
-            "/integrations/pinky/sessions" | "/integrations/pinky/sessions/close"
-        )
+    request_scope(method, path).is_some()
+}
+
+fn request_scope(method: &str, path: &str) -> Option<&'static str> {
+    if method != "POST" {
+        return None;
+    }
+    match path {
+        "/integrations/pinky/sessions" | "/integrations/pinky/sessions/close" => Some("ai:session"),
+        "/integrations/pinky/ask/stream" => Some("ai:ask"),
+        "/integrations/pinky/asks/cancel" => Some("ai:cancel"),
+        "/integrations/pinky/asks/status" => Some("ai:status"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +463,23 @@ mod tests {
             NOW
         )
         .is_err());
+    }
+
+    #[test]
+    fn integration_operations_require_distinct_scopes() {
+        let body = b"{}";
+        for (path, scope) in [
+            ("/integrations/pinky/ask/stream", "ai:ask"),
+            ("/integrations/pinky/asks/cancel", "ai:cancel"),
+            ("/integrations/pinky/asks/status", "ai:status"),
+        ] {
+            let mut delegated = claims(body);
+            delegated.path = path.into();
+            delegated.scope = scope.into();
+            assert!(verify(&token(&delegated), &config(), "POST", path, body, NOW).is_ok());
+            delegated.scope = "ai:session".into();
+            assert!(verify(&token(&delegated), &config(), "POST", path, body, NOW).is_err());
+        }
     }
 
     #[test]

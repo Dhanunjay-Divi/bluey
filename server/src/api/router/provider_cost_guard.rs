@@ -222,6 +222,18 @@ impl ProviderCostGuard {
         self.armed = false;
         Ok(())
     }
+
+    /// Release a durable provider hold only when the caller still owns the
+    /// pre-dispatch boundary and can prove no provider request was started.
+    pub(crate) fn settle_not_dispatched(&mut self) -> Result<()> {
+        let mut event = self.fallback_event.clone();
+        event.input_tokens = 0;
+        event.output_tokens = 0;
+        event.latency_ms = 0;
+        event.cost_cents_to_bluey = 0;
+        event.cost_cents_to_customer = 0;
+        self.settle(event, 0, UsageProvenance::Exact)
+    }
 }
 
 impl Drop for ProviderCostGuard {
