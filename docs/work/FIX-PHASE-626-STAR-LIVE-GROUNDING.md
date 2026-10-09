@@ -29,3 +29,11 @@ all-target server 932/932 and strict all-target Clippy with `-D warnings`.
 The owned `/tmp/bluey-pinky-postgres-tests.KuTzVN` DB/build root was removed
 and no owned PostgreSQL/compiler process remained. Independent source review
 found no P0/P1 defect; arbitrary semantic truth remains a live quality gate.
+
+The exact repair `556525a5` was locally built and cut over only on isolated
+preprod. Fresh automated STAR labels/transport/settlement passed, but manual
+strict factual review **failed**: output added an improved-plan/access-pattern
+claim not supplied. A separate visible answer also claimed timeouts resolved
+beyond the verified one-time result. Do not mark this grounding bug closed or
+promote the product on those results. See the exact-artifact receipt for source,
+hashes, individual timings, cleanup, retained rollback and remaining gates.

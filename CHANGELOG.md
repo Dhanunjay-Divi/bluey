@@ -8,8 +8,9 @@ under `docs/release/`.
 ### Added
 
 - Made delegated STAR's four explicit labels override the shared natural-story
-  presentation, with no inferred dates, diagnostics or ongoing outcomes after
+  presentation, with guidance against inferred dates, diagnostics or outcomes after
   a real synthetic interview trial exposed unsupported details.
+  Live labels passed; strict factual quality remains unaccepted.
 - Tightened delegated Short mode to a 60–90 word target, one paragraph and
   a 256-token ceiling after a real 140-word preprod answer failed its limit.
   Prompt guidance remains probabilistic; live acceptance is required.

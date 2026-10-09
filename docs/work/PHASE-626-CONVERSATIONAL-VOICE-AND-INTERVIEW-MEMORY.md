@@ -13,6 +13,9 @@ Source tests assert that every style retains the managed contract, truthful
 personal-experience boundary and unavailable-source boundary. Real answer
 quality and first-visible-token latency still require the live preprod test.
 No detector-evasion or "indistinguishable from a human" guarantee is made.
+Latest exact source/artifact and real trial results are in the
+[text-preprod receipt](PHASE-626-TEXT-PREPROD-ACCEPTANCE.md): natural voice and
+Short presentation observed, but strict STAR grounding is not accepted.
 
 ## Actual baseline finding and bounded repair
 
@@ -32,7 +35,8 @@ question; HTTP tests retain pre-dispatch cancellation. Final local validation
 passed 932 all-target tests, 35 focused tests, the real PostgreSQL transaction
 test and strict all-target Clippy. These are prompt invariants, not deterministic
 word-count enforcement. A fresh visible completion after exact-artifact cutover
-is still required; see the [review](REVIEW-PHASE-626-VOICE-MODELS-PG.md).
+was subsequently run; see the [review](REVIEW-PHASE-626-VOICE-MODELS-PG.md)
+and latest receipt. Word limits remain probabilistic.
 
 ## Owner's Otter transcript idea — next scoped knowledge-base slice
 

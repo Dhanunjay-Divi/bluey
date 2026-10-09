@@ -79,12 +79,16 @@ Git copy; install using a normal file copy, not a symlink to a disposable worktr
 
 ## Evidence and handoff
 
-The Phase 626 delegation/lifecycle foundation is described in
-`docs/work/IMPL-PHASE-626-DELEGATION.md` and its matching review. It is default-off,
-cannot dispatch or charge, and does not complete I2. Context `active` is not
-billable time or AI entitlement. Pinky's signer is source-only until accepted
-runtime wiring. Reconcile exact test receipts and remaining PostgreSQL,
-admission-fairness, consent, cancellation and physical-device gates before use.
+The historical Phase 626 delegation/lifecycle foundation is described in
+`docs/work/IMPL-PHASE-626-DELEGATION.md` and its matching review; it alone could
+not dispatch or charge. The isolated authenticated text path now has live
+artifact, PostgreSQL, lifecycle and synthetic accounting evidence. Read
+`docs/work/PHASE-626-TEXT-PREPROD-ACCEPTANCE.md` for current pins and individual
+gates, not branch HEAD or a historical skill snapshot. Context `active` is
+still not billable time or AI entitlement. Strict STAR factual quality failed
+despite label/transport success; private Otter memory is planned, not built.
+Physical Mac/Windows, media consent, real billing and latency percentiles remain
+separate open gates. No whole-product or production acceptance is implied.
 
 Report each gate separately: offline tests, VM/resources, accepted source,
 live API/auth, billing/consent, physical Mac/Windows and promotion. No mock-only

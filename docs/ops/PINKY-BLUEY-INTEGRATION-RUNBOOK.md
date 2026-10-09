@@ -31,11 +31,11 @@ work; its source pointer and overlap agreement must be recorded before porting.
 | Gate | Observed state | Remaining work |
 | --- | --- | --- |
 | I0 offline profile | 16 tests and independent review passed | connect to a reviewed deploy controller later |
-| Dedicated host | approved $7 host; exact locally built baseline now active, independent users/roots/signing secrets | latest source gate and limited artifact cutover |
-| Runtime base | Pinky `22ff76d6` on clean production base; Bluey `65ec499c` | physical/native acceptance; no dirty hardening import |
-| DNS/TLS/application | public TLS active; real synthetic auth/lifecycle/isolation tests passed | provider latency/quality/recovery and UI gates |
-| Identity/AI/billing | Bluey 922 tests, then 33 focused + strict all-target Clippy; final Pinky targeted Go race, Node32/Python26 passed | real PostgreSQL and latest model changes; synthetic billing only |
-| Native/UI | Mac arm64/x86_64 compile; Node32/32; Windows repair under native test | physical/native/real-stream evidence; I6 |
+| Dedicated host | approved $7 host; exact locally built text artifacts active, independent users/roots/signing secrets | resource/load qualification, no production sizing claim |
+| Runtime base | Pinky `76482a17` on clean accepted base; Bluey `556525a5` | reconcile additive changes with active Pinky team before promotion |
+| DNS/TLS/application | public TLS and fresh synthetic auth/lifecycle/isolation passed | broader recovery/quality/physical gates |
+| Identity/AI/billing | Bluey PG1/1, focused35/35, all-target932/932 + strict Clippy; Pinky targeted race + Node35/Python26 | synthetic accounting only; real billing policy/acceptance open |
+| Native/UI | Mac arm64/x86_64 and Windows compile evidence; real web streaming visible | physical Mac/Windows acceptance; strict STAR factual quality failed |
 | Promotion | not approved | I7 exact-artifact handoff and owner approval |
 
 A VM being Active alone is not an application launch. A profile PASS is not proof
@@ -56,7 +56,29 @@ strict pinned SSH pipes into the dedicated root-0600 provider file, without
 copying production envs/customer data/signing/payment/storage keys. Only the
 dedicated Bluey unit was restarted; NRestarts remained zero and health passed.
 
-### Actual activation and public checks — 2026-10-09
+### Latest text-preprod receipt — 2026-10-09
+
+Read the [exact-artifact acceptance/handoff](../work/PHASE-626-TEXT-PREPROD-ACCEPTANCE.md).
+Pinky live source is `76482a171693f67d833a839a10504895be25a449`;
+Bluey live source is `556525a5be58f4c68ece5a994fc3c44822a31645`.
+Both reviewed single-role cutovers verified process binary hashes and health;
+NRestarts=0. No bootstrap, seed, DB, key, credit or configuration replacement.
+The selected provider credentials are the explicit owner-approved exception;
+no full production environment or customer data was copied.
+
+Fresh public negative/lifecycle tests passed with zero provider dispatch.
+Real synthetic Short delivered 88 words at 913ms first text /1548ms total;
+Default 257 words at 784ms/3318ms; STAR 108 words at1433ms/1901ms.
+Transport, settlement, Short length and STAR labels passed. **Manual strict
+STAR factual quality failed**: inferred query-plan/access-pattern details;
+a second visible answer inflated a one-time verified result. Prompt assertions
+and delivery success are not semantic correctness. Keep production promotion
+held, retain the failed evidence, and implement source-grounded story authority
+before claiming dependable personal interview answers. Timings are individual
+observations, not percentiles or proof that these models are always fastest.
+Otter memory, audio consent, physical devices and real billing remain open.
+
+### Initial activation and historical public checks — 2026-10-09
 
 - Pinky deployed source: `22ff76d6d1bdca1006673908f13df5f7682f9877`;
   build `hashes.txt` SHA256 `91f4b1c1213384172191ed17895ba0c8aeaa081be12e5aa0d4a7216b919635b2`.
@@ -79,7 +101,7 @@ dedicated Bluey unit was restarted; NRestarts remained zero and health passed.
   This baseline **failed Short UX expectations**: excessive length and literal
   Markdown emphasis. It is not a latest-model, conversational-voice, first-token
   percentile or overall quality PASS. Root cause and repairs remain under test.
-- Latest Haiku5.5/GPT6/voice/PG source is not deployed. Review found and repaired
+- At that checkpoint, Haiku5.5/GPT6/voice/PG source was not deployed. Review found and repaired
   default fallback gating and tier-aware final pricing defects. Final local gate
   passed 932 all-target tests, PostgreSQL1/1, focused35/35 and strict Clippy;
   owned DB/build roots were removed. Build and live acceptance remain separate.
@@ -95,8 +117,9 @@ Historical foundation source/validation detail follows (not current runtime):
 [`REVIEW-PHASE-626-DELEGATION.md`](../work/REVIEW-PHASE-626-DELEGATION.md).
 The lifecycle foundation cannot dispatch models or charge users. Its context
 state `active` is ownership/lifetime only, not AI entitlement or billable time.
-Pinky's matching signer is not wired into runtime yet. All implementation stays
-on the two feature branches; the accepted Pinky runtime base remains open.
+At that foundation checkpoint Pinky's signer was not wired into runtime and
+the accepted runtime base remained open. The latest receipt above supersedes
+these historical limitations; all work remains on feature branches.
 
 Continuation on 2026-10-09: Pinky adds an isolated simulated Assist UI and
 bounded lifecycle client in new files only. These are preparation, not a native
@@ -133,12 +156,13 @@ feature checkpoints, not merged/deployed release artifacts. Pinky draft PR
 125 remains preparation-only; Bluey PR creation is deferred because its PR
 event would automatically trigger hosted CI, prohibited for this preprod work.
 
-Next agent: obtain the accepted current Pinky runtime commit/overlap agreement,
+Historical next-agent instruction at this foundation checkpoint: obtain the accepted current Pinky runtime commit/overlap agreement,
 then wire the signer only behind isolated configuration and server-owned user
 authority. Close live PostgreSQL/identity/entitlement/consent/cancellation gates
 before model dispatch; implement I3–I6 UI, billing, streaming and physical tests
 without touching existing Pinky environments or Jobs. Do not infer deployment
-approval from this checkpoint. No qualified release artifact exists yet.
+approval from this checkpoint. No qualified artifact existed at that time.
+Use the latest receipt and exact-artifact handoff for current continuation.
 
 ## Approved infrastructure inventory
 
