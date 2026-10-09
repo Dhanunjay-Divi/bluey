@@ -268,7 +268,7 @@ impl ResponseMode {
                 "Short mode: answer in exactly one compact paragraph of three or four short sentences. Aim for 60 to 90 words; the absolute ceiling is 120 words. Cover the core answer and its essential caveat, then stop. Omit optional examples, follow-up questions, headings, lists and extra detail. This length and format replace any longer planner presentation. Use plain text without Markdown emphasis or backticks. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
             }
             Self::Star => {
-                "When the question is behavioral, organize the answer as Situation, Task, Action, Result. Never invent the user's experience or missing facts; ask for the minimum missing detail when necessary. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
+                "STAR mode: output exactly four plain-text labeled paragraphs, beginning Situation:, Task:, Action:, and Result:. This explicitly replaces any earlier presentation instruction to shape STAR internally, hide labels, or tell one unlabeled natural story. Use conversational first-person wording only for facts the user actually supplied. Never embellish or fill gaps with plausible dates, elapsed time, employers, tools, diagnoses, technical details, actions, metrics or results. A verified one-time outcome must not become an ongoing guarantee. If a section lacks evidence, say that detail was not provided and ask only for the missing fact; do not supply it yourself. Start with Situation:, not a preface. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
             }
         }
     }

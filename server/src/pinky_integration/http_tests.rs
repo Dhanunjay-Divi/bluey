@@ -28,7 +28,9 @@ fn conversational_styles_preserve_truth_and_source_boundaries() {
     assert!(answer_system(ResponseMode::Short).contains("60 to 90 words"));
     assert!(answer_system(ResponseMode::Short).contains("exactly one compact paragraph"));
     assert_eq!(ResponseMode::Short.max_tokens(), 256);
-    assert!(answer_system(ResponseMode::Star).contains("Situation, Task, Action, Result"));
+    assert!(answer_system(ResponseMode::Star).contains("Situation:, Task:, Action:, and Result:"));
+    assert!(final_presentation_rules(ResponseMode::Star).contains("hide labels"));
+    assert!(final_presentation_rules(ResponseMode::Star).contains("Never embellish"));
 }
 
 struct ProviderTestEnv;
