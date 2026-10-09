@@ -22,6 +22,22 @@ review. The active Pinky task was notified of the isolated scope and asked for
 an accepted base; receipt of that message does not prove agreement or a response.
 Final I0 test/review evidence is in the matching Phase 626 work review.
 
+Pinky preparation review: [draft PR #125](https://github.com/Dhanunjay-Divi/pinky/pull/125).
+Both feature branches are pushed; this is not a mainline merge or deployment.
+Bluey PR creation is deferred because its PR event automatically starts a
+hosted cross-platform matrix; no hosted build/signing/deploy was dispatched.
+
+## Project-scoped owner alerts — 2026-10-09
+
+Owner explicitly enabled actionable blocker/input/model-change iMessage
+alerts. Load `owner-alerts`; use its deduplicated sender with project
+`bluey-pinky-integration`. Private authorization/configuration lives outside
+Git. Do not place recipient details or message history in this repository.
+The existing user-local `imsg` binary was reused: no toolkit reinstall or
+global Homebrew change. The test-target capacity question was accepted by the
+sender; phone delivery/read status is unverified. Do not resend the unchanged
+condition or treat a successful send as hosting/deployment approval.
+
 Load `bluey-ops` and `pinky-ops` before continuing. Repository source and current
 release runbooks override historical skill snapshots. This document is the
 cross-repository handoff; it grants no production or signing authority.
