@@ -69,6 +69,9 @@ under `docs/release/`.
 
 ### Fixed
 
+- Matched the isolated Linux Assist cross-build to the pinned Ubuntu 24.04
+  OpenSSL/glibc 2.39 ABI and isolated Zig caches under automatic cleanup.
+
 - Kept shortcut help fully readable in macOS light mode at every overlay
   opacity, including live theme changes, while delayed onboarding now preserves
   active modals, history, and composer focus.

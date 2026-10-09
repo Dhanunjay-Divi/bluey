@@ -11,7 +11,10 @@ readonly known_hosts=/Users/uno/.config/bluey-pinky-integration/known_hosts
 readonly archive_host=162.243.248.189
 readonly archive_remote=/root/assist-linux-openssl-sysroot.tar.gz
 readonly archive_sha256=2d960d2b686783043678c6fa90f3669aa1dbf23c22c673b2e63545f93aa8505d
-readonly target=x86_64-unknown-linux-gnu
+readonly rust_target=x86_64-unknown-linux-gnu
+readonly glibc_version=2.39
+readonly zigbuild_target="$rust_target.$glibc_version"
+readonly zig_cc_target="x86_64-linux-gnu.$glibc_version"
 readonly private_build_root="$HOME/.local/state/bluey-pinky-integration/linux-builds"
 
 usage() {
@@ -211,10 +214,20 @@ ssh-keygen -F "$archive_host" -f "$known_hosts" >/dev/null || {
   exit 1
 }
 cargo zigbuild --help >/dev/null
-rustup target list --installed | grep -qx "$target" || {
-  printf 'Rust target is not installed: %s\n' "$target" >&2
+cargo zigbuild --target "$zigbuild_target" --help >/dev/null
+rustup target list --installed | grep -qx "$rust_target" || {
+  printf 'Rust target is not installed: %s\n' "$rust_target" >&2
   exit 1
 }
+zig_target=$(zig cc -target "$zig_cc_target" --version 2>&1)
+case "$zig_target" in
+  *"Target: x86_64-"*"linux"*"gnu2.39.0"*) ;;
+  *)
+    printf 'Installed Zig does not accept the required glibc %s target\n' \
+      "$glibc_version" >&2
+    exit 1
+    ;;
+esac
 
 readonly head_sha=$(git -C "$repo" rev-parse HEAD)
 if [[ -z "$source_sha" ]]; then
@@ -253,7 +266,8 @@ dirty=$(git -C "$repo" status --porcelain --untracked-files=all)
 if [[ "$mode" == "dry-run" ]]; then
   printf 'Dry run only; no SSH, build, queue acquisition, or file writes performed.\n'
   printf 'Source SHA: %s\n' "$source_sha"
-  printf 'Target: %s\n' "$target"
+  printf 'Rust target: %s\n' "$rust_target"
+  printf 'Zigbuild target: %s\n' "$zigbuild_target"
   printf 'Final output: %s\n' "$output_dir"
   printf 'Archive: root@%s:%s\n' "$archive_host" "$archive_remote"
   printf 'Archive SHA-256: %s\n' "$archive_sha256"
@@ -306,7 +320,7 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-mkdir -p "$root"/{cargo,tmp,data,config,runtime,logs,db,source,sysroot,stage}
+mkdir -p "$root"/{cargo,zig-global-cache,zig-local-cache,tmp,data,config,runtime,logs,db,source,sysroot,stage}
 chmod 700 "$root" "$root/runtime" "$root/stage"
 
 # Build an immutable archive of the exact commit rather than reading a shared
@@ -358,9 +372,12 @@ resolve_openssl_layout "$sysroot"
 openssl_cflags="-I$openssl_include_dir -I$openssl_multiarch_include_dir"
 
 readonly source_epoch=$(git -C "$repo" show -s --format=%ct "$source_sha")
-printf 'Building bluey-server for %s in an owned temporary root...\n' "$target"
+printf 'Building bluey-server for %s (glibc %s) in an owned temporary root...\n' \
+  "$rust_target" "$glibc_version"
 env -i PATH="$PATH" HOME="$HOME" \
   CARGO_TARGET_DIR="$root/cargo" TMPDIR="$root/tmp" \
+  ZIG_GLOBAL_CACHE_DIR="$root/zig-global-cache" \
+  ZIG_LOCAL_CACHE_DIR="$root/zig-local-cache" \
   XDG_DATA_HOME="$root/data" XDG_CONFIG_HOME="$root/config" \
   XDG_RUNTIME_DIR="$root/runtime" BLUEY_DATA_DIR="$root/data" \
   BLUEY_DB_PATH="$root/db/build.db" BLUEY_LOG_DIR="$root/logs" \
@@ -371,13 +388,13 @@ env -i PATH="$PATH" HOME="$HOME" \
   PKG_CONFIG_LIBDIR="$openssl_lib_dir/pkgconfig:$sysroot/share/pkgconfig" \
   SOURCE_DATE_EPOCH="$source_epoch" \
   cargo zigbuild --offline --locked --release \
-    --manifest-path "$root/source/server/Cargo.toml" --target "$target" \
+    --manifest-path "$root/source/server/Cargo.toml" --target "$zigbuild_target" \
     --bin bluey-server -j 2 &
 child=$!
 wait "$child"
 child=""
 
-built_binary="$root/cargo/$target/release/bluey-server"
+built_binary="$root/cargo/$rust_target/release/bluey-server"
 [[ -s "$built_binary" ]] || { printf 'Expected Linux binary is missing\n' >&2; exit 1; }
 binary_description=$(file -b "$built_binary")
 case "$binary_description" in
@@ -395,7 +412,8 @@ rust_version=$(rustc --version)
 cargo_zigbuild_path=$(command -v cargo-zigbuild)
 cargo_zigbuild_sha=$(shasum -a 256 "$cargo_zigbuild_path" | awk '{print $1}')
 python3 - "$root/stage/manifest.json" "$source_sha" "$source_epoch" \
-  "$target" "$binary_sha" "$binary_description" "$archive_sha256" \
+  "$rust_target" "$zigbuild_target" "$glibc_version" \
+  "$binary_sha" "$binary_description" "$archive_sha256" \
   "$lock_sha" "$zig_version" "$rust_version" "$cargo_zigbuild_sha" <<'PY'
 import json
 import pathlib
@@ -405,7 +423,9 @@ import sys
     output,
     source_sha,
     source_epoch,
-    target,
+    rust_target,
+    zigbuild_target,
+    glibc_version,
     binary_sha,
     binary_description,
     archive_sha,
@@ -418,7 +438,10 @@ manifest = {
     "schema_version": 1,
     "source_sha": source_sha,
     "source_date_epoch": int(source_epoch),
-    "target": target,
+    "target": rust_target,
+    "rust_target": rust_target,
+    "zigbuild_target": zigbuild_target,
+    "minimum_glibc_version": glibc_version,
     "artifact": "bluey-server",
     "artifact_sha256": binary_sha,
     "artifact_format": binary_description,
