@@ -49,6 +49,17 @@ state `active` is ownership/lifetime only, not AI entitlement or billable time.
 Pinky's matching signer is not wired into runtime yet. All implementation stays
 on the two feature branches; the accepted Pinky runtime base remains open.
 
+Continuation on 2026-10-09: Pinky adds an isolated simulated Assist UI and
+bounded lifecycle client in new files only. These are preparation, not a native
+pill, live AI, login, billing or release. Source review found/fixed credential-
+domain and cross-identity late-token defects before reuse. Consult Pinky's
+`BLUEY-INTEGRATION-TRANSPORT-20261009.md` and preview round for final checks.
+The [runtime seam map](../work/PHASE-626-RUNTIME-SEAMS.md) records the missing
+managed cancellation/entitlement/consent and accepted-base integration work.
+Pinky has replied that the runtime hold remains in force; its dirty hardening
+tree is not an accepted source to import. The owner requested its eventual
+accepted-base/seam response be sent back to this coordinator.
+
 ## Source checkpoint — foundation, not release
 
 | Repo | Code checkpoint | Branch |

@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Documented the remaining Pinky/Bluey streaming, cancellation, accounting and
+  consent seams, plus the active runtime-base hold; isolated preview and
+  lifecycle-client preparation are not a completed or deployed integration.
 - Added a default-off Pinky delegation and owned AI-context lifecycle foundation,
   with request-bound short-lived tokens, fresh-only account provisioning,
   durable preprod bounds and standalone-auth regression coverage; not deployed.
