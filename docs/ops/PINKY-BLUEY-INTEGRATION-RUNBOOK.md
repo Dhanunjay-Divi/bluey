@@ -49,6 +49,25 @@ state `active` is ownership/lifetime only, not AI entitlement or billable time.
 Pinky's matching signer is not wired into runtime yet. All implementation stays
 on the two feature branches; the accepted Pinky runtime base remains open.
 
+## Source checkpoint — foundation, not release
+
+| Repo | Code checkpoint | Branch |
+| --- | --- | --- |
+| Bluey | `764b0bce699d894b73e18db588208ebecdb91978` | `feat/phase-626-pinky-integration` |
+| Pinky | `d6f0fa9f8e69c2fdb44694c89959f761ca77fffe` | `codex/bluey-isolated-integration` |
+
+Later receipt-only commits do not change these tested source files. Both are
+feature checkpoints, not merged/deployed release artifacts. Pinky draft PR
+125 remains preparation-only; Bluey PR creation is deferred because its PR
+event would automatically trigger hosted CI, prohibited for this preprod work.
+
+Next agent: obtain the accepted current Pinky runtime commit/overlap agreement,
+then wire the signer only behind isolated configuration and server-owned user
+authority. Close live PostgreSQL/identity/entitlement/consent/cancellation gates
+before model dispatch; implement I3–I6 UI, billing, streaming and physical tests
+without touching existing Pinky environments or Jobs. Do not infer deployment
+approval from this checkpoint. No qualified release artifact exists yet.
+
 ## Approved infrastructure inventory
 
 DigitalOcean UI was used under the owner's explicit $7/month approval.
