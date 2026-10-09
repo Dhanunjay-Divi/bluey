@@ -56,9 +56,21 @@ domain and cross-identity late-token defects before reuse. Consult Pinky's
 `BLUEY-INTEGRATION-TRANSPORT-20261009.md` and preview round for final checks.
 The [runtime seam map](../work/PHASE-626-RUNTIME-SEAMS.md) records the missing
 managed cancellation/entitlement/consent and accepted-base integration work.
-Pinky has replied that the runtime hold remains in force; its dirty hardening
-tree is not an accepted source to import. The owner requested its eventual
-accepted-base/seam response be sent back to this coordinator.
+At that checkpoint, Pinky reserved overlapping runtime files; its dirty hardening
+tree was not an accepted source to import. The owner's clarification below
+narrows that hold to actual overlaps rather than all independent integration
+work. A clean-current-base and precise mounting-seam response has been requested.
+
+Owner clarification on 2026-10-09: this is a frontend-first integration of
+Pinky's overlay/web UI with Bluey's existing AI core, not a rewrite of either
+backend. Pinky's existing production availability is not a task blocker.
+Independent UI and adapter work continues; only actual shared-file mounting or
+auth/media/billing/native contract conflicts require a narrow overlap handoff.
+Do not make unrelated Pinky hardening completion a prerequisite for the whole
+integration. The public production version read returned source
+`4e0e4e793dbf021cc0cec6ed16aea13f338379b2` and
+`1.0.32-r803captionguard`; this is advertised metadata, not signed acceptance
+of a new integration build. Production and existing preprod remain untouched.
 
 ## Source checkpoint — foundation, not release
 
