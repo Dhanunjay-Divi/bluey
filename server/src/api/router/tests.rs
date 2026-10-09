@@ -6,6 +6,43 @@ mod story_grounding;
 
 static FIRST_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn delegated_presentation_is_last_without_changing_standalone_prompt() {
+    let req = complete_request(
+        "Explain why a database index speeds up reads but can slow down writes. Keep it conversational and accurate.",
+    );
+    let plan = answer_plan_for_request(&req, "instant", &[]);
+    let (composed, user) = prompt_with_answer_plan_context(
+        &req.system,
+        &req.user,
+        &[],
+        &plan,
+        &WebSearchOutcome::default(),
+        Some(384),
+    );
+    assert_eq!(
+        ManagedStreamPolicy::standalone().finalize_provider_system(composed.clone()),
+        composed
+    );
+    let rules = "Plain text; no more than 120 words; no invented experience.";
+    let policy = ManagedStreamPolicy::delegated_text(
+        std::sync::Arc::new(|| true),
+        ManagedSettlementSignal::default(),
+        rules.into(),
+    );
+    let final_system = policy.finalize_provider_system(composed.clone());
+    assert!(
+        final_system.starts_with(&composed),
+        "retain safety/planner context"
+    );
+    assert!(
+        final_system.ends_with(rules),
+        "selected format has final precedence"
+    );
+    assert!(final_system.contains("never override factual or security requirements"));
+    assert_eq!(user, req.user, "presentation does not replace user facts");
+}
+
 fn png_data_url(width: u32, height: u32) -> String {
     let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
     bytes.extend_from_slice(&13_u32.to_be_bytes());

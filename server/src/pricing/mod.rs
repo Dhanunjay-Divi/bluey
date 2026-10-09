@@ -2,7 +2,7 @@
 //!
 //! Source of truth lives here AND in `docs/PRICING-MODEL.md`. Any
 //! change to either must be reflected in both. Last reconciled
-//! 2026-07-10 against PRICING-MODEL.md and MODEL-ROUTING.md.
+//! 2026-10-09 against PRICING-MODEL.md and MODEL-ROUTING.md.
 //!
 //! ## Unit semantics
 //!
@@ -68,9 +68,11 @@ pub fn utf8_input_token_upper_bound<'a>(parts: impl IntoIterator<Item = &'a str>
 pub struct ModelPricing {
     pub provider: &'static str,
     pub model: &'static str,
-    /// Bluey upstream cost per 1M input tokens (microcents).
+    /// Conservative upstream cost per 1M input tokens (microcents).
+    /// Tiered models store their high-context admission rate here.
     pub upstream_in_microcents_per_1m: i64,
-    /// Bluey upstream cost per 1M output tokens (microcents).
+    /// Conservative upstream cost per 1M output tokens (microcents).
+    /// Tiered models store their high-context admission rate here.
     pub upstream_out_microcents_per_1m: i64,
     /// Markup applied. 200 = 200% markup → customer pays 3× upstream.
     pub markup_percent: i64,
@@ -96,6 +98,15 @@ pub const PRICING: &[ModelPricing] = &[
         markup_percent: 150,
     },
     ModelPricing {
+        // OpenAI gpt-6-sol: admission reserves the >272K-input tier
+        // ($4/1M in, $15/1M out); exact settlement selects the usage tier.
+        provider: "openai",
+        model: "gpt-6-sol",
+        upstream_in_microcents_per_1m: 4_000_000,
+        upstream_out_microcents_per_1m: 15_000_000,
+        markup_percent: 200,
+    },
+    ModelPricing {
         // Anthropic Claude Sonnet 4.6: $3/1M in, $15/1M out.
         provider: "anthropic",
         model: "claude-sonnet-4-6",
@@ -117,6 +128,15 @@ pub const PRICING: &[ModelPricing] = &[
         model: "claude-haiku-4-5-20251001",
         upstream_in_microcents_per_1m: 1_000_000,
         upstream_out_microcents_per_1m: 5_000_000,
+        markup_percent: 200,
+    },
+    ModelPricing {
+        // Anthropic Claude Haiku 5.5: admission reserves the >100K-input tier
+        // ($0.50/1M in, $2.50/1M out); exact settlement selects the usage tier.
+        provider: "anthropic",
+        model: "claude-haiku-5-5",
+        upstream_in_microcents_per_1m: 500_000,
+        upstream_out_microcents_per_1m: 2_500_000,
         markup_percent: 200,
     },
     ModelPricing {
@@ -235,15 +255,29 @@ pub fn lookup(provider: &str, model: &str) -> Option<&'static ModelPricing> {
         .find(|p| p.provider == provider && p.model == model)
 }
 
-/// Compute the cost in cents (rounded up to the nearest cent).
-/// Returns (bluey_cost_cents, customer_cost_cents).
-pub fn compute_cost(pricing: &ModelPricing, input_tokens: i64, output_tokens: i64) -> (i64, i64) {
-    let input_microcents = i128::from(pricing.upstream_in_microcents_per_1m.max(0))
-        .saturating_mul(i128::from(input_tokens.max(0)))
-        / 1_000_000;
-    let output_microcents = i128::from(pricing.upstream_out_microcents_per_1m.max(0))
-        .saturating_mul(i128::from(output_tokens.max(0)))
-        / 1_000_000;
+fn settlement_rates(pricing: &ModelPricing, input_tokens: i64) -> (i64, i64) {
+    let input_tokens = input_tokens.max(0);
+    match (pricing.provider, pricing.model) {
+        ("anthropic", "claude-haiku-5-5") if input_tokens <= 100_000 => (100_000, 500_000),
+        ("openai", "gpt-6-sol") if input_tokens <= 272_000 => (2_000_000, 10_000_000),
+        _ => (
+            pricing.upstream_in_microcents_per_1m,
+            pricing.upstream_out_microcents_per_1m,
+        ),
+    }
+}
+
+fn compute_cost_with_rates(
+    pricing: &ModelPricing,
+    input_tokens: i64,
+    output_tokens: i64,
+    input_rate: i64,
+    output_rate: i64,
+) -> (i64, i64) {
+    let input_microcents =
+        i128::from(input_rate.max(0)).saturating_mul(i128::from(input_tokens.max(0))) / 1_000_000;
+    let output_microcents =
+        i128::from(output_rate.max(0)).saturating_mul(i128::from(output_tokens.max(0))) / 1_000_000;
     let bluey_microcents = input_microcents.saturating_add(output_microcents);
     let markup_multiplier = 100_i128.saturating_add(i128::from(pricing.markup_percent.max(0)));
     let customer_microcents = bluey_microcents.saturating_mul(markup_multiplier) / 100;
@@ -259,6 +293,20 @@ pub fn compute_cost(pricing: &ModelPricing, input_tokens: i64, output_tokens: i6
     )
 }
 
+/// Compute exact settlement cost in cents (rounded up to the nearest cent).
+/// Tiered models select their rate from the provider-reported full input usage.
+/// Returns (bluey_cost_cents, customer_cost_cents).
+pub fn compute_cost(pricing: &ModelPricing, input_tokens: i64, output_tokens: i64) -> (i64, i64) {
+    let (input_rate, output_rate) = settlement_rates(pricing, input_tokens);
+    compute_cost_with_rates(
+        pricing,
+        input_tokens,
+        output_tokens,
+        input_rate,
+        output_rate,
+    )
+}
+
 /// Estimate cost upper bound for the entry check.
 /// `max_output_tokens` is the request's `max_tokens`. We add 10% safety
 /// margin so a slight overrun in actual completion length stays inside
@@ -268,7 +316,13 @@ pub fn estimate_cost_ceiling(
     input_tokens: i64,
     max_output_tokens: i64,
 ) -> i64 {
-    let (_, customer_cents) = compute_cost(pricing, input_tokens, max_output_tokens);
+    let (_, customer_cents) = compute_cost_with_rates(
+        pricing,
+        input_tokens,
+        max_output_tokens,
+        pricing.upstream_in_microcents_per_1m,
+        pricing.upstream_out_microcents_per_1m,
+    );
     customer_cents.saturating_add((customer_cents / 10).max(1))
 }
 
@@ -277,7 +331,13 @@ pub fn estimate_bluey_cost_ceiling(
     input_tokens: i64,
     max_output_tokens: i64,
 ) -> i64 {
-    let (bluey_cents, _) = compute_cost(pricing, input_tokens, max_output_tokens);
+    let (bluey_cents, _) = compute_cost_with_rates(
+        pricing,
+        input_tokens,
+        max_output_tokens,
+        pricing.upstream_in_microcents_per_1m,
+        pricing.upstream_out_microcents_per_1m,
+    );
     bluey_cents.saturating_add((bluey_cents / 10).max(1))
 }
 
@@ -292,6 +352,10 @@ mod tests {
             200
         );
         assert_eq!(lookup("openai", "gpt-5.5").unwrap().markup_percent, 150);
+        let sol = lookup("openai", "gpt-6-sol").unwrap();
+        assert_eq!(sol.upstream_in_microcents_per_1m, 4_000_000);
+        assert_eq!(sol.upstream_out_microcents_per_1m, 15_000_000);
+        assert_eq!(sol.markup_percent, 200);
         assert_eq!(
             lookup("anthropic", "claude-sonnet-4-6")
                 .unwrap()
@@ -310,6 +374,10 @@ mod tests {
                 .markup_percent,
             200
         );
+        let haiku = lookup("anthropic", "claude-haiku-5-5").unwrap();
+        assert_eq!(haiku.upstream_in_microcents_per_1m, 500_000);
+        assert_eq!(haiku.upstream_out_microcents_per_1m, 2_500_000);
+        assert_eq!(haiku.markup_percent, 200);
         assert_eq!(
             lookup("gemini", "gemini-3.1-pro-preview")
                 .unwrap()
@@ -345,6 +413,39 @@ mod tests {
     #[test]
     fn unknown_model_returns_none() {
         assert!(lookup("openai", "gpt-nonexistent").is_none());
+    }
+
+    #[test]
+    fn tiered_settlement_rates_switch_after_full_input_threshold() {
+        let haiku = lookup("anthropic", "claude-haiku-5-5").unwrap();
+        assert_eq!(settlement_rates(haiku, 100_000), (100_000, 500_000));
+        assert_eq!(settlement_rates(haiku, 100_001), (500_000, 2_500_000));
+
+        let sol = lookup("openai", "gpt-6-sol").unwrap();
+        assert_eq!(settlement_rates(sol, 272_000), (2_000_000, 10_000_000));
+        assert_eq!(settlement_rates(sol, 272_001), (4_000_000, 15_000_000));
+    }
+
+    #[test]
+    fn tiered_exact_cost_uses_provider_input_boundary() {
+        let haiku = lookup("anthropic", "claude-haiku-5-5").unwrap();
+        assert_eq!(compute_cost(haiku, 100_000, 1_000_000), (51, 153));
+        assert_eq!(compute_cost(haiku, 100_001, 1_000_000), (255, 765));
+
+        let sol = lookup("openai", "gpt-6-sol").unwrap();
+        assert_eq!(compute_cost(sol, 272_000, 1_000_000), (1_055, 3_164));
+        assert_eq!(compute_cost(sol, 272_001, 1_000_000), (1_609, 4_827));
+    }
+
+    #[test]
+    fn tiered_admission_ceiling_always_uses_high_context_rates() {
+        let haiku = lookup("anthropic", "claude-haiku-5-5").unwrap();
+        assert_eq!(estimate_cost_ceiling(haiku, 100_000, 1_000_000), 841);
+        assert_eq!(estimate_bluey_cost_ceiling(haiku, 100_000, 1_000_000), 280);
+
+        let sol = lookup("openai", "gpt-6-sol").unwrap();
+        assert_eq!(estimate_cost_ceiling(sol, 272_000, 1_000_000), 5_309);
+        assert_eq!(estimate_bluey_cost_ceiling(sol, 272_000, 1_000_000), 1_769);
     }
 
     #[test]

@@ -31,14 +31,14 @@ work; its source pointer and overlap agreement must be recorded before porting.
 | Gate | Observed state | Remaining work |
 | --- | --- | --- |
 | I0 offline profile | 16 tests and independent review passed | connect to a reviewed deploy controller later |
-| Dedicated host | approved $7 host, strict SSH, isolated users/roots and independent secrets ready | exact local-build application activation |
-| Runtime base | Pinky clean production-source `4e0e4e79` plus additive preparation; new runtime branch | runtime commit and native gates; no dirty hardening import |
-| DNS/TLS/application | three isolated hostnames, TLS verified; deliberate HTTP503 only | deploy reviewed artifacts, authenticated E2E |
-| Identity/AI/billing | Bluey 922 tests, then 33 focused + strict all-target Clippy; targeted Pinky runtime passed before final native Stop fix | final Pinky Stop regressions; real provider and PostgreSQL execution |
+| Dedicated host | approved $7 host; exact locally built baseline now active, independent users/roots/signing secrets | latest source gate and limited artifact cutover |
+| Runtime base | Pinky `22ff76d6` on clean production base; Bluey `65ec499c` | physical/native acceptance; no dirty hardening import |
+| DNS/TLS/application | public TLS active; real synthetic auth/lifecycle/isolation tests passed | provider latency/quality/recovery and UI gates |
+| Identity/AI/billing | Bluey 922 tests, then 33 focused + strict all-target Clippy; final Pinky targeted Go race, Node32/Python26 passed | real PostgreSQL and latest model changes; synthetic billing only |
 | Native/UI | Mac arm64/x86_64 compile; Node32/32; Windows repair under native test | physical/native/real-stream evidence; I6 |
 | Promotion | not approved | I7 exact-artifact handoff and owner approval |
 
-A VM being Active is not an application launch. A profile PASS is not proof
+A VM being Active alone is not an application launch. A profile PASS is not proof
 of secret independence, SSO, billing, health, signing or deployment authority.
 
 Current runtime source/validation detail:
@@ -50,8 +50,45 @@ Pinky owns the visible compact panel and authenticated same-origin API; Bluey
 reuses its managed stream/accounting core with exact external-account authority.
 Synthetic credit is confined to two generated, non-admin test identities.
 No real billing, remote relay/media, customer data or Jobs activation is included
-in the first text slice. A dedicated provider credential/input remains needed
-for real model tests; no production environment file is copied.
+in the first text slice. The owner approved reuse of selected existing Bluey
+provider keys. Exactly the first OpenAI and Anthropic keys were installed via
+strict pinned SSH pipes into the dedicated root-0600 provider file, without
+copying production envs/customer data/signing/payment/storage keys. Only the
+dedicated Bluey unit was restarted; NRestarts remained zero and health passed.
+
+### Actual activation and public checks — 2026-10-09
+
+- Pinky deployed source: `22ff76d6d1bdca1006673908f13df5f7682f9877`;
+  build `hashes.txt` SHA256 `91f4b1c1213384172191ed17895ba0c8aeaa081be12e5aa0d4a7216b919635b2`.
+- Bluey deployed source: `65ec499cf9b2460b4f609e33efd9a9b50dcbed0a`;
+  binary SHA256 `be7cb72e56e414b39293a789e0e51618da3a091b28d6192b65b7fb6c06e6ac91`.
+- `activate-assist-preprod.sh` passed artifact/config/systemd/Caddy validation
+  and seeded three generated non-admin, plan-none synthetic accounts. Only two
+  receive 50 cents test credit each; upstream cap is 100 cents per 24 hours.
+  Root-only seed credentials never belong in Git, logs or this document.
+- Public TLS test passed: health; anonymous denial; remote/standalone model
+  routes unexposed; unsigned delegation denied; three real logins and immutable
+  identities; CSRF/foreign Origin denial; available/available/not_added; all
+  media unavailable; independent AI sessions; reordered Stop-before-Ask with
+  zero dispatch; exact late Ask409; foreign Stop404; durable own-state recovery.
+  Test client identifies itself honestly. Cloudflare rejected Python's default
+  UA; no browser impersonation or protection weakening was used.
+- A visible real text answer was delivered through the authenticated Pinky
+  page without a remote subscription. Metadata: Haiku4.5, 706 input/283 output
+  tokens, 4101ms recorded server latency, 1 cent synthetic customer debit.
+  This baseline **failed Short UX expectations**: excessive length and literal
+  Markdown emphasis. It is not a latest-model, conversational-voice, first-token
+  percentile or overall quality PASS. Root cause and repairs remain under test.
+- Latest Haiku5.5/GPT6/voice/PG source is not deployed. Review found and repaired
+  default fallback gating and tier-aware final pricing defects. Final local gate
+  passed 932 all-target tests, PostgreSQL1/1, focused35/35 and strict Clippy;
+  owned DB/build roots were removed. Build and live acceptance remain separate.
+  Metadata GET200 only proves model access, not inference quality or latency.
+- Existing Pinky environments, Bluey production and Jobs were not deployed or
+  restarted. Relay remains503; no payment or media capability is active.
+
+Activation is one-shot: do not rerun bootstrap/seed on this active environment.
+Future cutover must preserve synthetic DBs/keys and validate exact artifacts.
 
 Historical foundation source/validation detail follows (not current runtime):
 [`IMPL-PHASE-626-DELEGATION.md`](../work/IMPL-PHASE-626-DELEGATION.md) and
@@ -140,11 +177,11 @@ entry. Never use `StrictHostKeyChecking=no` or trust `ssh-keyscan` alone.
 If the host is rebuilt or its key changes, verify through the provider again.
 Do not print private keys, env files, JWTs or provider secrets.
 
-## Bootstrap contract — not executed yet
+## Bootstrap contract — historical preparation; baseline activated
 
 Use the declared role origins/roots/services in Pinky's
 `deploy/bluey-integration.profile.json`. The profile is an offline schema;
-actual resource receipts must be added separately. Planned origins are:
+actual resource receipts are recorded above. Isolated origins are:
 
 - `https://assist-preprod.bluey.sh`: Pinky web/API.
 - `https://relay-assist-preprod.bluey.sh`: isolated relay.

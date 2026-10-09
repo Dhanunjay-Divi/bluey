@@ -7,6 +7,17 @@ under `docs/release/`.
 
 ### Added
 
+- Added Haiku5.5 request/typed-content support and a default-off GPT6Sol
+  benchmark fallback, with context-tier-aware exact settlement separated from
+  conservative admission holds. Historical Haiku4.5 pricing is retained.
+- Added truth-grounded conversational Pinky Assist guidance and a final
+  server-owned presentation fence after shared planning; Short requests plain
+  text within 120 words. Private Otter interview memory is documented as a
+  pending opt-in, provenance-preserving slice, not claimed implemented.
+- Added operator-only selected-provider metadata/credential transfer tooling
+  for the approved isolated preprod, with exact SSH pins and atomic root-only
+  destination creation; production envs and customer data are excluded.
+
 - Added default-off Pinky-owned managed Assist streaming, durable exact-owner
   admission/cancellation/status and allowlisted synthetic preprod credit;
   trusted response styles reuse Bluey's model/accounting core. Production

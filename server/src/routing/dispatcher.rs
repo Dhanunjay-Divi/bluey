@@ -45,9 +45,10 @@ use crate::{
 
 const OPENAI_FAST_MODEL: &str = "gpt-5.4-mini";
 const OPENAI_ACCURATE_MODEL: &str = "gpt-5.5";
+const OPENAI_SOL_MODEL: &str = "gpt-6-sol";
 const ANTHROPIC_BALANCED_MODEL: &str = "claude-sonnet-4-6";
 const ANTHROPIC_DEEP_MODEL: &str = "claude-opus-4-8";
-const ANTHROPIC_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
+const ANTHROPIC_FAST_MODEL: &str = "claude-haiku-5-5";
 const GEMINI_PRO_MODEL: &str = "gemini-3.1-pro-preview";
 const GEMINI_FLASH_MODEL: &str = "gemini-3.5-flash";
 const GEMINI_LITE_MODEL: &str = "gemini-3.1-flash-lite";
@@ -445,7 +446,33 @@ fn resolve_route_candidates_for_policy_and_seed(
     policy: RoutePolicy,
     seed: &str,
 ) -> Vec<(&'static str, &'static str)> {
-    match (policy, lane) {
+    resolve_route_candidates_for_policy_seed_and_sol(
+        lane,
+        policy,
+        seed,
+        gpt6_sol_benchmark_enabled(),
+    )
+}
+
+fn gpt6_sol_benchmark_enabled() -> bool {
+    gpt6_sol_benchmark_enabled_from(
+        std::env::var("BLUEY_GPT6_SOL_BENCHMARK_ENABLED")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn gpt6_sol_benchmark_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn resolve_route_candidates_for_policy_seed_and_sol(
+    lane: &str,
+    policy: RoutePolicy,
+    seed: &str,
+    gpt6_sol_enabled: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mut candidates = match (policy, lane) {
         (RoutePolicy::ProviderMix, lane) => resolve_provider_mix_candidates(lane, seed),
         (RoutePolicy::CostOptimized, "instant") => vec![
             ("deepseek", DEEPSEEK_FLASH_MODEL),
@@ -518,7 +545,11 @@ fn resolve_route_candidates_for_policy_and_seed(
             ("gemini", GEMINI_FLASH_MODEL),
             ("openai", OPENAI_FAST_MODEL),
         ],
+    };
+    if gpt6_sol_enabled && matches!(lane, "instant" | "balanced") {
+        candidates.push(("openai", OPENAI_SOL_MODEL));
     }
+    candidates
 }
 
 fn resolve_provider_mix_candidates(lane: &str, seed: &str) -> Vec<(&'static str, &'static str)> {
@@ -928,11 +959,16 @@ struct OpenAiCompatibleThinking {
 }
 
 fn openai_token_limit_fields(model: &str, max_tokens: Option<u32>) -> (Option<u32>, Option<u32>) {
-    if model.to_ascii_lowercase().starts_with("gpt-5") {
+    if openai_uses_completion_token_limit(model) {
         (None, max_tokens)
     } else {
         (max_tokens, None)
     }
+}
+
+fn openai_uses_completion_token_limit(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("gpt-5") || model.starts_with("gpt-6")
 }
 
 fn openai_effective_token_limit_fields(
@@ -966,8 +1002,18 @@ fn openai_compatible_chat_url(provider: &str) -> Result<String> {
 
 fn openai_compatible_thinking_for(
     provider: &str,
+    model: &str,
     thinking: ThinkingBudget,
 ) -> (Option<OpenAiCompatibleThinking>, Option<&'static str>) {
+    if provider == "openai" && model.eq_ignore_ascii_case(OPENAI_SOL_MODEL) {
+        let effort = match thinking.mode {
+            ThinkingMode::Off => "none",
+            ThinkingMode::Low => "low",
+            ThinkingMode::Medium | ThinkingMode::Auto => "medium",
+            ThinkingMode::High => "high",
+        };
+        return (None, Some(effort));
+    }
     if !matches!(provider, "deepseek" | "zai") {
         return (None, None);
     }
@@ -989,7 +1035,7 @@ fn openai_compatible_temperature_for(
     model: &str,
     temperature: Option<f32>,
 ) -> Option<f32> {
-    if provider == "openai" && model.to_ascii_lowercase().starts_with("gpt-5") {
+    if provider == "openai" && openai_uses_completion_token_limit(model) {
         return None;
     }
     temperature
@@ -1265,7 +1311,7 @@ async fn openai_compatible_complete(
     let user_content = openai_user_content(user, image_data_urls);
     let (max_tokens, max_completion_tokens) =
         openai_effective_token_limit_fields(model, max_tokens, thinking);
-    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, thinking);
+    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, model, thinking);
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -1411,7 +1457,7 @@ async fn openai_compatible_complete_stream(
     let user_content = openai_user_content(user, image_data_urls);
     let (max_tokens, max_completion_tokens) =
         openai_effective_token_limit_fields(model, max_tokens, thinking);
-    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, thinking);
+    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, model, thinking);
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -2131,6 +2177,8 @@ struct AnthropicReq<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinkingReq>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
 }
 
@@ -2138,7 +2186,13 @@ struct AnthropicReq<'a> {
 struct AnthropicThinkingReq {
     #[serde(rename = "type")]
     ty: &'static str,
-    budget_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct AnthropicOutputConfig {
+    effort: &'static str,
 }
 
 #[derive(Serialize)]
@@ -2159,7 +2213,7 @@ struct AnthropicContent {
     #[serde(default)]
     text: String,
     #[serde(rename = "type")]
-    _type: String,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -2191,6 +2245,7 @@ async fn anthropic_complete(
     }
 
     let thinking_req = anthropic_thinking_for(model, thinking);
+    let output_config = anthropic_output_config_for(model, thinking);
     let effective_max_tokens = if thinking_req.is_some() {
         effective_max_output_tokens(max_tokens, thinking)
     } else {
@@ -2204,13 +2259,9 @@ async fn anthropic_complete(
             role: "user",
             content: user,
         }],
-        // Anthropic rejects temperature together with extended thinking.
-        temperature: if thinking_req.is_some() {
-            None
-        } else {
-            temperature
-        },
+        temperature: anthropic_temperature_for(model, thinking_req.is_some(), temperature),
         thinking: thinking_req,
+        output_config,
         stream: None,
     };
     let resp = upstream_http_client()
@@ -2235,12 +2286,7 @@ async fn anthropic_complete(
     }
     let parsed: AnthropicResp = resp.json().await.context("anthropic json")?;
     ensure_anthropic_completion_finished(&parsed)?;
-    let text = parsed
-        .content
-        .into_iter()
-        .map(|c| c.text)
-        .collect::<Vec<_>>()
-        .join("");
+    let text = anthropic_text_from_content(parsed.content);
     let usage = match parsed.usage {
         Some(usage) if trusted_text_usage(usage.input_tokens, usage.output_tokens, text.len()) => {
             NormalizedUsage {
@@ -2321,6 +2367,7 @@ async fn anthropic_complete_stream(
     }
 
     let thinking_req = anthropic_thinking_for(model, thinking);
+    let output_config = anthropic_output_config_for(model, thinking);
     let effective_max_tokens = if thinking_req.is_some() {
         effective_max_output_tokens(max_tokens, thinking)
     } else {
@@ -2334,12 +2381,9 @@ async fn anthropic_complete_stream(
             role: "user",
             content: user,
         }],
-        temperature: if thinking_req.is_some() {
-            None
-        } else {
-            temperature
-        },
+        temperature: anthropic_temperature_for(model, thinking_req.is_some(), temperature),
         thinking: thinking_req,
+        output_config,
         stream: Some(true),
     };
     let resp = upstream_http_client()
@@ -2516,7 +2560,7 @@ fn parse_anthropic_stream_event(
     }
     if event == "content_block_delta" || parsed.kind == "content_block_delta" {
         if let Some(delta) = parsed.delta {
-            if delta.kind.as_deref() == Some("text_delta") || delta.text.is_some() {
+            if delta.kind.as_deref() == Some("text_delta") {
                 return Ok(ParsedTextStreamChunk {
                     deltas: delta
                         .text
@@ -2567,27 +2611,54 @@ fn provider_stream_capacity_error(
 }
 
 fn anthropic_thinking_for(model: &str, thinking: ThinkingBudget) -> Option<AnthropicThinkingReq> {
-    if !thinking.is_enabled() || !anthropic_supports_manual_thinking(model) {
+    if !model.eq_ignore_ascii_case(ANTHROPIC_FAST_MODEL) {
         return None;
     }
-    let default_tokens = match thinking.mode {
-        ThinkingMode::Off => return None,
-        ThinkingMode::Low => 1_024,
-        ThinkingMode::Medium | ThinkingMode::Auto => 4_096,
-        ThinkingMode::High => 8_192,
+    let ty = if thinking.is_enabled() {
+        "adaptive"
+    } else {
+        "disabled"
     };
     Some(AnthropicThinkingReq {
-        ty: "enabled",
-        budget_tokens: thinking.max_tokens.unwrap_or(default_tokens),
+        ty,
+        budget_tokens: None,
     })
 }
 
-fn anthropic_supports_manual_thinking(model: &str) -> bool {
-    let _ = model;
-    // Current Anthropic flagship models reject the older
-    // `thinking.type=enabled` request shape. Keep manual thinking off until
-    // Bluey implements the newer adaptive/output_config effort schema.
-    false
+fn anthropic_output_config_for(
+    model: &str,
+    thinking: ThinkingBudget,
+) -> Option<AnthropicOutputConfig> {
+    if !model.eq_ignore_ascii_case(ANTHROPIC_FAST_MODEL) {
+        return None;
+    }
+    let effort = match thinking.mode {
+        ThinkingMode::Off | ThinkingMode::Low => "low",
+        ThinkingMode::Medium | ThinkingMode::Auto => "medium",
+        ThinkingMode::High => "high",
+    };
+    Some(AnthropicOutputConfig { effort })
+}
+
+fn anthropic_temperature_for(
+    model: &str,
+    thinking_configured: bool,
+    temperature: Option<f32>,
+) -> Option<f32> {
+    if model.eq_ignore_ascii_case(ANTHROPIC_FAST_MODEL) || thinking_configured {
+        None
+    } else {
+        temperature
+    }
+}
+
+fn anthropic_text_from_content(content: Vec<AnthropicContent>) -> String {
+    content
+        .into_iter()
+        .filter(|block| block.kind == "text")
+        .map(|block| block.text)
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn append_utf8_chunk(bytes: &[u8], pending: &mut Vec<u8>, buffer: &mut String) -> Result<()> {
@@ -3123,18 +3194,28 @@ mod tests {
     #[test]
     fn route_candidates_preserve_2026_lane_order() {
         assert_eq!(
-            resolve_route_candidates_for_policy_and_seed("instant", RoutePolicy::QualityFirst, ""),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "instant",
+                RoutePolicy::QualityFirst,
+                "",
+                false,
+            ),
             vec![
                 ("openai", "gpt-5.4-mini"),
                 ("deepseek", "deepseek-v4-flash"),
                 ("gemini", "gemini-3.1-flash-lite"),
-                ("anthropic", "claude-haiku-4-5-20251001"),
+                ("anthropic", "claude-haiku-5-5"),
                 ("gemini", "gemini-3.5-flash"),
                 ("anthropic", "claude-sonnet-4-6")
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy_and_seed("balanced", RoutePolicy::QualityFirst, ""),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "balanced",
+                RoutePolicy::QualityFirst,
+                "",
+                false,
+            ),
             vec![
                 ("anthropic", "claude-sonnet-4-6"),
                 ("deepseek", "deepseek-v4-flash"),
@@ -3146,7 +3227,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy_and_seed("deep", RoutePolicy::QualityFirst, ""),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "deep",
+                RoutePolicy::QualityFirst,
+                "",
+                false,
+            ),
             vec![
                 ("anthropic", "claude-opus-4-8"),
                 ("zai", "glm-5.2"),
@@ -3159,7 +3245,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy_and_seed("vision", RoutePolicy::QualityFirst, ""),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "vision",
+                RoutePolicy::QualityFirst,
+                "",
+                false,
+            ),
             vec![
                 ("openai", "gpt-5.5"),
                 ("gemini", "gemini-3.1-pro-preview"),
@@ -3168,8 +3259,13 @@ mod tests {
             ]
         );
         assert!(
-            resolve_route_candidates_for_policy_and_seed("local", RoutePolicy::QualityFirst, "")
-                .is_empty(),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "local",
+                RoutePolicy::QualityFirst,
+                "",
+                false,
+            )
+            .is_empty(),
             "managed cloud must not dispatch daemon-only local lanes"
         );
     }
@@ -3177,29 +3273,35 @@ mod tests {
     #[test]
     fn cost_optimized_policy_prefers_glm_and_deepseek_text_routes() {
         assert_eq!(
-            resolve_route_candidates_for_policy_and_seed("instant", RoutePolicy::CostOptimized, ""),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "instant",
+                RoutePolicy::CostOptimized,
+                "",
+                false,
+            ),
             vec![
                 ("deepseek", "deepseek-v4-flash"),
                 ("gemini", "gemini-3.1-flash-lite"),
                 ("zai", "glm-4.7-flashx"),
                 ("openai", "gpt-5.4-mini"),
-                ("anthropic", "claude-haiku-4-5-20251001"),
+                ("anthropic", "claude-haiku-5-5"),
                 ("gemini", "gemini-3.5-flash"),
                 ("anthropic", "claude-sonnet-4-6")
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy_and_seed(
+            resolve_route_candidates_for_policy_seed_and_sol(
                 "balanced",
                 RoutePolicy::CostOptimized,
-                ""
+                "",
+                false,
             ),
             vec![
                 ("zai", "glm-4.7-flashx"),
                 ("deepseek", "deepseek-v4-flash"),
                 ("gemini", "gemini-3.5-flash"),
                 ("openai", "gpt-5.4-mini"),
-                ("anthropic", "claude-haiku-4-5-20251001"),
+                ("anthropic", "claude-haiku-5-5"),
                 ("anthropic", "claude-sonnet-4-6"),
                 ("zai", "glm-5.2"),
                 ("gemini", "gemini-3.1-pro-preview"),
@@ -3207,7 +3309,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy_and_seed("deep", RoutePolicy::CostOptimized, ""),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "deep",
+                RoutePolicy::CostOptimized,
+                "",
+                false,
+            ),
             vec![
                 ("zai", "glm-5.2"),
                 ("deepseek", "deepseek-v4-pro"),
@@ -3220,10 +3327,64 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy_and_seed("vision", RoutePolicy::CostOptimized, ""),
-            resolve_route_candidates_for_policy_and_seed("vision", RoutePolicy::QualityFirst, ""),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "vision",
+                RoutePolicy::CostOptimized,
+                "",
+                false,
+            ),
+            resolve_route_candidates_for_policy_seed_and_sol(
+                "vision",
+                RoutePolicy::QualityFirst,
+                "",
+                false,
+            ),
             "GLM/DeepSeek text policy must not steal image routes"
         );
+    }
+
+    #[test]
+    fn gpt6_sol_is_an_exact_default_off_fast_lane_benchmark() {
+        assert!(!gpt6_sol_benchmark_enabled_from(None));
+        assert!(!gpt6_sol_benchmark_enabled_from(Some("0")));
+        assert!(!gpt6_sol_benchmark_enabled_from(Some("true")));
+        assert!(!gpt6_sol_benchmark_enabled_from(Some(" 1")));
+        assert!(gpt6_sol_benchmark_enabled_from(Some("1")));
+
+        for policy in [
+            RoutePolicy::ProviderMix,
+            RoutePolicy::QualityFirst,
+            RoutePolicy::CostOptimized,
+        ] {
+            for lane in ["instant", "balanced"] {
+                let disabled = resolve_route_candidates_for_policy_seed_and_sol(
+                    lane,
+                    policy,
+                    "benchmark",
+                    false,
+                );
+                assert!(!disabled.iter().any(|route| route.1 == OPENAI_SOL_MODEL));
+
+                let enabled = resolve_route_candidates_for_policy_seed_and_sol(
+                    lane,
+                    policy,
+                    "benchmark",
+                    true,
+                );
+                assert_eq!(enabled.last(), Some(&("openai", OPENAI_SOL_MODEL)));
+                assert_eq!(enabled.len(), disabled.len() + 1);
+            }
+
+            for lane in ["deep", "vision", "local"] {
+                let enabled = resolve_route_candidates_for_policy_seed_and_sol(
+                    lane,
+                    policy,
+                    "benchmark",
+                    true,
+                );
+                assert!(!enabled.iter().any(|route| route.1 == OPENAI_SOL_MODEL));
+            }
+        }
     }
 
     #[test]
@@ -3232,10 +3393,11 @@ mod tests {
             let mut first_providers = Vec::new();
             for idx in 0..80 {
                 let seed = format!("mix-request-{idx}");
-                let Some((provider, _model)) = resolve_route_candidates_for_policy_and_seed(
+                let Some((provider, _model)) = resolve_route_candidates_for_policy_seed_and_sol(
                     lane,
                     RoutePolicy::ProviderMix,
                     &seed,
+                    false,
                 )
                 .into_iter()
                 .next() else {
@@ -3263,8 +3425,12 @@ mod tests {
     #[test]
     fn provider_mix_text_top_tiers_give_each_provider_one_slot() {
         for lane in ["instant", "balanced", "deep"] {
-            let routes =
-                resolve_route_candidates_for_policy_and_seed(lane, RoutePolicy::ProviderMix, "");
+            let routes = resolve_route_candidates_for_policy_seed_and_sol(
+                lane,
+                RoutePolicy::ProviderMix,
+                "",
+                false,
+            );
             let preferred_count = if lane == "balanced" { 3 } else { 5 };
             let mut providers = routes
                 .iter()
@@ -3290,10 +3456,11 @@ mod tests {
         for lane in ["instant", "balanced"] {
             for idx in 0..100 {
                 let seed = format!("fast-tier-request-{idx}");
-                let routes = resolve_route_candidates_for_policy_and_seed(
+                let routes = resolve_route_candidates_for_policy_seed_and_sol(
                     lane,
                     RoutePolicy::ProviderMix,
                     &seed,
+                    false,
                 );
                 let (_, model) = routes.first().expect("fast lane route");
                 assert!(
@@ -3315,10 +3482,11 @@ mod tests {
     fn provider_mix_keeps_vision_on_image_capable_routes() {
         for idx in 0..24 {
             let seed = format!("vision-request-{idx}");
-            let routes = resolve_route_candidates_for_policy_and_seed(
+            let routes = resolve_route_candidates_for_policy_seed_and_sol(
                 "vision",
                 RoutePolicy::ProviderMix,
                 &seed,
+                false,
             );
             assert!(
                 routes
@@ -3341,13 +3509,18 @@ mod tests {
             RoutePolicy::CostOptimized,
         ] {
             for lane in ["instant", "balanced", "deep", "vision"] {
-                for (provider, model) in
-                    resolve_route_candidates_for_policy_and_seed(lane, policy, "")
-                {
-                    assert!(
-                        crate::pricing::lookup(provider, model).is_some(),
-                        "missing pricing for {policy:?} {lane} candidate {provider}/{model}"
-                    );
+                for gpt6_sol_enabled in [false, true] {
+                    for (provider, model) in resolve_route_candidates_for_policy_seed_and_sol(
+                        lane,
+                        policy,
+                        "",
+                        gpt6_sol_enabled,
+                    ) {
+                        assert!(
+                            crate::pricing::lookup(provider, model).is_some(),
+                            "missing pricing for {policy:?} {lane} candidate {provider}/{model}"
+                        );
+                    }
                 }
             }
         }
@@ -3942,6 +4115,11 @@ mod tests {
             openai_effective_token_limit_fields("gpt-4o", Some(8000), off);
         assert_eq!(max_tokens, Some(expected));
         assert_eq!(max_completion_tokens, None);
+
+        let (max_tokens, max_completion_tokens) =
+            openai_effective_token_limit_fields(OPENAI_SOL_MODEL, Some(8000), off);
+        assert_eq!(max_tokens, None);
+        assert_eq!(max_completion_tokens, Some(expected));
     }
 
     #[test]
@@ -3957,11 +4135,13 @@ mod tests {
 
     #[test]
     fn openai_compatible_thinking_is_provider_scoped() {
-        let (thinking, effort) = openai_compatible_thinking_for("openai", ThinkingBudget::off());
+        let (thinking, effort) =
+            openai_compatible_thinking_for("openai", OPENAI_FAST_MODEL, ThinkingBudget::off());
         assert!(thinking.is_none());
         assert!(effort.is_none());
 
-        let (thinking, effort) = openai_compatible_thinking_for("deepseek", ThinkingBudget::off());
+        let (thinking, effort) =
+            openai_compatible_thinking_for("deepseek", DEEPSEEK_FLASH_MODEL, ThinkingBudget::off());
         assert_eq!(thinking.unwrap().ty, "disabled");
         assert_eq!(effort, None);
 
@@ -3969,9 +4149,47 @@ mod tests {
             mode: ThinkingMode::High,
             max_tokens: Some(4096),
         };
-        let (thinking, effort) = openai_compatible_thinking_for("zai", budget);
+        let (thinking, effort) = openai_compatible_thinking_for("zai", ZAI_FAST_MODEL, budget);
         assert_eq!(thinking.unwrap().ty, "enabled");
         assert_eq!(effort, Some("max"));
+    }
+
+    #[test]
+    fn openai_sol_uses_explicit_reasoning_effort_without_legacy_thinking() {
+        let (thinking, effort) =
+            openai_compatible_thinking_for("openai", OPENAI_SOL_MODEL, ThinkingBudget::off());
+        assert!(thinking.is_none());
+        assert_eq!(effort, Some("none"));
+        let (max_tokens, max_completion_tokens) =
+            openai_token_limit_fields(OPENAI_SOL_MODEL, Some(512));
+        let value = serde_json::to_value(OpenAiChatReq {
+            model: OPENAI_SOL_MODEL,
+            messages: Vec::new(),
+            max_tokens,
+            max_completion_tokens,
+            temperature: openai_compatible_temperature_for("openai", OPENAI_SOL_MODEL, Some(0.2)),
+            stream: None,
+            stream_options: None,
+            thinking,
+            reasoning_effort: effort,
+        })
+        .unwrap();
+        assert_eq!(value["reasoning_effort"], "none");
+        assert_eq!(value["max_completion_tokens"], 512);
+        assert!(value.get("max_tokens").is_none());
+        assert!(value.get("temperature").is_none());
+        assert!(value.get("thinking").is_none());
+
+        let (thinking, effort) = openai_compatible_thinking_for(
+            "openai",
+            OPENAI_SOL_MODEL,
+            ThinkingBudget {
+                mode: ThinkingMode::High,
+                max_tokens: Some(4096),
+            },
+        );
+        assert!(thinking.is_none());
+        assert_eq!(effort, Some("high"));
     }
 
     #[test]
@@ -3985,6 +4203,10 @@ mod tests {
             None
         );
         assert_eq!(
+            openai_compatible_temperature_for("openai", OPENAI_SOL_MODEL, Some(0.2)),
+            None
+        );
+        assert_eq!(
             openai_compatible_temperature_for("openai", "gpt-4o", Some(0.2)),
             Some(0.2)
         );
@@ -3995,12 +4217,101 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_manual_thinking_disabled_until_adaptive_schema() {
+    fn anthropic_haiku_5_5_uses_adaptive_schema_without_legacy_budget() {
+        let off = ThinkingBudget::off();
+        let thinking = anthropic_thinking_for(ANTHROPIC_FAST_MODEL, off).unwrap();
+        assert_eq!(thinking.ty, "disabled");
+        assert_eq!(thinking.budget_tokens, None);
+        assert_eq!(
+            anthropic_output_config_for(ANTHROPIC_FAST_MODEL, off)
+                .unwrap()
+                .effort,
+            "low"
+        );
+        assert_eq!(
+            anthropic_temperature_for(ANTHROPIC_FAST_MODEL, true, Some(0.2)),
+            None
+        );
+        let value = serde_json::to_value(AnthropicReq {
+            model: ANTHROPIC_FAST_MODEL,
+            max_tokens: 512,
+            system: "system",
+            messages: Vec::new(),
+            temperature: anthropic_temperature_for(ANTHROPIC_FAST_MODEL, true, Some(0.2)),
+            thinking: anthropic_thinking_for(ANTHROPIC_FAST_MODEL, off),
+            output_config: anthropic_output_config_for(ANTHROPIC_FAST_MODEL, off),
+            stream: None,
+        })
+        .unwrap();
+        assert_eq!(value["thinking"]["type"], "disabled");
+        assert_eq!(value["output_config"]["effort"], "low");
+        assert!(value["thinking"].get("budget_tokens").is_none());
+        assert!(value.get("temperature").is_none());
+        assert!(value.get("top_p").is_none());
+        assert!(value.get("top_k").is_none());
+
         let budget = resolve_thinking_budget("deep", None, None);
+        let thinking = anthropic_thinking_for(ANTHROPIC_FAST_MODEL, budget).unwrap();
+        assert_eq!(thinking.ty, "adaptive");
+        assert_eq!(thinking.budget_tokens, None);
+        assert_eq!(
+            anthropic_output_config_for(ANTHROPIC_FAST_MODEL, budget)
+                .unwrap()
+                .effort,
+            "medium"
+        );
+
         assert!(anthropic_thinking_for("claude-opus-4-8", budget).is_none());
         assert!(anthropic_thinking_for("claude-sonnet-4-6", budget).is_none());
         assert!(anthropic_thinking_for("claude-haiku-4-5-20251001", budget).is_none());
         assert!(anthropic_thinking_for("claude-fable-5-20260609", budget).is_none());
         assert!(anthropic_thinking_for("gpt-5.5", budget).is_none());
+    }
+
+    #[test]
+    fn anthropic_text_extraction_ignores_non_text_blocks() {
+        let parsed: AnthropicResp = serde_json::from_value(serde_json::json!({
+            "content": [
+                {"type": "thinking", "text": "hidden reasoning"},
+                {"type": "text", "text": "visible "},
+                {"type": "text", "text": "answer"}
+            ],
+            "usage": {"input_tokens": 11, "output_tokens": 17},
+            "stop_reason": "end_turn"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            anthropic_text_from_content(parsed.content),
+            "visible answer"
+        );
+        let usage = parsed.usage.unwrap();
+        assert_eq!(usage.output_tokens, 17, "provider usage includes thinking");
+    }
+
+    #[test]
+    fn anthropic_stream_exposes_only_text_delta_blocks() {
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut seen_stop = false;
+        let thinking = parse_anthropic_stream_event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","delta":{"type":"thinking_delta","text":"hidden reasoning"}}"#,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut seen_stop,
+        )
+        .unwrap();
+        assert!(thinking.deltas.is_empty());
+
+        let text = parse_anthropic_stream_event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"visible"}}"#,
+            &mut input_tokens,
+            &mut output_tokens,
+            &mut seen_stop,
+        )
+        .unwrap();
+        assert_eq!(text.deltas, vec!["visible"]);
     }
 }

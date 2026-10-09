@@ -1,7 +1,8 @@
 # Phase 626 — isolated Pinky + Bluey integration preprod
 
 Date: 2026-10-08. Updated: 2026-10-09.
-Status: offline preparation verified; dedicated VM provisioned; **application not deployed**.
+Status: dedicated text Assist baseline deployed; real public auth/isolation tests passed.
+Latest model/voice/PG and physical UX gates remain open; no production promotion.
 
 2026-10-09 continuation: default-off request delegation and owned context
 lifecycle source passed local foundation validation; see the
@@ -108,11 +109,12 @@ base, **not** an approved deployment candidate.
 | --- | --- | --- |
 | Existing Pinky preprod | `https://preprod-internal.pinky.sh` | reserved to Pinky team; do not mutate |
 | Existing Pinky preprod relay | `https://relay-preprod-internal.pinky.sh` | reserved to Pinky team; do not mutate |
-| Integration Pinky frontend/API | `https://assist-preprod.bluey.sh` | proposed, not provisioned |
-| Integration relay | `https://relay-assist-preprod.bluey.sh` | proposed, not provisioned |
-| Integration Bluey API | `https://api-assist-preprod.bluey.sh` | proposed, not provisioned |
+| Integration Pinky frontend/API | `https://assist-preprod.bluey.sh` | live isolated baseline `22ff76d6` |
+| Integration relay | `https://relay-assist-preprod.bluey.sh` | provisioned TLS; intentionally503, remote off |
+| Integration Bluey API | `https://api-assist-preprod.bluey.sh` | live isolated baseline `65ec499c` |
 
-The new hostnames are a plan, not evidence of DNS, TLS or a live application.
+Current activation and public TLS evidence is in the integration runbook;
+historical preparation sections below are not current runtime limitations.
 Read-only inventory found no established Bluey preprod; the historical
 `api-test.bluey.dev` example is not provisioning evidence.
 

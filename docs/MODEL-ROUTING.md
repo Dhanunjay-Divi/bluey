@@ -1,6 +1,6 @@
 # Bluey Model Routing
 
-Last updated: 2026-06-30
+Last updated: 2026-10-09
 
 This document is the source-of-truth snapshot for the model/provider routing
 currently implemented in the Bluey codebase. It is intentionally operational:
@@ -60,7 +60,7 @@ HTTP 429/529 cooldowns still fall through to the next approved route.
 
 | Bluey lane | Default top tier | Primary use |
 | --- | --- | --- |
-| `instant` | OpenAI `gpt-5.4-mini`, DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.1-flash-lite`, Anthropic `claude-haiku-4-5-20251001`, Z.AI `glm-4.7-flashx` | Easy questions and quick answers; each provider has one rotating low-latency first-attempt slot |
+| `instant` | OpenAI `gpt-5.4-mini`, DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.1-flash-lite`, Anthropic `claude-haiku-5-5`, Z.AI `glm-4.7-flashx` | Easy questions and quick answers; each provider has one rotating low-latency first-attempt slot |
 | `balanced` | Anthropic `claude-sonnet-4-6`, DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.5-flash`, OpenAI `gpt-5.4-mini`, Z.AI `glm-4.7-flashx` | Default technical/general answer with one rotating first-attempt slot per provider |
 | `deep` | Anthropic `claude-opus-4-8`, Z.AI `glm-5.2`, DeepSeek `deepseek-v4-pro`, Gemini `gemini-3.1-pro-preview`, OpenAI `gpt-5.5` | Hard coding, system design, long reasoning with a larger thinking/output budget |
 | `vision` | Gemini `gemini-3.5-flash`, OpenAI `gpt-5.5` | Analyse Screen, screenshots, and image context with slower Gemini Pro as fallback |
@@ -74,6 +74,8 @@ configured:
 | Z.AI | `glm-5.2` | `deep` and balanced fallback | OpenAI-compatible flagship route; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-pro` | `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-flash` | `instant`, `balanced`, `deep` fallback | OpenAI-compatible endpoint; instant/balanced send thinking disabled |
+| Anthropic | `claude-haiku-5-5` | `instant`, `balanced` fallback | Fast candidate using adaptive thinking controls; its predecessor remains pricing history only |
+| OpenAI | `gpt-6-sol` | default-off final `instant` and `balanced` fallback | Supported Chat Completions candidate only when the server sets `BLUEY_GPT6_SOL_BENCHMARK_ENABLED=1`; `gpt-5.4-mini` remains the initial live baseline |
 
 ## AnswerPlan Pre-Routing
 
@@ -172,16 +174,19 @@ Request overrides use the same concepts:
 
 Provider mapping today:
 
-- Anthropic `claude-opus-4-8` and `claude-sonnet-4-6` map to `thinking:
-  {"type":"enabled","budget_tokens":...}` and reserves enough
-  `max_tokens` for both thinking and visible answer text. The Haiku fallback
-  also supports the same manual thinking payload when a caller explicitly asks
-  for thinking on that route.
-- OpenAI managed routes still use Chat Completions in this codebase, so
-  `reasoning_effort` is accepted but not sent upstream yet. The GPT-5.4 models
-  in the route table are Chat Completions compatible; switching OpenAI managed
-  routes to the Responses API is the right future hook for explicit OpenAI
-  reasoning controls.
+- Anthropic `claude-haiku-5-5` defaults to adaptive thinking. Bluey sends
+  `thinking: {"type":"disabled"}` for instant/non-thinking work and
+  `thinking: {"type":"adaptive"}` with a bounded `output_config.effort` of
+  `low`, `medium`, or `high` when thinking is enabled. It never sends legacy
+  `budget_tokens`, `temperature`, `top_p`, or `top_k` for Haiku 5.5. Bluey
+  exposes only `text`/`text_delta` blocks and uses Anthropic's reported output
+  usage, which includes thinking tokens. Existing Opus, Sonnet, and historical
+  Haiku 4.5 behavior is unchanged.
+- OpenAI managed routes use Chat Completions. Existing GPT-5 routes keep their
+  current payload behavior. The bounded `gpt-6-sol` fallback sends
+  `reasoning_effort` explicitly (`none` for instant/non-thinking work), uses
+  `max_completion_tokens`, and omits `temperature`. It remains benchmark-only
+  behind the preferred `gpt-5.4-mini` baseline until measured live.
 - Gemini is wired as a managed text/vision candidate. We pass output token and
   temperature controls today; explicit thinking-budget controls are left to a
   future Gemini-specific pass once live quality/cost measurements are in.
@@ -192,6 +197,13 @@ Provider mapping today:
 
 This gives us the operational knob the user asked for without making every
 easy question slower or more expensive.
+
+Provider contract references: Anthropic's
+[Haiku 5.5 overview](https://platform.claude.com/docs/en/models/haiku-5-5/overview),
+[migration guide](https://platform.claude.com/docs/en/models/haiku-5-5/migration-guide),
+and [thinking guide](https://platform.claude.com/docs/en/build-with-claude/thinking);
+OpenAI's [GPT-6 Sol model card](https://developers.openai.com/api/docs/models/gpt-6-sol)
+and [reasoning guide](https://developers.openai.com/api/docs/guides/reasoning).
 
 The server now resolves each lane to an ordered candidate list, not a single
 hard dependency. If the first provider for that request is unavailable, over
@@ -207,8 +219,8 @@ harder work.
 
 | Lane | Rotated top tier | Fixed fallback tail |
 | --- | --- | --- |
-| `instant` | OpenAI `gpt-5.4-mini` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.1-flash-lite` / Anthropic `claude-haiku-4-5-20251001` / Z.AI `glm-4.7-flashx` | Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
-| `balanced` | Anthropic `claude-sonnet-4-6` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.5-flash` / OpenAI `gpt-5.4-mini` / Z.AI `glm-4.7-flashx` | Anthropic `claude-haiku-4-5-20251001` -> OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Z.AI `glm-5.2` |
+| `instant` | OpenAI `gpt-5.4-mini` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.1-flash-lite` / Anthropic `claude-haiku-5-5` / Z.AI `glm-4.7-flashx` | Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Anthropic `claude-sonnet-4-6` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.5-flash` / OpenAI `gpt-5.4-mini` / Z.AI `glm-4.7-flashx` | Anthropic `claude-haiku-5-5` -> OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Z.AI `glm-5.2` |
 | `deep` | Anthropic `claude-opus-4-8` / Z.AI `glm-5.2` / DeepSeek `deepseek-v4-pro` / Gemini `gemini-3.1-pro-preview` / OpenAI `gpt-5.5` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
 | `vision` | Gemini `gemini-3.5-flash` / OpenAI `gpt-5.5` | Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.4-mini` |
 
@@ -219,7 +231,7 @@ static first-provider order.
 
 | Lane | Candidate order |
 | --- | --- |
-| `instant` | OpenAI `gpt-5.4-mini` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
+| `instant` | OpenAI `gpt-5.4-mini` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-5-5` -> Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
 | `balanced` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
 | `deep` | Anthropic `claude-opus-4-8` -> Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
 | `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
@@ -233,14 +245,20 @@ image support.
 
 | Lane | Candidate order |
 | --- | --- |
-| `instant` | DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Z.AI `glm-4.7-flashx` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
-| `balanced` | Z.AI `glm-4.7-flashx` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` -> Anthropic `claude-sonnet-4-6` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` |
+| `instant` | DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Z.AI `glm-4.7-flashx` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-5-5` -> Gemini `gemini-3.5-flash` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Z.AI `glm-4.7-flashx` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-5-5` -> Anthropic `claude-sonnet-4-6` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` |
 | `deep` | Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Anthropic `claude-opus-4-8` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.5-flash` |
 | `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3.5-flash` -> OpenAI `gpt-5.4-mini` |
 
 Every managed LLM candidate above has a matching entry in
 `server/src/pricing/mod.rs`; the dispatcher unit tests assert this so an
 unpriced model cannot silently become a paid route.
+
+GPT-6 Sol is not in any default table above. Setting the server-only flag
+`BLUEY_GPT6_SOL_BENCHMARK_ENABLED=1` appends it as the final fallback for the
+exact `instant` and `balanced` lanes under every route policy. Missing values
+and spellings other than exact `1` remain disabled. Clients cannot select or
+enable this candidate.
 
 ### First-useful-text budgets
 
@@ -489,15 +507,15 @@ currently handles screenshots, quick questions, or hard reasoning. The product
 can still expose simple intent controls like Auto, Balanced, and Deep; the
 provider menu should stay server-owned.
 
-### 2026-06-10 provider stance
+### 2026-10-09 provider stance
 
 Do not hardcode the marketing site or overlay to one provider family. The
 server route table is the product control plane:
 
 - **Keep OpenAI** for fast mini answers, accurate current vision, embeddings,
-  and OpenAI STT fallback. The current managed OpenAI path is Chat
-  Completions, so use Chat-compatible GPT-5.4 family models until the server
-  has a Responses API path for explicit reasoning controls.
+  and OpenAI STT fallback. Keep `gpt-5.4-mini` as the initial live baseline;
+  `gpt-6-sol` is a final fast/balanced fallback whose bounded Chat Completions
+  serializer is ready for benchmark traffic, not an unmeasured primary swap.
 - **Keep Anthropic** for human-like technical/system-design answers and long
   structured reasoning. `claude-sonnet-4-6` is the balanced default;
   `claude-opus-4-8` owns the Deep lane when budget allows.
@@ -518,12 +536,13 @@ Why this is still conservative:
   model wins".
 - Route changes must move with the pricing table, cost-label copy, and load
   tests. Unknown model names are intentionally filtered out of priced routes.
-- OpenAI reasoning-era controls are best wired through a Responses-style
-  managed path; the current managed OpenAI path still uses Chat Completions, so
-  the route table uses GPT-5.4 models that the current endpoint supports.
-- Anthropic Opus/Fable-class adaptive-thinking models may require request-shape
-  changes around effort and sampling parameters. Keep Sonnet 4.6 as the safe
-  Messages API route until those semantics are covered by dispatcher tests.
+- The current managed OpenAI path still uses Chat Completions. GPT-6 Sol is
+  therefore limited to the provider-documented Chat payload already covered by
+  dispatcher tests: explicit reasoning effort, completion-token limit, and no
+  sampling temperature.
+- Haiku 5.5's adaptive/disabled request shapes and typed text extraction are
+  covered in the dispatcher. Keep Sonnet 4.6 and Opus 4.8 behavior unchanged;
+  broader Anthropic adaptive-thinking migrations remain separate work.
 
 Recommended next implementation after the managed smoke is an admin/server-owned
 route config table:

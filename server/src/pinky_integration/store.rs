@@ -1617,6 +1617,204 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    fn postgres_fixture(pool: &DbPool, label: &str) -> (String, String, String) {
+        let subject = format!("{label}-{}", uuid::Uuid::new_v4());
+        let key = subject_key("pinky", "bluey", "preprod", &subject);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let opened = open_with_entitlement(
+            pool,
+            &key,
+            &session_id,
+            1_000,
+            Some(SyntheticEntitlement {
+                credit_cents: 50,
+                ttl_seconds: 3_600,
+            }),
+        )
+        .expect("open PostgreSQL Pinky fixture");
+        assert_eq!(opened.state, "active");
+        assert_eq!(opened.access, "available");
+        (format!("pinky_{key}"), key, session_id)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_lifecycle_claim_and_cancel_admit_use_real_store_transactions() {
+        if std::env::var("BLUEY_PINKY_TEST_POSTGRES_EPHEMERAL")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+        let database_url = std::env::var("BLUEY_TEST_POSTGRES_URL")
+            .expect("ephemeral PostgreSQL test URL is required");
+        let pool = crate::db::open_postgres_pool(&database_url)
+            .expect("open ephemeral PostgreSQL test pool");
+        initialize(&pool).expect("initialize PostgreSQL Pinky schema");
+        let mut account_ids = Vec::new();
+
+        let (account_id, key, session_id) = postgres_fixture(&pool, "lifecycle");
+        account_ids.push(account_id);
+        let replay = open_with_entitlement(&pool, &key, &session_id, 1_100, None)
+            .expect("replay exact PostgreSQL session");
+        assert_eq!(replay.state, "active");
+        assert_eq!(replay.access, "available");
+        let closed = close(&pool, &key, &session_id, 1_200)
+            .expect("close PostgreSQL session")
+            .expect("owned PostgreSQL session");
+        assert_eq!(closed.state, "closed");
+        assert_eq!(closed.access, "unavailable");
+
+        let (account_id, key, session_id) = postgres_fixture(&pool, "single-claim");
+        account_ids.push(account_id);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        admit_ask(
+            &pool,
+            &key,
+            &session_id,
+            &request_id,
+            &"f".repeat(64),
+            "default",
+            1_001,
+        )
+        .expect("admit PostgreSQL claim fixture");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let claims = (0..2)
+            .map(|_| {
+                let pool = pool.clone();
+                let key = key.clone();
+                let session_id = session_id.clone();
+                let request_id = request_id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    mark_request_running(&pool, &key, &session_id, &request_id, 1_002)
+                        .expect("claim PostgreSQL request")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            claims
+                .into_iter()
+                .map(|claim| claim.join().expect("join PostgreSQL claim"))
+                .filter(|claimed| *claimed)
+                .count(),
+            1
+        );
+        let running = status(&pool, &key, &session_id, &request_id)
+            .expect("read PostgreSQL claim status")
+            .expect("PostgreSQL claim status");
+        assert_eq!(running.state, "running");
+        assert_eq!(running.accounting_status, "pending");
+
+        let (account_id, key, session_id) = postgres_fixture(&pool, "stop-before-ask");
+        account_ids.push(account_id);
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let first = cancel_request(&pool, &key, &session_id, &request_id, 1_001)
+            .expect("create PostgreSQL cancel tombstone")
+            .expect("owned PostgreSQL session");
+        let replay = cancel_request(&pool, &key, &session_id, &request_id, 1_002)
+            .expect("replay PostgreSQL cancel tombstone")
+            .expect("owned PostgreSQL tombstone");
+        assert_eq!(first, replay);
+        assert_eq!(first.state, "cancelled");
+        assert_eq!(first.accounting_status, "settled");
+        let error = admit_ask(
+            &pool,
+            &key,
+            &session_id,
+            &request_id,
+            &"a".repeat(64),
+            "short",
+            1_003,
+        )
+        .expect_err("a PostgreSQL tombstone must reject late admission");
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::Cancelled)
+        ));
+        assert!(!dispatch_allowed(
+            &pool,
+            &key,
+            &session_id,
+            &request_id,
+            1_004
+        ));
+
+        let (account_id, key, session_id) = postgres_fixture(&pool, "stop-admit-race");
+        account_ids.push(account_id);
+        for round in 0_i64..12 {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let cancel_pool = pool.clone();
+            let cancel_key = key.clone();
+            let cancel_session = session_id.clone();
+            let cancel_request_id = request_id.clone();
+            let cancel_barrier = barrier.clone();
+            let cancel = std::thread::spawn(move || {
+                cancel_barrier.wait();
+                cancel_request(
+                    &cancel_pool,
+                    &cancel_key,
+                    &cancel_session,
+                    &cancel_request_id,
+                    1_010 + round,
+                )
+                .expect("race PostgreSQL cancellation")
+                .expect("owned PostgreSQL race session")
+            });
+            let admit_pool = pool.clone();
+            let admit_key = key.clone();
+            let admit_session = session_id.clone();
+            let admit_request = request_id.clone();
+            let admission = std::thread::spawn(move || {
+                barrier.wait();
+                admit_ask(
+                    &admit_pool,
+                    &admit_key,
+                    &admit_session,
+                    &admit_request,
+                    &"b".repeat(64),
+                    "star",
+                    1_010 + round,
+                )
+            });
+            let cancelled = cancel.join().expect("join PostgreSQL cancellation");
+            let admitted = admission.join().expect("join PostgreSQL admission");
+            assert!(matches!(
+                cancelled.state.as_str(),
+                "cancelled" | "cancellation_requested"
+            ));
+            if let Err(error) = admitted {
+                assert!(matches!(
+                    error.downcast_ref::<StoreError>(),
+                    Some(StoreError::Cancelled)
+                ));
+            }
+            let final_status = status(&pool, &key, &session_id, &request_id)
+                .expect("read PostgreSQL race status")
+                .expect("PostgreSQL race status");
+            assert!(matches!(
+                final_status.state.as_str(),
+                "cancelled" | "cancellation_requested"
+            ));
+            assert!(!dispatch_allowed(
+                &pool,
+                &key,
+                &session_id,
+                &request_id,
+                1_100 + round
+            ));
+        }
+
+        let mut conn = pool.get_pg().expect("get PostgreSQL cleanup connection");
+        for account_id in account_ids {
+            conn.execute("DELETE FROM accounts WHERE id=$1", &[&account_id])
+                .expect("delete PostgreSQL Pinky fixture");
+        }
+    }
+
     fn assert_domain(error: anyhow::Error, capacity: bool) {
         assert!(matches!(
             (error.downcast_ref::<StoreError>(), capacity),

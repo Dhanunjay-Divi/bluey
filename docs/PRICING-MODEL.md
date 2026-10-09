@@ -7,7 +7,7 @@
 > per-decision sections. Cross-referenced from `DECISIONS.md`,
 > `docs/HOW-IT-WORKS.md`, `FUTURE-IMPLEMENTATIONS.md` R14.13.
 >
-> Last updated: 2026-06-29.
+> Last updated: 2026-10-09.
 
 ---
 
@@ -44,19 +44,20 @@
 > - The Light tier projection (~1,500 cues per $15) reflects the
 >   1¢ floor; under fractional-cent billing it would be ~10x higher.
 
-> **Provider price snapshot date:** 2026-06-29. List prices from
+> **Provider price snapshot date:** 2026-10-09. List prices from
 > `https://platform.openai.com/docs/models`,
 > `https://docs.anthropic.com/en/docs/about-claude/pricing`, and
 > `https://ai.google.dev/gemini-api/docs/pricing`,
 > `https://docs.z.ai/guides/overview/pricing`, and
 > `https://api-docs.deepseek.com/quick_start/pricing`.
 > Refresh at every minor release. Managed LLM routes currently price
-> OpenAI `gpt-5.4-mini`, OpenAI `gpt-5.5`, Anthropic
+> OpenAI `gpt-5.4-mini`, OpenAI `gpt-5.5`, OpenAI `gpt-6-sol`, Anthropic
 > `claude-sonnet-4-6`, Anthropic `claude-opus-4-8`, Anthropic
-> `claude-haiku-4-5-20251001`, Gemini `gemini-3.1-pro-preview`,
+> `claude-haiku-5-5`, Gemini `gemini-3.1-pro-preview`,
 > Gemini `gemini-3.5-flash`, Gemini `gemini-3.1-flash-lite`,
 > Z.AI `glm-5.2`, Z.AI `glm-4.7-flashx`, DeepSeek `deepseek-v4-pro`, and DeepSeek
-> `deepseek-v4-flash`.
+> `deepseek-v4-flash`. Haiku 4.5 remains in the code pricing table for
+> historical usage-row reconciliation but is no longer a routed candidate.
 >
 > **Cache-price caveat:** DeepSeek and Z.AI publish lower cached-input prices.
 > Bluey v0.2 uses cache-miss input pricing for reservation and billing until
@@ -84,11 +85,25 @@
 
 | Provider/model | Upstream input | Upstream output | Customer markup | Bluey note |
 |---|---:|---:|---:|---|
+| Anthropic `claude-haiku-5-5` | $0.10/1M through 100K input; $0.50/1M above | $0.50/1M through 100K input; $2.50/1M above | 200% | Admission always reserves at the high tier; exact settlement selects the tier from full provider-reported input usage |
+| OpenAI `gpt-6-sol` | $2.00/1M through 272K input; $4.00/1M above | $10.00/1M through 272K input; $15.00/1M above | 200% | Default-off benchmark candidate; admission reserves high while exact settlement uses full input usage and `gpt-5.4-mini` remains the live baseline |
 | Gemini `gemini-3.5-flash` | $1.50/1M tokens | $9.00/1M tokens | 150% | Stable fast-capable candidate for instant, balanced, vision, and deep fallback |
 | Z.AI `glm-4.7-flashx` | $0.07/1M tokens | $0.40/1M tokens | 200% | Fast instant/balanced candidate with thinking disabled |
 | Z.AI `glm-5.2` | $1.40/1M cache-miss tokens | $4.40/1M tokens | 150% | Flagship deep candidate and balanced fallback when `ZAI_API_KEY(S)` is configured |
 | DeepSeek `deepseek-v4-pro` | $0.435/1M cache-miss tokens | $0.87/1M tokens | 150% | Deep candidate in default `provider_mix`; second deep candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
 | DeepSeek `deepseek-v4-flash` | $0.14/1M cache-miss tokens | $0.28/1M tokens | 200% | Instant/balanced candidate in default `provider_mix`; first instant candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
+
+The Haiku 5.5 rates follow Anthropic's
+[model overview](https://platform.claude.com/docs/en/models/haiku-5-5/overview).
+The GPT-6 Sol rates and long-context multiplier follow OpenAI's
+[model card](https://developers.openai.com/api/docs/models/gpt-6-sol). Bluey
+stores the higher context tier in each candidate's table entry and uses it for
+admission because the router does not enforce provider tier thresholds before
+dispatch. Exact settlement instead selects the documented low or high tier
+from the provider-reported full input-token count: at most 100,000 for Haiku
+5.5 and at most 272,000 for GPT-6 Sol remain low-tier. No cache-price request
+variant is sent. This keeps the reservation conservative without overcharging
+short-context completions.
 
 **STT pricing used by server meters:**
 

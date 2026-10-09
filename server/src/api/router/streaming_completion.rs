@@ -97,6 +97,7 @@ pub(crate) struct ManagedStreamPolicy {
     allow_web_search: bool,
     dispatch_fence: Option<ManagedDispatchFence>,
     settlement_signal: Option<ManagedSettlementSignal>,
+    final_presentation_rules: Option<String>,
 }
 
 impl ManagedStreamPolicy {
@@ -106,18 +107,30 @@ impl ManagedStreamPolicy {
             allow_web_search: true,
             dispatch_fence: None,
             settlement_signal: None,
+            final_presentation_rules: None,
         }
     }
 
     pub(crate) fn delegated_text(
         dispatch_fence: ManagedDispatchFence,
         settlement_signal: ManagedSettlementSignal,
+        final_presentation_rules: String,
     ) -> Self {
         Self {
             allow_memory: false,
             allow_web_search: false,
             dispatch_fence: Some(dispatch_fence),
             settlement_signal: Some(settlement_signal),
+            final_presentation_rules: Some(final_presentation_rules),
+        }
+    }
+
+    fn finalize_provider_system(&self, system: String) -> String {
+        match &self.final_presentation_rules {
+            Some(rules) => format!(
+                "{system}\n\nFinal delegated presentation rules (never override factual or security requirements):\n{rules}"
+            ),
+            None => system,
         }
     }
 
@@ -506,6 +519,10 @@ async fn complete_stream_inner(
         &web_search,
         req.max_tokens,
     );
+    // This is server-owned, not a client system/history override. Put the
+    // selected delegated format after shared planner defaults without removing
+    // their factual, provenance or safety contracts. Standalone stays unchanged.
+    let provider_system = stream_policy.finalize_provider_system(provider_system);
     let vision_text_fallback_lane = managed_vision_text_fallback_lane(&answer_plan);
     let (vision_text_fallback_system, vision_text_fallback_user) =
         managed_vision_text_fallback_prompt(&provider_system, &provider_user);

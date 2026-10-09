@@ -10,6 +10,24 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SECRET: &str = "synthetic-pinky-delegation-secret-at-least-32-bytes";
 
+#[test]
+fn conversational_styles_preserve_truth_and_source_boundaries() {
+    for mode in [
+        ResponseMode::Default,
+        ResponseMode::Short,
+        ResponseMode::Star,
+    ] {
+        let system = answer_system(mode);
+        assert!(system.starts_with(cue_core::prompt_contracts::MANAGED_PROVIDER_BASE_CONTRACT));
+        assert!(system.contains("natural conversational voice"));
+        assert!(system.contains("do not invent personal employers"));
+        assert!(system.contains("unless authorized source context is actually supplied"));
+        assert!(system.ends_with(mode.answer_rules()));
+    }
+    assert!(answer_system(ResponseMode::Short).contains("120 words"));
+    assert!(answer_system(ResponseMode::Star).contains("Situation, Task, Action, Result"));
+}
+
 struct ProviderTestEnv;
 
 impl ProviderTestEnv {
@@ -696,7 +714,11 @@ async fn predispatch_cancel_finishes_cancelled_without_provider_or_holds() {
         account,
         request,
         "pinky-predispatch-cancel".into(),
-        ManagedStreamPolicy::delegated_text(Arc::new(|| false), signal.clone()),
+        ManagedStreamPolicy::delegated_text(
+            Arc::new(|| false),
+            signal.clone(),
+            final_presentation_rules(ResponseMode::Short),
+        ),
     )
     .await;
     let error = match result {

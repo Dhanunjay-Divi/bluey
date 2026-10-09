@@ -265,7 +265,7 @@ impl ResponseMode {
                 "Answer the text question directly and concisely. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
             }
             Self::Short => {
-                "Give a short direct answer, normally no more than 120 words or three compact bullets. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
+                "Give a short direct answer in no more than 120 words: one compact paragraph or at most three short bullets. Compress any longer planner format into this limit. Use plain text, without Markdown headings, emphasis markers or backticks. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
             }
             Self::Star => {
                 "When the question is behavioral, organize the answer as Situation, Task, Action, Result. Never invent the user's experience or missing facts; ask for the minimum missing detail when necessary. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
@@ -442,9 +442,17 @@ fn validate_ask_identity(request: &AskIdentityRequest) -> Result<(), ApiError> {
 
 fn answer_system(mode: ResponseMode) -> String {
     format!(
-        "{}{}{}",
+        "{}{}{} {}",
         cue_core::prompt_contracts::MANAGED_PROVIDER_BASE_CONTRACT,
         cue_core::prompt_contracts::MANAGED_PROVIDER_ANSWER_RULES_SEPARATOR,
+        "Use a natural conversational voice: answer first, use clear everyday language and varied short sentences, and avoid canned openings, corporate filler, exaggerated praise or unnecessary headings. Sound like a thoughtful colleague, not a rewrite template. Preserve uncertainty and meaning rather than dressing guesses as facts. For interview answers, distinguish general examples from the user's actual experience; do not invent personal employers, responsibilities, dates, metrics or outcomes. Never claim to have read Otter transcripts or a private knowledge base unless authorized source context is actually supplied.",
+        mode.answer_rules()
+    )
+}
+
+fn final_presentation_rules(mode: ResponseMode) -> String {
+    format!(
+        "Use a natural conversational voice, answer first, avoid canned filler and unnecessary headings. Use plain text without Markdown emphasis markers. Never invent the user's experience or claim unavailable transcript access. {}",
         mode.answer_rules()
     )
 }
@@ -622,7 +630,11 @@ async fn ask_stream(
         account,
         managed_request,
         trace_id,
-        ManagedStreamPolicy::delegated_text(fence, settlement_signal.clone()),
+        ManagedStreamPolicy::delegated_text(
+            fence,
+            settlement_signal.clone(),
+            final_presentation_rules(request.response_mode),
+        ),
     )
     .await
     {
