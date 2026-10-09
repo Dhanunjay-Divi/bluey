@@ -2,23 +2,25 @@
 
 Date: 2026-10-08. Status: preparation, **not deployed**.
 
-## Continuation checkpoint
+## Checkpoint history and current gate
 
-The owner's standing stop-at-25%-remaining gate was reached: Codex reported
-76% used / 24% remaining. Implementation was stopped. The isolation builder
-was interrupted; its profile, validator and tests exist but are **unreviewed
-and untested**. No infrastructure, product runtime or workflow was changed.
+The owner's original stop-at-25%-remaining gate was reached at 76% used / 24%
+remaining. Work was checkpointed, then the owner explicitly lifted that limit
+and authorized continuation to 0%. The interrupted first draft was committed
+as Pinky `095b0ebf` and the initial Bluey handoff as `0ca7ef2f`; they were not
+merge/deploy approvals. Subsequent review found URL-role misbinding and
+malformed-input traceback/read-boundary defects. Preserve that failed-draft
+history rather than presenting it as verified tooling.
 
 Checkouts to resume:
 
 - Bluey: `/Users/uno/.codex/worktrees/bluey-pinky-integration/cue`.
 - Pinky: `/Users/uno/.codex/worktrees/pinky-bluey-integration/pinky-git`.
 
-First continuation step: review the three Pinky preparation files and run their
-offline tests; do not interpret their presence as completion of I0. Complete
-the signed/current deployment-base dependency review before I1. The active
-Pinky task was notified of the isolated scope and asked for an accepted base;
-receipt of that message does not prove agreement or a response.
+I1 is held by the live capacity check below and the accepted Pinky runtime-base
+review. The active Pinky task was notified of the isolated scope and asked for
+an accepted base; receipt of that message does not prove agreement or a response.
+Final I0 test/review evidence is in the matching Phase 626 work review.
 
 Load `bluey-ops` and `pinky-ops` before continuing. Repository source and current
 release runbooks override historical skill snapshots. This document is the
@@ -76,6 +78,22 @@ separate limited service identities, resource budgets and routing, no shared
 deployment lock/paths, no restart of other services. New paid infrastructure
 requires a stated budget and owner approval. Do not run legacy deploy scripts
 with their production defaults to bootstrap this environment.
+
+### Read-only capacity evidence — 2026-10-08
+
+The known-host, noninteractive SSH probe of documented Bluey host `bluey-brain`
+returned the following for `df -B1 /`:
+
+| Filesystem | Bytes | Used | Available | Use |
+| --- | --- | --- | --- | --- |
+| `/dev/vda1` | 61,285,326,848 | 61,268,549,632 | 0 | 100% |
+
+`systemctl is-active bluey-api.service bluey-jobs-api.service` returned active
+for both. The service inventory also included Jobs discovery workers. No env,
+credential, customer content or database was read. No cleanup, deployment,
+restart or host mutation occurred. Adding integration services here is **held**.
+The owner was asked to select another test target/budget or approve a separate
+capacity fix; this task must not remove Jobs/release data to make space.
 
 The Pinky preparation branch contains an unfinished first draft of
 `deploy/bluey-integration.profile.json` and an offline validator at
