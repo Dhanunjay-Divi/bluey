@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added a default-off Pinky delegation and owned AI-context lifecycle foundation,
+  with request-bound short-lived tokens, fresh-only account provisioning,
+  durable preprod bounds and standalone-auth regression coverage; not deployed.
 - Added a Git-backed Pinky/Bluey integration ops skill and runbook covering
   Pinky-owned sign-in/UI, independent AI authority, the dedicated test host,
   resource isolation, consent, billing proposals and promotion evidence.

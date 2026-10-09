@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Config
     let config = Config::from_env().context("load config")?;
+    let integration = bluey_server::pinky_integration::config_from_env(&config.jwt_secret)?;
     api::jobs_local_capability::validate_runtime_config()
         .context("validate Bluey Browser capability configuration")?;
     tracing::info!(
@@ -46,6 +47,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     db::run_migrations(&pool).context("run migrations")?;
+    let app = bluey_server::pinky_integration::build_application(
+        pool.clone(),
+        config.clone(),
+        integration,
+    )?;
     let expired_usage_released =
         db::usage_reservations::reconcile_expired_usage_reservations(&pool)
             .context("reconcile expired managed usage reservations at startup")?;
@@ -73,9 +79,6 @@ async fn main() -> anyhow::Result<()> {
             .clone()
             .or_else(|| config.object_storage.clone()),
     );
-
-    // Router
-    let app = api::build_router(pool.clone(), config.clone());
 
     // Bind
     let host = std::env::var("BLUEY_API_HOST")

@@ -34,12 +34,20 @@ work; its source pointer and overlap agreement must be recorded before porting.
 | Dedicated host | Active; strict SSH identity check passed | bootstrap isolated users/services/resources |
 | Runtime base | stable default is preparation-only | get accepted Pinky commit and modern guard closure |
 | DNS/TLS/application | not configured or deployed | exact origins, TLS, dedicated resources and config |
-| Identity/AI/billing | requirements documented, not implemented | I2–I5 source, security and accounting tests |
+| Identity/AI/billing | default-off foundation passed focused tests/strict Clippy; 909-test broad regression passed before lint-only fixes | remaining I2–I5 PostgreSQL, entitlement, dispatch, consent and accounting gates |
 | Native/UI | no current live integration acceptance | Mac + Windows evidence; I6 |
 | Promotion | not approved | I7 exact-artifact handoff and owner approval |
 
 A VM being Active is not an application launch. A profile PASS is not proof
 of secret independence, SSO, billing, health, signing or deployment authority.
+
+Current source/validation detail:
+[`IMPL-PHASE-626-DELEGATION.md`](../work/IMPL-PHASE-626-DELEGATION.md) and
+[`REVIEW-PHASE-626-DELEGATION.md`](../work/REVIEW-PHASE-626-DELEGATION.md).
+The lifecycle foundation cannot dispatch models or charge users. Its context
+state `active` is ownership/lifetime only, not AI entitlement or billable time.
+Pinky's matching signer is not wired into runtime yet. All implementation stays
+on the two feature branches; the accepted Pinky runtime base remains open.
 
 ## Approved infrastructure inventory
 
@@ -101,7 +109,9 @@ existing Pinky preprod deploy lock, service, port, path, database, update feed
 or bucket may be reused. Jobs services and flags remain untouched.
 
 Build on owner Mac/Windows or approved shared machines, not this 1 GiB host.
-No unnecessary GitHub-hosted runner jobs. Follow shared build/resource queues;
+Owner clarified: no GitHub runners or hosted fallback for preprod; use local
+Mac and Windows only. Production GitHub runners are a later coordinated Pinky
+release activity, not authorized by a passing preprod test. Follow shared build/resource queues;
 use isolated temporary test databases and automatically cleaned build roots.
 Deploy exact verified artifacts; record source SHA, digest and migration closure.
 

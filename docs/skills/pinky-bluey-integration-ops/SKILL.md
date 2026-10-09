@@ -48,9 +48,12 @@ Git copy; install using a normal file copy, not a symlink to a disposable worktr
   prove services, users, DBs, storage, signing keys, cookies and updates.
 - Do not copy production envs/customer data or use production-default deploy
   scripts. Preserve exact verified artifacts for later coordinated promotion.
-- Use owner Mac/Windows and shared resource queues. No unnecessary hosted
-  GitHub runners or heavy builds on the small integration host. Isolate test
-  databases/build roots and clean task-owned temporary outputs on every exit.
+- Use owner Mac/Windows and shared resource queues. No GitHub runners or hosted
+  fallback for preprod, and no heavy builds on the small integration host.
+  Production GitHub runners are a later coordinated Pinky release activity.
+  Isolate test databases/build roots and clean task-owned temporary outputs
+  on every exit. Use the local queue even for agent-started builds; source-only
+  agents must not silently run Cargo/Go outside the owned harness.
 
 ## Integration invariants
 
@@ -75,6 +78,13 @@ Git copy; install using a normal file copy, not a symlink to a disposable worktr
   permissions, retention/export/deletion; it is not permission to log every input.
 
 ## Evidence and handoff
+
+The Phase 626 delegation/lifecycle foundation is described in
+`docs/work/IMPL-PHASE-626-DELEGATION.md` and its matching review. It is default-off,
+cannot dispatch or charge, and does not complete I2. Context `active` is not
+billable time or AI entitlement. Pinky's signer is source-only until accepted
+runtime wiring. Reconcile exact test receipts and remaining PostgreSQL,
+admission-fairness, consent, cancellation and physical-device gates before use.
 
 Report each gate separately: offline tests, VM/resources, accepted source,
 live API/auth, billing/consent, physical Mac/Windows and promotion. No mock-only

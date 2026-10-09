@@ -3,6 +3,13 @@
 Date: 2026-10-08. Updated: 2026-10-09.
 Status: offline preparation verified; dedicated VM provisioned; **application not deployed**.
 
+2026-10-09 continuation: default-off request delegation and owned context
+lifecycle source passed local foundation validation; see the
+[implementation](../work/IMPL-PHASE-626-DELEGATION.md) and
+[review](../work/REVIEW-PHASE-626-DELEGATION.md). This is a partial I2 foundation,
+not entitlement, model, billing or UI completion. Pinky has a matching source-only
+signer plus a PLAN_ONLY bootstrap generator. No production/Jobs surface changed.
+
 Integration operations entry point:
 [`docs/ops/PINKY-BLUEY-INTEGRATION-RUNBOOK.md`](../ops/PINKY-BLUEY-INTEGRATION-RUNBOOK.md).
 Git-backed skill:
@@ -238,6 +245,9 @@ combined AI+remote; opted-in viewer source; revoked/stale source; identity
 switch; zero-credit/provider timeout; attach/delete; sleep/reconnect; test
 checkout/reload; old Pinky preprod regression. No hosted build dispatches or
 real provider spend without the shared runner/cost gates.
+Owner clarified on 2026-10-09: preprod uses local Mac/Windows only, with no
+GitHub runners or hosted fallback. Production GitHub runners will be handled
+later with the Pinky release owner after preprod acceptance.
 Also run standalone Bluey regression scenarios: existing login/device linking,
 account auth, AI streaming/cancel, wallet/usage and session history with Pinky
 absent. Pinky delegation must not become a required dependency of these paths.

@@ -27,6 +27,7 @@ pub mod jobs_mailbox_sync;
 pub mod jobs_resume_template;
 pub mod mail;
 pub mod object_storage;
+pub mod pinky_integration;
 pub mod pricing;
 pub mod provider_health;
 pub mod rate_limit;
