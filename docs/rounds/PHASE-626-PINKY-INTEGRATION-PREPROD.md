@@ -1,0 +1,181 @@
+# Phase 626 — isolated Pinky + Bluey integration preprod
+
+Date: 2026-10-08. Status: preparation, **not deployed**.
+
+## Continuation checkpoint
+
+The owner's standing stop-at-25%-remaining gate was reached: Codex reported
+76% used / 24% remaining. Implementation was stopped. The isolation builder
+was interrupted; its profile, validator and tests exist but are **unreviewed
+and untested**. No infrastructure, product runtime or workflow was changed.
+
+Checkouts to resume:
+
+- Bluey: `/Users/uno/.codex/worktrees/bluey-pinky-integration/cue`.
+- Pinky: `/Users/uno/.codex/worktrees/pinky-bluey-integration/pinky-git`.
+
+First continuation step: review the three Pinky preparation files and run their
+offline tests; do not interpret their presence as completion of I0. Complete
+the signed/current deployment-base dependency review before I1. The active
+Pinky task was notified of the isolated scope and asked for an accepted base;
+receipt of that message does not prove agreement or a response.
+
+Load `bluey-ops` and `pinky-ops` before continuing. Repository source and current
+release runbooks override historical skill snapshots. This document is the
+cross-repository handoff; it grants no production or signing authority.
+
+## Owner decision
+
+Both products belong to the owner. Keep two repositories and independently
+deployed backends. Pinky's existing preprod continues its own release work;
+a separate integration deployment combines Pinky's frontend with Bluey's AI.
+The owner will authorize promotion after joint validation. Bluey Jobs is out
+of scope, including its flags, database, workers and deployments.
+
+## Bases and ownership
+
+| Stream | Starting point | Owned branch |
+| --- | --- | --- |
+| Bluey integration coordination | `660f8d2bd19c22180c34630233300b351ea472e7` (`origin/main`) | `feat/phase-626-pinky-integration` |
+| Pinky integration preparation | `5837197f81649c5841a94e17d4558984d3d65e52` (repository default) | `codex/bluey-isolated-integration` |
+| Prior Pinky AI feature, reference only | `17202496e1005869a5da73dec131124ddd9b3249` | `codex/ai-assist-button-20260921` |
+
+Feature worktrees live under `~/.codex/worktrees`, not new Downloads folders.
+Do not stage, reset or clean either canonical checkout's owner changes.
+Do not merge the entire old AI branch: it modifies native audio, WebRTC, DB
+migrations, API and overlay files. The active Pinky team owns newer media,
+authentication, payment and caption-plane changes. Ask that team for the
+accepted integration base/seams before importing overlapping runtime files.
+The stable default lacks several newer operations guards; it is a preparation
+base, **not** an approved deployment candidate.
+
+## Separate environments
+
+| Target | URL | Status |
+| --- | --- | --- |
+| Existing Pinky preprod | `https://preprod-internal.pinky.sh` | reserved to Pinky team; do not mutate |
+| Existing Pinky preprod relay | `https://relay-preprod-internal.pinky.sh` | reserved to Pinky team; do not mutate |
+| Integration Pinky frontend/API | `https://assist-preprod.bluey.sh` | proposed, not provisioned |
+| Integration relay | `https://relay-assist-preprod.bluey.sh` | proposed, not provisioned |
+| Integration Bluey API | `https://api-assist-preprod.bluey.sh` | proposed, not provisioned |
+
+The new hostnames are a plan, not evidence of DNS, TLS or a live application.
+Read-only inventory found no established Bluey preprod; the historical
+`api-test.bluey.dev` example is not provisioning evidence.
+
+Use dedicated service names, data roots, database/schema, cache namespace,
+object-store bucket/prefix, API/relay ports, JWT signing material, integration
+credentials, webhook destinations, logs and synthetic users. Never copy
+production/preprod databases, login files or environment files into the new
+instance. Pin host-only cookies and exact-origin CORS/callback allowlists;
+reject credentials from either other environment. A separate URL alone does
+not isolate storage, identity or billing.
+
+Existing droplets may be reused only after capacity and isolation review:
+separate limited service identities, resource budgets and routing, no shared
+deployment lock/paths, no restart of other services. New paid infrastructure
+requires a stated budget and owner approval. Do not run legacy deploy scripts
+with their production defaults to bootstrap this environment.
+
+The Pinky preparation branch contains an unfinished first draft of
+`deploy/bluey-integration.profile.json` and an offline validator at
+`scripts/ops/check-bluey-integration-profile.py`. Once reviewed, a profile PASS means only
+that its declared configuration meets the offline preparation contract; it
+does not prove actual resources, secret independence or release eligibility.
+
+## Product and trust contract
+
+One compact Pinky overlay owns the integrated UI. Bluey's independent desktop
+product remains available; this does not require two overlapping pills or a
+shared codebase. Keep Pinky's visual language and conditional controls. Remote
+access must remain usable with AI disabled, unavailable or out of credit.
+
+The intended path is:
+
+`Pinky UI → authenticated Pinky assist API → delegated Bluey AI → SSE answer`
+
+Provider credentials stay on Bluey. The desktop receives neither provider
+keys nor a reusable Bluey service credential. A single login experience must
+still preserve independent Bluey entitlement and metering. Establish a durable
+Pinky immutable-subject → Bluey account binding with authenticated linking or
+reviewed token exchange. Email equality alone is not proof of account ownership.
+Delegation must bind issuer, audience, subject, environment, scopes, expiry and
+request identity. A shared service user's wallet is not per-customer billing.
+
+AI sessions have their own ownership/lifecycle, independent of remote codes.
+Do not achieve independence by deleting the existing session ownership check.
+Replace it with durable owned AI-session authority and request idempotency.
+Stopping AI does not stop remote sharing; ending sharing does not silently
+start/stop or alter AI billing. Account/entitlement changes revoke AI admission.
+
+Viewer audio → AI is **off by default**. Playback, Listen, captions and AI
+consent are separate. Opt-in must name the source and be visibly revocable;
+bind it to the accepted viewer/session generation and AI session, recheck at
+dispatch, and drop queued/stale input after revocation or source replacement.
+Never undo R873's viewer-loopback exclusion to provide this feature. Mic,
+screen and file context each retain their own explicit permission boundary.
+
+Default answers use the qualified Instant route. Deeper routing is explicit;
+do not assert model speed/quality from model names or stale price tables.
+Record content-free stage timings and sanitized error codes. User-approved
+session history is separate from diagnostics, with retention/export/deletion
+and tenant isolation; do not log every private input by default.
+
+## Billing proposal — not a shipped policy
+
+- PAYG default: minimum $15 wallet top-up. Optional $15 auto-reload requires
+  explicit consent, visible limits and durable idempotent provider handling.
+- Optional $9 buys 60 active AI-session minutes, with Start, Stop and timer;
+  retain unused time, no silent renewal, no simultaneous PAYG charge.
+- Confirm provider economics, any fair-use limits, rounding, disconnect/idle
+  semantics and refund policy before advertising or enabling hourly pricing.
+- Integration tests use synthetic balances/test entitlements. No real payments,
+  subscription changes or auto-reloads in this preparation slice.
+
+## Evidence behind required changes
+
+- Pinky AI reference `internal/api/assist_ask.go:167–190` requires a remote
+  session and checks its owner. `internal/webrtc/host_overlay_assist.go:228–237`
+  binds the controller's session ID to WebRTC's `s.code`. Independence needs
+  API **and** native lifecycle changes, not just a frontend button.
+- Reference `internal/assist/blueyclient.go:30` sets
+  `/api/assist/ask/stream`; the Pinky server calls Bluey's
+  `/router/complete/stream`. Preserve SSE cancellation and bounded parsing.
+- Bluey `server/src/auth/middleware.rs:20` authenticates Bluey account JWTs;
+  there is no evidence that Pinky identity delegation is already implemented.
+- Bluey `server/src/config.rs:175` provides `BLUEY_PUBLIC_URL`;
+  `crates/cue-cli/src/app.rs:264` provides `BLUEY_CLOUD_API_URL`.
+- Pinky default `.github/workflows/deploy-preprod.yml:291–316` reserves
+  existing preprod roots, services and origins. Never overwrite them.
+
+Pinky line references above apply to the pinned AI reference branch, not the
+default preparation branch. Re-resolve citations after selective porting.
+
+## Ordered implementation and separate test scenarios
+
+| Gate | Work | Required scenario/evidence |
+| --- | --- | --- |
+| I0 | preparation profile, negative isolation tests, coordination | reject old origins/roots/services and enabled unsafe defaults; no deploy |
+| I1 | accepted Pinky base, isolated infrastructure/config | fresh resource identity, no shared DB/secrets/storage/update feed; old preprod unchanged |
+| I2 | linked identity, AI sessions, entitlements | Pinky-only user has no AI; Bluey-added user asks without remote session; foreign/revoked identity denied |
+| I3 | selective AI API/controller/UI port | streaming, cancellation, bounded history, no changes to remote state when AI fails |
+| I4 | privacy sources and pack boundaries | default-off viewer audio, immediate revocation/replacement fences, cross-user pack denial |
+| I5 | synthetic billing, latency and reliability | no double charge on retry; crash/disconnect reconciled; first-token percentiles/cost for fixed workloads |
+| I6 | native and browser UX | actual Mac and Windows, light/dark, compact pill, keyboard/AT, reconnect/sleep; no mock-only claims |
+| I7 | reviewed exact-artifact promotion handoff | both owners/teams verify pins, flags, migration/recovery/backup and physical evidence before production |
+
+Keep fixtures/workloads distinct: AI-only/no remote; remote-only/no AI;
+combined AI+remote; opted-in viewer source; revoked/stale source; identity
+switch; zero-credit/provider timeout; attach/delete; sleep/reconnect; test
+checkout/reload; old Pinky preprod regression. No hosted build dispatches or
+real provider spend without the shared runner/cost gates.
+
+## Promotion handoff to Pinky
+
+Promote reviewed changes through each repository's normal PR target, not a
+direct main push or wholesale cross-repo merge. Supply exact source commits,
+artifact digests/signatures, schema/migration dependency closure, configuration
+and entitlement contract, test receipts, explicit unknowns and recovery plan.
+Pinky promotes its UI/API/native slice; Bluey promotes its AI/delegation slice
+in a coordinated compatible rollout. Tested artifacts are not rebuilt between
+preprod and production. A passing profile/unit suite is not approval to promote.

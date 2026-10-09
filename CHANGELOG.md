@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added a cross-repository Pinky/Bluey integration-preprod plan with dedicated
+  isolation, independent AI-session, consent, billing and promotion gates;
+  preparation only, with no production or Bluey Jobs changes.
 - Added a one-time, keyboard-accessible macOS shortcut coachmark after visible
   desktop sign-in, anchored to the real Shortcuts control without enlarging the
   112 by 30 Bluey pill.
