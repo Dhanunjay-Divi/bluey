@@ -160,3 +160,18 @@ The final frozen-source rerun used PostgreSQL 17.10 and private root
 The two routing tests that failed in the pre-repair run both passed in this
 final run. PostgreSQL fast-stopped, the owned root was removed, and no owned
 PostgreSQL process remained after cleanup.
+
+After the delegated Short policy was tightened, the complete harness was run
+again against that exact source. PostgreSQL 17.10 used private root
+`/tmp/bluey-pinky-postgres-tests.cbdTN2`, and the harness exited `0`:
+
+- exact real-PostgreSQL store test: `1 passed`, `847` filtered out;
+- focused Pinky tests: `35 passed`, `813` filtered out;
+- all-target tests: `932 passed` with the same `848 + 1 + 1 + 2 + 78 + 1 + 1`
+  breakdown; and
+- strict all-target Clippy with `-D warnings`: passed.
+
+The source tests verify the revised Short policy construction and token budget;
+they do not prove a hard provider word cap. A new live Haiku 5.5 trial remains
+the separate behavioral gate. PostgreSQL fast-stopped, the owned root was
+removed, and no owned process remained after cleanup.

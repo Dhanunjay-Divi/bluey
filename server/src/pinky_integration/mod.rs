@@ -265,7 +265,7 @@ impl ResponseMode {
                 "Answer the text question directly and concisely. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
             }
             Self::Short => {
-                "Give a short direct answer in no more than 120 words: one compact paragraph or at most three short bullets. Compress any longer planner format into this limit. Use plain text, without Markdown headings, emphasis markers or backticks. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
+                "Short mode: answer in exactly one compact paragraph of three or four short sentences. Aim for 60 to 90 words; the absolute ceiling is 120 words. Cover the core answer and its essential caveat, then stop. Omit optional examples, follow-up questions, headings, lists and extra detail. This length and format replace any longer planner presentation. Use plain text without Markdown emphasis or backticks. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
             }
             Self::Star => {
                 "When the question is behavioral, organize the answer as Situation, Task, Action, Result. Never invent the user's experience or missing facts; ask for the minimum missing detail when necessary. Do not assume access to remote-session, screen, audio, files, prior conversation, or saved history."
@@ -276,7 +276,7 @@ impl ResponseMode {
     fn max_tokens(self) -> u32 {
         match self {
             Self::Default => 1_024,
-            Self::Short => 384,
+            Self::Short => 256,
             Self::Star => 900,
         }
     }

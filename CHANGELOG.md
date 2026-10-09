@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Tightened delegated Short mode to a 60–90 word target, one paragraph and
+  a 256-token ceiling after a real 140-word preprod answer failed its limit.
+  Prompt guidance remains probabilistic; live acceptance is required.
 - Added Haiku5.5 request/typed-content support and a default-off GPT6Sol
   benchmark fallback, with context-tier-aware exact settlement separated from
   conservative admission holds. Historical Haiku4.5 pricing is retained.
