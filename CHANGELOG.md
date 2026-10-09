@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added a Git-backed Pinky/Bluey integration ops skill and runbook covering
+  Pinky-owned sign-in/UI, independent AI authority, the dedicated test host,
+  resource isolation, consent, billing proposals and promotion evidence.
 - Added a cross-repository Pinky/Bluey integration-preprod plan with dedicated
   isolation, independent AI-session, consent, billing and promotion gates;
   preparation only, with no production or Bluey Jobs changes.

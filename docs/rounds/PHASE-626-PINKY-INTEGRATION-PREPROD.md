@@ -1,6 +1,13 @@
 # Phase 626 — isolated Pinky + Bluey integration preprod
 
-Date: 2026-10-08. Status: preparation, **not deployed**.
+Date: 2026-10-08. Updated: 2026-10-09.
+Status: offline preparation verified; dedicated VM provisioned; **application not deployed**.
+
+Integration operations entry point:
+[`docs/ops/PINKY-BLUEY-INTEGRATION-RUNBOOK.md`](../ops/PINKY-BLUEY-INTEGRATION-RUNBOOK.md).
+Git-backed skill:
+[`pinky-bluey-integration-ops`](../skills/pinky-bluey-integration-ops/SKILL.md).
+Load it alongside `$bluey-ops` and `$pinky-ops` for this integration.
 
 ## Checkpoint history and current gate
 
@@ -17,8 +24,9 @@ Checkouts to resume:
 - Bluey: `/Users/uno/.codex/worktrees/bluey-pinky-integration/cue`.
 - Pinky: `/Users/uno/.codex/worktrees/pinky-bluey-integration/pinky-git`.
 
-I1 is held by the live capacity check below and the accepted Pinky runtime-base
-review. The active Pinky task was notified of the isolated scope and asked for
+I1 no longer depends on the full production host: a separate VM was approved
+and provisioned. It still requires isolated application resources and accepted
+Pinky runtime-base review. The active Pinky task was notified of the isolated scope and asked for
 an accepted base; receipt of that message does not prove agreement or a response.
 Final I0 test/review evidence is in the matching Phase 626 work review.
 
@@ -47,8 +55,28 @@ cross-repository handoff; it grants no production or signing authority.
 Both products belong to the owner. Keep two repositories and independently
 deployed backends. Pinky's existing preprod continues its own release work;
 a separate integration deployment combines Pinky's frontend with Bluey's AI.
-The owner will authorize promotion after joint validation. Bluey Jobs is out
+The owner will authorize promotion after joint validation. For this phase,
+Pinky owns the entire customer AI experience; a separate Bluey desktop/UI is
+deferred, not a launch dependency. Preserve Bluey's independent backend and
+existing standalone product without spending this batch on its UI. Bluey Jobs is out
 of scope, including its flags, database, workers and deployments.
+
+### Repository and standalone compatibility
+
+Use the existing Pinky and Bluey repositories; no third repository was created.
+Pinky owns its integrated UI/client adapter, while Bluey owns the reusable AI
+backend, authorization/metering and existing standalone client. Feature
+branches/PRs preserve integration work without a copied full product tree.
+Revisit a separate shared-contract package only if actual multiple-client
+versioning/release needs justify it; it is not needed for preparation.
+
+Standalone Bluey is preserved, not disabled or replaced. Keep its existing
+desktop, device-link/login, account JWT, wallet, routing and session flows
+compatible when adding Pinky delegation. Add explicit regression coverage for
+those paths before promotion. Shared AI logic stays in Bluey; Pinky-specific
+subject delegation belongs at a distinct reviewed server boundary, not in the
+standalone client's authentication or UI. Future standalone work can continue
+without Pinky running or installed.
 
 ## Bases and ownership
 
@@ -89,7 +117,8 @@ instance. Pin host-only cookies and exact-origin CORS/callback allowlists;
 reject credentials from either other environment. A separate URL alone does
 not isolate storage, identity or billing.
 
-Existing droplets may be reused only after capacity and isolation review:
+The owner approved one dedicated $7/month instance on 2026-10-09. Existing
+droplets must not be reused for this integration. Any later reuse requires capacity and isolation review:
 separate limited service identities, resource budgets and routing, no shared
 deployment lock/paths, no restart of other services. New paid infrastructure
 requires a stated budget and owner approval. Do not run legacy deploy scripts
@@ -111,17 +140,23 @@ restart or host mutation occurred. Adding integration services here is **held**.
 The owner was asked to select another test target/budget or approve a separate
 capacity fix; this task must not remove Jobs/release data to make space.
 
-The Pinky preparation branch contains an unfinished first draft of
+This capacity observation is historical. A later owner-approved package-cache
+cleanup left 110,981,120 available bytes; retained backups were untouched.
+Production remains unsuitable for integration. The separate VM and unresolved
+backup-health findings are recorded in the integration runbook.
+
+The Pinky preparation branch contains the reviewed offline draft of
 `deploy/bluey-integration.profile.json` and an offline validator at
-`scripts/ops/check-bluey-integration-profile.py`. Once reviewed, a profile PASS means only
+`scripts/ops/check-bluey-integration-profile.py`. A profile PASS means only
 that its declared configuration meets the offline preparation contract; it
 does not prove actual resources, secret independence or release eligibility.
 
 ## Product and trust contract
 
-One compact Pinky overlay owns the integrated UI. Bluey's independent desktop
-product remains available; this does not require two overlapping pills or a
-shared codebase. Keep Pinky's visual language and conditional controls. Remote
+One compact Pinky overlay owns the integrated UI. No separate Bluey app,
+second pill, second login or connect-code step is required for a Pinky user
+adding AI. The old AI branch is reference material, not a mandated blueprint.
+Keep Pinky's visual language and conditional controls. Remote
 access must remain usable with AI disabled, unavailable or out of credit.
 
 The intended path is:
@@ -203,6 +238,9 @@ combined AI+remote; opted-in viewer source; revoked/stale source; identity
 switch; zero-credit/provider timeout; attach/delete; sleep/reconnect; test
 checkout/reload; old Pinky preprod regression. No hosted build dispatches or
 real provider spend without the shared runner/cost gates.
+Also run standalone Bluey regression scenarios: existing login/device linking,
+account auth, AI streaming/cancel, wallet/usage and session history with Pinky
+absent. Pinky delegation must not become a required dependency of these paths.
 
 ## Promotion handoff to Pinky
 

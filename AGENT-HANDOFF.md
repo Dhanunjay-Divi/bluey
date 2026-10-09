@@ -1,6 +1,7 @@
 # Bluey Agent Handoff
 
-Last updated: 2026-06-02
+Last updated: 2026-10-09 (integration entry point).
+The standalone desktop snapshot below was recorded on 2026-06-02.
 
 > **Codex preflight:** Load `$bluey-ops` from
 > `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before continuing this handoff.
@@ -8,7 +9,21 @@ Last updated: 2026-06-02
 
 Start here when joining the Bluey repo.
 
-## Read First
+## Pinky-integrated AI — current scoped handoff
+
+For Pinky/Bluey integration, load `$pinky-ops` and
+`$pinky-bluey-integration-ops` alongside `$bluey-ops`, then read
+[`docs/ops/PINKY-BLUEY-INTEGRATION-RUNBOOK.md`](docs/ops/PINKY-BLUEY-INTEGRATION-RUNBOOK.md)
+and the Phase 626 plan linked there. Pinky owns the UI/sign-in for that phase;
+standalone Bluey UI is deferred. The historical desktop snapshot below is not
+the integration's deployment/source authority. Existing Pinky preprod and
+Bluey Jobs remain out of scope.
+
+## Historical standalone desktop context — revalidate before use
+
+The following June context and architecture snapshot is retained for history,
+not current release/model/deployment truth. For Pinky integration, use the
+scoped handoff above and its current source pins/gates instead.
 
 1. `docs/rounds/END-TO-END-AGENT-CONTEXT-2026-05-25.md`
 2. `docs/rounds/END-TO-END-READINESS-PASS-2026-05-29.md`
@@ -19,7 +34,7 @@ Start here when joining the Bluey repo.
 7. `docs/PRELAUNCH-CHECKLIST.md`
 8. `docs/rounds/SESSION-KNOWLEDGE-RAG-2026-06-01.md`
 
-The first file is the complete current context: product flow, architecture,
+The first file records the context at that historical checkpoint: product flow, architecture,
 implemented state, provider routing, capacity policy, cloud/RAG/storage plan,
 environment variables, QA commands, known gaps, and what to tell the next
 agent.

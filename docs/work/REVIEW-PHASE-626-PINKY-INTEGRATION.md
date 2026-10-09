@@ -66,3 +66,28 @@ capacity work. This task did not perform cleanup.
 Reconcile the active
 Pinky team's accepted runtime base and infrastructure identities. Follow I1–I7
 in `docs/rounds/PHASE-626-PINKY-INTEGRATION-PREPROD.md` without bypassing gates.
+
+## 2026-10-09 operations extension
+
+Owner approved a dedicated $7/month VM and clarified Pinky-owned UI/sign-in.
+Authenticated provider overview showed Droplet `607491621` Active, and the
+provider console's public SSH host key matched before a strict SSH probe.
+The runbook records resource samples and unconfigured application ports.
+This closes VM provisioning/host identity only, not all of I1 or any runtime gate.
+
+Added a Git-backed integration skill/runbook and cross-repo handoff links.
+Independent `isolation_review` forward-tested the skill against an old-branch
+deployment request and correctly held application deployment while identifying
+accepted-base/resource/identity/runtime gates. Its stale-global-handoff date
+and target-UX wording findings were corrected. The local skill is installed
+by file copy and checked against source, not linked to a disposable worktree.
+
+Both repo diff checks, Bluey runbook preflight and all 16 Pinky offline-profile
+tests passed again. The first skill validation attempt failed because the
+default Python lacked PyYAML; a task-owned temporary virtual environment is
+used for the actual validation and removed afterward. No global dependency
+installation or retained test/build database is part of this slice.
+No integration product code, DNS/TLS, user database, provider configuration,
+live billing, native build or application deployment was changed by this slice.
+The original no-cleanup statement above applies to the earlier preparation
+slice; a later owner-approved package-cache cleanup is recorded in the runbook.
