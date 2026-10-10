@@ -4,6 +4,10 @@ Updated: 2026-10-09. Codex preflight: load `$bluey-ops`, `$pinky-ops` and
 `$pinky-bluey-integration-ops`. Read the current repository `AGENTS.md` and
 the [Phase 626 plan](../rounds/PHASE-626-PINKY-INTEGRATION-PREPROD.md).
 
+Latest source-only handoff: [selected text and overlay continuation](../work/PHASE-626-SELECTED-TEXT-CONTINUATION-20261010.md).
+It records the exact cross-repo boundary and open validation gates. No new live
+pin or feature enablement is implied by that implementation checkpoint.
+
 ## Product decision and ownership
 
 Pinky owns login, the compact native overlay and web UI. Bluey is the AI
@@ -32,10 +36,10 @@ work; its source pointer and overlap agreement must be recorded before porting.
 | --- | --- | --- |
 | I0 offline profile | 16 tests and independent review passed | connect to a reviewed deploy controller later |
 | Dedicated host | approved $7 host; exact locally built text artifacts active, independent users/roots/signing secrets | resource/load qualification, no production sizing claim |
-| Runtime base | Pinky `76482a17` on clean accepted base; Bluey `556525a5` | reconcile additive changes with active Pinky team before promotion |
+| Runtime base | Pinky `b7de1545` two-product website on clean accepted base; Bluey `625b9131` | reconcile additive changes with active Pinky team before promotion |
 | DNS/TLS/application | public TLS and fresh synthetic auth/lifecycle/isolation passed | broader recovery/quality/physical gates |
-| Identity/AI/billing | Bluey PG1/1, focused35/35, all-target932/932 + strict Clippy; Pinky targeted race + Node35/Python26 | synthetic accounting only; real billing policy/acceptance open |
-| Native/UI | Mac arm64/x86_64 and Windows compile evidence; real web streaming visible | physical Mac/Windows acceptance; strict STAR factual quality failed |
+| Identity/AI/billing | Bluey PG1/1, focused38/38, all-target935/935 + strict Clippy; Pinky targeted race + Node44/Python26; exact account/lifecycle live tests passed | synthetic accounting only; real billing policy/acceptance open |
+| Native/UI | actual Mac text stream/Stop/reopen; compact account light/dark/320px navigation; Mac/Windows helper + Windows CLI build/smoke passed | full device/Windows UI/media acceptance; strict STAR factual quality failed |
 | Promotion | not approved | I7 exact-artifact handoff and owner approval |
 
 A VM being Active alone is not an application launch. A profile PASS is not proof
@@ -59,15 +63,62 @@ dedicated Bluey unit was restarted; NRestarts remained zero and health passed.
 ### Latest text-preprod receipt — 2026-10-09
 
 Read the [exact-artifact acceptance/handoff](../work/PHASE-626-TEXT-PREPROD-ACCEPTANCE.md).
-Pinky live source is `76482a171693f67d833a839a10504895be25a449`;
-Bluey live source is `556525a5be58f4c68ece5a994fc3c44822a31645`.
+Pinky live source is `b7de1545ef6e10a13f3c5d37bf30998e68d14560`;
+Bluey live source is `625b9131db0ef6e8b89cd28e9f7a595a12c0350e`.
+The latest two-product shell keeps Remote access/Pinky AI separate with one
+existing Billing entry; it does not enable real AI pricing or mixed checkout.
+Runtime-race/Node50/Python26, exact local Linux build, live auth/CSRF/tenant
+checks and actual light/dark/320px/hash/keyboard browser tests passed. b68 is
+the immediate Pinky rollback. Latest native QA is `ae3eef3d`: selectable
+non-overlapping CC+AI, unchanged pill/panel, local guarded shortcuts, queued
+Mac AppKit/both-arch and Dell native tests/builds, actual Mac synthetic-caption
++ real text/themed QA. Read Pinky's `BLUEY-INTEGRATION-PRODUCT-SHELL-20261009.md`
+and `BLUEY-INTEGRATION-CC-AI-LAYOUT-20261009.md` rounds for exact hashes.
+Only dedicated Pinky API was restarted; Bluey/configuration/data/credit,
+other environments, production and Jobs are unchanged. Private unsigned
+native QA is not an installer/updater release. Physical Windows/DPI/media,
+STAR grounding, transcript memory, billing and percentile gates remain open.
+
+Preceding b68 compact-site and 925 overlay checkpoints follow as historical
+evidence, not current live source or current native design:
+The superseding UI-only cutover is recorded in the receipt's compact-website
+section. Local runtime Go + Node45/Python26, exact Linux build, fresh live
+negative/lifecycle checks and visible light/dark/320px header/menu/keyboard
+checks passed. c8 remains the Pinky rollback. A newer overlay-only native QA
+checkpoint `92513204243940148d2c77d84c2af65101bcf425` passed queued Mac Swift
+presentation/action-guard tests, arm64/x86_64 helpers/CLI, Dell C state tests and
+helper compilation, and actual Mac Ask/Stop/Hide/reopen. Pill116×36/panel320×320
+remain unchanged. See Pinky's integration feature checkout
+`docs/rounds/BLUEY-INTEGRATION-OVERLAY-FIRST-20261009.md` for hashes/residues.
+This did not replace the live backend/web artifacts or publish a signed updater;
+Windows physical UI, visual themes and controlled live selection soak stay open.
+Exact Windows Go1.26.5 CLI compile/offline argument smoke passed; physical UI
+and full Windows suite stay open. GitHub publishing is pending authorized
+noninteractive Git transport; verified private feature bundles retain source.
+No Keychain access or history rewrite was used to work around SSH denial.
 Both reviewed single-role cutovers verified process binary hashes and health;
 NRestarts=0. No bootstrap, seed, DB, key, credit or configuration replacement.
+The exact account route allowlist extension preserved signing/auth checks;
+no other upstream routes were enabled. Website owns account/history/balance;
+actual AI input/output belongs to the native compact panel. Account history is
+metadata-only; unavailable data is never fabricated as zero. Native final
+request ownership and bounded Stop/Done reconciliation have race tests and
+visible Mac text evidence. Consult the receipt for exact hashes and limitations.
 The selected provider credentials are the explicit owner-approved exception;
 no full production environment or customer data was copied.
 
+Owner-approved guidance from the active Pinky thread identifies its current
+c75808f3 plus concurrent dirty work as navigation only, not a frozen integration
+baseline. Preserve subscription/customer/provider attachment, durable checkout
+idempotency, paid-through/downgrade dates and separate AI entitlement. Next UX
+direction is Remote Access / Pinky AI with one Billing entrypoint; no real add-on
+or prices are activated. Read Pinky's integration-feature
+`docs/work/PINKY-AI-PRODUCT-BILLING-BOUNDARY-20261009.md` first. The additive Pinky
+integration runbook is absent from the active release tree and must be included
+in a coordinated promotion; do not bulk-import or edit its owned release work.
+
 Fresh public negative/lifecycle tests passed with zero provider dispatch.
-Real synthetic Short delivered 88 words at 913ms first text /1548ms total;
+Earlier source556525 real synthetic Short delivered 88 words at913ms first text /1548ms total;
 Default 257 words at 784ms/3318ms; STAR 108 words at1433ms/1901ms.
 Transport, settlement, Short length and STAR labels passed. **Manual strict
 STAR factual quality failed**: inferred query-plan/access-pattern details;
@@ -76,7 +127,10 @@ and delivery success are not semantic correctness. Keep production promotion
 held, retain the failed evidence, and implement source-grounded story authority
 before claiming dependable personal interview answers. Timings are individual
 observations, not percentiles or proof that these models are always fastest.
-Otter memory, audio consent, physical devices and real billing remain open.
+Otter memory, audio consent, full physical-device acceptance and real billing
+remain open. Bounded actual Mac independent text QA passed; it does not certify
+Windows physical UI, Intel hardware, media or a signed installer. The b68 opt-in
+shell now fixes the earlier phone header overflow; broader device QA stays open.
 
 ### Initial activation and historical public checks — 2026-10-09
 

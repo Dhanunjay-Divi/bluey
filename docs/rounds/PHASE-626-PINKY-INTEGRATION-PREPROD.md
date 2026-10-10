@@ -1,9 +1,11 @@
 # Phase 626 — isolated Pinky + Bluey integration preprod
 
 Date: 2026-10-08. Updated: 2026-10-09.
-Status: dedicated text Assist deployed at Pinky76482a17 / Bluey556525a5;
-real public auth/isolation and PostgreSQL gates passed. Strict STAR factual
-quality failed; physical/media/billing/memory/percentile gates remain open.
+Status: dedicated text Assist deployed at Pinkyc8ac6511 / Bluey625b9131;
+real public auth/account/isolation and PostgreSQL gates passed. Actual Mac text
+stream/Stop/repeated owned reopen and web account light/dark/mobile-tab checks
+passed. Strict STAR factual quality failed; full device/Windows/media/billing/
+memory/percentile gates remain open.
 No production promotion. Read the [latest exact-artifact receipt](../work/PHASE-626-TEXT-PREPROD-ACCEPTANCE.md).
 
 2026-10-09 continuation: default-off request delegation and owned context
@@ -111,9 +113,9 @@ base, **not** an approved deployment candidate.
 | --- | --- | --- |
 | Existing Pinky preprod | `https://preprod-internal.pinky.sh` | reserved to Pinky team; do not mutate |
 | Existing Pinky preprod relay | `https://relay-preprod-internal.pinky.sh` | reserved to Pinky team; do not mutate |
-| Integration Pinky frontend/API | `https://assist-preprod.bluey.sh` | live isolated text `76482a17` |
+| Integration Pinky frontend/API | `https://assist-preprod.bluey.sh` | live isolated text `c8ac6511` |
 | Integration relay | `https://relay-assist-preprod.bluey.sh` | provisioned TLS; intentionally503, remote off |
-| Integration Bluey API | `https://api-assist-preprod.bluey.sh` | live isolated text `556525a5` |
+| Integration Bluey API | `https://api-assist-preprod.bluey.sh` | live isolated text `625b9131` |
 
 Current activation and public TLS evidence is in the integration runbook;
 historical preparation sections below are not current runtime limitations.

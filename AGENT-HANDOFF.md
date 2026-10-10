@@ -1,6 +1,6 @@
 # Bluey Agent Handoff
 
-Last updated: 2026-10-09 (integration entry point).
+Last updated: 2026-10-10 (integration entry point).
 The standalone desktop snapshot below was recorded on 2026-06-02.
 
 > **Codex preflight:** Load `$bluey-ops` from
@@ -10,6 +10,11 @@ The standalone desktop snapshot below was recorded on 2026-06-02.
 Start here when joining the Bluey repo.
 
 ## Pinky-integrated AI — current scoped handoff
+
+Read [the current backend continuation](docs/work/PHASE-626-SELECTED-TEXT-CONTINUATION-20261010.md)
+and [Git-backed integration skill](docs/skills/pinky-bluey-integration-ops/SKILL.md)
+first. They separate verified source tests, unpublished implementation,
+documentation-only GitHub snapshots and actual live deployment.
 
 For Pinky/Bluey integration, load `$pinky-ops` and
 `$pinky-bluey-integration-ops` alongside `$bluey-ops`, then read

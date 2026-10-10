@@ -6,6 +6,11 @@ Before any Bluey task, load the local `$bluey-ops` skill from
 `/Users/uno/.codex/skills/bluey-ops/SKILL.md`. Use it as navigation and operating
 memory; this file and the current repository remain authoritative.
 
+For Pinky-integrated AI work, also read the Git-backed
+`docs/skills/pinky-bluey-integration-ops/SKILL.md` and
+`docs/work/PHASE-626-SELECTED-TEXT-CONTINUATION-20261010.md`.
+Do not apply this integration task to Jobs or unrelated production work.
+
 ## Architecture
 
 Cue is a cross-platform AI meeting copilot built with Tauri 2 (Rust backend + React 19 frontend). The workspace contains three Rust crates (`cue-core` for shared logic, `cue-daemon` for background services, `cue-cli` for developer tooling), a React dashboard (`web/`), and native platform overlays (`native/`). Audio capture, STT, LLM streaming, and RAG are orchestrated by the daemon; the overlay and dashboard consume results via Tauri IPC events.

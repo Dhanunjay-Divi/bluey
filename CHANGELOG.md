@@ -7,6 +7,18 @@ under `docs/release/`.
 
 ### Added
 
+- Added default-off Pinky selected-text artifacts with owned-session authority,
+  bounded UTF-8 context, content/hash replay, explicit deletion and delegated-only
+  untrusted USER evidence projection. This is source-only; live document, media,
+  billing and platform acceptance remain separate gates.
+
+- Recorded the isolated Pinky compact-workspace cutover and rendered phone/
+  light/dark acceptance, unchanged native artifacts and separate open gates.
+
+- Added a default-off, signed read-only Pinky account credit summary with
+  immutable-subject isolation, coherent spendable/held accounting snapshots and
+  no wallet/session provisioning or private prompt/answer persistence.
+
 - Made delegated STAR's four explicit labels override the shared natural-story
   presentation, with guidance against inferred dates, diagnostics or outcomes after
   a real synthetic interview trial exposed unsupported details.
