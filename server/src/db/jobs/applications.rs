@@ -624,8 +624,7 @@ fn prepare_application_inner(
     let profile = get_profile(pool, account_id, "")?;
     let stored_posting =
         get_posting(pool, account_id, job_id)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
-    let composed =
-        resolve_composed_job_integrity_projection(pool, account_id, &stored_posting)?;
+    let composed = resolve_composed_job_integrity_projection(pool, account_id, &stored_posting)?;
     let posting =
         posting_with_original_source_projection(&stored_posting, &composed.original_source);
     let original_source_expected_head = composed.original_source.expected_head.clone();
@@ -860,8 +859,7 @@ pub fn finalize_prepared_application_kit(
     }
     let stored_posting = get_posting(pool, account_id, &application.job_id)?
         .ok_or_else(|| anyhow::anyhow!("job not found"))?;
-    let composed =
-        resolve_composed_job_integrity_projection(pool, account_id, &stored_posting)?;
+    let composed = resolve_composed_job_integrity_projection(pool, account_id, &stored_posting)?;
     if !original_source_projection_matches_application(&application, &composed.original_source)? {
         anyhow::bail!("original-source verification changed during resume generation")
     }
@@ -2134,7 +2132,7 @@ fn commit_prepared_application(
                         application,
                         &authority_posting,
                         &employer_domain,
-                )?;
+                    )?;
                 let mut queue_authorized = false;
                 let mut held = None;
                 for (runner_name, runner, entitled) in [
@@ -2777,7 +2775,10 @@ mod queue_admission_tests {
             "composed.discovery_evidence.clone()",
             "enforce_application_finalization_eligibility_at_ms",
         ] {
-            assert!(validator.contains(required), "missing current-effect gate {required}");
+            assert!(
+                validator.contains(required),
+                "missing current-effect gate {required}"
+            );
         }
 
         let sqlite = source
@@ -2834,7 +2835,10 @@ mod queue_admission_tests {
                 "LIMIT 1",
                 "daily_limit",
             ] {
-                assert!(loader.contains(required), "{label} omits bounded {required}");
+                assert!(
+                    loader.contains(required),
+                    "{label} omits bounded {required}"
+                );
             }
             assert!(!loader.contains("WHERE account_id=?1 ORDER BY reserved_at_ms DESC"));
             assert!(!loader.contains("WHERE account_id=$1 ORDER BY reserved_at_ms DESC"));
@@ -2875,8 +2879,7 @@ mod queue_admission_tests {
             .map(|offset| application_lock + offset)
             .expect("packet E lock query");
         assert!(
-            !commit[application_lock..entitlement_lock]
-                .contains("jobs_attempt_reservations"),
+            !commit[application_lock..entitlement_lock].contains("jobs_attempt_reservations"),
             "packet commit must not read R between A and E",
         );
         let child_loader = source
@@ -2929,9 +2932,8 @@ mod queue_admission_tests {
             .split_once("\nstruct ApplicationFinalizationAuthorities")
             .expect("bounded database-time discovery authority evaluator")
             .0;
-        assert!(discovery_at_ms.contains(
-            "authority_at_ms.saturating_sub(LIVE_VERIFICATION_MAX_AGE_MS)"
-        ));
+        assert!(discovery_at_ms
+            .contains("authority_at_ms.saturating_sub(LIVE_VERIFICATION_MAX_AGE_MS)"));
         assert!(!discovery_at_ms.contains("now_ms()"));
 
         let validator = eligibility
@@ -3735,10 +3737,7 @@ mod queue_admission_tests {
         let schema = format!("fix753_evidence_{suffix}");
         let account_id = format!("acct-fix753-evidence-{suffix}");
         let track_id = format!("track-fix753-evidence-{suffix}");
-        let finalizer_name = format!(
-            "bluey-fix753-evidence-finalizer-{}",
-            &suffix[..16]
-        );
+        let finalizer_name = format!("bluey-fix753-evidence-finalizer-{}", &suffix[..16]);
         let mut setup = postgres::Client::connect(&url, postgres::NoTls)
             .expect("connect FIX-753 evidence setup client");
         setup
@@ -5069,9 +5068,7 @@ fn require_packet_commit_account_write_fence_postgres_tx(
         )?
         .is_none()
     {
-        return Err(
-            crate::db::object_uploads::UploadControlError::SessionNotOwned.into(),
-        );
+        return Err(crate::db::object_uploads::UploadControlError::SessionNotOwned.into());
     }
     if tx
         .query_opt(
@@ -5081,9 +5078,7 @@ fn require_packet_commit_account_write_fence_postgres_tx(
         )?
         .is_some()
     {
-        return Err(
-            crate::db::object_uploads::UploadControlError::AccountDeleting.into(),
-        );
+        return Err(crate::db::object_uploads::UploadControlError::AccountDeleting.into());
     }
     Ok(())
 }
@@ -5118,18 +5113,15 @@ fn validate_packet_commit_current_job(
         anyhow::bail!("current job integrity does not permit packet commit")
     }
 
-    let track = track.ok_or_else(|| {
-        anyhow::anyhow!("current Career Track does not permit packet commit")
-    })?;
+    let track = track
+        .ok_or_else(|| anyhow::anyhow!("current Career Track does not permit packet commit"))?;
     let current_track_policy_authority = serde_json::to_value(&track.policy.authority)
         .context("encode current Career Track policy authority for packet commit")?;
     let frozen_track_id = application
         .receipt
         .get("career_track_id")
         .and_then(Value::as_str);
-    let frozen_track_policy_authority = application
-        .receipt
-        .get("career_track_policy_authority");
+    let frozen_track_policy_authority = application.receipt.get("career_track_policy_authority");
     let frozen_truth_fingerprint = application
         .receipt
         .get("candidate_truth_fingerprint")
@@ -5221,7 +5213,7 @@ fn packet_commit_current_inputs_sqlite(
             {
                 downgrade_track_policy_ledger(&mut track);
             }
-            Ok(track)
+            Ok::<_, anyhow::Error>(track)
         })
         .transpose()?;
     let discovery_authorities = {
@@ -5233,19 +5225,20 @@ fn packet_commit_current_inputs_sqlite(
               WHERE m.account_id=?1 AND m.job_id=?2
               ORDER BY m.last_seen_at_ms DESC",
         )?;
-        statement
-            .query_map(params![account_id, posting.id], |row| {
-                Ok(JobDiscoveryAuthority {
-                    source_id: row.get(0)?,
-                    provider: row.get(1)?,
-                    source_status: row.get(2)?,
-                    source_health: row.get(3)?,
-                    membership_status: row.get(4)?,
-                    last_seen_at_ms: row.get(5)?,
-                    last_seen_run_id: row.get(6)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+        let mapped = statement.query_map(params![account_id, posting.id], |row| {
+            Ok(JobDiscoveryAuthority {
+                source_id: row.get(0)?,
+                provider: row.get(1)?,
+                source_status: row.get(2)?,
+                source_health: row.get(3)?,
+                membership_status: row.get(4)?,
+                last_seen_at_ms: row.get(5)?,
+                last_seen_run_id: row.get(6)?,
+            })
+        })?;
+        let collected = mapped.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        collected
     };
     Ok((profile, preferences, track, discovery_authorities))
 }
@@ -5288,10 +5281,8 @@ fn packet_commit_current_inputs_postgres(
         .map(|row| {
             let authoritative_id: String = row.get(0);
             let authoritative_active = row.get::<_, i32>(2) != 0;
-            let mut track = parse_json::<CareerTrack>(
-                row.get(1),
-                "Career Track during packet commit",
-            )?;
+            let mut track =
+                parse_json::<CareerTrack>(row.get(1), "Career Track during packet commit")?;
             track.id = authoritative_id;
             let activation_drift = track.active != authoritative_active;
             track.active = authoritative_active;
@@ -5301,7 +5292,7 @@ fn packet_commit_current_inputs_postgres(
             {
                 downgrade_track_policy_ledger(&mut track);
             }
-            Ok(track)
+            Ok::<_, anyhow::Error>(track)
         })
         .transpose()?;
     let discovery_authorities = tx
@@ -5344,9 +5335,7 @@ fn packet_commit_attempt_reservation_from_sqlite_row(
     })
 }
 
-fn packet_commit_attempt_reservation_from_postgres_row(
-    row: postgres::Row,
-) -> AttemptReservation {
+fn packet_commit_attempt_reservation_from_postgres_row(row: postgres::Row) -> AttemptReservation {
     AttemptReservation {
         id: row.get(0),
         application_id: row.get(1),
@@ -5368,10 +5357,7 @@ fn packet_commit_relevant_attempt_reservations_sqlite(
     eligibility_at_ms: i64,
 ) -> Result<Vec<AttemptReservation>> {
     let company_key = normalize_company_key(&posting.company);
-    let period_key = attempt_period_key(
-        eligibility_at_ms,
-        preferences.time_zone_offset_minutes,
-    );
+    let period_key = attempt_period_key(eligibility_at_ms, preferences.time_zone_offset_minutes);
     let daily_limit = preferences.daily_limit.clamp(1, 50);
     let mut relevant = BTreeMap::new();
     if let Some(reservation) = tx
@@ -5416,10 +5402,7 @@ fn packet_commit_relevant_attempt_reservations_postgres(
     eligibility_at_ms: i64,
 ) -> Result<Vec<AttemptReservation>> {
     let company_key = normalize_company_key(&posting.company);
-    let period_key = attempt_period_key(
-        eligibility_at_ms,
-        preferences.time_zone_offset_minutes,
-    );
+    let period_key = attempt_period_key(eligibility_at_ms, preferences.time_zone_offset_minutes);
     let daily_limit = preferences.daily_limit.clamp(1, 50);
     let mut relevant = BTreeMap::new();
     if let Some(row) = tx.query_opt(
@@ -5496,10 +5479,7 @@ fn packet_commit_current_authority_sqlite_after_entitlement(
 ) -> Result<PacketCommitCurrentJobAuthority> {
     let db_time_ms = original_source_db_now_sqlite(tx)?;
     let composed = resolve_composed_job_integrity_projection_sqlite_tx_at_ms(
-        tx,
-        account_id,
-        &posting,
-        db_time_ms,
+        tx, account_id, &posting, db_time_ms,
     )?;
     let (profile, preferences, track, discovery_authorities) =
         packet_commit_current_inputs_sqlite(tx, account_id, &posting)?;
@@ -5535,12 +5515,8 @@ fn packet_commit_current_job_postgres_after_prelock(
         .ok_or_else(|| anyhow::anyhow!("application or current job not found"))?;
     let id: String = row.get(0);
     let job_id: String = row.get(1);
-    let mut application = parse_application_json(
-        row.get(3),
-        &id,
-        &job_id,
-        "packet commit application",
-    )?;
+    let mut application =
+        parse_application_json(row.get(3), &id, &job_id, "packet commit application")?;
     application.resume_version_id = row.get(2);
     if application.resume_version_id.is_none() {
         anyhow::bail!("application packet has no job-specific resume")
@@ -5559,10 +5535,7 @@ fn packet_commit_current_authority_postgres_after_entitlement(
 ) -> Result<PacketCommitCurrentJobAuthority> {
     let db_time_ms = original_source_db_now_postgres(tx)?;
     let composed = resolve_composed_job_integrity_projection_postgres_tx_after_prelock_at_ms(
-        tx,
-        account_id,
-        &posting,
-        db_time_ms,
+        tx, account_id, &posting, db_time_ms,
     )?;
     let (profile, preferences, track, discovery_authorities) =
         packet_commit_current_inputs_postgres(tx, account_id, &posting)?;
@@ -5725,12 +5698,7 @@ pub fn commit_packet(
                     "UPDATE jobs_generation_allowance_reservations
                         SET status = 'committed', application_id = ?3, updated_at_ms = ?4
                       WHERE account_id = ?1 AND job_id = ?2 AND status = 'reserved'",
-                    params![
-                        account_id,
-                        application.job_id,
-                        application.id,
-                        effect_at_ms,
-                    ],
+                    params![account_id, application.job_id, application.id, effect_at_ms,],
                 )?;
             }
             tx.commit()?;

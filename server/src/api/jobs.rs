@@ -864,12 +864,7 @@ fn schedule_verified_import_discovery_backfill(
         }
     };
     std::mem::drop(tokio::task::spawn_blocking(
-        move || match run_verified_import_discovery_backfill(
-            &pool,
-            &account_id,
-            &email,
-            &lease,
-        ) {
+        move || match run_verified_import_discovery_backfill(&pool, &account_id, &email, &lease) {
             Ok(result) if result.scanned_count > 0 || result.completed => tracing::info!(
                 account_fingerprint = %account_fingerprint,
                 scanned_count = result.scanned_count,
@@ -1483,12 +1478,7 @@ fn run_verified_import_discovery_backfill(
     email: &str,
     lease: &jobs::VerifiedImportBackfillLease,
 ) -> anyhow::Result<VerifiedImportBackfillRun> {
-    let result = run_verified_import_discovery_backfill_with_lease(
-        pool,
-        account_id,
-        email,
-        lease,
-    );
+    let result = run_verified_import_discovery_backfill_with_lease(pool, account_id, email, lease);
     if result.is_err() {
         if let Err(error) = jobs::release_verified_import_backfill_lease(pool, account_id, lease) {
             return Err(error.context("release failed verified-import repair lease"));
@@ -12331,9 +12321,11 @@ mod tests {
 
         let write_transactions = jobs::verified_import_backfill_sqlite_claim_write_tx_count();
         for _ in 0..120 {
-            assert!(jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
-                .unwrap()
-                .is_none());
+            assert!(
+                jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert_eq!(
             jobs::verified_import_backfill_sqlite_claim_write_tx_count(),
@@ -12350,12 +12342,11 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(!jobs::release_verified_import_backfill_lease(
-            &pool,
-            "acct-claim-load",
-            &original,
-        )
-        .unwrap(), "an expired owner cannot release an unreplaced lease");
+        assert!(
+            !jobs::release_verified_import_backfill_lease(&pool, "acct-claim-load", &original,)
+                .unwrap(),
+            "an expired owner cannot release an unreplaced lease"
+        );
         let replacement = jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
             .unwrap()
             .expect("expired repair lease can be replaced");
@@ -12374,12 +12365,10 @@ mod tests {
             false,
         )
         .unwrap());
-        assert!(!jobs::release_verified_import_backfill_lease(
-            &pool,
-            "acct-claim-load",
-            &original,
-        )
-        .unwrap());
+        assert!(
+            !jobs::release_verified_import_backfill_lease(&pool, "acct-claim-load", &original,)
+                .unwrap()
+        );
         assert!(jobs::release_verified_import_backfill_lease(
             &pool,
             "acct-claim-load",
@@ -12410,9 +12399,11 @@ mod tests {
             .unwrap();
         let completed_write_transactions =
             jobs::verified_import_backfill_sqlite_claim_write_tx_count();
-        assert!(jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
-            .unwrap()
-            .is_none());
+        assert!(
+            jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             jobs::verified_import_backfill_sqlite_claim_write_tx_count(),
             completed_write_transactions,
@@ -12427,10 +12418,7 @@ mod tests {
             .split_once("pub struct VerifiedImportBackfillLease")
             .expect("verified-import lease declaration")
             .0;
-        let declaration_attribute = declaration_prefix
-            .rsplit("\n\n")
-            .next()
-            .unwrap_or_default();
+        let declaration_attribute = declaration_prefix.rsplit("\n\n").next().unwrap_or_default();
         assert!(!declaration_attribute.contains("Debug"));
         assert!(!declaration_attribute.contains("Clone"));
         let release = source
@@ -12485,14 +12473,25 @@ mod tests {
                 &CareerProfile::default(),
                 &JobPreferences::default(),
             ),
-            0,
+            1,
         );
         assert_eq!(
             jobs::verified_import_discovery_membership_job_id(
                 &pool, "acct-one", "lever", "acme", "job-123",
             )
             .unwrap(),
-            Some(stored.id),
+            Some(stored.id.clone()),
+        );
+        assert_eq!(
+            backfill_verified_import_discovery_sources(
+                &pool,
+                "acct-one",
+                std::slice::from_ref(&stored),
+                &CareerProfile::default(),
+                &JobPreferences::default(),
+            ),
+            0,
+            "an already repaired membership is an exact no-op",
         );
         assert_eq!(jobs::list_postings(&pool, "acct-one").unwrap().len(), 1);
     }

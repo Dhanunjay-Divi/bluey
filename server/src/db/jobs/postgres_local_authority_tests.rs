@@ -307,14 +307,9 @@ fn prepared_packet_commit_fixture(pool: &DbPool, label: &str) -> PreparedPacketC
         &format!("packet-commit-{label}-{suffix}"),
     )
     .posting;
-    let (application, _) = prepare_application(
-        pool,
-        &account_id,
-        &posting.id,
-        "factual",
-        "review_first",
-    )
-    .expect("prepare PostgreSQL packet-commit application");
+    let (application, _) =
+        prepare_application(pool, &account_id, &posting.id, "factual", "review_first")
+            .expect("prepare PostgreSQL packet-commit application");
     PreparedPacketCommitFixture {
         account_id,
         profile,
@@ -572,8 +567,7 @@ fn postgres_packet_commit_locks_entitlement_before_rechecking_attempt_reservatio
         .commit()
         .expect("commit PostgreSQL packet reservation-race fixture");
 
-    let before =
-        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id);
+    let before = postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id);
     let mut entitlement_connection = pool
         .get_pg()
         .expect("get PostgreSQL packet entitlement owner connection");
@@ -685,8 +679,7 @@ fn postgres_packet_commit_locks_entitlement_before_rechecking_attempt_reservatio
     let worker_error = worker_result
         .expect_err("packet commit must re-read the newly committed relevant R and reject");
     assert_eq!(
-        worker_error,
-        "recompose current packet-commit effect eligibility",
+        worker_error, "recompose current packet-commit effect eligibility",
         "the newly committed relevant R must be the packet denial authority",
     );
     assert_eq!(
@@ -766,7 +759,10 @@ fn postgres_packet_commit_waits_on_parent_account_before_deletion_children() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(blocked_on_parent, "packet commit must wait on the parent Account lock");
+    assert!(
+        blocked_on_parent,
+        "packet commit must wait on the parent Account lock"
+    );
 
     deletion
         .execute("DELETE FROM accounts WHERE id=$1", &[&fixture.account_id])

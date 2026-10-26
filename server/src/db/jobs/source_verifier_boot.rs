@@ -25,6 +25,7 @@
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SourceVerifierBootRegistrationRequest {
+    pub session_token: String,
     pub registration_request_id: String,
     pub boot_id: String,
     pub runtime_instance_id: String,
@@ -53,6 +54,7 @@ pub(crate) struct SourceVerifierBootRegistration {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SourceVerifierBootStartupRequest {
+    pub session_token: String,
     pub startup_request_id: String,
     pub boot_id: String,
     pub runtime_instance_id: String,
@@ -130,9 +132,12 @@ fn source_verifier_boot_registration_fields(
 pub(crate) fn source_verifier_boot_registration_request_sha256(
     request: &SourceVerifierBootRegistrationRequest,
 ) -> String {
-    source_verifier_boot_sha256_hex(&source_verifier_boot_canonical_bytes(
-        &source_verifier_boot_registration_fields(request),
-    ))
+    let mut fields = source_verifier_boot_registration_fields(request);
+    fields.insert(
+        "sessionTokenSha256",
+        source_verifier_boot_sha256_hex(request.session_token.as_bytes()),
+    );
+    source_verifier_boot_sha256_hex(&source_verifier_boot_canonical_bytes(&fields))
 }
 
 fn source_verifier_boot_startup_fields(
@@ -155,9 +160,140 @@ fn source_verifier_boot_startup_fields(
 pub(crate) fn source_verifier_boot_startup_request_sha256(
     request: &SourceVerifierBootStartupRequest,
 ) -> String {
-    source_verifier_boot_sha256_hex(&source_verifier_boot_canonical_bytes(
-        &source_verifier_boot_startup_fields(request),
-    ))
+    let mut fields = source_verifier_boot_startup_fields(request);
+    fields.insert(
+        "sessionTokenSha256",
+        source_verifier_boot_sha256_hex(request.session_token.as_bytes()),
+    );
+    source_verifier_boot_sha256_hex(&source_verifier_boot_canonical_bytes(&fields))
+}
+
+fn validate_source_verifier_boot_identity(
+    instance: &ManagedCloudRuntimeInstance,
+    session_proof: &str,
+    runtime_instance_id: &str,
+    instance_epoch: i64,
+    worker_id: &str,
+    session_token: &str,
+) -> Result<()> {
+    if instance.runtime_instance_id != runtime_instance_id
+        || instance.instance_epoch != instance_epoch
+        || instance.worker_id != worker_id
+        || instance.component_id != "jobs-workflows"
+        || instance.role != "original_source_verifier"
+        || !managed_cloud_safe_integer(instance_epoch, true)
+    {
+        anyhow::bail!("source-verifier boot runtime identity conflicts")
+    }
+    let expected = managed_cloud_runtime_session_proof_hmac(
+        session_token,
+        &instance.grant_id,
+        worker_id,
+        runtime_instance_id,
+        instance_epoch,
+    )?;
+    require_managed_cloud_secret_match(session_proof, &expected)?;
+    Ok(())
+}
+
+fn source_verifier_boot_instance_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    runtime_instance_id: &str,
+    instance_epoch: i64,
+    worker_id: &str,
+    session_token: &str,
+) -> Result<ManagedCloudRuntimeInstance> {
+    let (instance, proof) = sqlite_managed_cloud_runtime_instance_by_runtime_id(
+        tx,
+        runtime_instance_id,
+        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+    )?
+    .ok_or_else(|| anyhow::anyhow!("source-verifier boot runtime not found"))?;
+    validate_source_verifier_boot_identity(
+        &instance,
+        &proof,
+        runtime_instance_id,
+        instance_epoch,
+        worker_id,
+        session_token,
+    )?;
+    let now = managed_cloud_db_now_sqlite(tx)?;
+    require_sqlite_managed_cloud_runtime_authority_active(tx, &instance, now)?;
+    let admitted: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols
+          WHERE manifest_sha256=?1 AND protocol_id='source_verifier_boot'
+            AND protocol_version=1 AND ordinal=11)",
+        params![instance.manifest_sha256],
+        |row| row.get(0),
+    )?;
+    if !admitted {
+        anyhow::bail!("source-verifier boot protocol is not admitted")
+    }
+    Ok(instance)
+}
+
+fn source_verifier_boot_instance_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    runtime_instance_id: &str,
+    instance_epoch: i64,
+    worker_id: &str,
+    session_token: &str,
+) -> Result<ManagedCloudRuntimeInstance> {
+    // Match the real lease path: H -> M -> runtime/boot -> D -> assignment.
+    lock_operational_hold_shared_postgres_tx(tx)?;
+    lock_managed_cloud_release_registry_exclusive_postgres_tx(tx)?;
+    let row = tx
+        .query_opt(
+            &format!(
+                "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS} FROM {}
+          WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR UPDATE",
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.instances
+            ),
+            &[&runtime_instance_id, &instance_epoch],
+        )?
+        .ok_or_else(|| anyhow::anyhow!("source-verifier boot runtime not found"))?;
+    let (instance, proof) = managed_cloud_runtime_instance_from_postgres(&row);
+    validate_source_verifier_boot_identity(
+        &instance,
+        &proof,
+        runtime_instance_id,
+        instance_epoch,
+        worker_id,
+        session_token,
+    )?;
+    let now = managed_cloud_db_now_postgres(tx)?;
+    require_postgres_managed_cloud_runtime_authority_active(tx, &instance, now)?;
+    let admitted: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols
+          WHERE manifest_sha256=$1 AND protocol_id='source_verifier_boot'
+            AND protocol_version=1 AND ordinal=11)",
+            &[&instance.manifest_sha256],
+        )?
+        .get(0);
+    if !admitted {
+        anyhow::bail!("source-verifier boot protocol is not admitted")
+    }
+    Ok(instance)
+}
+
+fn require_source_verifier_boot_registration_identity(
+    instance: &ManagedCloudRuntimeInstance,
+    request: &SourceVerifierBootRegistrationRequest,
+) -> Result<()> {
+    if !managed_cloud_token(&request.boot_id, 128)
+        || request.boot_id.len() < 20
+        || !managed_cloud_token(&request.registration_request_id, 128)
+        || request.registration_request_id.len() < 20
+        || instance.runtime_identity_sha256 != request.runtime_identity_sha256
+        || instance.activation_sha256 != request.activation_sha256
+        || instance.manifest_sha256 != request.manifest_sha256
+        || instance.component_id != request.component_id
+        || instance.role != request.role
+    {
+        anyhow::bail!("source-verifier boot registration identity conflicts")
+    }
+    Ok(())
 }
 
 /// Canonical registration response. Contains no mutable replay flag so that an
@@ -263,11 +399,19 @@ pub(crate) fn register_source_verifier_boot(
     request: &SourceVerifierBootRegistrationRequest,
 ) -> Result<SourceVerifierBootRegistration> {
     let request_sha256 = source_verifier_boot_registration_request_sha256(request);
-    let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let instance = source_verifier_boot_instance_sqlite(
+                &tx,
+                &request.runtime_instance_id,
+                request.instance_epoch,
+                &request.worker_id,
+                &request.session_token,
+            )?;
+            require_source_verifier_boot_registration_identity(&instance, request)?;
+            let now = managed_cloud_db_now_sqlite(&tx)?;
             let existing = tx
                 .query_row(
                     "SELECT boot_id, boot_generation, registration_request_sha256,
@@ -351,6 +495,15 @@ pub(crate) fn register_source_verifier_boot(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let instance = source_verifier_boot_instance_postgres(
+                &mut tx,
+                &request.runtime_instance_id,
+                request.instance_epoch,
+                &request.worker_id,
+                &request.session_token,
+            )?;
+            require_source_verifier_boot_registration_identity(&instance, request)?;
+            let now = managed_cloud_db_now_postgres(&mut tx)?;
             let existing = tx.query_opt(
                 "SELECT boot_id, boot_generation, registration_request_sha256,
                         canonical_response_base64url, response_sha256, registered_at_ms
@@ -386,11 +539,7 @@ pub(crate) fn register_source_verifier_boot(
                         jobs_managed_cloud_source_verifier_boot_generation_heads
                             .current_boot_generation + 1,
                     updated_at_ms = $3",
-                &[
-                    &request.runtime_instance_id,
-                    &request.instance_epoch,
-                    &now,
-                ],
+                &[&request.runtime_instance_id, &request.instance_epoch, &now],
             )?;
             let boot_generation: i64 = tx
                 .query_one(
@@ -443,6 +592,173 @@ pub(crate) fn register_source_verifier_boot(
     })
 }
 
+fn require_source_verifier_boot_head_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    request: &SourceVerifierBootStartupRequest,
+) -> Result<()> {
+    let matched: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs_managed_cloud_source_verifier_boot_generation_heads head
+           JOIN jobs_managed_cloud_source_verifier_boot_registrations registration
+             ON registration.runtime_instance_id=head.runtime_instance_id
+            AND registration.instance_epoch=head.instance_epoch
+            AND registration.boot_generation=head.current_boot_generation
+          WHERE head.runtime_instance_id=?1 AND head.instance_epoch=?2
+            AND head.current_boot_generation=?3 AND registration.boot_id=?4
+            AND registration.worker_id=?5)",
+        params![
+            request.runtime_instance_id,
+            request.instance_epoch,
+            request.boot_generation,
+            request.boot_id,
+            request.worker_id
+        ],
+        |row| row.get(0),
+    )?;
+    if !matched {
+        anyhow::bail!("source-verifier boot startup generation conflicts")
+    }
+    Ok(())
+}
+
+fn require_source_verifier_boot_head_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    request: &SourceVerifierBootStartupRequest,
+) -> Result<()> {
+    let matched = tx
+        .query_opt(
+            "SELECT 1 FROM jobs_managed_cloud_source_verifier_boot_generation_heads head
+           JOIN jobs_managed_cloud_source_verifier_boot_registrations registration
+             ON registration.runtime_instance_id=head.runtime_instance_id
+            AND registration.instance_epoch=head.instance_epoch
+            AND registration.boot_generation=head.current_boot_generation
+          WHERE head.runtime_instance_id=$1 AND head.instance_epoch=$2
+            AND head.current_boot_generation=$3 AND registration.boot_id=$4
+            AND registration.worker_id=$5 FOR UPDATE OF head",
+            &[
+                &request.runtime_instance_id,
+                &request.instance_epoch,
+                &request.boot_generation,
+                &request.boot_id,
+                &request.worker_id,
+            ],
+        )?
+        .is_some();
+    if !matched {
+        anyhow::bail!("source-verifier boot startup generation conflicts")
+    }
+    Ok(())
+}
+
+fn source_verifier_boot_probe_binding(
+    instance: &ManagedCloudRuntimeInstance,
+    request: &SourceVerifierBootStartupRequest,
+) -> Result<OriginalSourceVerifierBinding> {
+    Ok(OriginalSourceVerifierBinding {
+        worker_id: request.worker_id.clone(),
+        runtime_instance_id: request.runtime_instance_id.clone(),
+        runtime_instance_epoch: request.instance_epoch,
+        runtime_authority_sha256: original_source_verifier_runtime_authority_sha256(instance)?,
+        runtime_session_token: request.session_token.clone(),
+        boot_id: Some(request.boot_id.clone()),
+        boot_generation: Some(request.boot_generation),
+    })
+}
+
+fn probe_source_verifier_boot_sqlite(
+    tx: &mut rusqlite::Transaction<'_>,
+    instance: &ManagedCloudRuntimeInstance,
+    request: &SourceVerifierBootStartupRequest,
+    now: i64,
+) -> Result<String> {
+    let binding = source_verifier_boot_probe_binding(instance, request)?;
+    let (canonical, response_sha256, authority_sha256) =
+        source_verifier_boot_startup_response(request, "idle", now);
+    let request_sha256 = source_verifier_boot_startup_request_sha256(request);
+    tx.execute_batch("SAVEPOINT bluey_osv_boot_probe")?;
+    let probe = (|| -> Result<bool> {
+        tx.execute(
+            "INSERT INTO jobs_managed_cloud_source_verifier_boot_startup_authorities (
+                startup_request_id,boot_id,runtime_instance_id,instance_epoch,boot_generation,
+                worker_id,request_sha256,degraded_heartbeat_sequence,ready_heartbeat_sequence,
+                probe_result,startup_authority_sha256,canonical_response_base64url,response_sha256,startup_at_ms
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8+1,'idle',?9,?10,?11,?12)",
+            params![request.startup_request_id,request.boot_id,request.runtime_instance_id,
+                request.instance_epoch,request.boot_generation,request.worker_id,request_sha256,
+                request.degraded_heartbeat_sequence,authority_sha256,canonical,response_sha256,now],
+        )?;
+        tx.execute(
+            "UPDATE jobs_managed_cloud_source_verifier_boot_generation_heads
+                SET ready_boot_generation=?3,updated_at_ms=?4
+              WHERE runtime_instance_id=?1 AND instance_epoch=?2 AND current_boot_generation=?3",
+            params![
+                request.runtime_instance_id,
+                request.instance_epoch,
+                request.boot_generation,
+                now
+            ],
+        )?;
+        commit_source_verifier_boot_ready_sqlite_tx(tx, request, now)?;
+        Ok(probe_original_source_verification_leaseability_sqlite_tx(
+            tx, &binding, now,
+        )?)
+    })();
+    // Roll back even when probe/transition fails. No assignment, heartbeat,
+    // event, boot authority or generation mutation survives this savepoint.
+    let rollback = tx.execute_batch(
+        "ROLLBACK TO SAVEPOINT bluey_osv_boot_probe; RELEASE SAVEPOINT bluey_osv_boot_probe",
+    );
+    let leaseable = probe?;
+    rollback?;
+    Ok(if leaseable { "leaseable" } else { "idle" }.to_string())
+}
+
+fn probe_source_verifier_boot_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    instance: &ManagedCloudRuntimeInstance,
+    request: &SourceVerifierBootStartupRequest,
+    now: i64,
+) -> Result<String> {
+    let binding = source_verifier_boot_probe_binding(instance, request)?;
+    let (canonical, response_sha256, authority_sha256) =
+        source_verifier_boot_startup_response(request, "idle", now);
+    let request_sha256 = source_verifier_boot_startup_request_sha256(request);
+    let ready = request.degraded_heartbeat_sequence + 1;
+    tx.batch_execute("SAVEPOINT bluey_osv_boot_probe")?;
+    let probe = (|| -> Result<bool> {
+        tx.execute(
+            "INSERT INTO jobs_managed_cloud_source_verifier_boot_startup_authorities (
+                startup_request_id,boot_id,runtime_instance_id,instance_epoch,boot_generation,
+                worker_id,request_sha256,degraded_heartbeat_sequence,ready_heartbeat_sequence,
+                probe_result,startup_authority_sha256,canonical_response_base64url,response_sha256,startup_at_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'idle',$10,$11,$12,$13)",
+            &[&request.startup_request_id,&request.boot_id,&request.runtime_instance_id,
+                &request.instance_epoch,&request.boot_generation,&request.worker_id,&request_sha256,
+                &request.degraded_heartbeat_sequence,&ready,&authority_sha256,&canonical,&response_sha256,&now],
+        )?;
+        tx.execute(
+            "UPDATE jobs_managed_cloud_source_verifier_boot_generation_heads
+                SET ready_boot_generation=$3,updated_at_ms=$4
+              WHERE runtime_instance_id=$1 AND instance_epoch=$2 AND current_boot_generation=$3",
+            &[
+                &request.runtime_instance_id,
+                &request.instance_epoch,
+                &request.boot_generation,
+                &now,
+            ],
+        )?;
+        commit_source_verifier_boot_ready_postgres_tx(tx, request, now)?;
+        Ok(probe_original_source_verification_leaseability_postgres_tx(
+            tx, &binding, now,
+        )?)
+    })();
+    let rollback = tx.batch_execute(
+        "ROLLBACK TO SAVEPOINT bluey_osv_boot_probe; RELEASE SAVEPOINT bluey_osv_boot_probe",
+    );
+    let leaseable = probe?;
+    rollback?;
+    Ok(if leaseable { "leaseable" } else { "idle" }.to_string())
+}
+
 /// Idempotently records the one-shot startup readiness transition
 /// `N degraded -> N+1 ready` for an exact boot generation.
 ///
@@ -455,17 +771,28 @@ pub(crate) fn register_source_verifier_boot(
 pub(crate) fn record_source_verifier_boot_startup(
     pool: &DbPool,
     request: &SourceVerifierBootStartupRequest,
-    probe_result: &str,
 ) -> Result<SourceVerifierBootStartup> {
-    if probe_result != "idle" && probe_result != "leaseable" {
-        anyhow::bail!("source-verifier boot startup probe result is invalid")
+    if !managed_cloud_safe_integer(request.boot_generation, true)
+        || !(1..9007199254740991).contains(&request.degraded_heartbeat_sequence)
+        || !managed_cloud_token(&request.startup_request_id, 128)
+        || request.startup_request_id.len() < 20
+    {
+        anyhow::bail!("source-verifier boot startup request is invalid")
     }
     let request_sha256 = source_verifier_boot_startup_request_sha256(request);
-    let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let instance = source_verifier_boot_instance_sqlite(
+                &tx,
+                &request.runtime_instance_id,
+                request.instance_epoch,
+                &request.worker_id,
+                &request.session_token,
+            )?;
+            require_source_verifier_boot_head_sqlite(&tx, request)?;
+            let now = managed_cloud_db_now_sqlite(&tx)?;
             let existing = tx
                 .query_row(
                     "SELECT request_sha256, boot_generation, degraded_heartbeat_sequence,
@@ -515,6 +842,8 @@ pub(crate) fn record_source_verifier_boot_startup(
                     replayed: true,
                 });
             }
+            let probe_result = probe_source_verifier_boot_sqlite(&mut tx, &instance, request, now)?;
+            let probe_result = probe_result.as_str();
             let (canonical_response_base64url, response_sha256, authority_sha256) =
                 source_verifier_boot_startup_response(request, probe_result, now);
             tx.execute(
@@ -555,6 +884,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                     now,
                 ],
             )?;
+            commit_source_verifier_boot_ready_sqlite_tx(&tx, request, now)?;
             tx.commit()?;
             Ok(SourceVerifierBootStartup {
                 startup_request_id: request.startup_request_id.clone(),
@@ -571,6 +901,15 @@ pub(crate) fn record_source_verifier_boot_startup(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let instance = source_verifier_boot_instance_postgres(
+                &mut tx,
+                &request.runtime_instance_id,
+                request.instance_epoch,
+                &request.worker_id,
+                &request.session_token,
+            )?;
+            require_source_verifier_boot_head_postgres(&mut tx, request)?;
+            let now = managed_cloud_db_now_postgres(&mut tx)?;
             let existing = tx.query_opt(
                 "SELECT request_sha256, boot_generation, degraded_heartbeat_sequence,
                         ready_heartbeat_sequence, probe_result,
@@ -598,6 +937,9 @@ pub(crate) fn record_source_verifier_boot_startup(
                 tx.commit()?;
                 return Ok(startup);
             }
+            let probe_result =
+                probe_source_verifier_boot_postgres(&mut tx, &instance, request, now)?;
+            let probe_result = probe_result.as_str();
             let (canonical_response_base64url, response_sha256, authority_sha256) =
                 source_verifier_boot_startup_response(request, probe_result, now);
             let ready_sequence = request.degraded_heartbeat_sequence + 1;
@@ -637,6 +979,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                     &now,
                 ],
             )?;
+            commit_source_verifier_boot_ready_postgres_tx(&mut tx, request, now)?;
             tx.commit()?;
             Ok(SourceVerifierBootStartup {
                 startup_request_id: request.startup_request_id.clone(),
@@ -657,8 +1000,88 @@ pub(crate) fn record_source_verifier_boot_startup(
 mod source_verifier_boot_tests {
     use super::*;
 
+    #[test]
+    fn source_verifier_boot_migration_replay_preserves_ready_authority_and_manifest_bytes() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let registration = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-replay-00000000001",
+                "boot-replay-000000001",
+            ),
+        )
+        .expect("register replay fixture");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        let request = db_startup(
+            &fixture.request,
+            "startup-replay-000000001",
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        let ready = record_source_verifier_boot_startup(&fixture.pool, &request)
+            .expect("establish ready authority before migration replay");
+        fn snapshot(pool: &DbPool, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+            let connection = pool.get().expect("snapshot connection");
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+                .expect("snapshot prepared fixture table");
+            let rows = statement
+                .query_map([], |row| {
+                    (0..row.as_ref().column_count())
+                        .map(|column| row.get(column))
+                        .collect()
+                })
+                .expect("snapshot rows");
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .expect("snapshot values")
+        }
+        let tables = [
+            "jobs_managed_cloud_manifests",
+            "jobs_managed_cloud_manifest_components",
+            "jobs_managed_cloud_source_verifier_boot_registrations",
+            "jobs_managed_cloud_source_verifier_boot_startup_authorities",
+            "jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+            "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+        ];
+        let before: Vec<_> = tables
+            .iter()
+            .map(|table| snapshot(&fixture.pool, table))
+            .collect();
+        for _ in 0..2 {
+            crate::db::run_migrations(&fixture.pool).expect("replay full SQLite migration chain");
+            for (index, table) in tables.iter().enumerate() {
+                assert_eq!(
+                    before[index],
+                    snapshot(&fixture.pool, table),
+                    "replay changed {table}"
+                );
+            }
+            let connection = fixture.pool.get().expect("check replay foreign keys");
+            let violations: i64 = connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .expect("check replay foreign key consistency");
+            assert_eq!(violations, 0);
+        }
+        let replay = record_source_verifier_boot_startup(&fixture.pool, &request)
+            .expect("replay authority after migration replay");
+        assert_eq!(
+            ready.canonical_response_base64url,
+            replay.canonical_response_base64url
+        );
+        assert_eq!(ready.startup_at_ms, replay.startup_at_ms);
+    }
+
     fn registration_request() -> SourceVerifierBootRegistrationRequest {
         SourceVerifierBootRegistrationRequest {
+            session_token: "unit-test-session-token".to_string(),
             registration_request_id: "reg-00000000000000001".to_string(),
             boot_id: "boot-0000000000000001".to_string(),
             runtime_instance_id: "ri-1".to_string(),
@@ -674,6 +1097,7 @@ mod source_verifier_boot_tests {
 
     fn startup_request() -> SourceVerifierBootStartupRequest {
         SourceVerifierBootStartupRequest {
+            session_token: "unit-test-session-token".to_string(),
             startup_request_id: "sreq-000000000000001".to_string(),
             boot_id: "boot-0000000000000001".to_string(),
             runtime_instance_id: "ri-1".to_string(),
@@ -693,7 +1117,7 @@ mod source_verifier_boot_tests {
         assert_eq!(first.len(), 64);
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
         let mut changed = registration_request();
-        changed.worker_id = "w-2".to_string();
+        changed.session_token = "different-unit-test-session-token".to_string();
         assert_ne!(
             first,
             source_verifier_boot_registration_request_sha256(&changed),
@@ -710,11 +1134,8 @@ mod source_verifier_boot_tests {
             source_verifier_boot_startup_request_sha256(&request.clone())
         );
         let mut changed = startup_request();
-        changed.degraded_heartbeat_sequence = 9;
-        assert_ne!(
-            first,
-            source_verifier_boot_startup_request_sha256(&changed)
-        );
+        changed.session_token = "different-unit-test-session-token".to_string();
+        assert_ne!(first, source_verifier_boot_startup_request_sha256(&changed));
     }
 
     #[test]
@@ -772,68 +1193,162 @@ mod source_verifier_boot_tests {
     #[test]
     fn different_generations_produce_different_registration_authority() {
         let request = registration_request();
-        let (_, _, generation_one) =
-            source_verifier_boot_registration_response(&request, 1, 1_000);
-        let (_, _, generation_two) =
-            source_verifier_boot_registration_response(&request, 2, 1_000);
+        let (_, _, generation_one) = source_verifier_boot_registration_response(&request, 1, 1_000);
+        let (_, _, generation_two) = source_verifier_boot_registration_response(&request, 2, 1_000);
         assert_ne!(generation_one, generation_two);
     }
 
     // ---- DB-backed regression coverage (Phase 628 required cases) ----
+    // Use the managed v3 release fixture, never the generic fake `test_pool`.
+    use super::managed_cloud_release_authority_tests::original_source_verifier_startup_test_fixture;
 
-    fn db_registration(request_id: &str, boot_id: &str) -> SourceVerifierBootRegistrationRequest {
+    fn db_registration(
+        fixture: &ManagedCloudOriginalSourceVerifierStartupRequest,
+        request_id: &str,
+        boot_id: &str,
+    ) -> SourceVerifierBootRegistrationRequest {
         SourceVerifierBootRegistrationRequest {
+            session_token: fixture.session_token.clone(),
             registration_request_id: request_id.to_string(),
             boot_id: boot_id.to_string(),
-            runtime_instance_id: "cloud-instance-1234567890".to_string(),
-            instance_epoch: 1,
-            worker_id: "worker-1234567890abcd".to_string(),
-            runtime_identity_sha256: "a".repeat(64),
-            activation_sha256: "b".repeat(64),
-            manifest_sha256: "c".repeat(64),
-            component_id: "jobs-workflows".to_string(),
-            role: "original_source_verifier".to_string(),
+            runtime_instance_id: fixture.runtime_instance_id.clone(),
+            instance_epoch: fixture.instance_epoch,
+            worker_id: fixture.worker_id.clone(),
+            runtime_identity_sha256: fixture.runtime_identity_sha256.clone(),
+            activation_sha256: fixture.activation_sha256.clone(),
+            manifest_sha256: fixture.manifest_sha256.clone(),
+            component_id: fixture.component_id.clone(),
+            role: fixture.role.clone(),
         }
     }
 
     fn db_startup(
+        fixture: &ManagedCloudOriginalSourceVerifierStartupRequest,
         request_id: &str,
         boot_id: &str,
         boot_generation: i64,
-        degraded_sequence: i64,
     ) -> SourceVerifierBootStartupRequest {
         SourceVerifierBootStartupRequest {
+            session_token: fixture.session_token.clone(),
             startup_request_id: request_id.to_string(),
             boot_id: boot_id.to_string(),
-            runtime_instance_id: "cloud-instance-1234567890".to_string(),
-            instance_epoch: 1,
+            runtime_instance_id: fixture.runtime_instance_id.clone(),
+            instance_epoch: fixture.instance_epoch,
             boot_generation,
-            worker_id: "worker-1234567890abcd".to_string(),
-            degraded_heartbeat_sequence: degraded_sequence,
+            worker_id: fixture.worker_id.clone(),
+            degraded_heartbeat_sequence: 2,
         }
     }
 
-    fn ready_generation(pool: &DbPool) -> Option<i64> {
+    fn boot_heartbeat(
+        fixture: &ManagedCloudOriginalSourceVerifierStartupRequest,
+        sequence: i64,
+        health_state: &str,
+        reason_code: Option<&str>,
+        boot_id: &str,
+        boot_generation: i64,
+    ) -> ManagedCloudRuntimeHeartbeatInput {
+        ManagedCloudRuntimeHeartbeatInput {
+            runtime_instance_id: fixture.runtime_instance_id.clone(),
+            worker_id: fixture.worker_id.clone(),
+            session_token: fixture.session_token.clone(),
+            heartbeat_sequence: sequence,
+            observed_head_revision: fixture.observed_head_revision,
+            observed_transition_sha256: fixture.observed_transition_sha256.clone(),
+            activation_sha256: fixture.activation_sha256.clone(),
+            manifest_sha256: fixture.manifest_sha256.clone(),
+            component_id: fixture.component_id.clone(),
+            role: fixture.role.clone(),
+            artifact_sha256: fixture.artifact_sha256.clone(),
+            migration_set_sha256: fixture.migration_set_sha256.clone(),
+            config_schema_sha256: fixture.config_schema_sha256.clone(),
+            protocol_set_sha256: fixture.protocol_set_sha256.clone(),
+            task_queue_sha256: fixture.task_queue_sha256.clone(),
+            failure_converter_sha256: fixture.failure_converter_sha256.clone(),
+            dependency_evidence_sha256: fixture.dependency_evidence_sha256.clone(),
+            health_state: health_state.to_string(),
+            reason_code: reason_code.map(str::to_string),
+            boot_id: Some(boot_id.to_string()),
+            boot_generation: Some(boot_generation),
+        }
+    }
+
+    fn publish_boot_degraded(
+        pool: &DbPool,
+        fixture: &ManagedCloudOriginalSourceVerifierStartupRequest,
+        boot_id: &str,
+        boot_generation: i64,
+    ) {
+        let heartbeat = record_managed_cloud_runtime_heartbeat(
+            pool,
+            &boot_heartbeat(
+                fixture,
+                2,
+                "degraded",
+                Some("startup"),
+                boot_id,
+                boot_generation,
+            ),
+        )
+        .expect("publish boot-scoped degraded N2");
+        assert_eq!(
+            (
+                heartbeat.heartbeat_sequence,
+                heartbeat.health_state.as_str()
+            ),
+            (2, "degraded")
+        );
+    }
+
+    fn ready_generation(
+        pool: &DbPool,
+        fixture: &ManagedCloudOriginalSourceVerifierStartupRequest,
+    ) -> Option<i64> {
         let conn = pool.get().expect("sqlite connection");
         conn.query_row(
             "SELECT ready_boot_generation
                FROM jobs_managed_cloud_source_verifier_boot_generation_heads
               WHERE runtime_instance_id = ?1 AND instance_epoch = ?2",
-            params!["cloud-instance-1234567890", 1_i64],
+            params![fixture.runtime_instance_id, fixture.instance_epoch],
             |row| row.get::<_, Option<i64>>(0),
         )
         .expect("generation head row")
     }
 
+    fn boot_binding(
+        pool: &DbPool,
+        request: &SourceVerifierBootStartupRequest,
+    ) -> OriginalSourceVerifierBinding {
+        let connection = pool.get().expect("load runtime instance for boot binding");
+        let instance = connection
+            .query_row(
+                &format!(
+                    "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS} FROM {} \
+                     WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                    MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.instances,
+                ),
+                params![request.runtime_instance_id, request.instance_epoch],
+                |row| managed_cloud_runtime_instance_from_sqlite(row).map(|(instance, _)| instance),
+            )
+            .expect("claimed runtime instance");
+        source_verifier_boot_probe_binding(&instance, request).expect("derive boot binding")
+    }
+
     /// Required case: registration response loss followed by an exact retry.
     #[test]
     fn registration_retry_replays_identical_canonical_bytes() {
-        let pool = super::tests::test_pool();
-        let request = db_registration("reg-00000000000000001", "boot-0000000000000001");
-        let first = register_source_verifier_boot(&pool, &request).expect("first registration");
+        let fixture = original_source_verifier_startup_test_fixture();
+        let request = db_registration(
+            &fixture.request,
+            "reg-00000000000000001",
+            "boot-0000000000000001",
+        );
+        let first =
+            register_source_verifier_boot(&fixture.pool, &request).expect("first registration");
         assert!(!first.replayed, "first registration must not be a replay");
-        assert_eq!(first.boot_generation, 1);
-        let retry = register_source_verifier_boot(&pool, &request).expect("registration retry");
+        assert!(first.boot_generation > 0);
+        let retry =
+            register_source_verifier_boot(&fixture.pool, &request).expect("registration retry");
         assert!(retry.replayed, "retry must be served as a replay");
         assert_eq!(
             first.canonical_response_base64url, retry.canonical_response_base64url,
@@ -850,12 +1365,16 @@ mod source_verifier_boot_tests {
     /// Required case: same idempotency token with a changed payload conflicts.
     #[test]
     fn registration_token_with_changed_payload_conflicts() {
-        let pool = super::tests::test_pool();
-        let request = db_registration("reg-00000000000000001", "boot-0000000000000001");
-        register_source_verifier_boot(&pool, &request).expect("first registration");
+        let fixture = original_source_verifier_startup_test_fixture();
+        let request = db_registration(
+            &fixture.request,
+            "reg-00000000000000001",
+            "boot-0000000000000001",
+        );
+        register_source_verifier_boot(&fixture.pool, &request).expect("first registration");
         let mut changed = request.clone();
-        changed.worker_id = "worker-9999999999zzzz".to_string();
-        let error = register_source_verifier_boot(&pool, &changed)
+        changed.boot_id = "boot-0000000000000002".to_string();
+        let error = register_source_verifier_boot(&fixture.pool, &changed)
             .expect_err("changed payload under the same token must conflict");
         assert!(
             error.to_string().contains("conflicts"),
@@ -867,20 +1386,44 @@ mod source_verifier_boot_tests {
     /// receiving a strictly higher generation.
     #[test]
     fn new_boot_receives_strictly_higher_generation() {
-        let pool = super::tests::test_pool();
+        let fixture = original_source_verifier_startup_test_fixture();
         let first = register_source_verifier_boot(
-            &pool,
-            &db_registration("reg-00000000000000001", "boot-0000000000000001"),
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000001",
+                "boot-0000000000000001",
+            ),
         )
         .expect("first boot");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &first.boot_id,
+            first.boot_generation,
+        );
+        record_source_verifier_boot_startup(
+            &fixture.pool,
+            &db_startup(
+                &fixture.request,
+                "sreq-000000000000001",
+                &first.boot_id,
+                first.boot_generation,
+            ),
+        )
+        .expect("first boot startup");
         let second = register_source_verifier_boot(
-            &pool,
-            &db_registration("reg-00000000000000002", "boot-0000000000000002"),
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000002",
+                "boot-0000000000000002",
+            ),
         )
         .expect("second boot");
-        assert_eq!(first.boot_generation, 1);
         assert_eq!(
-            second.boot_generation, 2,
+            second.boot_generation,
+            first.boot_generation + 1,
             "a genuine new boot must receive a higher generation"
         );
         assert!(second.boot_generation > first.boot_generation);
@@ -890,19 +1433,43 @@ mod source_verifier_boot_tests {
     /// startup response loss followed by an exact retry.
     #[test]
     fn startup_retry_replays_identical_bytes_without_reprobing() {
-        let pool = super::tests::test_pool();
-        register_source_verifier_boot(
-            &pool,
-            &db_registration("reg-00000000000000001", "boot-0000000000000001"),
+        let fixture = original_source_verifier_startup_test_fixture();
+        let registration = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000001",
+                "boot-0000000000000001",
+            ),
         )
         .expect("registration");
-        let request = db_startup("sreq-000000000000001", "boot-0000000000000001", 1, 1);
-        let first = record_source_verifier_boot_startup(&pool, &request, "idle").expect("startup");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        let request = db_startup(
+            &fixture.request,
+            "sreq-000000000000001",
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        let first = record_source_verifier_boot_startup(&fixture.pool, &request).expect("startup");
         assert!(!first.replayed);
-        assert_eq!(first.degraded_heartbeat_sequence, 1);
-        assert_eq!(first.ready_heartbeat_sequence, 2);
-        assert_eq!(ready_generation(&pool), Some(1));
-        let retry = record_source_verifier_boot_startup(&pool, &request, "idle").expect("startup retry");
+        assert_eq!(
+            (
+                first.degraded_heartbeat_sequence,
+                first.ready_heartbeat_sequence
+            ),
+            (2, 3)
+        );
+        assert_eq!(
+            ready_generation(&fixture.pool, &fixture.request),
+            Some(registration.boot_generation)
+        );
+        let retry =
+            record_source_verifier_boot_startup(&fixture.pool, &request).expect("startup retry");
         assert!(retry.replayed, "startup retry must replay");
         assert_eq!(
             first.canonical_response_base64url, retry.canonical_response_base64url,
@@ -910,8 +1477,8 @@ mod source_verifier_boot_tests {
         );
         assert_eq!(first.startup_at_ms, retry.startup_at_ms);
         assert_eq!(
-            ready_generation(&pool),
-            Some(1),
+            ready_generation(&fixture.pool, &fixture.request),
+            Some(registration.boot_generation),
             "duplicate ready reporting must be a no-op"
         );
     }
@@ -919,17 +1486,32 @@ mod source_verifier_boot_tests {
     /// Required case: same startup token with a changed payload conflicts.
     #[test]
     fn startup_token_with_changed_payload_conflicts() {
-        let pool = super::tests::test_pool();
-        register_source_verifier_boot(
-            &pool,
-            &db_registration("reg-00000000000000001", "boot-0000000000000001"),
+        let fixture = original_source_verifier_startup_test_fixture();
+        let registration = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000001",
+                "boot-0000000000000001",
+            ),
         )
         .expect("registration");
-        let request = db_startup("sreq-000000000000001", "boot-0000000000000001", 1, 1);
-        record_source_verifier_boot_startup(&pool, &request, "idle").expect("startup");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        let request = db_startup(
+            &fixture.request,
+            "sreq-000000000000001",
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        record_source_verifier_boot_startup(&fixture.pool, &request).expect("startup");
         let mut changed = request.clone();
-        changed.degraded_heartbeat_sequence = 9;
-        let error = record_source_verifier_boot_startup(&pool, &changed, "idle")
+        changed.boot_id = "boot-0000000000000002".to_string();
+        let error = record_source_verifier_boot_startup(&fixture.pool, &changed)
             .expect_err("changed startup payload must conflict");
         assert!(
             error.to_string().contains("conflicts"),
@@ -940,70 +1522,357 @@ mod source_verifier_boot_tests {
     /// Required case: a stale boot generation can never win readiness.
     #[test]
     fn stale_generation_startup_cannot_lower_committed_readiness() {
-        let pool = super::tests::test_pool();
-        register_source_verifier_boot(
-            &pool,
-            &db_registration("reg-00000000000000001", "boot-0000000000000001"),
+        let fixture = original_source_verifier_startup_test_fixture();
+        let first = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000001",
+                "boot-0000000000000001",
+            ),
         )
         .expect("first boot");
-        register_source_verifier_boot(
-            &pool,
-            &db_registration("reg-00000000000000002", "boot-0000000000000002"),
+        let second = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000002",
+                "boot-0000000000000002",
+            ),
         )
         .expect("second boot");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &second.boot_id,
+            second.boot_generation,
+        );
         record_source_verifier_boot_startup(
-            &pool,
-            &db_startup("sreq-000000000000002", "boot-0000000000000002", 2, 5),
-            "idle",
+            &fixture.pool,
+            &db_startup(
+                &fixture.request,
+                "sreq-000000000000002",
+                &second.boot_id,
+                second.boot_generation,
+            ),
         )
         .expect("generation 2 startup");
-        assert_eq!(ready_generation(&pool), Some(2));
+        assert_eq!(
+            ready_generation(&fixture.pool, &fixture.request),
+            Some(second.boot_generation)
+        );
         let stale = record_source_verifier_boot_startup(
-            &pool,
-            &db_startup("sreq-000000000000001", "boot-0000000000000001", 1, 1),
-            "idle",
+            &fixture.pool,
+            &db_startup(
+                &fixture.request,
+                "sreq-000000000000001",
+                &first.boot_id,
+                first.boot_generation,
+            ),
         );
         assert!(
             stale.is_err(),
             "a stale generation startup must be rejected"
         );
         assert_eq!(
-            ready_generation(&pool),
-            Some(2),
+            ready_generation(&fixture.pool, &fixture.request),
+            Some(second.boot_generation),
             "committed readiness must not regress"
         );
     }
 
     /// Required case: concurrent duplicate startup is atomic in SQLite.
     #[test]
-    fn concurrent_duplicate_registration_is_atomic_in_sqlite() {
-        let pool = super::tests::test_pool();
-        let request = db_registration("reg-00000000000000001", "boot-0000000000000001");
-        let pool_a = pool.clone();
-        let pool_b = pool.clone();
+    fn concurrent_duplicate_startup_is_atomic_in_sqlite() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let registration = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000001",
+                "boot-0000000000000001",
+            ),
+        )
+        .expect("registration");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        let request = db_startup(
+            &fixture.request,
+            "sreq-000000000000001",
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        let pool_a = fixture.pool.clone();
+        let pool_b = fixture.pool.clone();
         let request_a = request.clone();
         let request_b = request.clone();
-        let left = std::thread::spawn(move || register_source_verifier_boot(&pool_a, &request_a));
-        let right = std::thread::spawn(move || register_source_verifier_boot(&pool_b, &request_b));
+        let left =
+            std::thread::spawn(move || record_source_verifier_boot_startup(&pool_a, &request_a));
+        let right =
+            std::thread::spawn(move || record_source_verifier_boot_startup(&pool_b, &request_b));
         let left = left.join().expect("left thread");
         let right = right.join().expect("right thread");
-        let left = left.expect("left registration");
-        let right = right.expect("right registration");
+        let left = left.expect("left startup");
+        let right = right.expect("right startup");
         assert_eq!(
             left.response_sha256, right.response_sha256,
-            "concurrent duplicate registration must converge on one authority"
+            "concurrent duplicate startup must converge on one authority"
         );
         assert_eq!(left.boot_generation, right.boot_generation);
-        assert_eq!(left.boot_generation, 1, "no generation may be skipped");
-        let conn = pool.get().expect("sqlite connection");
+        let conn = fixture.pool.get().expect("sqlite connection");
         let rows: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM jobs_managed_cloud_source_verifier_boot_registrations",
+                "SELECT COUNT(*) FROM jobs_managed_cloud_source_verifier_boot_startup_authorities",
                 [],
                 |row| row.get(0),
             )
-            .expect("registration count");
-        assert_eq!(rows, 1, "exactly one registration row may exist");
+            .expect("startup count");
+        assert_eq!(rows, 1, "exactly one startup row may exist");
     }
 
+    #[test]
+    fn unknown_instance_bad_session_and_missing_probe_cannot_make_runtime_ready() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let mut unknown = db_registration(
+            &fixture.request,
+            "reg-00000000000000001",
+            "boot-0000000000000001",
+        );
+        unknown.runtime_instance_id = "unknown-runtime-instance-0001".to_string();
+        assert!(register_source_verifier_boot(&fixture.pool, &unknown).is_err());
+
+        let mut bad_session = db_registration(
+            &fixture.request,
+            "reg-00000000000000002",
+            "boot-0000000000000002",
+        );
+        bad_session.session_token = "not-the-claimed-session-token".to_string();
+        assert!(register_source_verifier_boot(&fixture.pool, &bad_session).is_err());
+
+        let registration = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000003",
+                "boot-0000000000000003",
+            ),
+        )
+        .expect("registration");
+        let startup = db_startup(
+            &fixture.request,
+            "sreq-000000000000003",
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        assert!(record_source_verifier_boot_startup(&fixture.pool, &startup).is_err());
+        let connection = fixture
+            .pool
+            .get()
+            .expect("read heartbeat after failed startup");
+        let state: (i64, String) = connection
+            .query_row(
+                "SELECT heartbeat_sequence,health_state
+                   FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+                  WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                params![
+                    fixture.request.runtime_instance_id,
+                    fixture.request.instance_epoch
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("runtime heartbeat");
+        assert_eq!(state, (1, "degraded".to_string()));
+        assert_eq!(ready_generation(&fixture.pool, &fixture.request), None);
+    }
+
+    #[test]
+    fn late_stale_probe_failure_cannot_downgrade_newer_ready() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let first = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000001",
+                "boot-0000000000000001",
+            ),
+        )
+        .expect("first boot");
+        let second = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-00000000000000002",
+                "boot-0000000000000002",
+            ),
+        )
+        .expect("second boot");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &second.boot_id,
+            second.boot_generation,
+        );
+        record_source_verifier_boot_startup(
+            &fixture.pool,
+            &db_startup(
+                &fixture.request,
+                "sreq-000000000000002",
+                &second.boot_id,
+                second.boot_generation,
+            ),
+        )
+        .expect("newest ready");
+
+        let late_failure = boot_heartbeat(
+            &fixture.request,
+            4,
+            "degraded",
+            Some("probe_failed"),
+            &first.boot_id,
+            first.boot_generation,
+        );
+        assert!(record_managed_cloud_runtime_heartbeat(&fixture.pool, &late_failure).is_err());
+        assert_eq!(
+            ready_generation(&fixture.pool, &fixture.request),
+            Some(second.boot_generation)
+        );
+    }
+
+    #[test]
+    fn current_boot_generation_fences_leases_even_with_a_fresh_old_ready_heartbeat() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let first = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-fence-00000000001",
+                "boot-fence-000000001",
+            ),
+        )
+        .expect("register first tested boot");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &first.boot_id,
+            first.boot_generation,
+        );
+        let first_startup = db_startup(
+            &fixture.request,
+            "startup-fence-000000001",
+            &first.boot_id,
+            first.boot_generation,
+        );
+        record_source_verifier_boot_startup(&fixture.pool, &first_startup)
+            .expect("commit first boot ready");
+        let first_binding = boot_binding(&fixture.pool, &first_startup);
+        assert!(
+            lease_original_source_verification(&fixture.pool, &first_binding)
+                .expect("current ready boot may poll")
+                .is_none()
+        );
+
+        let second = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-fence-00000000002",
+                "boot-fence-000000002",
+            ),
+        )
+        .expect("register replacement boot");
+        assert_eq!(second.boot_generation, first.boot_generation + 1);
+        assert!(lease_original_source_verification(&fixture.pool, &first_binding).is_err());
+
+        let degraded = record_managed_cloud_runtime_heartbeat(
+            &fixture.pool,
+            &boot_heartbeat(
+                &fixture.request,
+                4,
+                "degraded",
+                Some("startup"),
+                &second.boot_id,
+                second.boot_generation,
+            ),
+        )
+        .expect("publish replacement boot degraded N4");
+        assert_eq!(degraded.heartbeat_sequence, 4);
+        let mut second_startup = db_startup(
+            &fixture.request,
+            "startup-fence-000000002",
+            &second.boot_id,
+            second.boot_generation,
+        );
+        second_startup.degraded_heartbeat_sequence = 4;
+        record_source_verifier_boot_startup(&fixture.pool, &second_startup)
+            .expect("commit replacement boot ready N5");
+        let second_binding = boot_binding(&fixture.pool, &second_startup);
+        assert!(lease_original_source_verification(&fixture.pool, &first_binding).is_err());
+        assert!(
+            lease_original_source_verification(&fixture.pool, &second_binding)
+                .expect("current replacement boot may poll")
+                .is_none()
+        );
+        let mut omitted = second_binding;
+        omitted.boot_id = None;
+        omitted.boot_generation = None;
+        assert!(lease_original_source_verification(&fixture.pool, &omitted).is_err());
+    }
+
+    #[test]
+    fn probe_failed_boot_cannot_be_promoted_by_a_later_startup_request() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let registration = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-failed-0000000001",
+                "boot-failed-00000001",
+            ),
+        )
+        .expect("register failed boot");
+        record_managed_cloud_runtime_heartbeat(
+            &fixture.pool,
+            &boot_heartbeat(
+                &fixture.request,
+                2,
+                "degraded",
+                Some("probe_failed"),
+                &registration.boot_id,
+                registration.boot_generation,
+            ),
+        )
+        .expect("publish probe failure");
+        let request = db_startup(
+            &fixture.request,
+            "startup-failed-00000001",
+            &registration.boot_id,
+            registration.boot_generation,
+        );
+        assert!(record_source_verifier_boot_startup(&fixture.pool, &request).is_err());
+        let connection = fixture.pool.get().expect("inspect failed boot state");
+        let state: (i64, String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT heartbeat_sequence,health_state,reason_code,
+                        (SELECT COUNT(*) FROM jobs_managed_cloud_source_verifier_boot_startup_authorities)
+                   FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+                  WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                params![fixture.request.runtime_instance_id, fixture.request.instance_epoch],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("failed boot heartbeat state");
+        assert_eq!(
+            state,
+            (
+                2,
+                "degraded".to_string(),
+                Some("probe_failed".to_string()),
+                0
+            )
+        );
+        assert_eq!(ready_generation(&fixture.pool, &fixture.request), None);
+    }
 }

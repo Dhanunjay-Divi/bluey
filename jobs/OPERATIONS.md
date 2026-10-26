@@ -1508,9 +1508,9 @@ source-only wording is:
 > Signed ATS certification authority is source-ready; every provider remains
 > Review first pending authorized tenant and runner evidence.
 
-## Managed original-source verifier release-v2 authority
+## Historical managed original-source verifier release-v2 authority
 
-The managed-cloud candidate workflow emits only the version-2 source-verification
+Release-v2 remains a readable and runnable historical source-verification
 contract. It keeps direct and global discovery false and measures the exact
 `jobs-workflows` image for these sorted roles:
 
@@ -1559,6 +1559,54 @@ provider canaries, rights/rate approval, hosted PostgreSQL/Temporal behavior,
 runtime capacity, monitoring, kill-switch exercise, and rollback rehearsal are
 separate release gates.
 
+## Managed discovery and source-verifier release-v3 authority
+
+The candidate workflow now emits release-v3. V1 and v2 audiences, migration
+heads, feature matrices, canonical fixture bytes, and runtime behavior remain
+accepted without reinterpretation. Release-v3 alone enables direct discovery,
+global discovery, and original-source verification together, binds SQLite head
+`062` and PostgreSQL head `040`, and measures `jobs-workflows` for exactly:
+
+```text
+discovery_worker
+global_discovery_worker
+original_source_verifier
+workflow_gateway
+workflow_worker
+```
+
+The verifier may not announce v3 readiness through the generic heartbeat API.
+It must claim its one-time grant, publish sequence `N` as `degraded/startup`,
+then call exactly:
+
+```text
+POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/original-source-verifier-startup
+```
+
+That request uses the managed-runtime HMAC, exact origin, body digest, nonce,
+clock, worker, path, and runtime-session proof. The server runs the real bounded
+lease-decision path inside a rollback-only savepoint. An idle queue is healthy;
+a leaseable queue proves the same claim path without retaining an assignment,
+attempt, event, lease, or provider subject. The server then atomically records
+immutable startup authority and changes `N degraded/startup` to `N+1 ready`.
+Only after receiving that canonical response may the worker start and recurring
+heartbeats begin at `N+2`.
+
+An exact startup replay returns the original bytes and database time. A changed
+request or a second request for the same instance epoch conflicts. On startup
+failure, the process attempts one `N+1 degraded/probe_failed` heartbeat, starts
+no worker, and exits. A v3 instance that later degrades must use a fresh grant
+and epoch before becoming ready again. Historical v2 instances retain their
+reviewed direct-ready and ready-to-ready behavior because they do not carry the
+v3 startup protocol row.
+
+Release-v3 reuses builder policy v2, exact-tip test evidence v2, portal readback
+v2, and the reviewed publication, promotion, and rollback generations. It does
+not authorize a build, registry write, signature, workflow dispatch, deployment,
+flag change, provider call, application, email, or customer cohort. Require
+exact-source local and hosted evidence plus action-time authorization before any
+of those operations.
+
 ### Managed-cloud artifact publication and read-back
 
 Candidate creation now requires two successful default-branch `push` runs at
@@ -1566,8 +1614,9 @@ the exact candidate commit: Bluey Jobs CI / Privacy Gate and Observability
 Policy. The candidate's own release-contract self-test is supplemental evidence
 only; it cannot replace either full exact-tip run. GitHub's Actions-run payload
 does not supply repository `default_branch`; the workflow therefore passes the
-trusted workflow-event default branch separately, stores it once in release-v2
-CI evidence, and requires both normalized runs' `headBranch` to equal it.
+trusted workflow-event default branch separately, stores it once in generation-2
+CI evidence used by release-v2 and release-v3, and requires both normalized
+runs' `headBranch` to equal it.
 Each candidate run response is piped through Bluey's fixed 128 KiB `run`
 capture before it becomes evidence. The capture creates a private partial file
 and atomically renames it only after success; cap overflow, capture failure, or
@@ -1830,3 +1879,44 @@ No source change can manufacture provider approvals, signing certificates, or
 production credentials. Keep the Jobs beta flag off until the applicable
 cloud-first launch gates pass. Keep local distribution disabled independently;
 do not block the browser-delivered launch on the parked P2 device matrix.
+
+## Source-verifier boot generation endpoints
+
+Both require the managed-cloud-runtime worker HMAC scope, exact path admission,
+and the actual claimed runtime session token. Canonical responses never include
+the session token. Never supply a production credential to a local verification run.
+
+- POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-registration
+  Server assigns a strictly monotonic boot generation. Idempotent by registrationRequestId:
+  an identical canonical payload replays stored bytes, a changed payload returns HTTP 409.
+
+- POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-startup
+  Runs the real backend lease path in a rollback-only savepoint, then atomically
+  commits degraded N to ready N+1 bound to an exact generation.
+  Idempotent by startupRequestId. A stale generation is rejected and committed readiness never
+  regresses. Duplicate ready reporting is a no-op.
+
+Operators must not describe readiness recovery as client-ordered replay. Replay is a server-side
+idempotency detail only.
+
+The client makes at most three attempts on transport/timeouts and transient
+502/503/504 responses, keeping its boot ID, request token and body identical.
+It never sends a speculative `probe_failed` heartbeat after an ambiguous startup.
+A new process registers a new generation and must prove readiness again.
+
+All boot-scoped startup and recurring heartbeats carry `bootId` and
+`bootGeneration`. Missing, mismatched or stale fences fail closed, including
+otherwise exact heartbeat replays. Generic liveness cannot lower the committed
+ready generation; liveness expiration remains independently authoritative.
+
+Verifier work requests use paired `boot_id` / `boot_generation` in their
+binding. Runtime readiness must match the process's current ready generation;
+each claimed attempt retains that exact boot identity. Never auto-follow a new
+boot head or adopt a predecessor's in-flight attempt. Legacy non-boot release
+bindings omit both fields. Startup accepts only a current `degraded/startup`
+heartbeat, never a `degraded/probe_failed` predecessor.
+
+V3 release heads are SQLite `065_jobs_source_verifier_heartbeat_boot_bindings.sql`
+and PostgreSQL `043_jobs_source_verifier_heartbeat_boot_bindings.sql`.
+They preserve earlier migration bytes and historical manifests. Do not enable
+flags, publish images or deploy merely because local checks pass.

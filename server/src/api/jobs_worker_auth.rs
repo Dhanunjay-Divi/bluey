@@ -309,7 +309,23 @@ fn managed_cloud_runtime_path(path: &str) -> bool {
         .strip_prefix("/api/jobs/internal/managed-cloud/runtime-instances/")
         .and_then(|rest| rest.strip_suffix("/heartbeats"))
         .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
-    grant_claim || heartbeat
+    let original_source_verifier_startup = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/runtime-instances/")
+        .and_then(|rest| rest.strip_suffix("/original-source-verifier-startup"))
+        .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
+    let source_verifier_boot_registration = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/runtime-instances/")
+        .and_then(|rest| rest.strip_suffix("/source-verifier-boot-registration"))
+        .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
+    let source_verifier_boot_startup = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/runtime-instances/")
+        .and_then(|rest| rest.strip_suffix("/source-verifier-boot-startup"))
+        .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
+    grant_claim
+        || heartbeat
+        || original_source_verifier_startup
+        || source_verifier_boot_registration
+        || source_verifier_boot_startup
 }
 
 fn original_source_verification_path(path: &str) -> bool {
@@ -531,6 +547,23 @@ mod tests {
                 "/api/jobs/internal/managed-cloud/runtime-grants/cloud-grant-1234567890/claim"
             ),
             Some("managed-cloud-runtime")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                concat!(
+                    "/api/jobs/internal/managed-cloud/runtime-instances/",
+                    "cloud-instance-1234567890/original-source-verifier-startup"
+                )
+            ),
+            Some("managed-cloud-runtime")
+        );
+        assert_eq!(
+            signed_body_limit(concat!(
+                "/api/jobs/internal/managed-cloud/runtime-instances/",
+                "cloud-instance-1234567890/original-source-verifier-startup"
+            )),
+            MANAGED_CLOUD_RUNTIME_SIGNED_BODY_BYTES
         );
         assert_eq!(
             worker_scope(
@@ -868,5 +901,22 @@ mod tests {
             .unwrap();
         assert!(legacy_debug_token_valid(&legacy_discovery));
         std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+    }
+    #[test]
+    fn source_verifier_boot_paths_are_admitted() {
+        let base = "/api/jobs/internal/managed-cloud/runtime-instances/";
+        let instance = "cloud-instance-1234567890";
+        assert!(managed_cloud_runtime_path(&format!(
+            "{base}{instance}/source-verifier-boot-registration"
+        )));
+        assert!(managed_cloud_runtime_path(&format!(
+            "{base}{instance}/source-verifier-boot-startup"
+        )));
+        assert!(!managed_cloud_runtime_path(&format!(
+            "{base}{instance}/source-verifier-boot-unknown"
+        )));
+        assert!(!managed_cloud_runtime_path(
+            "/api/jobs/internal/managed-cloud/runtime-instances/short/source-verifier-boot-startup"
+        ));
     }
 }

@@ -2,6 +2,8 @@ const MANAGED_CLOUD_RELEASE_AUDIENCE: &str = "bluey-jobs-managed-cloud-release-v
 const MANAGED_CLOUD_ACTIVATION_AUDIENCE: &str = "bluey-jobs-managed-cloud-activation-v1";
 const MANAGED_CLOUD_RELEASE_V2_AUDIENCE: &str = "bluey-jobs-managed-cloud-release-v2";
 const MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE: &str = "bluey-jobs-managed-cloud-activation-v2";
+const MANAGED_CLOUD_RELEASE_V3_AUDIENCE: &str = "bluey-jobs-managed-cloud-release-v3";
+const MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE: &str = "bluey-jobs-managed-cloud-activation-v3";
 const MANAGED_CLOUD_COHORT_AUDIENCE: &str = "bluey-jobs-managed-cloud-cohort-v1";
 const MANAGED_CLOUD_ROLLBACK_AUDIENCE: &str = "bluey-jobs-managed-cloud-rollback-v1";
 const MANAGED_CLOUD_REVOCATION_AUDIENCE: &str = "bluey-jobs-managed-cloud-revocation-v1";
@@ -45,6 +47,10 @@ const MANAGED_CLOUD_SQLITE_V2_MIGRATION_HEAD: &str =
     "057_jobs_original_source_verification_authority.sql";
 const MANAGED_CLOUD_POSTGRES_V2_MIGRATION_HEAD: &str =
     "035_jobs_original_source_verification_authority.sql";
+const MANAGED_CLOUD_SQLITE_V3_MIGRATION_HEAD: &str =
+    "065_jobs_source_verifier_heartbeat_boot_bindings.sql";
+const MANAGED_CLOUD_POSTGRES_V3_MIGRATION_HEAD: &str =
+    "043_jobs_source_verifier_heartbeat_boot_bindings.sql";
 const MANAGED_CLOUD_MAX_ENVELOPE_BYTES: usize = 128 * 1024;
 const MANAGED_CLOUD_MAX_CONTENT_INVENTORY_BYTES: usize = 12 * 1024 * 1024;
 const MANAGED_CLOUD_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
@@ -67,6 +73,8 @@ const MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_AUDIENCE: &str =
     "bluey-jobs-original-source-verification-authority-v1";
 const MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_AUTHORITY_AUDIENCE: &str =
     "bluey-jobs-original-source-verifier-runtime-authority-v1";
+const MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUDIENCE: &str =
+    "bluey-jobs-managed-cloud-original-source-verifier-startup-v1";
 const MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH: &str =
     "app/.bluey/managed-cloud-runtime-measurement.json";
 const MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_PATH: &str =
@@ -106,6 +114,24 @@ fn managed_cloud_runtime_measurement_inventory_path(component_id: &str, path: &s
         }
         _ => false,
     }
+}
+
+fn managed_cloud_original_source_verifier_measurement_roles_valid(roles: &[String]) -> bool {
+    let roles = roles.iter().map(String::as_str).collect::<Vec<_>>();
+    roles
+        == [
+            "original_source_verifier",
+            "workflow_gateway",
+            "workflow_worker",
+        ]
+        || roles
+            == [
+                "discovery_worker",
+                "global_discovery_worker",
+                "original_source_verifier",
+                "workflow_gateway",
+                "workflow_worker",
+            ]
 }
 
 const MANAGED_CLOUD_BASE_RUNTIME_ROLES: [&str; 6] = [
@@ -158,12 +184,44 @@ const MANAGED_CLOUD_V2_PROTOCOLS: [(&str, i64); 12] = [
     ("workflow_command", 2),
 ];
 
+const MANAGED_CLOUD_V3_PROTOCOLS: [(&str, i64); 14] = [
+    ("ats_certification", 1),
+    ("execution_lease", 1),
+    ("gateway_command", 3),
+    ("managed_cloud_release", 1),
+    ("object_evidence", 1),
+    ("runner_checkpoint", 2),
+    ("runner_profile_snapshot", 1),
+    ("runner_result", 2),
+    ("runtime_heartbeat", 1),
+    ("source_verification", 1),
+    ("source_verifier_startup", 1),
+    ("source_verifier_boot", 1),
+    ("workflow_cleanup", 3),
+    ("workflow_command", 2),
+];
+
 #[derive(Clone, Copy)]
 struct ManagedCloudReleaseContract {
     sqlite_migration_head: &'static str,
     postgres_migration_head: &'static str,
     protocols: &'static [(&'static str, i64)],
-    source_verification_required: bool,
+    features: ManagedCloudFeatureAuthority,
+}
+
+const fn managed_cloud_contract_features(
+    direct_discovery: bool,
+    global_discovery: bool,
+    source_verification: bool,
+) -> ManagedCloudFeatureAuthority {
+    ManagedCloudFeatureAuthority {
+        cloud_distribution: true,
+        workflow_command_dispatch: true,
+        workflow_cleanup: true,
+        direct_discovery,
+        global_discovery,
+        source_verification,
+    }
 }
 
 fn managed_cloud_release_contract(
@@ -175,22 +233,38 @@ fn managed_cloud_release_contract(
             sqlite_migration_head: MANAGED_CLOUD_SQLITE_MIGRATION_HEAD,
             postgres_migration_head: MANAGED_CLOUD_POSTGRES_MIGRATION_HEAD,
             protocols: &MANAGED_CLOUD_PROTOCOLS,
-            source_verification_required: false,
+            features: managed_cloud_contract_features(false, false, false),
         }),
         (2, MANAGED_CLOUD_RELEASE_V2_AUDIENCE) => Some(ManagedCloudReleaseContract {
             sqlite_migration_head: MANAGED_CLOUD_SQLITE_V2_MIGRATION_HEAD,
             postgres_migration_head: MANAGED_CLOUD_POSTGRES_V2_MIGRATION_HEAD,
             protocols: &MANAGED_CLOUD_V2_PROTOCOLS,
-            source_verification_required: true,
+            features: managed_cloud_contract_features(false, false, true),
+        }),
+        (3, MANAGED_CLOUD_RELEASE_V3_AUDIENCE) => Some(ManagedCloudReleaseContract {
+            sqlite_migration_head: MANAGED_CLOUD_SQLITE_V3_MIGRATION_HEAD,
+            postgres_migration_head: MANAGED_CLOUD_POSTGRES_V3_MIGRATION_HEAD,
+            protocols: &MANAGED_CLOUD_V3_PROTOCOLS,
+            features: managed_cloud_contract_features(true, true, true),
         }),
         _ => None,
     }
 }
 
-fn managed_cloud_activation_contract(version: i64, audience: &str) -> Option<bool> {
+fn managed_cloud_activation_contract(
+    version: i64,
+    audience: &str,
+) -> Option<ManagedCloudFeatureAuthority> {
     match (version, audience) {
-        (1, MANAGED_CLOUD_ACTIVATION_AUDIENCE) => Some(false),
-        (2, MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE) => Some(true),
+        (1, MANAGED_CLOUD_ACTIVATION_AUDIENCE) => {
+            Some(managed_cloud_contract_features(false, false, false))
+        }
+        (2, MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE) => {
+            Some(managed_cloud_contract_features(false, false, true))
+        }
+        (3, MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE) => {
+            Some(managed_cloud_contract_features(true, true, true))
+        }
         _ => None,
     }
 }
@@ -366,7 +440,7 @@ struct ManagedCloudResolvedHead {
     task_queue_sha256: String,
     failure_converter_sha256: String,
     activation_expires_at_ms: i64,
-    source_verification: bool,
+    features: ManagedCloudFeatureAuthority,
 }
 
 #[derive(Debug, Clone)]
@@ -531,6 +605,10 @@ pub struct ManagedCloudRuntimeHeartbeatInput {
     pub dependency_evidence_sha256: String,
     pub health_state: String,
     pub reason_code: Option<String>,
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    #[serde(default)]
+    pub boot_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -557,6 +635,68 @@ pub struct ManagedCloudRuntimeHeartbeat {
     pub reason_code: Option<String>,
     pub heartbeat_at_ms: i64,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManagedCloudOriginalSourceVerifierStartupRequest {
+    pub version: i64,
+    pub audience: String,
+    pub startup_request_id: String,
+    pub runtime_instance_id: String,
+    pub worker_id: String,
+    pub session_token: String,
+    pub instance_epoch: i64,
+    pub expected_degraded_heartbeat_sequence: i64,
+    pub runtime_identity_sha256: String,
+    pub observed_head_revision: i64,
+    pub observed_transition_sha256: String,
+    pub activation_sha256: String,
+    pub manifest_sha256: String,
+    pub component_id: String,
+    pub role: String,
+    pub artifact_sha256: String,
+    pub migration_set_sha256: String,
+    pub config_schema_sha256: String,
+    pub protocol_set_sha256: String,
+    pub task_queue_sha256: String,
+    pub failure_converter_sha256: String,
+    pub dependency_evidence_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManagedCloudOriginalSourceVerifierStartupResponse {
+    version: i64,
+    audience: String,
+    startup_request_id: String,
+    runtime_instance_id: String,
+    worker_id: String,
+    instance_epoch: i64,
+    runtime_identity_sha256: String,
+    degraded_heartbeat_sequence: i64,
+    ready_heartbeat_sequence: i64,
+    observed_head_revision: i64,
+    observed_transition_sha256: String,
+    activation_sha256: String,
+    manifest_sha256: String,
+    component_id: String,
+    role: String,
+    artifact_sha256: String,
+    migration_set_sha256: String,
+    config_schema_sha256: String,
+    protocol_set_sha256: String,
+    task_queue_sha256: String,
+    failure_converter_sha256: String,
+    dependency_evidence_sha256: String,
+    probe_result: String,
+    startup_authority_sha256: String,
+    startup_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCloudOriginalSourceVerifierStartupResult {
+    pub canonical_response: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -898,7 +1038,7 @@ struct ManagedCloudContentInventoryAuthority {
     runtime: Option<ManagedCloudContentInventoryRuntime>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ManagedCloudFeatureAuthority {
     cloud_distribution: bool,
@@ -1777,11 +1917,9 @@ pub fn inspect_managed_cloud_runtime_identity(
             ]) || measurement.measured_files.len() != 1
                 || measurement.measured_files[0].path != "usr/local/bin/bluey-jobs-api"))
         || (role == "original_source_verifier"
-            && (measurement.roles.iter().map(String::as_str).ne([
-                "original_source_verifier",
-                "workflow_gateway",
-                "workflow_worker",
-            ]) || !measurement
+            && (!managed_cloud_original_source_verifier_measurement_roles_valid(
+                &measurement.roles,
+            ) || !measurement
                 .measured_files
                 .iter()
                 .any(|file| file.path == MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_PATH)))
@@ -1966,12 +2104,14 @@ fn validate_managed_cloud_trust_policy(
 fn validate_managed_cloud_signature_set(
     signature_set: &ManagedCloudSignatureSetAuthority,
 ) -> ManagedCloudResult<()> {
-    const TARGETS: [&str; 8] = [
+    const TARGETS: [&str; 10] = [
         MANAGED_CLOUD_ACTIVATION_AUDIENCE,
         MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
+        MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE,
         MANAGED_CLOUD_COHORT_AUDIENCE,
         MANAGED_CLOUD_RELEASE_AUDIENCE,
         MANAGED_CLOUD_RELEASE_V2_AUDIENCE,
+        MANAGED_CLOUD_RELEASE_V3_AUDIENCE,
         MANAGED_CLOUD_REVOCATION_AUDIENCE,
         MANAGED_CLOUD_ROLLBACK_AUDIENCE,
         MANAGED_CLOUD_TRUST_POLICY_AUDIENCE,
@@ -2387,12 +2527,7 @@ fn validate_managed_cloud_release(
         || !managed_cloud_hex64(&release.verification_evidence_sha256)
         || release.components.len() != 4
         || release.protocols.len() != contract.protocols.len()
-        || !release.feature_authority.cloud_distribution
-        || !release.feature_authority.workflow_command_dispatch
-        || !release.feature_authority.workflow_cleanup
-        || release.feature_authority.direct_discovery
-        || release.feature_authority.global_discovery
-        || release.feature_authority.source_verification != contract.source_verification_required
+        || release.feature_authority != contract.features
     {
         return Err(ManagedCloudRegistryError::InvalidAuthority);
     }
@@ -2547,7 +2682,10 @@ fn validate_managed_cloud_verification_evidence(
             Some(OCI_PATH),
             "pwuser",
             &[],
-            &[MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE, "runner/dist/server.js"],
+            &[
+                MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE,
+                "runner/dist/server.js",
+            ],
             &[
                 "app/.bluey/managed-cloud-runtime-measurement.json",
                 "app/runner/dist/native/bluey_jobs_runner_native_storage.node",
@@ -2802,7 +2940,10 @@ fn validate_managed_cloud_content_inventories(
             Some((
                 "pwuser",
                 &[],
-                &[MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE, "runner/dist/server.js"],
+                &[
+                    MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE,
+                    "runner/dist/server.js",
+                ],
                 &["8091/tcp"],
                 &[
                     "BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs-runner",
@@ -3134,7 +3275,7 @@ fn validate_managed_cloud_activation(
     activation: &ManagedCloudActivationAuthority,
 ) -> ManagedCloudResult<()> {
     validate_managed_cloud_scope(&activation.scope)?;
-    let source_verification_required =
+    let required_features =
         managed_cloud_activation_contract(activation.version, &activation.audience)
             .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
     if !managed_cloud_token(&activation.activation_id, 128)
@@ -3161,12 +3302,7 @@ fn validate_managed_cloud_activation(
         || !managed_cloud_hex64(&activation.feature_authority_sha256)
         || managed_cloud_digest(&activation.feature_authority)?
             != activation.feature_authority_sha256
-        || !activation.feature_authority.cloud_distribution
-        || !activation.feature_authority.workflow_command_dispatch
-        || !activation.feature_authority.workflow_cleanup
-        || activation.feature_authority.direct_discovery
-        || activation.feature_authority.global_discovery
-        || activation.feature_authority.source_verification != source_verification_required
+        || activation.feature_authority != required_features
         || !managed_cloud_hex64(&activation.runner_fleet_evidence_sha256)
         || !managed_cloud_hex64(&activation.cleanup_authority_sha256)
         || !managed_cloud_hex64(&activation.temporal_namespace_sha256)
@@ -4479,7 +4615,12 @@ fn insert_sqlite_managed_cloud_release(
         .protocols
         .iter()
         .enumerate()
-        .filter(|(_, protocol)| protocol.protocol_id != "source_verification")
+        .filter(|(_, protocol)| {
+            !matches!(
+                protocol.protocol_id.as_str(),
+                "source_verification" | "source_verifier_startup" | "source_verifier_boot"
+            )
+        })
     {
         tx.execute(
             "INSERT INTO jobs_managed_cloud_manifest_protocols(
@@ -4534,6 +4675,32 @@ fn insert_sqlite_managed_cloud_release(
             params![manifest_sha256, protocol.schema_sha256],
         )
         .map_err(managed_cloud_storage)?;
+        if release.version == 3 {
+            let startup_protocol = release
+                .protocols
+                .iter()
+                .find(|protocol| protocol.protocol_id == "source_verifier_startup")
+                .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+            tx.execute(
+                "INSERT INTO jobs_managed_cloud_manifest_source_verifier_startup_protocols(
+                   manifest_sha256,protocol_id,protocol_version,schema_sha256,ordinal
+                 ) VALUES(?1,'source_verifier_startup',1,?2,10)",
+                params![manifest_sha256, startup_protocol.schema_sha256],
+            )
+            .map_err(managed_cloud_storage)?;
+            let boot_protocol = release
+                .protocols
+                .iter()
+                .find(|protocol| protocol.protocol_id == "source_verifier_boot")
+                .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+            tx.execute(
+                "INSERT INTO jobs_managed_cloud_manifest_source_verifier_boot_protocols(
+                   manifest_sha256,protocol_id,protocol_version,schema_sha256,ordinal
+                 ) VALUES(?1,'source_verifier_boot',1,?2,11)",
+                params![manifest_sha256, boot_protocol.schema_sha256],
+            )
+            .map_err(managed_cloud_storage)?;
+        }
     }
     Ok(())
 }
@@ -4694,7 +4861,12 @@ fn insert_postgres_managed_cloud_release(
         .protocols
         .iter()
         .enumerate()
-        .filter(|(_, protocol)| protocol.protocol_id != "source_verification")
+        .filter(|(_, protocol)| {
+            !matches!(
+                protocol.protocol_id.as_str(),
+                "source_verification" | "source_verifier_startup" | "source_verifier_boot"
+            )
+        })
     {
         let ordinal =
             i64::try_from(ordinal).map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?;
@@ -4751,6 +4923,32 @@ fn insert_postgres_managed_cloud_release(
             &[&manifest_sha256, &protocol.schema_sha256],
         )
         .map_err(managed_cloud_storage)?;
+        if release.version == 3 {
+            let startup_protocol = release
+                .protocols
+                .iter()
+                .find(|protocol| protocol.protocol_id == "source_verifier_startup")
+                .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+            tx.execute(
+                "INSERT INTO jobs_managed_cloud_manifest_source_verifier_startup_protocols(
+                   manifest_sha256,protocol_id,protocol_version,schema_sha256,ordinal
+                 ) VALUES($1,'source_verifier_startup',1,$2,10)",
+                &[&manifest_sha256, &startup_protocol.schema_sha256],
+            )
+            .map_err(managed_cloud_storage)?;
+            let boot_protocol = release
+                .protocols
+                .iter()
+                .find(|protocol| protocol.protocol_id == "source_verifier_boot")
+                .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+            tx.execute(
+                "INSERT INTO jobs_managed_cloud_manifest_source_verifier_boot_protocols(
+                   manifest_sha256,protocol_id,protocol_version,schema_sha256,ordinal
+                 ) VALUES($1,'source_verifier_boot',1,$2,11)",
+                &[&manifest_sha256, &boot_protocol.schema_sha256],
+            )
+            .map_err(managed_cloud_storage)?;
+        }
     }
     Ok(())
 }
@@ -5620,6 +5818,7 @@ fn validate_managed_cloud_activation_dependencies(
         || manifest.version != activation.version
         || (manifest.version == 1 && activation.audience != MANAGED_CLOUD_ACTIVATION_AUDIENCE)
         || (manifest.version == 2 && activation.audience != MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE)
+        || (manifest.version == 3 && activation.audience != MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE)
         || dependencies.trust_generation != activation.trust_generation
         || dependencies.manifest_signature_set_sha256 != activation.manifest_signature_set_sha256
         || dependencies.cohort_signature_set_sha256 != activation.cohort_signature_set_sha256
@@ -8563,6 +8762,11 @@ fn sqlite_managed_cloud_resolved_head(
                 activation.channel_sequence,manifest.release_id,
                 manifest.release_sequence,activation.task_queue_sha256,
                 activation.failure_converter_sha256,activation.expires_at_ms,
+                activation.cloud_distribution_enabled,
+                activation.workflow_command_dispatch_enabled,
+                activation.workflow_cleanup_enabled,
+                activation.direct_discovery_enabled,
+                activation.global_discovery_enabled,
                 activation.source_verification_enabled
            FROM jobs_managed_cloud_heads head
            JOIN jobs_managed_cloud_activations activation
@@ -8589,7 +8793,14 @@ fn sqlite_managed_cloud_resolved_head(
                 task_queue_sha256: row.get(9)?,
                 failure_converter_sha256: row.get(10)?,
                 activation_expires_at_ms: row.get(11)?,
-                source_verification: row.get(12)?,
+                features: ManagedCloudFeatureAuthority {
+                    cloud_distribution: row.get(12)?,
+                    workflow_command_dispatch: row.get(13)?,
+                    workflow_cleanup: row.get(14)?,
+                    direct_discovery: row.get(15)?,
+                    global_discovery: row.get(16)?,
+                    source_verification: row.get(17)?,
+                },
             })
         },
     )
@@ -8609,6 +8820,11 @@ fn postgres_managed_cloud_resolved_head(
                 activation.channel_sequence,manifest.release_id,
                 manifest.release_sequence,activation.task_queue_sha256,
                 activation.failure_converter_sha256,activation.expires_at_ms,
+                activation.cloud_distribution_enabled,
+                activation.workflow_command_dispatch_enabled,
+                activation.workflow_cleanup_enabled,
+                activation.direct_discovery_enabled,
+                activation.global_discovery_enabled,
                 activation.source_verification_enabled
            FROM jobs_managed_cloud_heads head
            JOIN jobs_managed_cloud_activations activation
@@ -8637,7 +8853,14 @@ fn postgres_managed_cloud_resolved_head(
         task_queue_sha256: row.get(9),
         failure_converter_sha256: row.get(10),
         activation_expires_at_ms: row.get(11),
-        source_verification: row.get(12),
+        features: ManagedCloudFeatureAuthority {
+            cloud_distribution: row.get(12),
+            workflow_command_dispatch: row.get(13),
+            workflow_cleanup: row.get(14),
+            direct_discovery: row.get(15),
+            global_discovery: row.get(16),
+            source_verification: row.get(17),
+        },
     }))
 }
 
@@ -8768,18 +8991,14 @@ fn managed_cloud_resolver_input(
 
 fn managed_cloud_runtime_set_exact(
     runtimes: &[ManagedCloudRequiredRuntime],
-    source_verification: bool,
+    features: &ManagedCloudFeatureAuthority,
 ) -> bool {
-    let mut expected = MANAGED_CLOUD_BASE_RUNTIME_ROLES.to_vec();
-    if source_verification {
-        expected.push("original_source_verifier");
-        expected.sort_unstable();
-    }
+    let expected = managed_cloud_required_roles_for_feature(features);
     runtimes.len() == expected.len()
         && runtimes
             .iter()
             .map(|runtime| runtime.role.as_str())
-            .eq(expected)
+            .eq(expected.iter().map(String::as_str))
 }
 
 fn sqlite_managed_cloud_runtime_readiness(
@@ -8971,7 +9190,7 @@ fn resolve_sqlite_managed_cloud_readiness_tx(
         );
     };
     let runtimes = sqlite_managed_cloud_required_runtimes(tx, &head)?;
-    let mut authority_valid = managed_cloud_runtime_set_exact(&runtimes, head.source_verification);
+    let mut authority_valid = managed_cloud_runtime_set_exact(&runtimes, &head.features);
     if authority_valid {
         for runtime in &runtimes {
             match resolve_sqlite_managed_cloud_grant_authority(
@@ -9079,7 +9298,7 @@ fn resolve_postgres_managed_cloud_readiness_tx(
         );
     };
     let runtimes = postgres_managed_cloud_required_runtimes(tx, &head)?;
-    let mut authority_valid = managed_cloud_runtime_set_exact(&runtimes, head.source_verification);
+    let mut authority_valid = managed_cloud_runtime_set_exact(&runtimes, &head.features);
     if authority_valid {
         for runtime in &runtimes {
             match resolve_postgres_managed_cloud_grant_authority(
@@ -9190,8 +9409,7 @@ pub fn resolve_managed_cloud_readiness(
                 );
             };
             let runtimes = sqlite_managed_cloud_required_runtimes(&tx, &head)?;
-            let mut authority_valid =
-                managed_cloud_runtime_set_exact(&runtimes, head.source_verification);
+            let mut authority_valid = managed_cloud_runtime_set_exact(&runtimes, &head.features);
             if authority_valid {
                 for runtime in &runtimes {
                     match resolve_sqlite_managed_cloud_grant_authority(
@@ -9304,8 +9522,7 @@ pub fn resolve_managed_cloud_readiness(
                 );
             };
             let runtimes = postgres_managed_cloud_required_runtimes(&mut tx, &head)?;
-            let mut authority_valid =
-                managed_cloud_runtime_set_exact(&runtimes, head.source_verification);
+            let mut authority_valid = managed_cloud_runtime_set_exact(&runtimes, &head.features);
             if authority_valid {
                 for runtime in &runtimes {
                     match resolve_postgres_managed_cloud_grant_authority(
@@ -9938,12 +10155,7 @@ pub(crate) fn lock_managed_cloud_release_registry_postgres_tx(
     scope: &ManagedCloudScope,
 ) -> ManagedCloudResult<()> {
     validate_managed_cloud_scope(scope)?;
-    tx.query_one(
-        "SELECT pg_advisory_xact_lock(
-           hashtextextended('jobs-managed-cloud-release-registry',0))",
-        &[],
-    )
-    .map_err(managed_cloud_storage)?;
+    lock_managed_cloud_release_registry_exclusive_postgres_tx(tx)?;
     let lock_key = format!(
         "managed-cloud:{}:{}:{}",
         scope.environment, scope.region, scope.channel
@@ -9951,6 +10163,18 @@ pub(crate) fn lock_managed_cloud_release_registry_postgres_tx(
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
         &[&lock_key],
+    )
+    .map_err(managed_cloud_storage)?;
+    Ok(())
+}
+
+pub(crate) fn lock_managed_cloud_release_registry_exclusive_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+) -> ManagedCloudResult<()> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(
+           hashtextextended('jobs-managed-cloud-release-registry',0))",
+        &[],
     )
     .map_err(managed_cloud_storage)?;
     Ok(())
@@ -13325,6 +13549,109 @@ fn validate_managed_cloud_runtime_heartbeat(
     {
         return Err(ManagedCloudRegistryError::InvalidRequest);
     }
+    match (&input.boot_id, input.boot_generation) {
+        (None, None) => {}
+        (Some(boot_id), Some(boot_generation))
+            if input.role == "original_source_verifier"
+                && managed_cloud_route_id(boot_id)
+                && managed_cloud_safe_integer(boot_generation, true) => {}
+        _ => return Err(ManagedCloudRegistryError::InvalidRequest),
+    }
+    Ok(())
+}
+
+fn validate_managed_cloud_original_source_verifier_startup(
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+) -> ManagedCloudResult<()> {
+    if input.version != 1
+        || input.audience != MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUDIENCE
+        || !managed_cloud_route_id(&input.startup_request_id)
+        || !managed_cloud_route_id(&input.runtime_instance_id)
+        || !managed_cloud_route_id(&input.worker_id)
+        || !managed_cloud_base64url_32(&input.session_token)
+        || !managed_cloud_safe_integer(input.instance_epoch, true)
+        || !managed_cloud_safe_integer(input.expected_degraded_heartbeat_sequence, true)
+        || input.expected_degraded_heartbeat_sequence >= MANAGED_CLOUD_MAX_SAFE_INTEGER
+        || !managed_cloud_hex64(&input.runtime_identity_sha256)
+        || !managed_cloud_safe_integer(input.observed_head_revision, true)
+        || !managed_cloud_hex64(&input.observed_transition_sha256)
+        || !managed_cloud_hex64(&input.activation_sha256)
+        || !managed_cloud_hex64(&input.manifest_sha256)
+        || input.component_id != "jobs-workflows"
+        || input.role != "original_source_verifier"
+        || !managed_cloud_hex64(&input.artifact_sha256)
+        || !managed_cloud_hex64(&input.migration_set_sha256)
+        || !managed_cloud_hex64(&input.config_schema_sha256)
+        || !managed_cloud_hex64(&input.protocol_set_sha256)
+        || !managed_cloud_hex64(&input.task_queue_sha256)
+        || !managed_cloud_hex64(&input.failure_converter_sha256)
+        || !managed_cloud_hex64(&input.dependency_evidence_sha256)
+    {
+        return Err(ManagedCloudRegistryError::InvalidRequest);
+    }
+    if managed_cloud_dependency_evidence_sha256(
+        &input.role,
+        &input.activation_sha256,
+        &input.manifest_sha256,
+        &input.component_id,
+        &input.artifact_sha256,
+        &input.task_queue_sha256,
+        &input.failure_converter_sha256,
+    )? != input.dependency_evidence_sha256
+    {
+        return Err(ManagedCloudRegistryError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn managed_cloud_original_source_verifier_startup_request_sha256(
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+) -> ManagedCloudResult<String> {
+    let mut value = serde_json::to_value(input).map_err(managed_cloud_storage)?;
+    value
+        .as_object_mut()
+        .ok_or(ManagedCloudRegistryError::InvalidRequest)?
+        .remove("sessionToken")
+        .ok_or(ManagedCloudRegistryError::InvalidRequest)?;
+    managed_cloud_digest(&value)
+}
+
+fn managed_cloud_original_source_verifier_startup_authority_sha256(
+    response: &ManagedCloudOriginalSourceVerifierStartupResponse,
+) -> ManagedCloudResult<String> {
+    let mut value = serde_json::to_value(response).map_err(managed_cloud_storage)?;
+    value
+        .as_object_mut()
+        .ok_or(ManagedCloudRegistryError::InvalidAuthority)?
+        .remove("startupAuthoritySha256")
+        .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+    managed_cloud_digest(&value)
+}
+
+fn require_managed_cloud_original_source_verifier_startup_identity(
+    instance: &ManagedCloudRuntimeInstance,
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+) -> ManagedCloudResult<()> {
+    if instance.runtime_instance_id != input.runtime_instance_id
+        || instance.worker_id != input.worker_id
+        || instance.instance_epoch != input.instance_epoch
+        || instance.runtime_identity_sha256 != input.runtime_identity_sha256
+        || instance.head_revision != input.observed_head_revision
+        || instance.transition_sha256 != input.observed_transition_sha256
+        || instance.activation_sha256 != input.activation_sha256
+        || instance.manifest_sha256 != input.manifest_sha256
+        || instance.component_id != input.component_id
+        || instance.role != input.role
+        || instance.artifact_sha256 != input.artifact_sha256
+        || instance.migration_set_sha256 != input.migration_set_sha256
+        || instance.config_schema_sha256 != input.config_schema_sha256
+        || instance.protocol_set_sha256 != input.protocol_set_sha256
+        || instance.task_queue_sha256 != input.task_queue_sha256
+        || instance.failure_converter_sha256 != input.failure_converter_sha256
+        || instance.dependency_evidence_sha256 != input.dependency_evidence_sha256
+    {
+        return Err(ManagedCloudRegistryError::InvalidRequest);
+    }
     Ok(())
 }
 
@@ -13897,10 +14224,19 @@ fn resolve_sqlite_managed_cloud_grant_authority(
             AND activation.cloud_distribution_enabled=1
             AND activation.workflow_command_dispatch_enabled=1
             AND activation.workflow_cleanup_enabled=1
-            AND activation.direct_discovery_enabled=0
-            AND activation.global_discovery_enabled=0
-            AND (capability.capability<>'original_source_verifier'
-                 OR activation.source_verification_enabled=1)
+            AND ((activation.direct_discovery_enabled=0
+                  AND activation.global_discovery_enabled=0)
+              OR (activation.direct_discovery_enabled=1
+                  AND activation.global_discovery_enabled=1
+                  AND activation.source_verification_enabled=1))
+            AND ((capability.capability='discovery_worker'
+                  AND activation.direct_discovery_enabled=1)
+              OR (capability.capability='global_discovery_worker'
+                  AND activation.global_discovery_enabled=1)
+              OR (capability.capability='original_source_verifier'
+                  AND activation.source_verification_enabled=1)
+              OR capability.capability NOT IN (
+                  'discovery_worker','global_discovery_worker','original_source_verifier'))
             AND (activation.source_verification_enabled=0 OR EXISTS(
               SELECT 1
                 FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
@@ -13911,6 +14247,14 @@ fn resolve_sqlite_managed_cloud_grant_authority(
                  AND source_protocol.protocol_version=1
                  AND source_identity.component_id='jobs-workflows'
                  AND source_identity.role='original_source_verifier'
+            ))
+            AND ((activation.direct_discovery_enabled=0
+                  AND activation.global_discovery_enabled=0) OR EXISTS(
+              SELECT 1
+                FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols startup_protocol
+               WHERE startup_protocol.manifest_sha256=manifest.manifest_sha256
+                 AND startup_protocol.protocol_id='source_verifier_startup'
+                 AND startup_protocol.protocol_version=1 AND startup_protocol.ordinal=10
             ))
             AND (transition.transition_kind='activation'
                  OR rollback.rollback_sha256 IS NOT NULL)
@@ -14031,10 +14375,19 @@ fn resolve_postgres_managed_cloud_grant_authority(
             AND activation.cloud_distribution_enabled
             AND activation.workflow_command_dispatch_enabled
             AND activation.workflow_cleanup_enabled
-            AND NOT activation.direct_discovery_enabled
-            AND NOT activation.global_discovery_enabled
-            AND (capability.capability<>'original_source_verifier'
-                 OR activation.source_verification_enabled)
+            AND ((NOT activation.direct_discovery_enabled
+                  AND NOT activation.global_discovery_enabled)
+              OR (activation.direct_discovery_enabled
+                  AND activation.global_discovery_enabled
+                  AND activation.source_verification_enabled))
+            AND ((capability.capability='discovery_worker'
+                  AND activation.direct_discovery_enabled)
+              OR (capability.capability='global_discovery_worker'
+                  AND activation.global_discovery_enabled)
+              OR (capability.capability='original_source_verifier'
+                  AND activation.source_verification_enabled)
+              OR capability.capability NOT IN (
+                  'discovery_worker','global_discovery_worker','original_source_verifier'))
             AND (NOT activation.source_verification_enabled OR EXISTS(
               SELECT 1
                 FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
@@ -14045,6 +14398,14 @@ fn resolve_postgres_managed_cloud_grant_authority(
                  AND source_protocol.protocol_version=1
                  AND source_identity.component_id='jobs-workflows'
                  AND source_identity.role='original_source_verifier'
+            ))
+            AND ((NOT activation.direct_discovery_enabled
+                  AND NOT activation.global_discovery_enabled) OR EXISTS(
+              SELECT 1
+                FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols startup_protocol
+               WHERE startup_protocol.manifest_sha256=manifest.manifest_sha256
+                 AND startup_protocol.protocol_id='source_verifier_startup'
+                 AND startup_protocol.protocol_version=1 AND startup_protocol.ordinal=10
             ))
             AND (transition.transition_kind='activation'
                  OR rollback.rollback_sha256 IS NOT NULL)
@@ -14780,10 +15141,19 @@ fn require_sqlite_managed_cloud_grant_authority_active(
                 AND activation.cloud_distribution_enabled=1
                 AND activation.workflow_command_dispatch_enabled=1
                 AND activation.workflow_cleanup_enabled=1
-                AND activation.direct_discovery_enabled=0
-                AND activation.global_discovery_enabled=0
-                AND (runtime_grant.role<>'original_source_verifier'
-                     OR activation.source_verification_enabled=1)
+                AND ((activation.direct_discovery_enabled=0
+                      AND activation.global_discovery_enabled=0)
+                  OR (activation.direct_discovery_enabled=1
+                      AND activation.global_discovery_enabled=1
+                      AND activation.source_verification_enabled=1))
+                AND ((runtime_grant.role='discovery_worker'
+                      AND activation.direct_discovery_enabled=1)
+                  OR (runtime_grant.role='global_discovery_worker'
+                      AND activation.global_discovery_enabled=1)
+                  OR (runtime_grant.role='original_source_verifier'
+                      AND activation.source_verification_enabled=1)
+                  OR runtime_grant.role NOT IN (
+                      'discovery_worker','global_discovery_worker','original_source_verifier'))
                 AND (activation.source_verification_enabled=0 OR EXISTS(
                   SELECT 1
                     FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
@@ -14794,6 +15164,14 @@ fn require_sqlite_managed_cloud_grant_authority_active(
                      AND source_protocol.protocol_version=1
                      AND source_identity.component_id='jobs-workflows'
                      AND source_identity.role='original_source_verifier'
+                ))
+                AND ((activation.direct_discovery_enabled=0
+                      AND activation.global_discovery_enabled=0) OR EXISTS(
+                  SELECT 1
+                    FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols startup_protocol
+                   WHERE startup_protocol.manifest_sha256=manifest.manifest_sha256
+                     AND startup_protocol.protocol_id='source_verifier_startup'
+                     AND startup_protocol.protocol_version=1 AND startup_protocol.ordinal=10
                 ))",
                 tables.grant_revocations, tables.grants
             ),
@@ -14919,10 +15297,19 @@ fn require_postgres_managed_cloud_grant_authority_active(
                 AND activation.cloud_distribution_enabled
                 AND activation.workflow_command_dispatch_enabled
                 AND activation.workflow_cleanup_enabled
-                AND NOT activation.direct_discovery_enabled
-                AND NOT activation.global_discovery_enabled
-                AND (runtime_grant.role<>'original_source_verifier'
-                     OR activation.source_verification_enabled)
+                AND ((NOT activation.direct_discovery_enabled
+                      AND NOT activation.global_discovery_enabled)
+                  OR (activation.direct_discovery_enabled
+                      AND activation.global_discovery_enabled
+                      AND activation.source_verification_enabled))
+                AND ((runtime_grant.role='discovery_worker'
+                      AND activation.direct_discovery_enabled)
+                  OR (runtime_grant.role='global_discovery_worker'
+                      AND activation.global_discovery_enabled)
+                  OR (runtime_grant.role='original_source_verifier'
+                      AND activation.source_verification_enabled)
+                  OR runtime_grant.role NOT IN (
+                      'discovery_worker','global_discovery_worker','original_source_verifier'))
                 AND (NOT activation.source_verification_enabled OR EXISTS(
                   SELECT 1
                     FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
@@ -14933,6 +15320,14 @@ fn require_postgres_managed_cloud_grant_authority_active(
                      AND source_protocol.protocol_version=1
                      AND source_identity.component_id='jobs-workflows'
                      AND source_identity.role='original_source_verifier'
+                ))
+                AND ((NOT activation.direct_discovery_enabled
+                      AND NOT activation.global_discovery_enabled) OR EXISTS(
+                  SELECT 1
+                    FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols startup_protocol
+                   WHERE startup_protocol.manifest_sha256=manifest.manifest_sha256
+                     AND startup_protocol.protocol_id='source_verifier_startup'
+                     AND startup_protocol.protocol_version=1 AND startup_protocol.ordinal=10
                 ))
               FOR SHARE OF head",
                 tables.grant_revocations, tables.grants
@@ -15643,10 +16038,19 @@ fn require_sqlite_managed_cloud_runtime_authority_active(
                 AND activation.cloud_distribution_enabled=1
                 AND activation.workflow_command_dispatch_enabled=1
                 AND activation.workflow_cleanup_enabled=1
-                AND activation.direct_discovery_enabled=0
-                AND activation.global_discovery_enabled=0
-                AND (instance.role<>'original_source_verifier'
-                     OR activation.source_verification_enabled=1)
+                AND ((activation.direct_discovery_enabled=0
+                      AND activation.global_discovery_enabled=0)
+                  OR (activation.direct_discovery_enabled=1
+                      AND activation.global_discovery_enabled=1
+                      AND activation.source_verification_enabled=1))
+                AND ((instance.role='discovery_worker'
+                      AND activation.direct_discovery_enabled=1)
+                  OR (instance.role='global_discovery_worker'
+                      AND activation.global_discovery_enabled=1)
+                  OR (instance.role='original_source_verifier'
+                      AND activation.source_verification_enabled=1)
+                  OR instance.role NOT IN (
+                      'discovery_worker','global_discovery_worker','original_source_verifier'))
                 AND (activation.source_verification_enabled=0 OR EXISTS(
                   SELECT 1
                     FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
@@ -15657,6 +16061,14 @@ fn require_sqlite_managed_cloud_runtime_authority_active(
                      AND source_protocol.protocol_version=1
                      AND source_identity.component_id='jobs-workflows'
                      AND source_identity.role='original_source_verifier'
+                ))
+                AND ((activation.direct_discovery_enabled=0
+                      AND activation.global_discovery_enabled=0) OR EXISTS(
+                  SELECT 1
+                    FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols startup_protocol
+                   WHERE startup_protocol.manifest_sha256=manifest.manifest_sha256
+                     AND startup_protocol.protocol_id='source_verifier_startup'
+                     AND startup_protocol.protocol_version=1 AND startup_protocol.ordinal=10
                 ))",
                 tables.instances, tables.grants
             ),
@@ -15862,10 +16274,19 @@ fn require_postgres_managed_cloud_runtime_authority_active(
                 AND activation.cloud_distribution_enabled
                 AND activation.workflow_command_dispatch_enabled
                 AND activation.workflow_cleanup_enabled
-                AND NOT activation.direct_discovery_enabled
-                AND NOT activation.global_discovery_enabled
-                AND (instance.role<>'original_source_verifier'
-                     OR activation.source_verification_enabled)
+                AND ((NOT activation.direct_discovery_enabled
+                      AND NOT activation.global_discovery_enabled)
+                  OR (activation.direct_discovery_enabled
+                      AND activation.global_discovery_enabled
+                      AND activation.source_verification_enabled))
+                AND ((instance.role='discovery_worker'
+                      AND activation.direct_discovery_enabled)
+                  OR (instance.role='global_discovery_worker'
+                      AND activation.global_discovery_enabled)
+                  OR (instance.role='original_source_verifier'
+                      AND activation.source_verification_enabled)
+                  OR instance.role NOT IN (
+                      'discovery_worker','global_discovery_worker','original_source_verifier'))
                 AND (NOT activation.source_verification_enabled OR EXISTS(
                   SELECT 1
                     FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
@@ -15876,6 +16297,14 @@ fn require_postgres_managed_cloud_runtime_authority_active(
                      AND source_protocol.protocol_version=1
                      AND source_identity.component_id='jobs-workflows'
                      AND source_identity.role='original_source_verifier'
+                ))
+                AND ((NOT activation.direct_discovery_enabled
+                      AND NOT activation.global_discovery_enabled) OR EXISTS(
+                  SELECT 1
+                    FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols startup_protocol
+                   WHERE startup_protocol.manifest_sha256=manifest.manifest_sha256
+                     AND startup_protocol.protocol_id='source_verifier_startup'
+                     AND startup_protocol.protocol_version=1 AND startup_protocol.ordinal=10
                 ))
               FOR SHARE OF head",
                 tables.instances, tables.grants
@@ -15890,7 +16319,7 @@ fn require_postgres_managed_cloud_runtime_authority_active(
     Ok(())
 }
 
-fn validate_managed_cloud_v2_source_verification_pair(
+fn validate_managed_cloud_source_verification_pair(
     activation_sha256: &str,
     canonical_activation_base64url: &str,
     manifest_sha256: &str,
@@ -15906,12 +16335,28 @@ fn validate_managed_cloud_v2_source_verification_pair(
     let manifest: ManagedCloudReleaseAuthority = managed_cloud_parse_canonical(&manifest_bytes)?;
     validate_managed_cloud_activation(&activation)?;
     validate_managed_cloud_release(&manifest)?;
+    let exact_contract_pair = matches!(
+        (
+            activation.version,
+            activation.audience.as_str(),
+            manifest.version,
+            manifest.audience.as_str(),
+        ),
+        (
+            2,
+            MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
+            2,
+            MANAGED_CLOUD_RELEASE_V2_AUDIENCE,
+        ) | (
+            3,
+            MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE,
+            3,
+            MANAGED_CLOUD_RELEASE_V3_AUDIENCE,
+        )
+    );
     if managed_cloud_sha256(&activation_bytes) != activation_sha256
         || managed_cloud_sha256(&manifest_bytes) != manifest_sha256
-        || activation.version != 2
-        || activation.audience != MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE
-        || manifest.version != 2
-        || manifest.audience != MANAGED_CLOUD_RELEASE_V2_AUDIENCE
+        || !exact_contract_pair
         || activation.manifest_sha256 != manifest_sha256
         || activation.feature_authority != manifest.feature_authority
         || !activation.feature_authority.source_verification
@@ -16078,7 +16523,7 @@ fn require_managed_cloud_source_verification_candidate_active(
     {
         return Err(ManagedCloudRegistryError::InvalidAuthority);
     }
-    let (activation, manifest) = validate_managed_cloud_v2_source_verification_pair(
+    let (activation, manifest) = validate_managed_cloud_source_verification_pair(
         &candidate.activation_sha256,
         &candidate.canonical_activation_base64url,
         &candidate.manifest_sha256,
@@ -16131,7 +16576,7 @@ fn managed_cloud_source_verification_candidate_head(
         task_queue_sha256: candidate.task_queue_sha256.clone(),
         failure_converter_sha256: candidate.failure_converter_sha256.clone(),
         activation_expires_at_ms: candidate.activation_expires_at_ms,
-        source_verification: true,
+        features: managed_cloud_contract_features(false, false, true),
     }
 }
 
@@ -16885,7 +17330,7 @@ pub(crate) fn require_original_source_verifier_runtime_active_sqlite_tx(
         .optional()
         .map_err(managed_cloud_storage)?
         .ok_or(ManagedCloudRegistryError::Unavailable)?;
-    let (_, manifest) = validate_managed_cloud_v2_source_verification_pair(
+    let (_, manifest) = validate_managed_cloud_source_verification_pair(
         &instance.activation_sha256,
         &authority.0,
         &instance.manifest_sha256,
@@ -16923,7 +17368,18 @@ pub(crate) fn require_original_source_verifier_runtime_active_sqlite_tx(
                 AND heartbeat.failure_converter_sha256=?13
                 AND heartbeat.dependency_evidence_sha256=?14
                 AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
-                AND heartbeat.heartbeat_at_ms+requirement.heartbeat_ttl_ms>?15",
+                AND heartbeat.heartbeat_at_ms+requirement.heartbeat_ttl_ms>?15
+                AND (NOT EXISTS (SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols boot
+                                  WHERE boot.manifest_sha256=heartbeat.manifest_sha256
+                                    AND boot.protocol_id='source_verifier_boot' AND boot.protocol_version=1 AND boot.ordinal=11)
+                     OR EXISTS (SELECT 1 FROM jobs_managed_cloud_source_verifier_heartbeat_boot_bindings binding
+                                JOIN jobs_managed_cloud_source_verifier_boot_generation_heads head ON head.runtime_instance_id=binding.runtime_instance_id AND head.instance_epoch=binding.instance_epoch
+                                JOIN jobs_managed_cloud_source_verifier_boot_registrations registration ON registration.boot_id=binding.boot_id AND registration.boot_generation=binding.boot_generation
+                                JOIN jobs_managed_cloud_source_verifier_boot_startup_authorities startup ON startup.boot_id=binding.boot_id AND startup.boot_generation=binding.boot_generation
+                                WHERE binding.runtime_instance_id=heartbeat.runtime_instance_id AND binding.instance_epoch=heartbeat.instance_epoch AND binding.heartbeat_sequence=heartbeat.heartbeat_sequence
+                                  AND head.current_boot_generation=binding.boot_generation AND head.ready_boot_generation=binding.boot_generation
+                                  AND registration.runtime_instance_id=heartbeat.runtime_instance_id AND registration.instance_epoch=heartbeat.instance_epoch
+                                  AND startup.ready_heartbeat_sequence<=heartbeat.heartbeat_sequence))",
                 MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.heartbeats
             ),
             params![
@@ -16963,12 +17419,26 @@ pub(crate) fn require_original_source_verifier_runtime_active_postgres_tx(
     instance_epoch: i64,
     runtime_authority_sha256: &str,
 ) -> ManagedCloudResult<()> {
-    tx.query_one(
-        "SELECT pg_advisory_xact_lock(
-           hashtextextended('jobs-managed-cloud-release-registry',0))",
-        &[],
+    lock_managed_cloud_release_registry_exclusive_postgres_tx(tx)?;
+    require_original_source_verifier_runtime_active_postgres_tx_after_prelock(
+        tx,
+        worker_id,
+        runtime_instance_id,
+        runtime_session_token,
+        instance_epoch,
+        runtime_authority_sha256,
     )
-    .map_err(managed_cloud_storage)?;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn require_original_source_verifier_runtime_active_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    worker_id: &str,
+    runtime_instance_id: &str,
+    runtime_session_token: &str,
+    instance_epoch: i64,
+    runtime_authority_sha256: &str,
+) -> ManagedCloudResult<()> {
     let now_ms = managed_cloud_db_now_postgres(tx)?;
     let row = tx
         .query_opt(
@@ -17034,7 +17504,7 @@ pub(crate) fn require_original_source_verifier_runtime_active_postgres_tx(
     let canonical_activation_base64url: String = authority.get(0);
     let canonical_manifest_base64url: String = authority.get(1);
     let source_protocol_sha256: String = authority.get(2);
-    let (_, manifest) = validate_managed_cloud_v2_source_verification_pair(
+    let (_, manifest) = validate_managed_cloud_source_verification_pair(
         &instance.activation_sha256,
         &canonical_activation_base64url,
         &instance.manifest_sha256,
@@ -17073,6 +17543,17 @@ pub(crate) fn require_original_source_verifier_runtime_active_postgres_tx(
                 AND heartbeat.dependency_evidence_sha256=$14
                 AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
                 AND heartbeat.heartbeat_at_ms+requirement.heartbeat_ttl_ms>$15
+                AND (NOT EXISTS (SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols boot
+                                  WHERE boot.manifest_sha256=heartbeat.manifest_sha256
+                                    AND boot.protocol_id='source_verifier_boot' AND boot.protocol_version=1 AND boot.ordinal=11)
+                     OR EXISTS (SELECT 1 FROM jobs_managed_cloud_source_verifier_heartbeat_boot_bindings binding
+                                JOIN jobs_managed_cloud_source_verifier_boot_generation_heads head ON head.runtime_instance_id=binding.runtime_instance_id AND head.instance_epoch=binding.instance_epoch
+                                JOIN jobs_managed_cloud_source_verifier_boot_registrations registration ON registration.boot_id=binding.boot_id AND registration.boot_generation=binding.boot_generation
+                                JOIN jobs_managed_cloud_source_verifier_boot_startup_authorities startup ON startup.boot_id=binding.boot_id AND startup.boot_generation=binding.boot_generation
+                                WHERE binding.runtime_instance_id=heartbeat.runtime_instance_id AND binding.instance_epoch=heartbeat.instance_epoch AND binding.heartbeat_sequence=heartbeat.heartbeat_sequence
+                                  AND head.current_boot_generation=binding.boot_generation AND head.ready_boot_generation=binding.boot_generation
+                                  AND registration.runtime_instance_id=heartbeat.runtime_instance_id AND registration.instance_epoch=heartbeat.instance_epoch
+                                  AND startup.ready_heartbeat_sequence<=heartbeat.heartbeat_sequence))
               FOR SHARE OF heartbeat,requirement",
                 MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.heartbeats
             ),
@@ -17143,6 +17624,1279 @@ pub fn require_original_source_verifier_runtime_active(
     })
 }
 
+#[derive(Debug)]
+struct ManagedCloudStoredOriginalSourceVerifierStartup {
+    startup_request_id: String,
+    runtime_instance_id: String,
+    instance_epoch: i64,
+    request_sha256: String,
+    canonical_response_base64url: String,
+    response_sha256: String,
+}
+
+fn managed_cloud_original_source_verifier_startup_response(
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+    probe_result: &str,
+    startup_at_ms: i64,
+) -> ManagedCloudResult<(ManagedCloudOriginalSourceVerifierStartupResponse, Vec<u8>)> {
+    if !matches!(probe_result, "idle" | "leaseable") {
+        return Err(ManagedCloudRegistryError::InvalidAuthority);
+    }
+    let mut response = ManagedCloudOriginalSourceVerifierStartupResponse {
+        version: 1,
+        audience: MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUDIENCE.to_string(),
+        startup_request_id: input.startup_request_id.clone(),
+        runtime_instance_id: input.runtime_instance_id.clone(),
+        worker_id: input.worker_id.clone(),
+        instance_epoch: input.instance_epoch,
+        runtime_identity_sha256: input.runtime_identity_sha256.clone(),
+        degraded_heartbeat_sequence: input.expected_degraded_heartbeat_sequence,
+        ready_heartbeat_sequence: input.expected_degraded_heartbeat_sequence + 1,
+        observed_head_revision: input.observed_head_revision,
+        observed_transition_sha256: input.observed_transition_sha256.clone(),
+        activation_sha256: input.activation_sha256.clone(),
+        manifest_sha256: input.manifest_sha256.clone(),
+        component_id: input.component_id.clone(),
+        role: input.role.clone(),
+        artifact_sha256: input.artifact_sha256.clone(),
+        migration_set_sha256: input.migration_set_sha256.clone(),
+        config_schema_sha256: input.config_schema_sha256.clone(),
+        protocol_set_sha256: input.protocol_set_sha256.clone(),
+        task_queue_sha256: input.task_queue_sha256.clone(),
+        failure_converter_sha256: input.failure_converter_sha256.clone(),
+        dependency_evidence_sha256: input.dependency_evidence_sha256.clone(),
+        probe_result: probe_result.to_string(),
+        startup_authority_sha256: String::new(),
+        startup_at_ms,
+    };
+    response.startup_authority_sha256 =
+        managed_cloud_original_source_verifier_startup_authority_sha256(&response)?;
+    let canonical = managed_cloud_canonical_json(&response)?;
+    Ok((response, canonical))
+}
+
+fn managed_cloud_original_source_verifier_startup_replay(
+    stored: ManagedCloudStoredOriginalSourceVerifierStartup,
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+    request_sha256: &str,
+) -> ManagedCloudResult<ManagedCloudOriginalSourceVerifierStartupResult> {
+    if stored.startup_request_id != input.startup_request_id
+        || stored.runtime_instance_id != input.runtime_instance_id
+        || stored.instance_epoch != input.instance_epoch
+        || stored.request_sha256 != request_sha256
+    {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    let canonical = managed_cloud_decode_base64url(&stored.canonical_response_base64url)
+        .map_err(|_| ManagedCloudRegistryError::IdentityConflict)?;
+    if managed_cloud_sha256(&canonical)
+        .as_bytes()
+        .ct_eq(stored.response_sha256.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    let response: ManagedCloudOriginalSourceVerifierStartupResponse =
+        managed_cloud_parse_canonical(&canonical)
+            .map_err(|_| ManagedCloudRegistryError::IdentityConflict)?;
+    if response.startup_request_id != input.startup_request_id
+        || response.runtime_instance_id != input.runtime_instance_id
+        || response.worker_id != input.worker_id
+        || response.instance_epoch != input.instance_epoch
+        || response.runtime_identity_sha256 != input.runtime_identity_sha256
+        || response.degraded_heartbeat_sequence != input.expected_degraded_heartbeat_sequence
+        || response.ready_heartbeat_sequence != input.expected_degraded_heartbeat_sequence + 1
+        || response.observed_head_revision != input.observed_head_revision
+        || response.observed_transition_sha256 != input.observed_transition_sha256
+        || response.activation_sha256 != input.activation_sha256
+        || response.manifest_sha256 != input.manifest_sha256
+        || response.component_id != input.component_id
+        || response.role != input.role
+        || response.artifact_sha256 != input.artifact_sha256
+        || response.migration_set_sha256 != input.migration_set_sha256
+        || response.config_schema_sha256 != input.config_schema_sha256
+        || response.protocol_set_sha256 != input.protocol_set_sha256
+        || response.task_queue_sha256 != input.task_queue_sha256
+        || response.failure_converter_sha256 != input.failure_converter_sha256
+        || response.dependency_evidence_sha256 != input.dependency_evidence_sha256
+        || !matches!(response.probe_result.as_str(), "idle" | "leaseable")
+        || managed_cloud_original_source_verifier_startup_authority_sha256(&response)?
+            != response.startup_authority_sha256
+    {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    Ok(ManagedCloudOriginalSourceVerifierStartupResult {
+        canonical_response: canonical,
+    })
+}
+
+fn require_managed_cloud_original_source_verifier_startup_protocol_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    instance: &ManagedCloudRuntimeInstance,
+) -> ManagedCloudResult<()> {
+    let authority = tx
+        .query_row(
+            "SELECT activation.canonical_activation_base64url,
+                    manifest.canonical_manifest_base64url,startup_protocol.schema_sha256
+               FROM jobs_managed_cloud_activations activation
+               JOIN jobs_managed_cloud_manifests manifest
+                 ON manifest.manifest_sha256=activation.manifest_sha256
+               JOIN jobs_managed_cloud_manifest_source_verifier_startup_protocols startup_protocol
+                 ON startup_protocol.manifest_sha256=manifest.manifest_sha256
+                AND startup_protocol.protocol_id='source_verifier_startup'
+                AND startup_protocol.protocol_version=1 AND startup_protocol.ordinal=10
+              WHERE activation.activation_sha256=?1 AND activation.manifest_sha256=?2",
+            params![instance.activation_sha256, instance.manifest_sha256],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(managed_cloud_storage)?
+        .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    let (activation, manifest) = validate_managed_cloud_source_verification_pair(
+        &instance.activation_sha256,
+        &authority.0,
+        &instance.manifest_sha256,
+        &authority.1,
+    )?;
+    if activation.version != 3
+        || activation.audience != MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE
+        || manifest.version != 3
+        || manifest.audience != MANAGED_CLOUD_RELEASE_V3_AUDIENCE
+        || manifest
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol_id == "source_verifier_startup")
+            .is_none_or(|protocol| protocol.schema_sha256 != authority.2)
+    {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    Ok(())
+}
+
+fn require_managed_cloud_original_source_verifier_startup_protocol_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    instance: &ManagedCloudRuntimeInstance,
+) -> ManagedCloudResult<()> {
+    let row = tx
+        .query_opt(
+            "SELECT activation.canonical_activation_base64url,
+                    manifest.canonical_manifest_base64url,startup_protocol.schema_sha256
+               FROM jobs_managed_cloud_activations activation
+               JOIN jobs_managed_cloud_manifests manifest
+                 ON manifest.manifest_sha256=activation.manifest_sha256
+               JOIN jobs_managed_cloud_manifest_source_verifier_startup_protocols startup_protocol
+                 ON startup_protocol.manifest_sha256=manifest.manifest_sha256
+                AND startup_protocol.protocol_id='source_verifier_startup'
+                AND startup_protocol.protocol_version=1 AND startup_protocol.ordinal=10
+              WHERE activation.activation_sha256=$1 AND activation.manifest_sha256=$2
+              FOR SHARE OF activation,manifest,startup_protocol",
+            &[&instance.activation_sha256, &instance.manifest_sha256],
+        )
+        .map_err(managed_cloud_storage)?
+        .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    let canonical_activation: String = row.get(0);
+    let canonical_manifest: String = row.get(1);
+    let startup_schema_sha256: String = row.get(2);
+    let (activation, manifest) = validate_managed_cloud_source_verification_pair(
+        &instance.activation_sha256,
+        &canonical_activation,
+        &instance.manifest_sha256,
+        &canonical_manifest,
+    )?;
+    if activation.version != 3
+        || activation.audience != MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE
+        || manifest.version != 3
+        || manifest.audience != MANAGED_CLOUD_RELEASE_V3_AUDIENCE
+        || manifest
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol_id == "source_verifier_startup")
+            .is_none_or(|protocol| protocol.schema_sha256 != startup_schema_sha256)
+    {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    Ok(())
+}
+
+fn managed_cloud_stored_original_source_verifier_startup_from_sqlite(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ManagedCloudStoredOriginalSourceVerifierStartup> {
+    Ok(ManagedCloudStoredOriginalSourceVerifierStartup {
+        startup_request_id: row.get(0)?,
+        runtime_instance_id: row.get(1)?,
+        instance_epoch: row.get(2)?,
+        request_sha256: row.get(3)?,
+        canonical_response_base64url: row.get(4)?,
+        response_sha256: row.get(5)?,
+    })
+}
+
+fn managed_cloud_stored_original_source_verifier_startup_from_postgres(
+    row: &postgres::Row,
+) -> ManagedCloudStoredOriginalSourceVerifierStartup {
+    ManagedCloudStoredOriginalSourceVerifierStartup {
+        startup_request_id: row.get(0),
+        runtime_instance_id: row.get(1),
+        instance_epoch: row.get(2),
+        request_sha256: row.get(3),
+        canonical_response_base64url: row.get(4),
+        response_sha256: row.get(5),
+    }
+}
+
+fn insert_managed_cloud_original_source_verifier_startup_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+    request_sha256: &str,
+    response: &ManagedCloudOriginalSourceVerifierStartupResponse,
+    canonical_response: &[u8],
+    record_audit: bool,
+) -> ManagedCloudResult<()> {
+    let canonical_response_base64url =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(canonical_response);
+    let response_sha256 = managed_cloud_sha256(canonical_response);
+    tx.execute(
+        "INSERT INTO jobs_managed_cloud_original_source_verifier_startup_authorities(
+           startup_request_id,runtime_instance_id,instance_epoch,worker_id,
+           runtime_identity_sha256,request_sha256,degraded_heartbeat_sequence,
+           ready_heartbeat_sequence,observed_head_revision,observed_transition_sha256,
+           activation_sha256,manifest_sha256,component_id,role,artifact_sha256,
+           migration_set_sha256,config_schema_sha256,protocol_set_sha256,
+           task_queue_sha256,failure_converter_sha256,dependency_evidence_sha256,
+           probe_result,startup_authority_sha256,canonical_response_base64url,
+           response_sha256,startup_at_ms
+         ) VALUES(
+           ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
+           ?18,?19,?20,?21,?22,?23,?24,?25,?26
+         )",
+        params![
+            response.startup_request_id,
+            response.runtime_instance_id,
+            response.instance_epoch,
+            response.worker_id,
+            response.runtime_identity_sha256,
+            request_sha256,
+            response.degraded_heartbeat_sequence,
+            response.ready_heartbeat_sequence,
+            response.observed_head_revision,
+            response.observed_transition_sha256,
+            response.activation_sha256,
+            response.manifest_sha256,
+            response.component_id,
+            response.role,
+            response.artifact_sha256,
+            response.migration_set_sha256,
+            response.config_schema_sha256,
+            response.protocol_set_sha256,
+            response.task_queue_sha256,
+            response.failure_converter_sha256,
+            response.dependency_evidence_sha256,
+            response.probe_result,
+            response.startup_authority_sha256,
+            canonical_response_base64url,
+            response_sha256,
+            response.startup_at_ms,
+        ],
+    )
+    .map_err(managed_cloud_storage)?;
+    let changed = tx
+        .execute(
+            &format!(
+                "UPDATE {} SET heartbeat_sequence=?3,health_state='ready',reason_code=NULL,
+                        heartbeat_at_ms=?4
+                  WHERE runtime_instance_id=?1 AND instance_epoch=?2
+                    AND heartbeat_sequence=?5 AND health_state='degraded'
+                    AND reason_code='startup' AND worker_id=?6
+                    AND activation_sha256=?7 AND manifest_sha256=?8
+                    AND component_id=?9 AND role=?10 AND artifact_sha256=?11
+                    AND observed_head_revision=?12 AND observed_transition_sha256=?13
+                    AND migration_set_sha256=?14 AND config_schema_sha256=?15
+                    AND protocol_set_sha256=?16 AND task_queue_sha256=?17
+                    AND failure_converter_sha256=?18
+                    AND dependency_evidence_sha256=?19",
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.heartbeats
+            ),
+            params![
+                input.runtime_instance_id,
+                input.instance_epoch,
+                response.ready_heartbeat_sequence,
+                response.startup_at_ms,
+                response.degraded_heartbeat_sequence,
+                input.worker_id,
+                input.activation_sha256,
+                input.manifest_sha256,
+                input.component_id,
+                input.role,
+                input.artifact_sha256,
+                input.observed_head_revision,
+                input.observed_transition_sha256,
+                input.migration_set_sha256,
+                input.config_schema_sha256,
+                input.protocol_set_sha256,
+                input.task_queue_sha256,
+                input.failure_converter_sha256,
+                input.dependency_evidence_sha256,
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+    if changed != 1 {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    if record_audit {
+        let tables = MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES;
+        tx.execute(
+            &format!(
+                "INSERT INTO {}(
+                   runtime_instance_id,instance_epoch,heartbeat_sequence,activation_sha256,
+                   manifest_sha256,component_id,role,worker_id,artifact_sha256,
+                   observed_head_revision,observed_transition_sha256,migration_set_sha256,
+                   config_schema_sha256,protocol_set_sha256,task_queue_sha256,
+                   failure_converter_sha256,dependency_evidence_sha256,health_state,
+                   reason_code,heartbeat_at_ms
+                 ) SELECT runtime_instance_id,instance_epoch,heartbeat_sequence,
+                          activation_sha256,manifest_sha256,component_id,role,worker_id,
+                          artifact_sha256,observed_head_revision,observed_transition_sha256,
+                          migration_set_sha256,config_schema_sha256,protocol_set_sha256,
+                          task_queue_sha256,failure_converter_sha256,
+                          dependency_evidence_sha256,health_state,reason_code,heartbeat_at_ms
+                     FROM {}
+                    WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                tables.heartbeat_audit, tables.heartbeats
+            ),
+            params![input.runtime_instance_id, input.instance_epoch],
+        )
+        .map_err(managed_cloud_storage)?;
+        tx.execute(
+            &format!(
+                "DELETE FROM {} WHERE runtime_instance_id=?1 AND instance_epoch=?2
+                    AND heartbeat_sequence<=?3-?4",
+                tables.heartbeat_audit
+            ),
+            params![
+                input.runtime_instance_id,
+                input.instance_epoch,
+                response.ready_heartbeat_sequence,
+                MANAGED_CLOUD_HEARTBEAT_AUDIT_LIMIT,
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+    }
+    Ok(())
+}
+
+fn insert_managed_cloud_original_source_verifier_startup_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+    request_sha256: &str,
+    response: &ManagedCloudOriginalSourceVerifierStartupResponse,
+    canonical_response: &[u8],
+    record_audit: bool,
+) -> ManagedCloudResult<()> {
+    let canonical_response_base64url =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(canonical_response);
+    let response_sha256 = managed_cloud_sha256(canonical_response);
+    tx.execute(
+        "INSERT INTO jobs_managed_cloud_original_source_verifier_startup_authorities(
+           startup_request_id,runtime_instance_id,instance_epoch,worker_id,
+           runtime_identity_sha256,request_sha256,degraded_heartbeat_sequence,
+           ready_heartbeat_sequence,observed_head_revision,observed_transition_sha256,
+           activation_sha256,manifest_sha256,component_id,role,artifact_sha256,
+           migration_set_sha256,config_schema_sha256,protocol_set_sha256,
+           task_queue_sha256,failure_converter_sha256,dependency_evidence_sha256,
+           probe_result,startup_authority_sha256,canonical_response_base64url,
+           response_sha256,startup_at_ms
+         ) VALUES(
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+           $18,$19,$20,$21,$22,$23,$24,$25,$26
+         )",
+        &[
+            &response.startup_request_id,
+            &response.runtime_instance_id,
+            &response.instance_epoch,
+            &response.worker_id,
+            &response.runtime_identity_sha256,
+            &request_sha256,
+            &response.degraded_heartbeat_sequence,
+            &response.ready_heartbeat_sequence,
+            &response.observed_head_revision,
+            &response.observed_transition_sha256,
+            &response.activation_sha256,
+            &response.manifest_sha256,
+            &response.component_id,
+            &response.role,
+            &response.artifact_sha256,
+            &response.migration_set_sha256,
+            &response.config_schema_sha256,
+            &response.protocol_set_sha256,
+            &response.task_queue_sha256,
+            &response.failure_converter_sha256,
+            &response.dependency_evidence_sha256,
+            &response.probe_result,
+            &response.startup_authority_sha256,
+            &canonical_response_base64url,
+            &response_sha256,
+            &response.startup_at_ms,
+        ],
+    )
+    .map_err(managed_cloud_storage)?;
+    let changed = tx
+        .execute(
+            &format!(
+                "UPDATE {} SET heartbeat_sequence=$3,health_state='ready',reason_code=NULL,
+                        heartbeat_at_ms=$4
+                  WHERE runtime_instance_id=$1 AND instance_epoch=$2
+                    AND heartbeat_sequence=$5 AND health_state='degraded'
+                    AND reason_code='startup' AND worker_id=$6
+                    AND activation_sha256=$7 AND manifest_sha256=$8
+                    AND component_id=$9 AND role=$10 AND artifact_sha256=$11
+                    AND observed_head_revision=$12 AND observed_transition_sha256=$13
+                    AND migration_set_sha256=$14 AND config_schema_sha256=$15
+                    AND protocol_set_sha256=$16 AND task_queue_sha256=$17
+                    AND failure_converter_sha256=$18
+                    AND dependency_evidence_sha256=$19",
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.heartbeats
+            ),
+            &[
+                &input.runtime_instance_id,
+                &input.instance_epoch,
+                &response.ready_heartbeat_sequence,
+                &response.startup_at_ms,
+                &response.degraded_heartbeat_sequence,
+                &input.worker_id,
+                &input.activation_sha256,
+                &input.manifest_sha256,
+                &input.component_id,
+                &input.role,
+                &input.artifact_sha256,
+                &input.observed_head_revision,
+                &input.observed_transition_sha256,
+                &input.migration_set_sha256,
+                &input.config_schema_sha256,
+                &input.protocol_set_sha256,
+                &input.task_queue_sha256,
+                &input.failure_converter_sha256,
+                &input.dependency_evidence_sha256,
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+    if changed != 1 {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    if record_audit {
+        let tables = MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES;
+        tx.execute(
+            &format!(
+                "INSERT INTO {}(
+                   runtime_instance_id,instance_epoch,heartbeat_sequence,activation_sha256,
+                   manifest_sha256,component_id,role,worker_id,artifact_sha256,
+                   observed_head_revision,observed_transition_sha256,migration_set_sha256,
+                   config_schema_sha256,protocol_set_sha256,task_queue_sha256,
+                   failure_converter_sha256,dependency_evidence_sha256,health_state,
+                   reason_code,heartbeat_at_ms
+                 ) SELECT runtime_instance_id,instance_epoch,heartbeat_sequence,
+                          activation_sha256,manifest_sha256,component_id,role,worker_id,
+                          artifact_sha256,observed_head_revision,observed_transition_sha256,
+                          migration_set_sha256,config_schema_sha256,protocol_set_sha256,
+                          task_queue_sha256,failure_converter_sha256,
+                          dependency_evidence_sha256,health_state,reason_code,heartbeat_at_ms
+                     FROM {}
+                    WHERE runtime_instance_id=$1 AND instance_epoch=$2",
+                tables.heartbeat_audit, tables.heartbeats
+            ),
+            &[&input.runtime_instance_id, &input.instance_epoch],
+        )
+        .map_err(managed_cloud_storage)?;
+        tx.execute(
+            &format!(
+                "DELETE FROM {} WHERE runtime_instance_id=$1 AND instance_epoch=$2
+                    AND heartbeat_sequence<=($3::BIGINT-$4::BIGINT)",
+                tables.heartbeat_audit
+            ),
+            &[
+                &input.runtime_instance_id,
+                &input.instance_epoch,
+                &response.ready_heartbeat_sequence,
+                &MANAGED_CLOUD_HEARTBEAT_AUDIT_LIMIT,
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+    }
+    Ok(())
+}
+
+fn require_managed_cloud_original_source_verifier_degraded_heartbeat(
+    heartbeat: &ManagedCloudRuntimeHeartbeat,
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+) -> ManagedCloudResult<()> {
+    if heartbeat.runtime_instance_id != input.runtime_instance_id
+        || heartbeat.worker_id != input.worker_id
+        || heartbeat.instance_epoch != input.instance_epoch
+        || heartbeat.heartbeat_sequence != input.expected_degraded_heartbeat_sequence
+        || heartbeat.observed_head_revision != input.observed_head_revision
+        || heartbeat.observed_transition_sha256 != input.observed_transition_sha256
+        || heartbeat.activation_sha256 != input.activation_sha256
+        || heartbeat.manifest_sha256 != input.manifest_sha256
+        || heartbeat.component_id != input.component_id
+        || heartbeat.role != input.role
+        || heartbeat.artifact_sha256 != input.artifact_sha256
+        || heartbeat.migration_set_sha256 != input.migration_set_sha256
+        || heartbeat.config_schema_sha256 != input.config_schema_sha256
+        || heartbeat.protocol_set_sha256 != input.protocol_set_sha256
+        || heartbeat.task_queue_sha256 != input.task_queue_sha256
+        || heartbeat.failure_converter_sha256 != input.failure_converter_sha256
+        || heartbeat.dependency_evidence_sha256 != input.dependency_evidence_sha256
+        || heartbeat.health_state != "degraded"
+        || heartbeat.reason_code.as_deref() != Some("startup")
+    {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    Ok(())
+}
+
+pub fn record_managed_cloud_original_source_verifier_startup(
+    pool: &DbPool,
+    input: &ManagedCloudOriginalSourceVerifierStartupRequest,
+) -> ManagedCloudResult<ManagedCloudOriginalSourceVerifierStartupResult> {
+    validate_managed_cloud_original_source_verifier_startup(input)?;
+    let request_sha256 = managed_cloud_original_source_verifier_startup_request_sha256(input)?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut connection = pool.get().map_err(managed_cloud_storage)?;
+            let mut tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(managed_cloud_storage)?;
+            let (instance, session_proof) = sqlite_managed_cloud_runtime_instance_by_runtime_id(
+                &tx,
+                &input.runtime_instance_id,
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+            )?
+            .ok_or(ManagedCloudRegistryError::NotFound)?;
+            require_managed_cloud_original_source_verifier_startup_identity(&instance, input)?;
+            let expected_proof = managed_cloud_runtime_session_proof_hmac(
+                &input.session_token,
+                &instance.grant_id,
+                &input.worker_id,
+                &input.runtime_instance_id,
+                input.instance_epoch,
+            )?;
+            require_managed_cloud_secret_match(&session_proof, &expected_proof)?;
+
+            let by_request_id = tx
+                .query_row(
+                    "SELECT startup_request_id,runtime_instance_id,instance_epoch,
+                            request_sha256,canonical_response_base64url,response_sha256
+                       FROM jobs_managed_cloud_original_source_verifier_startup_authorities
+                      WHERE startup_request_id=?1",
+                    params![input.startup_request_id],
+                    managed_cloud_stored_original_source_verifier_startup_from_sqlite,
+                )
+                .optional()
+                .map_err(managed_cloud_storage)?;
+            let by_instance = tx
+                .query_row(
+                    "SELECT startup_request_id,runtime_instance_id,instance_epoch,
+                            request_sha256,canonical_response_base64url,response_sha256
+                       FROM jobs_managed_cloud_original_source_verifier_startup_authorities
+                      WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                    params![input.runtime_instance_id, input.instance_epoch],
+                    managed_cloud_stored_original_source_verifier_startup_from_sqlite,
+                )
+                .optional()
+                .map_err(managed_cloud_storage)?;
+            if let Some(stored) = by_request_id {
+                if by_instance.as_ref().is_none_or(|candidate| {
+                    candidate.startup_request_id != stored.startup_request_id
+                }) {
+                    return Err(ManagedCloudRegistryError::IdentityConflict);
+                }
+                let result = managed_cloud_original_source_verifier_startup_replay(
+                    stored,
+                    input,
+                    &request_sha256,
+                )?;
+                tx.commit().map_err(managed_cloud_storage)?;
+                return Ok(result);
+            }
+            if by_instance.is_some() {
+                return Err(ManagedCloudRegistryError::IdentityConflict);
+            }
+
+            let now_ms = managed_cloud_db_now_sqlite(&tx)?;
+            require_sqlite_managed_cloud_runtime_authority_active(&tx, &instance, now_ms)?;
+            require_managed_cloud_original_source_verifier_startup_protocol_sqlite(&tx, &instance)?;
+            let heartbeat = tx
+                .query_row(
+                    &format!(
+                        "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
+                           FROM {} WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.heartbeats
+                    ),
+                    params![input.runtime_instance_id, input.instance_epoch],
+                    managed_cloud_runtime_heartbeat_from_sqlite,
+                )
+                .optional()
+                .map_err(managed_cloud_storage)?
+                .ok_or(ManagedCloudRegistryError::HeartbeatSequenceConflict)?;
+            require_managed_cloud_original_source_verifier_degraded_heartbeat(&heartbeat, input)?;
+
+            let runtime_authority_sha256 =
+                original_source_verifier_runtime_authority_sha256(&instance)?;
+            let binding = OriginalSourceVerifierBinding {
+                worker_id: input.worker_id.clone(),
+                runtime_instance_id: input.runtime_instance_id.clone(),
+                runtime_instance_epoch: input.instance_epoch,
+                runtime_authority_sha256,
+                runtime_session_token: input.session_token.clone(),
+                boot_id: None,
+                boot_generation: None,
+            };
+            tx.execute_batch("SAVEPOINT bluey_osv_startup_probe")
+                .map_err(managed_cloud_storage)?;
+            let (provisional, provisional_canonical) =
+                managed_cloud_original_source_verifier_startup_response(input, "idle", now_ms)?;
+            let provisional_result = insert_managed_cloud_original_source_verifier_startup_sqlite(
+                &tx,
+                input,
+                &request_sha256,
+                &provisional,
+                &provisional_canonical,
+                false,
+            )
+            .and_then(|_| {
+                probe_original_source_verification_leaseability_sqlite_tx(&mut tx, &binding, now_ms)
+            });
+            let rollback_result = tx
+                .execute_batch(
+                    "ROLLBACK TO SAVEPOINT bluey_osv_startup_probe;
+                     RELEASE SAVEPOINT bluey_osv_startup_probe",
+                )
+                .map_err(managed_cloud_storage);
+            let leaseable = provisional_result?;
+            rollback_result?;
+            let probe_result = if leaseable { "leaseable" } else { "idle" };
+            let (response, canonical_response) =
+                managed_cloud_original_source_verifier_startup_response(
+                    input,
+                    probe_result,
+                    now_ms,
+                )?;
+            insert_managed_cloud_original_source_verifier_startup_sqlite(
+                &tx,
+                input,
+                &request_sha256,
+                &response,
+                &canonical_response,
+                true,
+            )?;
+            tx.commit().map_err(managed_cloud_storage)?;
+            Ok(ManagedCloudOriginalSourceVerifierStartupResult { canonical_response })
+        }
+        DbPool::Postgres(_) => {
+            let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
+            let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
+            // Canonical cross-authority order: H -> exclusive M -> instance/heartbeat -> D.
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(managed_cloud_storage)?;
+            lock_managed_cloud_release_registry_exclusive_postgres_tx(&mut tx)?;
+            let instance_row = tx
+                .query_opt(
+                    &format!(
+                        "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
+                           FROM {} WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR UPDATE",
+                        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.instances
+                    ),
+                    &[&input.runtime_instance_id, &input.instance_epoch],
+                )
+                .map_err(managed_cloud_storage)?
+                .ok_or(ManagedCloudRegistryError::NotFound)?;
+            let (instance, session_proof) =
+                managed_cloud_runtime_instance_from_postgres(&instance_row);
+            require_managed_cloud_original_source_verifier_startup_identity(&instance, input)?;
+            let expected_proof = managed_cloud_runtime_session_proof_hmac(
+                &input.session_token,
+                &instance.grant_id,
+                &input.worker_id,
+                &input.runtime_instance_id,
+                input.instance_epoch,
+            )?;
+            require_managed_cloud_secret_match(&session_proof, &expected_proof)?;
+
+            let by_request_id = tx
+                .query_opt(
+                    "SELECT startup_request_id,runtime_instance_id,instance_epoch,
+                            request_sha256,canonical_response_base64url,response_sha256
+                       FROM jobs_managed_cloud_original_source_verifier_startup_authorities
+                      WHERE startup_request_id=$1 FOR SHARE",
+                    &[&input.startup_request_id],
+                )
+                .map_err(managed_cloud_storage)?
+                .map(|row| {
+                    managed_cloud_stored_original_source_verifier_startup_from_postgres(&row)
+                });
+            let by_instance = tx
+                .query_opt(
+                    "SELECT startup_request_id,runtime_instance_id,instance_epoch,
+                            request_sha256,canonical_response_base64url,response_sha256
+                       FROM jobs_managed_cloud_original_source_verifier_startup_authorities
+                      WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR SHARE",
+                    &[&input.runtime_instance_id, &input.instance_epoch],
+                )
+                .map_err(managed_cloud_storage)?
+                .map(|row| {
+                    managed_cloud_stored_original_source_verifier_startup_from_postgres(&row)
+                });
+            if let Some(stored) = by_request_id {
+                if by_instance.as_ref().is_none_or(|candidate| {
+                    candidate.startup_request_id != stored.startup_request_id
+                }) {
+                    return Err(ManagedCloudRegistryError::IdentityConflict);
+                }
+                let result = managed_cloud_original_source_verifier_startup_replay(
+                    stored,
+                    input,
+                    &request_sha256,
+                )?;
+                tx.commit().map_err(managed_cloud_storage)?;
+                return Ok(result);
+            }
+            if by_instance.is_some() {
+                return Err(ManagedCloudRegistryError::IdentityConflict);
+            }
+
+            let now_ms = managed_cloud_db_now_postgres(&mut tx)?;
+            require_postgres_managed_cloud_runtime_authority_active(&mut tx, &instance, now_ms)?;
+            require_managed_cloud_original_source_verifier_startup_protocol_postgres(
+                &mut tx, &instance,
+            )?;
+            let heartbeat_row = tx
+                .query_opt(
+                    &format!(
+                        "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
+                           FROM {} WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR UPDATE",
+                        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.heartbeats
+                    ),
+                    &[&input.runtime_instance_id, &input.instance_epoch],
+                )
+                .map_err(managed_cloud_storage)?
+                .ok_or(ManagedCloudRegistryError::HeartbeatSequenceConflict)?;
+            let heartbeat = managed_cloud_runtime_heartbeat_from_postgres(&heartbeat_row);
+            require_managed_cloud_original_source_verifier_degraded_heartbeat(&heartbeat, input)?;
+
+            let runtime_authority_sha256 =
+                original_source_verifier_runtime_authority_sha256(&instance)?;
+            let binding = OriginalSourceVerifierBinding {
+                worker_id: input.worker_id.clone(),
+                runtime_instance_id: input.runtime_instance_id.clone(),
+                runtime_instance_epoch: input.instance_epoch,
+                runtime_authority_sha256,
+                runtime_session_token: input.session_token.clone(),
+                boot_id: None,
+                boot_generation: None,
+            };
+            tx.batch_execute("SAVEPOINT bluey_osv_startup_probe")
+                .map_err(managed_cloud_storage)?;
+            let (provisional, provisional_canonical) =
+                managed_cloud_original_source_verifier_startup_response(input, "idle", now_ms)?;
+            let provisional_result =
+                insert_managed_cloud_original_source_verifier_startup_postgres(
+                    &mut tx,
+                    input,
+                    &request_sha256,
+                    &provisional,
+                    &provisional_canonical,
+                    false,
+                )
+                .and_then(|_| {
+                    probe_original_source_verification_leaseability_postgres_tx(
+                        &mut tx, &binding, now_ms,
+                    )
+                });
+            let rollback_result = tx
+                .batch_execute(
+                    "ROLLBACK TO SAVEPOINT bluey_osv_startup_probe;
+                     RELEASE SAVEPOINT bluey_osv_startup_probe",
+                )
+                .map_err(managed_cloud_storage);
+            let leaseable = provisional_result?;
+            rollback_result?;
+            let probe_result = if leaseable { "leaseable" } else { "idle" };
+            let (response, canonical_response) =
+                managed_cloud_original_source_verifier_startup_response(
+                    input,
+                    probe_result,
+                    now_ms,
+                )?;
+            insert_managed_cloud_original_source_verifier_startup_postgres(
+                &mut tx,
+                input,
+                &request_sha256,
+                &response,
+                &canonical_response,
+                true,
+            )?;
+            tx.commit().map_err(managed_cloud_storage)?;
+            Ok(ManagedCloudOriginalSourceVerifierStartupResult { canonical_response })
+        }
+    })
+}
+
+fn bind_managed_cloud_original_source_verifier_heartbeat_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    instance: &ManagedCloudRuntimeInstance,
+    input: &ManagedCloudRuntimeHeartbeatInput,
+) -> ManagedCloudResult<()> {
+    if instance.role != "original_source_verifier" {
+        return Ok(());
+    }
+    let admitted: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols
+          WHERE manifest_sha256=?1 AND protocol_id='source_verifier_boot'
+            AND protocol_version=1 AND ordinal=11)",
+            params![instance.manifest_sha256],
+            |row| row.get(0),
+        )
+        .map_err(managed_cloud_storage)?;
+    if !admitted {
+        return if input.boot_id.is_none() && input.boot_generation.is_none() {
+            Ok(())
+        } else {
+            Err(ManagedCloudRegistryError::InvalidRequest)
+        };
+    }
+    let (boot_id, boot_generation) = input
+        .boot_id
+        .as_deref()
+        .zip(input.boot_generation)
+        .ok_or(ManagedCloudRegistryError::HeartbeatSequenceConflict)?;
+    let existing: Option<(String, i64)> = tx.query_row(
+        "SELECT boot_id,boot_generation FROM jobs_managed_cloud_source_verifier_heartbeat_boot_bindings
+          WHERE runtime_instance_id=?1 AND instance_epoch=?2 AND heartbeat_sequence=?3",
+        params![input.runtime_instance_id, instance.instance_epoch, input.heartbeat_sequence],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(managed_cloud_storage)?;
+    if let Some((stored_id, stored_generation)) = existing {
+        if stored_id != boot_id || stored_generation != boot_generation {
+            return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO jobs_managed_cloud_source_verifier_heartbeat_boot_bindings(
+                runtime_instance_id,instance_epoch,heartbeat_sequence,boot_id,boot_generation
+             ) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                input.runtime_instance_id,
+                instance.instance_epoch,
+                input.heartbeat_sequence,
+                boot_id,
+                boot_generation
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+    }
+    // Recheck on every delivery, including an exact heartbeat replay. The
+    // binding trigger only protects insertion; this rejects a once-valid old
+    // generation after a genuine later boot has advanced the head.
+    let current: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1
+           FROM jobs_managed_cloud_source_verifier_boot_registrations registration
+           JOIN jobs_managed_cloud_source_verifier_boot_generation_heads head
+             ON head.runtime_instance_id=registration.runtime_instance_id AND head.instance_epoch=registration.instance_epoch
+          WHERE registration.boot_id=?1 AND registration.runtime_instance_id=?2
+            AND registration.instance_epoch=?3 AND registration.boot_generation=?4
+            AND registration.worker_id=?5 AND registration.manifest_sha256=?6
+            AND head.current_boot_generation=?4)",
+        params![boot_id, input.runtime_instance_id, instance.instance_epoch, boot_generation, input.worker_id, input.manifest_sha256],
+        |row| row.get(0),
+    ).map_err(managed_cloud_storage)?;
+    if !current {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    Ok(())
+}
+
+fn bind_managed_cloud_original_source_verifier_heartbeat_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    instance: &ManagedCloudRuntimeInstance,
+    input: &ManagedCloudRuntimeHeartbeatInput,
+) -> ManagedCloudResult<()> {
+    if instance.role != "original_source_verifier" {
+        return Ok(());
+    }
+    let admitted: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols
+          WHERE manifest_sha256=$1 AND protocol_id='source_verifier_boot'
+            AND protocol_version=1 AND ordinal=11)",
+            &[&instance.manifest_sha256],
+        )
+        .map_err(managed_cloud_storage)?
+        .get(0);
+    if !admitted {
+        return if input.boot_id.is_none() && input.boot_generation.is_none() {
+            Ok(())
+        } else {
+            Err(ManagedCloudRegistryError::InvalidRequest)
+        };
+    }
+    let (boot_id, boot_generation) = input
+        .boot_id
+        .as_deref()
+        .zip(input.boot_generation)
+        .ok_or(ManagedCloudRegistryError::HeartbeatSequenceConflict)?;
+    if let Some(row) = tx.query_opt(
+        "SELECT boot_id,boot_generation FROM jobs_managed_cloud_source_verifier_heartbeat_boot_bindings
+          WHERE runtime_instance_id=$1 AND instance_epoch=$2 AND heartbeat_sequence=$3 FOR UPDATE",
+        &[&input.runtime_instance_id, &instance.instance_epoch, &input.heartbeat_sequence],
+    ).map_err(managed_cloud_storage)? {
+        let stored_id: String = row.get(0); let stored_generation: i64 = row.get(1);
+        if stored_id != boot_id || stored_generation != boot_generation {
+            return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO jobs_managed_cloud_source_verifier_heartbeat_boot_bindings(
+                runtime_instance_id,instance_epoch,heartbeat_sequence,boot_id,boot_generation
+             ) VALUES($1,$2,$3,$4,$5)",
+            &[&input.runtime_instance_id, &instance.instance_epoch, &input.heartbeat_sequence, &boot_id, &boot_generation],
+        ).map_err(managed_cloud_storage)?;
+    }
+    let current: bool = tx.query_one(
+        "SELECT EXISTS(SELECT 1
+           FROM jobs_managed_cloud_source_verifier_boot_registrations registration
+           JOIN jobs_managed_cloud_source_verifier_boot_generation_heads head
+             ON head.runtime_instance_id=registration.runtime_instance_id AND head.instance_epoch=registration.instance_epoch
+          WHERE registration.boot_id=$1 AND registration.runtime_instance_id=$2
+            AND registration.instance_epoch=$3 AND registration.boot_generation=$4
+            AND registration.worker_id=$5 AND registration.manifest_sha256=$6
+            AND head.current_boot_generation=$4)",
+        &[&boot_id, &input.runtime_instance_id, &instance.instance_epoch, &boot_generation, &input.worker_id, &input.manifest_sha256],
+    ).map_err(managed_cloud_storage)?.get(0);
+    if !current {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    Ok(())
+}
+
+fn require_managed_cloud_original_source_verifier_generic_heartbeat_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    instance: &ManagedCloudRuntimeInstance,
+    current: Option<&ManagedCloudRuntimeHeartbeat>,
+    input: &ManagedCloudRuntimeHeartbeatInput,
+) -> ManagedCloudResult<()> {
+    if instance.role != "original_source_verifier" {
+        return Ok(());
+    }
+    let startup_protocol: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1
+                 FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols protocol
+                WHERE protocol.manifest_sha256=?1
+                  AND protocol.protocol_id='source_verifier_startup'
+                  AND protocol.protocol_version=1 AND protocol.ordinal=10
+             )",
+            params![instance.manifest_sha256],
+            |row| row.get(0),
+        )
+        .map_err(managed_cloud_storage)?;
+    if !startup_protocol {
+        return Ok(());
+    }
+    let boot_protocol: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols
+              WHERE manifest_sha256=?1 AND protocol_id='source_verifier_boot'
+                AND protocol_version=1 AND ordinal=11)",
+            params![instance.manifest_sha256],
+            |row| row.get(0),
+        )
+        .map_err(managed_cloud_storage)?;
+    if boot_protocol {
+        // The boot binding and prospective 064 trigger carry the v3 transition
+        // authority. Do not reinterpret the historical v1 startup row here.
+        return Ok(());
+    }
+    let Some(current) = current else {
+        return if input.health_state == "degraded"
+            && input.reason_code.as_deref() == Some("startup")
+        {
+            Ok(())
+        } else {
+            Err(ManagedCloudRegistryError::HeartbeatSequenceConflict)
+        };
+    };
+    if input.health_state != "ready" {
+        return Ok(());
+    }
+    if current.health_state != "ready" {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    let authorized = tx
+        .query_row(
+            "SELECT 1
+               FROM jobs_managed_cloud_original_source_verifier_startup_authorities startup
+              WHERE startup.runtime_instance_id=?1 AND startup.instance_epoch=?2
+                AND startup.worker_id=?3 AND startup.activation_sha256=?4
+                AND startup.manifest_sha256=?5 AND startup.component_id=?6
+                AND startup.role=?7 AND startup.artifact_sha256=?8
+                AND startup.observed_head_revision=?9
+                AND startup.observed_transition_sha256=?10
+                AND startup.migration_set_sha256=?11
+                AND startup.config_schema_sha256=?12
+                AND startup.protocol_set_sha256=?13 AND startup.task_queue_sha256=?14
+                AND startup.failure_converter_sha256=?15
+                AND startup.dependency_evidence_sha256=?16",
+            params![
+                input.runtime_instance_id,
+                instance.instance_epoch,
+                input.worker_id,
+                input.activation_sha256,
+                input.manifest_sha256,
+                input.component_id,
+                input.role,
+                input.artifact_sha256,
+                input.observed_head_revision,
+                input.observed_transition_sha256,
+                input.migration_set_sha256,
+                input.config_schema_sha256,
+                input.protocol_set_sha256,
+                input.task_queue_sha256,
+                input.failure_converter_sha256,
+                input.dependency_evidence_sha256,
+            ],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(managed_cloud_storage)?
+        .is_some();
+    if !authorized {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    Ok(())
+}
+
+fn require_managed_cloud_original_source_verifier_generic_heartbeat_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    instance: &ManagedCloudRuntimeInstance,
+    current: Option<&ManagedCloudRuntimeHeartbeat>,
+    input: &ManagedCloudRuntimeHeartbeatInput,
+) -> ManagedCloudResult<()> {
+    if instance.role != "original_source_verifier" {
+        return Ok(());
+    }
+    let startup_protocol: bool = tx
+        .query_one(
+            "SELECT EXISTS(
+               SELECT 1
+                 FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols protocol
+                WHERE protocol.manifest_sha256=$1
+                  AND protocol.protocol_id='source_verifier_startup'
+                  AND protocol.protocol_version=1 AND protocol.ordinal=10
+             )",
+            &[&instance.manifest_sha256],
+        )
+        .map_err(managed_cloud_storage)?
+        .get(0);
+    if !startup_protocol {
+        return Ok(());
+    }
+    let boot_protocol: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols
+              WHERE manifest_sha256=$1 AND protocol_id='source_verifier_boot'
+                AND protocol_version=1 AND ordinal=11)",
+            &[&instance.manifest_sha256],
+        )
+        .map_err(managed_cloud_storage)?
+        .get(0);
+    if boot_protocol {
+        return Ok(());
+    }
+    let Some(current) = current else {
+        return if input.health_state == "degraded"
+            && input.reason_code.as_deref() == Some("startup")
+        {
+            Ok(())
+        } else {
+            Err(ManagedCloudRegistryError::HeartbeatSequenceConflict)
+        };
+    };
+    if input.health_state != "ready" {
+        return Ok(());
+    }
+    if current.health_state != "ready" {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    let authorized = tx
+        .query_opt(
+            "SELECT 1
+               FROM jobs_managed_cloud_original_source_verifier_startup_authorities startup
+              WHERE startup.runtime_instance_id=$1 AND startup.instance_epoch=$2
+                AND startup.worker_id=$3 AND startup.activation_sha256=$4
+                AND startup.manifest_sha256=$5 AND startup.component_id=$6
+                AND startup.role=$7 AND startup.artifact_sha256=$8
+                AND startup.observed_head_revision=$9
+                AND startup.observed_transition_sha256=$10
+                AND startup.migration_set_sha256=$11
+                AND startup.config_schema_sha256=$12
+                AND startup.protocol_set_sha256=$13 AND startup.task_queue_sha256=$14
+                AND startup.failure_converter_sha256=$15
+                AND startup.dependency_evidence_sha256=$16
+              FOR SHARE",
+            &[
+                &input.runtime_instance_id,
+                &instance.instance_epoch,
+                &input.worker_id,
+                &input.activation_sha256,
+                &input.manifest_sha256,
+                &input.component_id,
+                &input.role,
+                &input.artifact_sha256,
+                &input.observed_head_revision,
+                &input.observed_transition_sha256,
+                &input.migration_set_sha256,
+                &input.config_schema_sha256,
+                &input.protocol_set_sha256,
+                &input.task_queue_sha256,
+                &input.failure_converter_sha256,
+                &input.dependency_evidence_sha256,
+            ],
+        )
+        .map_err(managed_cloud_storage)?
+        .is_some();
+    if !authorized {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    Ok(())
+}
+
+/// Commits the boot-authorized `N degraded -> N+1 ready` heartbeat transition
+/// and its audit record inside the caller's existing SQLite immediate
+/// transaction. The caller must have inserted the immutable boot startup row
+/// and advanced the ready generation first; the prospective trigger verifies
+/// both facts at this write boundary.
+pub(crate) fn commit_source_verifier_boot_ready_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    request: &SourceVerifierBootStartupRequest,
+    now_ms: i64,
+) -> ManagedCloudResult<()> {
+    let ready_sequence = request.degraded_heartbeat_sequence + 1;
+    tx.execute(
+        "INSERT INTO jobs_managed_cloud_source_verifier_heartbeat_boot_bindings(
+            runtime_instance_id,instance_epoch,heartbeat_sequence,boot_id,boot_generation
+         ) VALUES(?1,?2,?3,?4,?5)",
+        params![
+            request.runtime_instance_id,
+            request.instance_epoch,
+            ready_sequence,
+            request.boot_id,
+            request.boot_generation
+        ],
+    )
+    .map_err(managed_cloud_storage)?;
+    let changed = tx
+        .execute(
+            "UPDATE jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+            SET heartbeat_sequence=?3,health_state='ready',reason_code=NULL,heartbeat_at_ms=?4
+          WHERE runtime_instance_id=?1 AND instance_epoch=?2
+            AND heartbeat_sequence=?3-1 AND health_state='degraded'
+            AND reason_code='startup'",
+            params![
+                request.runtime_instance_id,
+                request.instance_epoch,
+                ready_sequence,
+                now_ms
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+    if changed != 1 {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    tx.execute(
+        "INSERT INTO jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit(
+           runtime_instance_id,instance_epoch,heartbeat_sequence,activation_sha256,manifest_sha256,
+           component_id,role,worker_id,artifact_sha256,observed_head_revision,
+           observed_transition_sha256,migration_set_sha256,config_schema_sha256,
+           protocol_set_sha256,task_queue_sha256,failure_converter_sha256,
+           dependency_evidence_sha256,health_state,reason_code,heartbeat_at_ms)
+         SELECT runtime_instance_id,instance_epoch,heartbeat_sequence,activation_sha256,manifest_sha256,
+           component_id,role,worker_id,artifact_sha256,observed_head_revision,
+           observed_transition_sha256,migration_set_sha256,config_schema_sha256,
+           protocol_set_sha256,task_queue_sha256,failure_converter_sha256,
+           dependency_evidence_sha256,health_state,reason_code,heartbeat_at_ms
+         FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+         WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+        params![request.runtime_instance_id, request.instance_epoch],
+    ).map_err(managed_cloud_storage)?;
+    Ok(())
+}
+
+/// PostgreSQL counterpart. The startup path owns H -> M -> instance -> boot
+/// head before calling this helper; this function intentionally takes no new
+/// locks so it cannot invert the readiness probe's global order.
+pub(crate) fn commit_source_verifier_boot_ready_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    request: &SourceVerifierBootStartupRequest,
+    now_ms: i64,
+) -> ManagedCloudResult<()> {
+    let ready_sequence = request.degraded_heartbeat_sequence + 1;
+    tx.execute(
+        "INSERT INTO jobs_managed_cloud_source_verifier_heartbeat_boot_bindings(
+            runtime_instance_id,instance_epoch,heartbeat_sequence,boot_id,boot_generation
+         ) VALUES($1,$2,$3,$4,$5)",
+        &[
+            &request.runtime_instance_id,
+            &request.instance_epoch,
+            &ready_sequence,
+            &request.boot_id,
+            &request.boot_generation,
+        ],
+    )
+    .map_err(managed_cloud_storage)?;
+    let changed = tx
+        .execute(
+            "UPDATE jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+            SET heartbeat_sequence=$3,health_state='ready',reason_code=NULL,heartbeat_at_ms=$4
+          WHERE runtime_instance_id=$1 AND instance_epoch=$2
+            AND heartbeat_sequence=$3-1 AND health_state='degraded'
+            AND reason_code='startup'",
+            &[
+                &request.runtime_instance_id,
+                &request.instance_epoch,
+                &ready_sequence,
+                &now_ms,
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+    if changed != 1 {
+        return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
+    }
+    tx.execute(
+        "INSERT INTO jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit(
+           runtime_instance_id,instance_epoch,heartbeat_sequence,activation_sha256,manifest_sha256,
+           component_id,role,worker_id,artifact_sha256,observed_head_revision,
+           observed_transition_sha256,migration_set_sha256,config_schema_sha256,
+           protocol_set_sha256,task_queue_sha256,failure_converter_sha256,
+           dependency_evidence_sha256,health_state,reason_code,heartbeat_at_ms)
+         SELECT runtime_instance_id,instance_epoch,heartbeat_sequence,activation_sha256,manifest_sha256,
+           component_id,role,worker_id,artifact_sha256,observed_head_revision,
+           observed_transition_sha256,migration_set_sha256,config_schema_sha256,
+           protocol_set_sha256,task_queue_sha256,failure_converter_sha256,
+           dependency_evidence_sha256,health_state,reason_code,heartbeat_at_ms
+         FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+         WHERE runtime_instance_id=$1 AND instance_epoch=$2",
+        &[&request.runtime_instance_id, &request.instance_epoch],
+    ).map_err(managed_cloud_storage)?;
+    Ok(())
+}
+
 pub fn record_managed_cloud_runtime_heartbeat(
     pool: &DbPool,
     input: &ManagedCloudRuntimeHeartbeatInput,
@@ -17182,6 +18936,13 @@ pub fn record_managed_cloud_runtime_heartbeat(
                 )
                 .optional()
                 .map_err(managed_cloud_storage)?;
+            bind_managed_cloud_original_source_verifier_heartbeat_sqlite(&tx, &instance, input)?;
+            require_managed_cloud_original_source_verifier_generic_heartbeat_sqlite(
+                &tx,
+                &instance,
+                current.as_ref(),
+                input,
+            )?;
             let had_current = current.is_some();
             if let Some(mut current) = current {
                 if input.heartbeat_sequence == current.heartbeat_sequence {
@@ -17315,6 +19076,10 @@ pub fn record_managed_cloud_runtime_heartbeat(
             let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
             let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
             let tables = managed_cloud_runtime_tables_for_role(&input.role);
+            if input.role == "original_source_verifier" {
+                lock_operational_hold_shared_postgres_tx(&mut tx).map_err(managed_cloud_storage)?;
+                lock_managed_cloud_release_registry_exclusive_postgres_tx(&mut tx)?;
+            }
             let instance_row = tx
                 .query_opt(
                     &format!(
@@ -17349,6 +19114,15 @@ pub fn record_managed_cloud_runtime_heartbeat(
                 )
                 .map_err(managed_cloud_storage)?
                 .map(|row| managed_cloud_runtime_heartbeat_from_postgres(&row));
+            bind_managed_cloud_original_source_verifier_heartbeat_postgres(
+                &mut tx, &instance, input,
+            )?;
+            require_managed_cloud_original_source_verifier_generic_heartbeat_postgres(
+                &mut tx,
+                &instance,
+                current.as_ref(),
+                input,
+            )?;
             let had_current = current.is_some();
             if let Some(mut current) = current {
                 if input.heartbeat_sequence == current.heartbeat_sequence {
@@ -17486,13 +19260,16 @@ pub fn record_managed_cloud_runtime_heartbeat(
 pub(crate) mod managed_cloud_release_authority_tests {
     use super::*;
 
-    fn managed_cloud_test_feature(source_verification: bool) -> ManagedCloudFeatureAuthority {
+    fn managed_cloud_test_feature_for_version(
+        version: i64,
+        source_verification: bool,
+    ) -> ManagedCloudFeatureAuthority {
         ManagedCloudFeatureAuthority {
             cloud_distribution: true,
             workflow_command_dispatch: true,
             workflow_cleanup: true,
-            direct_discovery: false,
-            global_discovery: false,
+            direct_discovery: version == 3,
+            global_discovery: version == 3,
             source_verification,
         }
     }
@@ -17571,6 +19348,16 @@ pub(crate) mod managed_cloud_release_authority_tests {
                 capability: "managed_runner".to_string(),
             },
         ];
+        if version == 3 {
+            capabilities.push(ManagedCloudCapabilityAuthority {
+                component_id: "jobs-workflows".to_string(),
+                capability: "discovery_worker".to_string(),
+            });
+            capabilities.push(ManagedCloudCapabilityAuthority {
+                component_id: "jobs-workflows".to_string(),
+                capability: "global_discovery_worker".to_string(),
+            });
+        }
         if source_verification {
             capabilities.push(ManagedCloudCapabilityAuthority {
                 component_id: "jobs-workflows".to_string(),
@@ -17587,11 +19374,23 @@ pub(crate) mod managed_cloud_release_authority_tests {
                 capability: "workflow_worker".to_string(),
             },
         ]);
-        let contract = if version == 1 {
-            managed_cloud_release_contract(1, MANAGED_CLOUD_RELEASE_AUDIENCE).expect("v1 contract")
-        } else {
-            managed_cloud_release_contract(2, MANAGED_CLOUD_RELEASE_V2_AUDIENCE)
-                .expect("v2 contract")
+        let (audience, contract) = match version {
+            1 => (
+                MANAGED_CLOUD_RELEASE_AUDIENCE,
+                managed_cloud_release_contract(1, MANAGED_CLOUD_RELEASE_AUDIENCE)
+                    .expect("v1 contract"),
+            ),
+            2 => (
+                MANAGED_CLOUD_RELEASE_V2_AUDIENCE,
+                managed_cloud_release_contract(2, MANAGED_CLOUD_RELEASE_V2_AUDIENCE)
+                    .expect("v2 contract"),
+            ),
+            3 => (
+                MANAGED_CLOUD_RELEASE_V3_AUDIENCE,
+                managed_cloud_release_contract(3, MANAGED_CLOUD_RELEASE_V3_AUDIENCE)
+                    .expect("v3 contract"),
+            ),
+            _ => panic!("unsupported managed-cloud test release version"),
         };
         let protocols = contract
             .protocols
@@ -17606,11 +19405,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
             .collect();
         let mut release = ManagedCloudReleaseAuthority {
             version,
-            audience: if version == 1 {
-                MANAGED_CLOUD_RELEASE_AUDIENCE.to_string()
-            } else {
-                MANAGED_CLOUD_RELEASE_V2_AUDIENCE.to_string()
-            },
+            audience: audience.to_string(),
             manifest_id: format!("managed-cloud-release-{version}"),
             manifest_generation: version,
             release_id: release_id.to_string(),
@@ -17624,7 +19419,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
             protocol_set_sha256: "f".repeat(64),
             component_set_sha256: String::new(),
             feature_authority_sha256: String::new(),
-            feature_authority: managed_cloud_test_feature(source_verification),
+            feature_authority: managed_cloud_test_feature_for_version(version, source_verification),
             verification_evidence_sha256: "9".repeat(64),
             components,
             capabilities,
@@ -17638,14 +19433,17 @@ pub(crate) mod managed_cloud_release_authority_tests {
         version: i64,
         source_verification: bool,
     ) -> ManagedCloudActivationAuthority {
-        let feature_authority = managed_cloud_test_feature(source_verification);
+        let feature_authority =
+            managed_cloud_test_feature_for_version(version, source_verification);
+        let audience = match version {
+            1 => MANAGED_CLOUD_ACTIVATION_AUDIENCE,
+            2 => MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
+            3 => MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE,
+            _ => panic!("unsupported managed-cloud test activation version"),
+        };
         ManagedCloudActivationAuthority {
             version,
-            audience: if version == 1 {
-                MANAGED_CLOUD_ACTIVATION_AUDIENCE.to_string()
-            } else {
-                MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE.to_string()
-            },
+            audience: audience.to_string(),
             activation_id: format!("activation-614-{version}"),
             activation_generation: version,
             trust_generation: 1,
@@ -17686,13 +19484,16 @@ pub(crate) mod managed_cloud_release_authority_tests {
     }
 
     #[test]
-    fn managed_cloud_release_v1_rejects_source_verification_and_v2_requires_it() {
+    fn managed_cloud_release_versions_preserve_v1_v2_and_require_exact_v3_features() {
         validate_managed_cloud_release(&managed_cloud_test_release(1, false))
             .expect("exact v1 false release");
         assert!(validate_managed_cloud_release(&managed_cloud_test_release(1, true)).is_err());
         validate_managed_cloud_release(&managed_cloud_test_release(2, true))
             .expect("exact v2 source-verification release");
         assert!(validate_managed_cloud_release(&managed_cloud_test_release(2, false)).is_err());
+        validate_managed_cloud_release(&managed_cloud_test_release(3, true))
+            .expect("exact v3 discovery and source-verification release");
+        assert!(validate_managed_cloud_release(&managed_cloud_test_release(3, false)).is_err());
     }
 
     #[test]
@@ -17798,6 +19599,20 @@ pub(crate) mod managed_cloud_release_authority_tests {
                     MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
                     "f".repeat(64),
                 ),
+                (
+                    "1".repeat(64),
+                    "phase628-v3-release",
+                    "release",
+                    MANAGED_CLOUD_RELEASE_V3_AUDIENCE,
+                    "2".repeat(64),
+                ),
+                (
+                    "3".repeat(64),
+                    "phase628-v3-activation",
+                    "general_promotion",
+                    MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE,
+                    "4".repeat(64),
+                ),
             ] {
                 connection
                     .execute(
@@ -17878,6 +19693,42 @@ pub(crate) mod managed_cloud_release_authority_tests {
         assert!(
             validate_managed_cloud_activation(&managed_cloud_test_activation(2, false)).is_err()
         );
+        validate_managed_cloud_activation(&managed_cloud_test_activation(3, true))
+            .expect("exact v3 discovery and source-verification activation");
+        assert!(
+            validate_managed_cloud_activation(&managed_cloud_test_activation(3, false)).is_err()
+        );
+    }
+
+    #[test]
+    fn managed_cloud_source_verification_pair_accepts_same_version_v2_v3_only() {
+        let pair = |version| {
+            let release = managed_cloud_test_release(version, true);
+            let release_bytes = managed_cloud_canonical_json(&release).expect("canonical release");
+            let release_sha256 = managed_cloud_sha256(&release_bytes);
+            let mut activation = managed_cloud_test_activation(version, true);
+            activation.manifest_sha256 = release_sha256.clone();
+            let activation_bytes =
+                managed_cloud_canonical_json(&activation).expect("canonical activation");
+            (
+                managed_cloud_sha256(&activation_bytes),
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(activation_bytes),
+                release_sha256,
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(release_bytes),
+            )
+        };
+        let v2 = pair(2);
+        let v3 = pair(3);
+        validate_managed_cloud_source_verification_pair(&v2.0, &v2.1, &v2.2, &v2.3)
+            .expect("same-version v2 pair");
+        validate_managed_cloud_source_verification_pair(&v3.0, &v3.1, &v3.2, &v3.3)
+            .expect("same-version v3 pair");
+        assert!(
+            validate_managed_cloud_source_verification_pair(&v2.0, &v2.1, &v3.2, &v3.3,).is_err()
+        );
+        assert!(
+            validate_managed_cloud_source_verification_pair(&v3.0, &v3.1, &v2.2, &v2.3,).is_err()
+        );
     }
 
     #[test]
@@ -17951,6 +19802,56 @@ pub(crate) mod managed_cloud_release_authority_tests {
         )
         .is_err());
         std::fs::remove_dir_all(&artifact_root).expect("remove artifact root");
+    }
+
+    #[test]
+    fn original_source_verifier_measurement_roles_accept_only_exact_v2_or_v3_sets() {
+        let strings = |roles: &[&str]| {
+            roles
+                .iter()
+                .map(|role| (*role).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            managed_cloud_original_source_verifier_measurement_roles_valid(&strings(&[
+                "original_source_verifier",
+                "workflow_gateway",
+                "workflow_worker",
+            ]))
+        );
+        assert!(
+            managed_cloud_original_source_verifier_measurement_roles_valid(&strings(&[
+                "discovery_worker",
+                "global_discovery_worker",
+                "original_source_verifier",
+                "workflow_gateway",
+                "workflow_worker",
+            ]))
+        );
+        for rejected in [
+            strings(&[
+                "discovery_worker",
+                "original_source_verifier",
+                "workflow_gateway",
+                "workflow_worker",
+            ]),
+            strings(&[
+                "global_discovery_worker",
+                "original_source_verifier",
+                "workflow_gateway",
+                "workflow_worker",
+            ]),
+            strings(&[
+                "discovery_worker",
+                "global_discovery_worker",
+                "jobs_api",
+                "original_source_verifier",
+                "workflow_gateway",
+                "workflow_worker",
+            ]),
+        ] {
+            assert!(!managed_cloud_original_source_verifier_measurement_roles_valid(&rejected));
+        }
     }
 
     #[test]
@@ -18464,11 +20365,12 @@ pub(crate) mod managed_cloud_release_authority_tests {
 
     fn managed_cloud_test_release_import(
         issued_at_ms: i64,
+        version: i64,
     ) -> (
         ManagedCloudReleaseAuthority,
         ManagedCloudReleaseImportRequest,
     ) {
-        let mut release = managed_cloud_test_release(2, true);
+        let mut release = managed_cloud_test_release(version, true);
         release.manifest_generation = 1;
         release.release_sequence = 1;
         release.published_at_ms = issued_at_ms;
@@ -18496,10 +20398,16 @@ pub(crate) mod managed_cloud_release_authority_tests {
             managed_cloud_canonical_json(&verification).expect("canonical verification evidence");
         release.verification_evidence_sha256 = managed_cloud_sha256(&verification_bytes);
         refresh_managed_cloud_test_release_digests(&mut release);
-        validate_managed_cloud_release(&release).expect("valid production-positive v2 release");
+        validate_managed_cloud_release(&release)
+            .expect("valid production-positive managed-cloud release");
+        let release_audience = match version {
+            2 => MANAGED_CLOUD_RELEASE_V2_AUDIENCE,
+            3 => MANAGED_CLOUD_RELEASE_V3_AUDIENCE,
+            _ => panic!("unsupported production-positive release version"),
+        };
         let signed = managed_cloud_test_signed_envelope(
             &release,
-            MANAGED_CLOUD_RELEASE_V2_AUDIENCE,
+            release_audience,
             "release",
             issued_at_ms.saturating_add(1_000),
         );
@@ -18562,7 +20470,6 @@ pub(crate) mod managed_cloud_release_authority_tests {
             "managed-runner-runtime-artifact-attestation",
             "managed-runner-readiness",
             "migration-contract-readback",
-            "original-source-verifier-readiness",
             "protocol-contract-readback",
             "read-only-rootfs-policy",
             "workflow-cleanup-dispatcher-readiness",
@@ -18570,6 +20477,15 @@ pub(crate) mod managed_cloud_release_authority_tests {
             "workflow-gateway-readiness",
             "workflow-worker-readiness",
         ];
+        if release.feature_authority.direct_discovery {
+            check_ids.push("discovery-worker-readiness");
+        }
+        if release.feature_authority.global_discovery {
+            check_ids.push("global-discovery-worker-readiness");
+        }
+        if release.feature_authority.source_verification {
+            check_ids.push("original-source-verifier-readiness");
+        }
         check_ids.sort_unstable();
         let canary = ManagedCloudCanaryEvidenceAuthority {
             version: 1,
@@ -18724,8 +20640,10 @@ pub(crate) mod managed_cloud_release_authority_tests {
     fn current_original_source_managed_head(
         pool: &DbPool,
         minimum_remaining_ms: i64,
+        startup_protocol_required: bool,
     ) -> Option<(String, String)> {
-        crate::db::run_blocking_db(|| match pool {
+        crate::db::run_blocking_db(|| {
+            match pool {
             DbPool::Sqlite(_) => pool
                 .get()
                 .expect("managed-cloud fixture SQLite connection")
@@ -18741,10 +20659,17 @@ pub(crate) mod managed_cloud_release_authority_tests {
                         AND head.channel='general'
                         AND activation.source_verification_enabled=1
                         AND cohort.rollout_mode='all_eligible_accounts'
+                        AND EXISTS(
+                          SELECT 1
+                            FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols protocol
+                           WHERE protocol.manifest_sha256=head.current_manifest_sha256
+                             AND protocol.protocol_id='source_verifier_startup'
+                             AND protocol.protocol_version=1 AND protocol.ordinal=10
+                        )=?2
                         AND activation.expires_at_ms >
                             CAST(strftime('%s', 'now') AS INTEGER) * 1000 + ?1
                       LIMIT 1",
-                    params![minimum_remaining_ms],
+                    params![minimum_remaining_ms, startup_protocol_required],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -18764,18 +20689,27 @@ pub(crate) mod managed_cloud_release_authority_tests {
                         AND head.channel='general'
                         AND activation.source_verification_enabled
                         AND cohort.rollout_mode='all_eligible_accounts'
+                        AND EXISTS(
+                          SELECT 1
+                            FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols protocol
+                           WHERE protocol.manifest_sha256=head.current_manifest_sha256
+                             AND protocol.protocol_id='source_verifier_startup'
+                             AND protocol.protocol_version=1 AND protocol.ordinal=10
+                        )=$2
                         AND activation.expires_at_ms >
                             floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint + $1
                       LIMIT 1",
-                    &[&minimum_remaining_ms],
+                    &[&minimum_remaining_ms, &startup_protocol_required],
                 )
                 .expect("query current PostgreSQL original-source managed head")
                 .map(|row| (row.get(0), row.get(1))),
+        }
         })
     }
 
-    fn install_valid_v2_original_source_managed_head(
+    fn install_valid_original_source_managed_head(
         pool: &DbPool,
+        version: i64,
         now_ms: i64,
         heartbeat_ttl_ms: i64,
         authority_lifetime_ms: i64,
@@ -18902,6 +20836,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
 
         let (release, release_request) = managed_cloud_test_release_import(
             existing_release_published_at_ms.unwrap_or(issued_at_ms),
+            version,
         );
         let release_import =
             import_managed_cloud_release(pool, &release_request, "phase614b-production-positive")
@@ -18936,7 +20871,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
         )
         .expect("import signed managed-cloud cohort");
 
-        let mut activation = managed_cloud_test_activation(2, true);
+        let mut activation = managed_cloud_test_activation(version, true);
         activation.activation_id = format!("{authority_label}-activation");
         activation.activation_generation = crate::db::run_blocking_db(|| match pool {
             DbPool::Sqlite(_) => pool
@@ -18970,7 +20905,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
         activation.manifest_signature_set_sha256 = release_import.signature_set_sha256;
         activation.cohort_sha256 = cohort_import.authority_sha256;
         activation.cohort_signature_set_sha256 = cohort_import.signature_set_sha256;
-        activation.feature_authority = release.feature_authority.clone();
+        activation.feature_authority = release.feature_authority;
         activation.feature_authority_sha256 = release.feature_authority_sha256.clone();
         activation.portal_readback_at_ms = issued_at_ms;
         activation.portal_readback_ttl_ms = evidence_expires_at_ms - issued_at_ms;
@@ -18988,10 +20923,15 @@ pub(crate) mod managed_cloud_release_authority_tests {
             evidence_expires_at_ms,
         );
         validate_managed_cloud_activation(&activation)
-            .expect("valid production-positive v2 activation");
+            .expect("valid production-positive managed-cloud activation");
+        let activation_audience = match version {
+            2 => MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
+            3 => MANAGED_CLOUD_ACTIVATION_V3_AUDIENCE,
+            _ => panic!("unsupported production-positive activation version"),
+        };
         let activation_envelope = managed_cloud_test_signed_envelope(
             &activation,
-            MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
+            activation_audience,
             "general_promotion",
             signed_at_ms,
         );
@@ -19127,10 +21067,11 @@ pub(crate) mod managed_cloud_release_authority_tests {
         let grant_ttl_ms = bounded_test_runtime_grant_ttl_ms(grant_ttl_ms);
         let minimum_remaining_ms = grant_ttl_ms.saturating_add(5_000);
         let (activation_sha256, manifest_sha256) =
-            current_original_source_managed_head(&pool, minimum_remaining_ms).unwrap_or_else(
-                || {
-                    install_valid_v2_original_source_managed_head(
+            current_original_source_managed_head(&pool, minimum_remaining_ms, false)
+                .unwrap_or_else(|| {
+                    install_valid_original_source_managed_head(
                         &pool,
+                        2,
                         now_ms,
                         heartbeat_ttl_ms,
                         authority_lifetime_ms,
@@ -19141,8 +21082,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
                         },
                         "phase614b-production-positive",
                     )
-                },
-            );
+                });
         let fixture_suffix = uuid::Uuid::new_v4().simple().to_string();
         let worker_id = format!("phase614b-source-worker-{fixture_suffix}");
         let grant = issue_managed_cloud_runtime_grant(
@@ -19210,6 +21150,8 @@ pub(crate) mod managed_cloud_release_authority_tests {
             dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
             health_state: "ready".to_string(),
             reason_code: None,
+            boot_id: None,
+            boot_generation: None,
         };
         let heartbeat = record_managed_cloud_runtime_heartbeat(&pool, &heartbeat_input)
             .expect("record ready production-positive verifier heartbeat");
@@ -19254,6 +21196,559 @@ pub(crate) mod managed_cloud_release_authority_tests {
         }
     }
 
+    pub(crate) struct OriginalSourceVerifierStartupTestFixture {
+        pub(crate) database_path: std::path::PathBuf,
+        pub(crate) pool: DbPool,
+        pub(crate) request: ManagedCloudOriginalSourceVerifierStartupRequest,
+    }
+
+    pub(crate) fn original_source_verifier_startup_test_fixture(
+    ) -> OriginalSourceVerifierStartupTestFixture {
+        let database_path = std::env::temp_dir().join(format!(
+            "bluey-managed-cloud-verifier-startup-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&database_path).expect("open verifier startup fixture");
+        crate::db::run_migrations(&pool).expect("migrate verifier startup fixture");
+        let request = install_original_source_verifier_startup_request(&pool);
+        OriginalSourceVerifierStartupTestFixture {
+            database_path,
+            pool,
+            request,
+        }
+    }
+
+    fn install_original_source_verifier_startup_request(
+        pool: &DbPool,
+    ) -> ManagedCloudOriginalSourceVerifierStartupRequest {
+        let now_ms = managed_cloud_test_db_now(pool);
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let (activation_sha256, manifest_sha256) =
+            current_original_source_managed_head(pool, 15 * 60_000 + 5_000, true).unwrap_or_else(
+                || {
+                    install_valid_original_source_managed_head(
+                        pool,
+                        3,
+                        now_ms,
+                        300_000,
+                        24 * 60 * 60_000,
+                        ManagedCloudScope {
+                            environment: "production".to_string(),
+                            region: "us-east-1".to_string(),
+                            channel: "general".to_string(),
+                        },
+                        &format!("phase628-startup-{suffix}"),
+                    )
+                },
+            );
+        let worker_id = format!("phase628-source-worker-{suffix}");
+        let grant = issue_managed_cloud_runtime_grant(
+            pool,
+            &NewManagedCloudRuntimeGrant {
+                issuance_ref: format!("phase628-source-issuance-{suffix}"),
+                scope: ManagedCloudScope {
+                    environment: "production".to_string(),
+                    region: "us-east-1".to_string(),
+                    channel: "general".to_string(),
+                },
+                activation_sha256,
+                manifest_sha256,
+                component_id: "jobs-workflows".to_string(),
+                role: "original_source_verifier".to_string(),
+                expected_worker_id: worker_id.clone(),
+                authorization_ref: format!("phase628-source-authority-{suffix}"),
+                created_by: "phase628-startup-test".to_string(),
+                ttl_ms: 15 * 60_000,
+            },
+        )
+        .expect("issue v3 verifier grant");
+        let grant_token = grant
+            .grant_token
+            .clone()
+            .expect("new v3 verifier grant token");
+        let runtime_instance_id = format!("phase628-source-instance-{suffix}");
+        let session_token = derive_managed_cloud_runtime_session_token(
+            &grant_token,
+            &grant.grant_id,
+            &runtime_instance_id,
+        )
+        .expect("derive v3 verifier session");
+        let instance = claim_managed_cloud_runtime_grant(
+            pool,
+            &ClaimManagedCloudRuntimeGrant {
+                grant_id: grant.grant_id,
+                grant_token,
+                runtime_instance_id: runtime_instance_id.clone(),
+                worker_id: worker_id.clone(),
+                session_token: session_token.clone(),
+                runtime_identity_sha256: grant.expected_runtime_identity_sha256,
+            },
+        )
+        .expect("claim v3 verifier runtime");
+        let boot_id = format!("phase628-fixture-boot-{suffix}");
+        let boot = register_source_verifier_boot(
+            pool,
+            &SourceVerifierBootRegistrationRequest {
+                session_token: session_token.clone(),
+                registration_request_id: format!("phase628-fixture-registration-{suffix}"),
+                boot_id: boot_id.clone(),
+                runtime_instance_id: runtime_instance_id.clone(),
+                instance_epoch: instance.instance_epoch,
+                worker_id: worker_id.clone(),
+                runtime_identity_sha256: instance.runtime_identity_sha256.clone(),
+                activation_sha256: instance.activation_sha256.clone(),
+                manifest_sha256: instance.manifest_sha256.clone(),
+                component_id: instance.component_id.clone(),
+                role: instance.role.clone(),
+            },
+        )
+        .expect("register synthetic v3 verifier boot");
+        let degraded = record_managed_cloud_runtime_heartbeat(
+            pool,
+            &ManagedCloudRuntimeHeartbeatInput {
+                runtime_instance_id: runtime_instance_id.clone(),
+                worker_id: worker_id.clone(),
+                session_token: session_token.clone(),
+                heartbeat_sequence: 1,
+                observed_head_revision: instance.head_revision,
+                observed_transition_sha256: instance.transition_sha256.clone(),
+                activation_sha256: instance.activation_sha256.clone(),
+                manifest_sha256: instance.manifest_sha256.clone(),
+                component_id: instance.component_id.clone(),
+                role: instance.role.clone(),
+                artifact_sha256: instance.artifact_sha256.clone(),
+                migration_set_sha256: instance.migration_set_sha256.clone(),
+                config_schema_sha256: instance.config_schema_sha256.clone(),
+                protocol_set_sha256: instance.protocol_set_sha256.clone(),
+                task_queue_sha256: instance.task_queue_sha256.clone(),
+                failure_converter_sha256: instance.failure_converter_sha256.clone(),
+                dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
+                health_state: "degraded".to_string(),
+                reason_code: Some("startup".to_string()),
+                boot_id: Some(boot_id),
+                boot_generation: Some(boot.boot_generation),
+            },
+        )
+        .expect("record v3 degraded startup heartbeat");
+        assert_eq!(
+            (degraded.heartbeat_sequence, degraded.health_state.as_str()),
+            (1, "degraded")
+        );
+        ManagedCloudOriginalSourceVerifierStartupRequest {
+            version: 1,
+            audience: MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUDIENCE.to_string(),
+            startup_request_id: format!("osv-startup-{suffix}"),
+            runtime_instance_id,
+            worker_id,
+            session_token,
+            instance_epoch: instance.instance_epoch,
+            expected_degraded_heartbeat_sequence: 1,
+            runtime_identity_sha256: instance.runtime_identity_sha256,
+            observed_head_revision: instance.head_revision,
+            observed_transition_sha256: instance.transition_sha256,
+            activation_sha256: instance.activation_sha256,
+            manifest_sha256: instance.manifest_sha256,
+            component_id: instance.component_id,
+            role: instance.role,
+            artifact_sha256: instance.artifact_sha256,
+            migration_set_sha256: instance.migration_set_sha256,
+            config_schema_sha256: instance.config_schema_sha256,
+            protocol_set_sha256: instance.protocol_set_sha256,
+            task_queue_sha256: instance.task_queue_sha256,
+            failure_converter_sha256: instance.failure_converter_sha256,
+            dependency_evidence_sha256: instance.dependency_evidence_sha256,
+        }
+    }
+
+    #[test]
+    fn original_source_verifier_startup_idle_is_atomic_and_replays_exact_bytes() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let database_path = fixture.database_path.clone();
+        let boot_id = format!("phase628-test-boot-{}", uuid::Uuid::new_v4().simple());
+        let registration = register_source_verifier_boot(
+            &fixture.pool,
+            &SourceVerifierBootRegistrationRequest {
+                session_token: fixture.request.session_token.clone(),
+                registration_request_id: format!(
+                    "phase628-test-registration-{}",
+                    uuid::Uuid::new_v4().simple()
+                ),
+                boot_id: boot_id.clone(),
+                runtime_instance_id: fixture.request.runtime_instance_id.clone(),
+                instance_epoch: fixture.request.instance_epoch,
+                worker_id: fixture.request.worker_id.clone(),
+                runtime_identity_sha256: fixture.request.runtime_identity_sha256.clone(),
+                activation_sha256: fixture.request.activation_sha256.clone(),
+                manifest_sha256: fixture.request.manifest_sha256.clone(),
+                component_id: fixture.request.component_id.clone(),
+                role: fixture.request.role.clone(),
+            },
+        )
+        .expect("register test boot");
+        let heartbeat = ManagedCloudRuntimeHeartbeatInput {
+            runtime_instance_id: fixture.request.runtime_instance_id.clone(),
+            worker_id: fixture.request.worker_id.clone(),
+            session_token: fixture.request.session_token.clone(),
+            heartbeat_sequence: 2,
+            observed_head_revision: fixture.request.observed_head_revision,
+            observed_transition_sha256: fixture.request.observed_transition_sha256.clone(),
+            activation_sha256: fixture.request.activation_sha256.clone(),
+            manifest_sha256: fixture.request.manifest_sha256.clone(),
+            component_id: fixture.request.component_id.clone(),
+            role: fixture.request.role.clone(),
+            artifact_sha256: fixture.request.artifact_sha256.clone(),
+            migration_set_sha256: fixture.request.migration_set_sha256.clone(),
+            config_schema_sha256: fixture.request.config_schema_sha256.clone(),
+            protocol_set_sha256: fixture.request.protocol_set_sha256.clone(),
+            task_queue_sha256: fixture.request.task_queue_sha256.clone(),
+            failure_converter_sha256: fixture.request.failure_converter_sha256.clone(),
+            dependency_evidence_sha256: fixture.request.dependency_evidence_sha256.clone(),
+            health_state: "degraded".to_string(),
+            reason_code: Some("startup".to_string()),
+            boot_id: Some(boot_id.clone()),
+            boot_generation: Some(registration.boot_generation),
+        };
+        record_managed_cloud_runtime_heartbeat(&fixture.pool, &heartbeat)
+            .expect("publish boot degraded N2");
+        let request = SourceVerifierBootStartupRequest {
+            session_token: fixture.request.session_token.clone(),
+            startup_request_id: format!("phase628-test-startup-{}", uuid::Uuid::new_v4().simple()),
+            boot_id,
+            runtime_instance_id: fixture.request.runtime_instance_id.clone(),
+            instance_epoch: fixture.request.instance_epoch,
+            boot_generation: registration.boot_generation,
+            worker_id: fixture.request.worker_id.clone(),
+            degraded_heartbeat_sequence: 2,
+        };
+        let first = record_source_verifier_boot_startup(&fixture.pool, &request)
+            .expect("authorize boot startup");
+        let replay = record_source_verifier_boot_startup(&fixture.pool, &request)
+            .expect("replay boot startup");
+        assert_eq!(
+            first.canonical_response_base64url,
+            replay.canonical_response_base64url
+        );
+        assert_eq!(first.probe_result, "idle");
+        assert_eq!(
+            (
+                first.degraded_heartbeat_sequence,
+                first.ready_heartbeat_sequence
+            ),
+            (2, 3)
+        );
+        let connection = fixture.pool.get().expect("assert idle startup state");
+        let startup_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_managed_cloud_source_verifier_boot_startup_authorities",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count startup rows");
+        let heartbeat: (i64, String, Option<String>) = connection
+            .query_row(
+                "SELECT heartbeat_sequence,health_state,reason_code
+                   FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+                  WHERE runtime_instance_id=?1",
+                params![fixture.request.runtime_instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read startup heartbeat");
+        let probe_mutations: i64 = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM jobs_original_source_verification_attempts)
+                 + (SELECT COUNT(*) FROM jobs_original_source_verification_events)
+                 + (SELECT COUNT(*) FROM jobs_original_source_verification_assignments)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count rollback-only probe mutations");
+        assert_eq!(startup_rows, 1);
+        assert_eq!(heartbeat, (3, "ready".to_string(), None));
+        assert_eq!(probe_mutations, 0);
+        drop(connection);
+        drop(fixture);
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn original_source_verifier_startup_rejects_bypass_conflicts_and_rolls_back() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let database_path = fixture.database_path.clone();
+        let ready_bypass = ManagedCloudRuntimeHeartbeatInput {
+            runtime_instance_id: fixture.request.runtime_instance_id.clone(),
+            worker_id: fixture.request.worker_id.clone(),
+            session_token: fixture.request.session_token.clone(),
+            heartbeat_sequence: 2,
+            observed_head_revision: fixture.request.observed_head_revision,
+            observed_transition_sha256: fixture.request.observed_transition_sha256.clone(),
+            activation_sha256: fixture.request.activation_sha256.clone(),
+            manifest_sha256: fixture.request.manifest_sha256.clone(),
+            component_id: fixture.request.component_id.clone(),
+            role: fixture.request.role.clone(),
+            artifact_sha256: fixture.request.artifact_sha256.clone(),
+            migration_set_sha256: fixture.request.migration_set_sha256.clone(),
+            config_schema_sha256: fixture.request.config_schema_sha256.clone(),
+            protocol_set_sha256: fixture.request.protocol_set_sha256.clone(),
+            task_queue_sha256: fixture.request.task_queue_sha256.clone(),
+            failure_converter_sha256: fixture.request.failure_converter_sha256.clone(),
+            dependency_evidence_sha256: fixture.request.dependency_evidence_sha256.clone(),
+            health_state: "ready".to_string(),
+            reason_code: None,
+            boot_id: None,
+            boot_generation: None,
+        };
+        assert!(matches!(
+            record_managed_cloud_runtime_heartbeat(&fixture.pool, &ready_bypass),
+            Err(ManagedCloudRegistryError::HeartbeatSequenceConflict)
+        ));
+        let mut stale = fixture.request.clone();
+        stale.expected_degraded_heartbeat_sequence = 2;
+        assert!(
+            record_managed_cloud_original_source_verifier_startup(&fixture.pool, &stale).is_err()
+        );
+        {
+            let connection = fixture.pool.get().expect("assert failed startup rollback");
+            let state: (i64, String, i64) = connection
+                .query_row(
+                    "SELECT heartbeat.heartbeat_sequence,heartbeat.health_state,
+                            (SELECT COUNT(*) FROM jobs_managed_cloud_original_source_verifier_startup_authorities)
+                       FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats heartbeat
+                      WHERE heartbeat.runtime_instance_id=?1",
+                    params![fixture.request.runtime_instance_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read failed startup state");
+            assert_eq!(state, (1, "degraded".to_string(), 0));
+        }
+        let mut changed = fixture.request.clone();
+        changed.expected_degraded_heartbeat_sequence = 2;
+        assert!(
+            record_managed_cloud_original_source_verifier_startup(&fixture.pool, &changed).is_err()
+        );
+        let mut second_id = fixture.request.clone();
+        second_id.startup_request_id =
+            format!("osv-startup-second-{}", uuid::Uuid::new_v4().simple());
+        assert!(
+            record_managed_cloud_original_source_verifier_startup(&fixture.pool, &second_id)
+                .is_err()
+        );
+        drop(fixture);
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-shm"));
+    }
+
+    #[test]
+    fn postgres_original_source_verifier_startup_is_atomic_and_replays_under_concurrency_when_configured(
+    ) {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            eprintln!(
+                "SKIP postgres_original_source_verifier_startup_is_atomic_and_replays_under_concurrency_when_configured: \
+                 BLUEY_TEST_POSTGRES_URL is unavailable"
+            );
+            return;
+        };
+        let pool = crate::db::open_postgres_pool(&database_url)
+            .expect("open PostgreSQL verifier startup test pool");
+        crate::db::run_migrations(&pool).expect("apply PostgreSQL verifier startup migrations");
+        let fixture_request = install_original_source_verifier_startup_request(&pool);
+        let boot_id = format!("phase628-pg-boot-{}", uuid::Uuid::new_v4().simple());
+        let registration = register_source_verifier_boot(
+            &pool,
+            &SourceVerifierBootRegistrationRequest {
+                session_token: fixture_request.session_token.clone(),
+                registration_request_id: format!(
+                    "phase628-pg-registration-{}",
+                    uuid::Uuid::new_v4().simple()
+                ),
+                boot_id: boot_id.clone(),
+                runtime_instance_id: fixture_request.runtime_instance_id.clone(),
+                instance_epoch: fixture_request.instance_epoch,
+                worker_id: fixture_request.worker_id.clone(),
+                runtime_identity_sha256: fixture_request.runtime_identity_sha256.clone(),
+                activation_sha256: fixture_request.activation_sha256.clone(),
+                manifest_sha256: fixture_request.manifest_sha256.clone(),
+                component_id: fixture_request.component_id.clone(),
+                role: fixture_request.role.clone(),
+            },
+        )
+        .expect("register PostgreSQL boot");
+        record_managed_cloud_runtime_heartbeat(
+            &pool,
+            &ManagedCloudRuntimeHeartbeatInput {
+                runtime_instance_id: fixture_request.runtime_instance_id.clone(),
+                worker_id: fixture_request.worker_id.clone(),
+                session_token: fixture_request.session_token.clone(),
+                heartbeat_sequence: 2,
+                observed_head_revision: fixture_request.observed_head_revision,
+                observed_transition_sha256: fixture_request.observed_transition_sha256.clone(),
+                activation_sha256: fixture_request.activation_sha256.clone(),
+                manifest_sha256: fixture_request.manifest_sha256.clone(),
+                component_id: fixture_request.component_id.clone(),
+                role: fixture_request.role.clone(),
+                artifact_sha256: fixture_request.artifact_sha256.clone(),
+                migration_set_sha256: fixture_request.migration_set_sha256.clone(),
+                config_schema_sha256: fixture_request.config_schema_sha256.clone(),
+                protocol_set_sha256: fixture_request.protocol_set_sha256.clone(),
+                task_queue_sha256: fixture_request.task_queue_sha256.clone(),
+                failure_converter_sha256: fixture_request.failure_converter_sha256.clone(),
+                dependency_evidence_sha256: fixture_request.dependency_evidence_sha256.clone(),
+                health_state: "degraded".to_string(),
+                reason_code: Some("startup".to_string()),
+                boot_id: Some(boot_id.clone()),
+                boot_generation: Some(registration.boot_generation),
+            },
+        )
+        .expect("publish PostgreSQL boot degraded N2");
+        let request = SourceVerifierBootStartupRequest {
+            session_token: fixture_request.session_token.clone(),
+            startup_request_id: format!("phase628-pg-startup-{}", uuid::Uuid::new_v4().simple()),
+            boot_id,
+            runtime_instance_id: fixture_request.runtime_instance_id.clone(),
+            instance_epoch: fixture_request.instance_epoch,
+            boot_generation: registration.boot_generation,
+            worker_id: fixture_request.worker_id.clone(),
+            degraded_heartbeat_sequence: 2,
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let pool = pool.clone();
+                let request = request.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    record_source_verifier_boot_startup(&pool, &request)
+                        .expect("concurrent PostgreSQL verifier startup")
+                        .canonical_response_base64url
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("join PostgreSQL startup thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0], responses[1]);
+        let response =
+            record_source_verifier_boot_startup(&pool, &request).expect("read boot startup replay");
+        assert_eq!(response.probe_result, "idle");
+        assert_eq!(
+            (
+                response.degraded_heartbeat_sequence,
+                response.ready_heartbeat_sequence
+            ),
+            (2, 3)
+        );
+
+        let (startup_rows, heartbeat_sequence, health_state, startup_at_ms) =
+            crate::db::run_blocking_db(|| {
+                let mut connection = pool
+                    .get_pg()
+                    .expect("get PostgreSQL startup assertion connection");
+                let row = connection
+                    .query_one(
+                        "SELECT
+                           (SELECT COUNT(*)
+                              FROM jobs_managed_cloud_source_verifier_boot_startup_authorities
+                             WHERE startup_request_id=$1
+                               AND runtime_instance_id=$2 AND instance_epoch=$3),
+                           heartbeat.heartbeat_sequence,heartbeat.health_state,startup.startup_at_ms
+                           FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats heartbeat
+                           JOIN jobs_managed_cloud_source_verifier_boot_startup_authorities startup
+                             ON startup.runtime_instance_id=heartbeat.runtime_instance_id
+                            AND startup.instance_epoch=heartbeat.instance_epoch
+                          WHERE heartbeat.runtime_instance_id=$2 AND heartbeat.instance_epoch=$3",
+                        &[
+                            &request.startup_request_id,
+                            &request.runtime_instance_id,
+                            &request.instance_epoch,
+                        ],
+                    )
+                    .expect("read concurrent PostgreSQL startup authority");
+                (
+                    row.get::<_, i64>(0),
+                    row.get::<_, i64>(1),
+                    row.get::<_, String>(2),
+                    row.get::<_, i64>(3),
+                )
+            });
+        assert_eq!(startup_rows, 1);
+        assert_eq!((heartbeat_sequence, health_state.as_str()), (3, "ready"));
+        assert_eq!(startup_at_ms, response.startup_at_ms);
+
+        let mut changed = request.clone();
+        changed.degraded_heartbeat_sequence = 3;
+        assert!(record_source_verifier_boot_startup(&pool, &changed).is_err());
+        let mut second_id = request;
+        second_id.startup_request_id =
+            format!("osv-startup-second-{}", uuid::Uuid::new_v4().simple());
+        assert!(record_source_verifier_boot_startup(&pool, &second_id).is_err());
+    }
+
+    #[test]
+    fn original_source_verifier_v2_preserves_direct_ready_and_ready_heartbeat_compatibility() {
+        let fixture = original_source_verifier_runtime_test_fixture();
+        let database_path = fixture.database_path.clone();
+        let instance = fixture
+            .pool
+            .get()
+            .expect("v2 compatibility fixture connection")
+            .query_row(
+                &format!(
+                    "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
+                       FROM {} WHERE runtime_instance_id=?1",
+                    MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.instances
+                ),
+                params![fixture.runtime_instance_id],
+                managed_cloud_runtime_instance_from_sqlite,
+            )
+            .expect("load v2 verifier instance")
+            .0;
+        let heartbeat = record_managed_cloud_runtime_heartbeat(
+            &fixture.pool,
+            &ManagedCloudRuntimeHeartbeatInput {
+                runtime_instance_id: instance.runtime_instance_id.clone(),
+                worker_id: instance.worker_id.clone(),
+                session_token: fixture.runtime_session_token.clone(),
+                heartbeat_sequence: 2,
+                observed_head_revision: instance.head_revision,
+                observed_transition_sha256: instance.transition_sha256.clone(),
+                activation_sha256: instance.activation_sha256.clone(),
+                manifest_sha256: instance.manifest_sha256.clone(),
+                component_id: instance.component_id.clone(),
+                role: instance.role.clone(),
+                artifact_sha256: instance.artifact_sha256.clone(),
+                migration_set_sha256: instance.migration_set_sha256.clone(),
+                config_schema_sha256: instance.config_schema_sha256.clone(),
+                protocol_set_sha256: instance.protocol_set_sha256.clone(),
+                task_queue_sha256: instance.task_queue_sha256.clone(),
+                failure_converter_sha256: instance.failure_converter_sha256.clone(),
+                dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
+                health_state: "ready".to_string(),
+                reason_code: None,
+                boot_id: None,
+                boot_generation: None,
+            },
+        )
+        .expect("v2 ready-to-ready heartbeat remains valid");
+        assert_eq!(
+            (
+                heartbeat.heartbeat_sequence,
+                heartbeat.health_state.as_str()
+            ),
+            (2, "ready")
+        );
+        drop(fixture);
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-shm"));
+    }
+
     pub(crate) struct ManagedRunnerRuntimeTestFixture {
         pub(crate) scope: ManagedCloudScope,
         pub(crate) runtime_instance_id: String,
@@ -19266,16 +21761,26 @@ pub(crate) mod managed_cloud_release_authority_tests {
         scope: ManagedCloudScope,
         authority_now_ms: i64,
     ) -> ManagedRunnerRuntimeTestFixture {
-        assert!(managed_cloud_route_id(worker_id), "fixture worker id is invalid");
+        assert!(
+            managed_cloud_route_id(worker_id),
+            "fixture worker id is invalid"
+        );
         let grant_ttl_ms: i64 = 15 * 60_000;
         let existing_head = (scope.environment == "production"
             && scope.region == "us-east-1"
             && scope.channel == "general")
-            .then(|| current_original_source_managed_head(pool, grant_ttl_ms.saturating_add(5_000)))
+            .then(|| {
+                current_original_source_managed_head(
+                    pool,
+                    grant_ttl_ms.saturating_add(5_000),
+                    false,
+                )
+            })
             .flatten();
         let (activation_sha256, manifest_sha256) = existing_head.unwrap_or_else(|| {
-            install_valid_v2_original_source_managed_head(
+            install_valid_original_source_managed_head(
                 pool,
+                2,
                 authority_now_ms,
                 300_000,
                 24 * 60 * 60_000,
@@ -19319,8 +21824,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
                 .grant_token
                 .clone()
                 .unwrap_or_else(|| panic!("new {role} grant token"));
-            let runtime_instance_id =
-                format!("phase614b-{role}-instance-{fixture_suffix}");
+            let runtime_instance_id = format!("phase614b-{role}-instance-{fixture_suffix}");
             let runtime_session_token = derive_managed_cloud_runtime_session_token(
                 &grant_token,
                 &grant.grant_id,
@@ -19361,6 +21865,8 @@ pub(crate) mod managed_cloud_release_authority_tests {
                     dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
                     health_state: "ready".to_string(),
                     reason_code: None,
+                    boot_id: None,
+                    boot_generation: None,
                 },
             )
             .unwrap_or_else(|error| {
@@ -20657,6 +23163,10 @@ pub(crate) mod managed_cloud_release_authority_tests {
             "fn validate_application_transition(",
             "application queue persistence",
         );
-        assert_ordered(queue, &[H, M, ATS, D], "PostgreSQL application queue persistence");
+        assert_ordered(
+            queue,
+            &[H, M, ATS, D],
+            "PostgreSQL application queue persistence",
+        );
     }
 }

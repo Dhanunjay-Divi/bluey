@@ -42,10 +42,22 @@ export const PHASE_614B_PARITY_TABLES = [
   "jobs_job_integrity_trust_policies",
 ];
 
+export const PHASE_628_PARITY_TABLES = [
+  "jobs_managed_cloud_manifest_source_verifier_boot_protocols",
+  "jobs_managed_cloud_source_verifier_boot_generation_heads",
+  "jobs_managed_cloud_source_verifier_boot_registrations",
+  "jobs_managed_cloud_source_verifier_boot_startup_authorities",
+  "jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+  "jobs_original_source_verification_attempt_boot_bindings",
+  "jobs_managed_cloud_manifest_source_verifier_startup_protocols",
+  "jobs_managed_cloud_original_source_verifier_startup_authorities",
+];
+
 const SEMANTIC_PARITY_TABLES = new Set([
   ...PHASE_613_PARITY_TABLES,
   ...PHASE_614_PARITY_TABLES,
   ...PHASE_614B_PARITY_TABLES,
+  ...PHASE_628_PARITY_TABLES,
 ]);
 
 export const JOBS_PARITY_TABLES = [
@@ -126,9 +138,16 @@ export const JOBS_PARITY_TABLES = [
   ...PHASE_613_PARITY_TABLES,
   ...PHASE_614_PARITY_TABLES,
   ...PHASE_614B_PARITY_TABLES,
+  ...PHASE_628_PARITY_TABLES,
 ];
 
 const REQUIRED_INDEX_SIGNATURES = new Map([
+  [
+    "jobs_managed_cloud_source_verifier_boot_registrations",
+    [
+      "idx_jobs_managed_source_verifier_boot_registrations_instance on jobs_managed_cloud_source_verifier_boot_registrations (runtime_instance_id, instance_epoch, boot_generation desc)",
+    ],
+  ],
   ["jobs_public_beta_cohorts", []],
   [
     "jobs_public_beta_enrollments",
@@ -3120,6 +3139,22 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
     }
   }
 
+  for (const [dialect, source] of [
+    ["SQLite", sqliteSource],
+    ["Postgres", postgresSource],
+  ]) {
+    if (
+      !source.includes("FOREIGN KEY(boot_id)") ||
+      !source.includes(
+        "REFERENCES jobs_managed_cloud_source_verifier_boot_registrations(boot_id)",
+      )
+    ) {
+      issues.push(
+        `${dialect} jobs_managed_cloud_source_verifier_heartbeat_boot_bindings boot-registration foreign key is missing`,
+      );
+    }
+  }
+
   operationalHoldSqliteRequirements(issues, sqliteSource);
   operationalHoldPostgresRequirements(issues, postgresSource);
   requireIndexesPresent(issues, "SQLite", sqliteSource, "jobs_tracks", [
@@ -3262,6 +3297,86 @@ export function checkPhase614MigrationRegistration(runnerSource) {
     issues.push(
       "server Postgres migration runner must register 035_jobs_original_source_verification_authority.sql exactly once",
     );
+  }
+  return issues;
+}
+
+export function checkPhase628MigrationRegistration(runnerSource) {
+  const issues = [];
+  const sqliteDeclaration =
+    /const\s+SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY\s*:\s*&str\s*=\s*include_str!\(\s*"\.\.\/\.\.\/\.\.\/infra\/sqlite\/server-runtime\/062_jobs_original_source_verifier_startup_authority\.sql"\s*\)\s*;/g;
+  if ([...runnerSource.matchAll(sqliteDeclaration)].length !== 1) {
+    issues.push(
+      "server SQLite migration runner must include 062_jobs_original_source_verifier_startup_authority.sql exactly once",
+    );
+  }
+  const sqliteMigrations = extractRustArrayBody(runnerSource, "MIGRATIONS");
+  if (
+    !sqliteMigrations ||
+    (
+      sqliteMigrations.match(
+        /\bSQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY\b/g,
+      ) ?? []
+    ).length !== 1
+  ) {
+    issues.push(
+      "server SQLite migration runner must register 062_jobs_original_source_verifier_startup_authority.sql exactly once",
+    );
+  }
+
+  const postgresIdDeclaration =
+    /pub\s+const\s+JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID\s*:\s*&str\s*=\s*"040_jobs_original_source_verifier_startup_authority\.sql"\s*;/g;
+  if ([...runnerSource.matchAll(postgresIdDeclaration)].length !== 1) {
+    issues.push(
+      "server Postgres migration runner must declare 040_jobs_original_source_verifier_startup_authority.sql exactly once",
+    );
+  }
+  const postgresDeclaration =
+    /const\s+POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY\s*:\s*&str\s*=\s*include_str!\(\s*"\.\.\/\.\.\/\.\.\/infra\/postgres\/server-runtime\/040_jobs_original_source_verifier_startup_authority\.sql"\s*\)\s*;/g;
+  if ([...runnerSource.matchAll(postgresDeclaration)].length !== 1) {
+    issues.push(
+      "server Postgres migration runner must include 040_jobs_original_source_verifier_startup_authority.sql exactly once",
+    );
+  }
+  const postgresMigrations = extractRustArrayBody(
+    runnerSource,
+    "POSTGRES_POST_JOBS_MIGRATIONS",
+  );
+  const postgresRegistration =
+    /\(\s*JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID\s*,\s*POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY\s*,?\s*\)/g;
+  if (
+    !postgresMigrations ||
+    [...postgresMigrations.matchAll(postgresRegistration)].length !== 1
+  ) {
+    issues.push(
+      "server Postgres migration runner must register 040_jobs_original_source_verifier_startup_authority.sql exactly once",
+    );
+  }
+  for (const migration of [
+    [
+      "SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY",
+      "063_jobs_source_verifier_boot_generation_authority.sql",
+      "JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID",
+      "POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY",
+      "041_jobs_source_verifier_boot_generation_authority.sql",
+    ],
+    [
+      "SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS",
+      "065_jobs_source_verifier_heartbeat_boot_bindings.sql",
+      "JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID",
+      "POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS",
+      "043_jobs_source_verifier_heartbeat_boot_bindings.sql",
+    ],
+  ]) {
+    const [sqliteConst, sqliteFile, postgresId, postgresConst, postgresFile] = migration;
+    if ((runnerSource.match(new RegExp(sqliteFile, "g")) ?? []).length !== 1 || (sqliteMigrations.match(new RegExp(`\\b${sqliteConst}\\b`, "g")) ?? []).length !== 1) {
+      issues.push(`server SQLite migration runner must register ${sqliteFile} exactly once`);
+    }
+    const postgresFileOccurrences = (runnerSource.match(new RegExp(postgresFile, "g")) ?? []).length;
+    const expectedPostgresFileOccurrences = postgresFile.startsWith("041_") ? 3 : 2;
+    if (postgresFileOccurrences !== expectedPostgresFileOccurrences || !postgresMigrations.includes(postgresId) || !postgresMigrations.includes(postgresConst)) {
+      issues.push(`server Postgres migration runner must register ${postgresFile} exactly once`);
+    }
   }
   return issues;
 }
@@ -3493,6 +3608,30 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/038_jobs_public_beta_access.sql",
   );
+  const sqliteOriginalSourceVerifierStartupAuthorityPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/062_jobs_original_source_verifier_startup_authority.sql",
+  );
+  const postgresOriginalSourceVerifierStartupAuthorityPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/040_jobs_original_source_verifier_startup_authority.sql",
+  );
+  const sqliteSourceVerifierBootAuthorityPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql",
+  );
+  const postgresSourceVerifierBootAuthorityPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql",
+  );
+  const sqliteSourceVerifierHeartbeatBindingsPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql",
+  );
+  const postgresSourceVerifierHeartbeatBindingsPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
@@ -3509,6 +3648,9 @@ function main() {
     sqliteOriginalSourceVerificationAuthorityPath,
     sqliteSignedJobIntegrityAuthorityPath,
     sqlitePublicBetaAccessPath,
+    sqliteOriginalSourceVerifierStartupAuthorityPath,
+    sqliteSourceVerifierBootAuthorityPath,
+    sqliteSourceVerifierHeartbeatBindingsPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -3528,6 +3670,9 @@ function main() {
     postgresOriginalSourceVerificationAuthorityPath,
     postgresSignedJobIntegrityAuthorityPath,
     postgresPublicBetaAccessPath,
+    postgresOriginalSourceVerifierStartupAuthorityPath,
+    postgresSourceVerifierBootAuthorityPath,
+    postgresSourceVerifierHeartbeatBindingsPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -3536,6 +3681,7 @@ function main() {
     ...checkPhase613MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
     ...checkPhase614MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
     ...checkPhase614BMigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
+    ...checkPhase628MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
     ...checkPhase621MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
   );
 

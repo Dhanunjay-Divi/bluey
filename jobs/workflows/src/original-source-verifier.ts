@@ -7,10 +7,10 @@ import {
   claimManagedCloudRuntimeInstance,
   managedCloudReadyObservation,
   runManagedCloudRuntimeHeartbeats,
-  type ManagedCloudOriginalSourceVerifierStartup,
   type ManagedCloudOriginalSourceVerifierStartupApi,
   type ManagedCloudRuntimeInstance,
   type ManagedCloudRuntimeObservation,
+  type SourceVerifierBootStartupResult,
 } from "@bluey/jobs-automation/managed-cloud-runtime-client";
 
 import { OriginalSourceVerificationApiClient } from "./original-source-verification-api.js";
@@ -64,7 +64,7 @@ export async function runOriginalSourceVerifierFromEnvironment(): Promise<void> 
       origin: runtimeConfig.apiOrigin,
       signingKey: runtimeConfig.signingKey,
       binding: originalSourceVerifierBinding(
-        runtimeInstance,
+        reportingInstance,
         runtimeConfig.sessionToken,
       ),
       requestTimeoutMs: environmentInteger(
@@ -115,8 +115,8 @@ export async function runOriginalSourceVerifierFromEnvironment(): Promise<void> 
 
 export interface EstablishedOriginalSourceVerifierStartup {
   reportingInstance: ManagedCloudRuntimeInstance;
-  startup: ManagedCloudOriginalSourceVerifierStartup;
-  bootGeneration?: number;
+  startup: SourceVerifierBootStartupResult;
+  bootGeneration: number;
 }
 
 export async function establishOriginalSourceVerifierStartup(
@@ -124,33 +124,28 @@ export async function establishOriginalSourceVerifierStartup(
   runtimeInstance: ManagedCloudRuntimeInstance,
   observation: ManagedCloudRuntimeObservation,
 ): Promise<EstablishedOriginalSourceVerifierStartup> {
-  // Establish the server-assigned boot generation before any heartbeat so the
-  // readiness transition can be fenced by generation rather than by instance
-  // epoch alone. Registration is idempotent, so a retry inside this process
-  // replays the same generation instead of allocating a new one.
-  let bootGeneration: number | undefined;
-  const bootCapableApi = runtimeApi as Partial<{
-    registerSourceVerifierBoot: (
-      instance: ManagedCloudRuntimeInstance,
-    ) => Promise<{ bootGeneration: number }>;
-  }>;
-  if (typeof bootCapableApi.registerSourceVerifierBoot === "function") {
-    const registration = await bootCapableApi.registerSourceVerifierBoot(
-      runtimeInstance,
-    );
-    if (
-      !Number.isSafeInteger(registration.bootGeneration) ||
-      registration.bootGeneration < 1
-    ) {
-      throw new Error(
-        "Original-source verifier boot generation is invalid",
-      );
-    }
-    bootGeneration = registration.bootGeneration;
+  if (
+    typeof runtimeApi.registerSourceVerifierBoot !== "function" ||
+    typeof runtimeApi.sourceVerifierBootStartup !== "function"
+  ) {
+    throw new Error("Original-source verifier requires boot startup authority");
   }
+  // Registration has a stable per-process idempotency token. Its bounded
+  // transport retry is implemented by the client and returns the same
+  // server-assigned generation after a response loss.
+  const registration = await runtimeApi.registerSourceVerifierBoot(runtimeInstance);
+  const bootGeneration = registration.bootGeneration;
+  if (!Number.isSafeInteger(bootGeneration) || bootGeneration < 1) {
+    throw new Error("Original-source verifier boot generation is invalid");
+  }
+  const bootedRuntimeInstance: ManagedCloudRuntimeInstance = {
+    ...runtimeInstance,
+    bootId: registration.bootId,
+    bootGeneration,
+  };
   const degradedHeartbeatSequence = runtimeInstance.nextHeartbeatSequence;
   const degradedHeartbeat = await runtimeApi.heartbeat(
-    runtimeInstance,
+    bootedRuntimeInstance,
     degradedHeartbeatSequence,
     {
       ...observation,
@@ -169,10 +164,11 @@ export async function establishOriginalSourceVerifierStartup(
     );
   }
 
-  let startup: ManagedCloudOriginalSourceVerifierStartup;
+  let startup: SourceVerifierBootStartupResult;
   try {
-    startup = await runtimeApi.originalSourceVerifierStartup(
-      runtimeInstance,
+    startup = await runtimeApi.sourceVerifierBootStartup(
+      bootedRuntimeInstance,
+      bootGeneration,
       degradedHeartbeatSequence,
     );
     if (
@@ -184,33 +180,9 @@ export async function establishOriginalSourceVerifierStartup(
       );
     }
   } catch (startupError) {
-    try {
-      const failedHeartbeat = await runtimeApi.heartbeat(
-        runtimeInstance,
-        degradedHeartbeatSequence + 1,
-        {
-          ...observation,
-          healthState: "degraded",
-          reasonCode: "probe_failed",
-        },
-      );
-      if (
-        failedHeartbeat.replayed ||
-        failedHeartbeat.heartbeatSequence !== degradedHeartbeatSequence + 1 ||
-        failedHeartbeat.healthState !== "degraded" ||
-        failedHeartbeat.reasonCode !== "probe_failed"
-      ) {
-        throw new Error(
-          "Original-source verifier probe failure was not freshly acknowledged",
-        );
-      }
-    } catch (failureReportError) {
-      throw new AggregateError(
-        [startupError, failureReportError],
-        "Original-source verifier startup and probe-failure acknowledgement failed",
-      );
-    }
-    throw new Error("Original-source verifier startup probe failed", {
+    // A lost response can mean the server already committed ready. Never send
+    // a follow-up degraded heartbeat that could lower that committed state.
+    throw new Error("Original-source verifier boot startup failed", {
       cause: startupError,
     });
   }
@@ -219,7 +191,7 @@ export async function establishOriginalSourceVerifierStartup(
     startup,
     bootGeneration,
     reportingInstance: {
-      ...runtimeInstance,
+      ...bootedRuntimeInstance,
       nextHeartbeatSequence: startup.readyHeartbeatSequence + 1,
     },
   };
@@ -228,7 +200,7 @@ export async function establishOriginalSourceVerifierStartup(
 export async function runOriginalSourceVerifierLifecycle(
   worker: OriginalSourceVerifierRuntime,
   controller: AbortController,
-  startup: ManagedCloudOriginalSourceVerifierStartup,
+  startup: Pick<SourceVerifierBootStartupResult, "startupAuthoritySha256">,
   runRuntimeHeartbeats: () => Promise<void>,
 ): Promise<void> {
   // The transactional startup authority already performed the rollback-only

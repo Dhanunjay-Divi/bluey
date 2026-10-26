@@ -380,16 +380,9 @@ async fn record_source_verifier_boot_startup_endpoint(
     if request.runtime_instance_id != runtime_instance_id {
         return Err(invalid_request());
     }
-    // The server, not the client, must determine readiness from the
-    // rollback-only probe. Until that probe is integrated into the startup
-    // orchestration this endpoint refuses rather than fabricating readiness.
-    let _ = &request;
-    return Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Server-side source-verifier readiness probe is not yet integrated.".to_string(),
-    ));
-    #[allow(unreachable_code)]
-    let startup = jobs::record_source_verifier_boot_startup(&state.pool, &request, "idle")
+    // The authority transaction owns the rollback-only probe and the ready CAS.
+    // No client-supplied probe result can reach this boundary.
+    let startup = jobs::record_source_verifier_boot_startup(&state.pool, &request)
         .map_err(source_verifier_boot_api_error)?;
     let canonical = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(startup.canonical_response_base64url.as_bytes())

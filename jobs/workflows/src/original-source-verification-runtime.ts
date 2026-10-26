@@ -79,7 +79,10 @@ export class OriginalSourceVerifierRuntime {
   private readonly api: OriginalSourceVerificationWorkerApi;
   private readonly verifier: OriginalSourceVerifier;
   private readonly logger: OriginalSourceVerificationWorkerLogger;
-  private readonly sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  private readonly sleep: (
+    milliseconds: number,
+    signal: AbortSignal,
+  ) => Promise<void>;
   private readonly workerRuntimeIdentitySha256: string;
   private readonly stopController = new AbortController();
   private lastPollCompletedAtMs = 0;
@@ -101,8 +104,8 @@ export class OriginalSourceVerifierRuntime {
       "poll interval",
     );
     this.leaseHeartbeatIntervalMs = boundedInteger(
-      options.leaseHeartbeatIntervalMs
-        ?? DEFAULT_ORIGINAL_SOURCE_LEASE_HEARTBEAT_INTERVAL_MS,
+      options.leaseHeartbeatIntervalMs ??
+        DEFAULT_ORIGINAL_SOURCE_LEASE_HEARTBEAT_INTERVAL_MS,
       100,
       30_000,
       "lease heartbeat interval",
@@ -124,7 +127,8 @@ export class OriginalSourceVerifierRuntime {
             error_code: pollErrorCode(error),
           });
         }
-        if (!this.stopping) await this.sleep(this.pollIntervalMs, this.stopController.signal);
+        if (!this.stopping)
+          await this.sleep(this.pollIntervalMs, this.stopController.signal);
       }
     } finally {
       signal?.removeEventListener("abort", stop);
@@ -137,10 +141,23 @@ export class OriginalSourceVerifierRuntime {
     this.stopController.abort();
   }
 
+  markManagedCloudStartupReady(
+    startupAuthoritySha256: string,
+    nowMs: number = Date.now(),
+  ): void {
+    requiredSha256(startupAuthoritySha256, "managed startup authority");
+    if (!Number.isSafeInteger(nowMs) || nowMs < 1 || this.stopping) {
+      throw new Error("Original-source managed startup readiness is invalid");
+    }
+    this.lastPollCompletedAtMs = nowMs;
+  }
+
   managedCloudReady(nowMs: number = Date.now()): boolean {
     const maximumAgeMs = Math.max(15_000, this.pollIntervalMs * 3);
-    return this.lastPollCompletedAtMs > this.lastPollFailedAtMs
-      && nowMs - this.lastPollCompletedAtMs <= maximumAgeMs;
+    return (
+      this.lastPollCompletedAtMs > this.lastPollFailedAtMs &&
+      nowMs - this.lastPollCompletedAtMs <= maximumAgeMs
+    );
   }
 
   async establishReadiness(): Promise<OriginalSourceVerificationPollOutcome> {
@@ -161,7 +178,10 @@ export class OriginalSourceVerifierRuntime {
     let subject;
     let rawSubject: unknown;
     try {
-      if (originalSourceSha256(lease.canonical_subject_json) !== lease.subject_sha256) {
+      if (
+        originalSourceSha256(lease.canonical_subject_json) !==
+        lease.subject_sha256
+      ) {
         throw new Error("subject digest changed");
       }
       rawSubject = JSON.parse(lease.canonical_subject_json) as unknown;
@@ -211,7 +231,10 @@ export class OriginalSourceVerifierRuntime {
 
     let verification;
     try {
-      verification = await this.verifier.verify(subject, heartbeatController.signal);
+      verification = await this.verifier.verify(
+        subject,
+        heartbeatController.signal,
+      );
     } catch {
       const errorCode = "unreachable" as const;
       verification = {
@@ -283,8 +306,10 @@ export function originalSourceVerifierBinding(
   instance: ManagedCloudRuntimeInstance,
   runtimeSessionToken: string,
 ): OriginalSourceVerifierBinding {
-  if (instance.role !== "original_source_verifier"
-    || instance.componentId !== "jobs-workflows") {
+  if (
+    instance.role !== "original_source_verifier" ||
+    instance.componentId !== "jobs-workflows"
+  ) {
     throw new Error("Original-source managed runtime identity is invalid");
   }
   const authority = {
@@ -301,7 +326,7 @@ export function originalSourceVerifierBinding(
     version: 1,
     workerId: instance.workerId,
   };
-  return {
+  const binding: OriginalSourceVerifierBinding = {
     worker_id: instance.workerId,
     runtime_instance_id: instance.runtimeInstanceId,
     runtime_instance_epoch: instance.instanceEpoch,
@@ -310,9 +335,27 @@ export function originalSourceVerifierBinding(
     ),
     runtime_session_token: requiredRuntimeSessionToken(runtimeSessionToken),
   };
+  if (instance.bootId !== undefined || instance.bootGeneration !== undefined) {
+    const bootId = instance.bootId;
+    const bootGeneration = instance.bootGeneration;
+    if (
+      typeof bootId !== "string" ||
+      !/^[A-Za-z0-9_-]{20,128}$/.test(bootId) ||
+      typeof bootGeneration !== "number" ||
+      !Number.isSafeInteger(bootGeneration) ||
+      bootGeneration < 1
+    ) {
+      throw new Error("Original-source managed boot identity is invalid");
+    }
+    binding.boot_id = bootId;
+    binding.boot_generation = bootGeneration;
+  }
+  return binding;
 }
 
-export function terminalRequestId(lease: OriginalSourceVerificationLease): string {
+export function terminalRequestId(
+  lease: OriginalSourceVerificationLease,
+): string {
   const digest = createHash("sha256")
     .update("bluey-jobs-original-source-terminal-request-v1\0")
     .update(lease.assignment_id)
@@ -344,10 +387,12 @@ function pollErrorCode(
 }
 
 function requiredRuntimeSessionToken(value: string): string {
-  if (typeof value !== "string"
-    || !/^[A-Za-z0-9_-]{43}$/.test(value)
-    || Buffer.from(value, "base64url").length !== 32
-    || Buffer.from(value, "base64url").toString("base64url") !== value) {
+  if (
+    typeof value !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/.test(value) ||
+    Buffer.from(value, "base64url").length !== 32 ||
+    Buffer.from(value, "base64url").toString("base64url") !== value
+  ) {
     throw new Error("Original-source managed runtime session token is invalid");
   }
   return value;
@@ -360,14 +405,22 @@ function requiredSha256(value: string, label: string): string {
   return value;
 }
 
-function boundedInteger(value: number, minimum: number, maximum: number, label: string): number {
+function boundedInteger(
+  value: number,
+  minimum: number,
+  maximum: number,
+  label: string,
+): number {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new Error(`Original-source ${label} is invalid`);
   }
   return value;
 }
 
-function interruptibleSleep(milliseconds: number, signal: AbortSignal): Promise<void> {
+function interruptibleSleep(
+  milliseconds: number,
+  signal: AbortSignal,
+): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) return resolve();
     const timer = setTimeout(done, milliseconds);

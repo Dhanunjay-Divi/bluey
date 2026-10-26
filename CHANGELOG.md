@@ -4,9 +4,30 @@ All notable Bluey changes are documented here. Historical release detail lives
 under `docs/release/`.
 
 ## [Unreleased]
+- Jobs: complete session-authenticated source-verifier boot generation readiness.
+  Registration/startup retries preserve exact payloads and canonical responses;
+  the server owns the rollback-only lease probe and atomically commits readiness.
+  Prospective SQLite 065 / PostgreSQL 043 bind every heartbeat to the current boot
+  and admit the ten-capability v3 metadata shape without rewriting v1/v2 bytes.
+  Operational verifier requests and immutable attempt bindings now carry the
+  exact boot generation; replacement boots cannot inherit old readiness or
+  attempts, and failed-probe heartbeats cannot be promoted by startup.
 
 ### Added
 
+- Prepared Bluey Jobs managed-cloud release and activation contract v3 without reinterpreting
+  historical v1/v2 signed bytes. V3 binds direct discovery, global discovery, and original-source
+  verification to the complete nine-role runtime set, the SQLite `065` / PostgreSQL `043`
+  migration heads, and separate `source_verifier_startup` and `source_verifier_boot` protocols. An exact
+  `managed-cloud-runtime` endpoint admits only an original-source verifier that first publishes
+  `degraded/startup`, proves the real backend lease decision through a rollback-only savepoint,
+  and atomically advances one heartbeat sequence to ready with immutable, byte-replayable startup
+  authority. Generic heartbeats cannot bypass that transition. Ambiguous startup
+  never starts the worker or sends a speculative degrading failure report. Release-v3
+  reuses the reviewed artifact-publication, remote-readback, promotion-v2, and rollback-v2
+  authority without rebuilding artifacts. This source phase does not push, publish, sign,
+  activate, deploy, enable a production flag, access a provider, submit an application, send a
+  message, or change customer state.
 - Added bounded Bluey Jobs managed-cloud artifact-publication authority. New
   release-v2 candidates bind successful exact-tip default-branch Jobs CI and
   Observability runs instead of treating a candidate-local self-test as the

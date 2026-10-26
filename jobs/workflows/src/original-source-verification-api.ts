@@ -22,6 +22,8 @@ export interface OriginalSourceVerifierBinding {
   runtime_instance_epoch: number;
   runtime_authority_sha256: string;
   runtime_session_token: string;
+  boot_id?: string;
+  boot_generation?: number;
 }
 
 export interface OriginalSourceVerificationLease {
@@ -300,7 +302,17 @@ implements OriginalSourceVerificationWorkerApi {
 }
 
 function parseBinding(value: unknown): OriginalSourceVerifierBinding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Original-source runtime binding is invalid");
+  }
+  const supplied = value as Record<string, unknown>;
+  const hasBootId = Object.hasOwn(supplied, "boot_id");
+  const hasBootGeneration = Object.hasOwn(supplied, "boot_generation");
+  if (hasBootId !== hasBootGeneration) {
+    throw new Error("Original-source boot binding is incomplete");
+  }
   const row = exactRecord(value, [
+    ...(hasBootId ? ["boot_generation", "boot_id"] : []),
     "runtime_authority_sha256",
     "runtime_instance_epoch",
     "runtime_instance_id",
@@ -309,13 +321,18 @@ function parseBinding(value: unknown): OriginalSourceVerifierBinding {
   ], "runtime binding");
   const workerId = requiredString(row.worker_id, "worker ID", 128);
   if (!SAFE_WORKER_ID.test(workerId)) throw new Error("Original-source worker ID is invalid");
-  return {
+  const binding: OriginalSourceVerifierBinding = {
     worker_id: workerId,
     runtime_instance_id: exactId(row.runtime_instance_id, "runtime instance ID"),
     runtime_instance_epoch: positiveInteger(row.runtime_instance_epoch, "runtime instance epoch"),
     runtime_authority_sha256: sha256(row.runtime_authority_sha256, "runtime authority"),
     runtime_session_token: canonicalToken(row.runtime_session_token, "runtime session token"),
   };
+  if (hasBootId) {
+    binding.boot_id = exactId(row.boot_id, "boot ID");
+    binding.boot_generation = positiveInteger(row.boot_generation, "boot generation");
+  }
+  return binding;
 }
 
 function parseLease(value: unknown): OriginalSourceVerificationLease {

@@ -614,6 +614,8 @@ fn heartbeat_input(
         dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
         health_state: health_state.to_string(),
         reason_code,
+        boot_id: None,
+        boot_generation: None,
     }
 }
 

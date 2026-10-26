@@ -169,6 +169,10 @@ pub struct OriginalSourceVerifierBinding {
     pub runtime_instance_epoch: i64,
     pub runtime_authority_sha256: String,
     pub runtime_session_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1823,10 +1827,190 @@ fn original_source_validate_binding(
         || !original_source_valid_sha256(&binding.runtime_authority_sha256)
         || binding.runtime_session_token.len() < 32
         || binding.runtime_session_token.len() > 4096
+        || match (&binding.boot_id, binding.boot_generation) {
+            (None, None) => false,
+            (Some(id), Some(generation)) => {
+                !original_source_valid_id(id) || !(1..=9_007_199_254_740_991).contains(&generation)
+            }
+            _ => true,
+        }
     {
         return Err(OriginalSourceVerificationError::InvalidInput(
             "managed verifier binding is invalid".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn original_source_require_current_boot_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    binding: &OriginalSourceVerifierBinding,
+) -> OriginalSourceVerificationResult<()> {
+    let admitted: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1
+           FROM jobs_managed_cloud_original_source_verifier_runtime_instances i
+           JOIN jobs_managed_cloud_manifest_source_verifier_boot_protocols p
+             ON p.manifest_sha256=i.manifest_sha256
+          WHERE i.runtime_instance_id=?1 AND i.instance_epoch=?2)",
+            params![binding.runtime_instance_id, binding.runtime_instance_epoch],
+            |row| row.get(0),
+        )
+        .map_err(original_source_storage)?;
+    let matched: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1
+           FROM jobs_managed_cloud_source_verifier_boot_registrations r
+           JOIN jobs_managed_cloud_source_verifier_boot_generation_heads h
+             ON h.runtime_instance_id=r.runtime_instance_id AND h.instance_epoch=r.instance_epoch
+          WHERE r.runtime_instance_id=?1 AND r.instance_epoch=?2 AND r.worker_id=?3
+            AND r.boot_id=?4 AND r.boot_generation=?5
+            AND h.current_boot_generation=r.boot_generation
+            AND h.ready_boot_generation=r.boot_generation)",
+            params![
+                binding.runtime_instance_id,
+                binding.runtime_instance_epoch,
+                binding.worker_id,
+                binding.boot_id,
+                binding.boot_generation
+            ],
+            |row| row.get(0),
+        )
+        .map_err(original_source_storage)?;
+    if admitted != binding.boot_id.is_some() || (admitted && !matched) {
+        return Err(OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable);
+    }
+    Ok(())
+}
+
+fn original_source_require_current_boot_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    binding: &OriginalSourceVerifierBinding,
+) -> OriginalSourceVerificationResult<()> {
+    let admitted: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1
+           FROM jobs_managed_cloud_original_source_verifier_runtime_instances i
+           JOIN jobs_managed_cloud_manifest_source_verifier_boot_protocols p
+             ON p.manifest_sha256=i.manifest_sha256
+          WHERE i.runtime_instance_id=$1 AND i.instance_epoch=$2)",
+            &[
+                &binding.runtime_instance_id,
+                &binding.runtime_instance_epoch,
+            ],
+        )
+        .map_err(original_source_storage)?
+        .get(0);
+    let matched: bool = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1
+           FROM jobs_managed_cloud_source_verifier_boot_registrations r
+           JOIN jobs_managed_cloud_source_verifier_boot_generation_heads h
+             ON h.runtime_instance_id=r.runtime_instance_id AND h.instance_epoch=r.instance_epoch
+          WHERE r.runtime_instance_id=$1 AND r.instance_epoch=$2 AND r.worker_id=$3
+            AND r.boot_id=$4 AND r.boot_generation=$5
+            AND h.current_boot_generation=r.boot_generation
+            AND h.ready_boot_generation=r.boot_generation)",
+            &[
+                &binding.runtime_instance_id,
+                &binding.runtime_instance_epoch,
+                &binding.worker_id,
+                &binding.boot_id,
+                &binding.boot_generation,
+            ],
+        )
+        .map_err(original_source_storage)?
+        .get(0);
+    if admitted != binding.boot_id.is_some() || (admitted && !matched) {
+        return Err(OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable);
+    }
+    Ok(())
+}
+
+fn original_source_require_attempt_boot_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    binding: &OriginalSourceVerifierBinding,
+) -> OriginalSourceVerificationResult<()> {
+    let stored = tx.query_row(
+        "SELECT boot_id,boot_generation FROM jobs_original_source_verification_attempt_boot_bindings
+          WHERE attempt_id=?1 AND runtime_instance_id=?2 AND runtime_instance_epoch=?3",
+        params![attempt_id, binding.runtime_instance_id, binding.runtime_instance_epoch],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    ).optional().map_err(original_source_storage)?;
+    if stored
+        .as_ref()
+        .map(|(id, generation)| (id.as_str(), *generation))
+        != binding.boot_id.as_deref().zip(binding.boot_generation)
+    {
+        return Err(OriginalSourceVerificationError::LeaseLost);
+    }
+    Ok(())
+}
+
+fn original_source_require_attempt_boot_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    attempt_id: &str,
+    binding: &OriginalSourceVerifierBinding,
+) -> OriginalSourceVerificationResult<()> {
+    let stored = tx.query_opt(
+        "SELECT boot_id,boot_generation FROM jobs_original_source_verification_attempt_boot_bindings
+          WHERE attempt_id=$1 AND runtime_instance_id=$2 AND runtime_instance_epoch=$3",
+        &[&attempt_id, &binding.runtime_instance_id, &binding.runtime_instance_epoch],
+    ).map_err(original_source_storage)?
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)));
+    if stored
+        .as_ref()
+        .map(|(id, generation)| (id.as_str(), *generation))
+        != binding.boot_id.as_deref().zip(binding.boot_generation)
+    {
+        return Err(OriginalSourceVerificationError::LeaseLost);
+    }
+    Ok(())
+}
+
+fn original_source_bind_attempt_boot_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    attempt_id: &str,
+    binding: &OriginalSourceVerifierBinding,
+) -> OriginalSourceVerificationResult<()> {
+    if let (Some(boot_id), Some(generation)) = (&binding.boot_id, binding.boot_generation) {
+        tx.execute(
+            "INSERT INTO jobs_original_source_verification_attempt_boot_bindings(
+                attempt_id,runtime_instance_id,runtime_instance_epoch,boot_id,boot_generation)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![
+                attempt_id,
+                binding.runtime_instance_id,
+                binding.runtime_instance_epoch,
+                boot_id,
+                generation
+            ],
+        )
+        .map_err(original_source_storage)?;
+    }
+    Ok(())
+}
+
+fn original_source_bind_attempt_boot_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    attempt_id: &str,
+    binding: &OriginalSourceVerifierBinding,
+) -> OriginalSourceVerificationResult<()> {
+    if let (Some(boot_id), Some(generation)) = (&binding.boot_id, binding.boot_generation) {
+        tx.execute(
+            "INSERT INTO jobs_original_source_verification_attempt_boot_bindings(
+                attempt_id,runtime_instance_id,runtime_instance_epoch,boot_id,boot_generation)
+             VALUES($1,$2,$3,$4,$5)",
+            &[
+                &attempt_id,
+                &binding.runtime_instance_id,
+                &binding.runtime_instance_epoch,
+                &boot_id,
+                &generation,
+            ],
+        )
+        .map_err(original_source_storage)?;
     }
     Ok(())
 }
@@ -2847,6 +3031,7 @@ fn original_source_claim_lease_candidate_sqlite(
         ],
     )
     .map_err(original_source_storage)?;
+    original_source_bind_attempt_boot_sqlite(tx, &attempt_id, binding)?;
     let changed = tx
         .execute(
             "UPDATE jobs_original_source_verification_assignments SET
@@ -2995,6 +3180,7 @@ fn original_source_claim_lease_candidate_postgres(
         ],
     )
     .map_err(original_source_storage)?;
+    original_source_bind_attempt_boot_postgres(tx, &attempt_id, binding)?;
     let changed = tx
         .execute(
             "UPDATE jobs_original_source_verification_assignments SET
@@ -3052,6 +3238,121 @@ fn original_source_claim_lease_candidate_postgres(
     })
 }
 
+fn original_source_lease_sqlite_tx(
+    tx: &mut rusqlite::Transaction<'_>,
+    binding: &OriginalSourceVerifierBinding,
+    lease_token: &str,
+    lease_token_sha256: &str,
+    runtime_session_token_sha256: &str,
+    now: i64,
+) -> OriginalSourceVerificationResult<Option<OriginalSourceVerificationLease>> {
+    original_source_require_current_boot_sqlite(tx, binding)?;
+    original_source_reconcile_deferred_holds_sqlite(tx, binding, now)?;
+    original_source_scan_lease_candidates(
+        tx,
+        |tx, cursor| original_source_lease_candidates_sqlite(tx, binding, now, cursor),
+        |_, enumerated| Ok(Some(enumerated.clone())),
+        |tx, candidate| original_source_lease_candidate_decision_sqlite(tx, binding, candidate),
+        |tx, candidate| original_source_defer_operational_hold_sqlite(tx, candidate, now),
+        |tx, candidate, reason| {
+            original_source_supersede_lease_candidate_sqlite(tx, candidate, reason, now)
+        },
+        |tx, candidate| {
+            original_source_claim_lease_candidate_sqlite(
+                tx,
+                binding,
+                candidate,
+                lease_token,
+                lease_token_sha256,
+                runtime_session_token_sha256,
+                now,
+            )
+        },
+    )
+}
+
+fn original_source_lease_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    binding: &OriginalSourceVerifierBinding,
+    lease_token: &str,
+    lease_token_sha256: &str,
+    runtime_session_token_sha256: &str,
+    now: i64,
+) -> OriginalSourceVerificationResult<Option<OriginalSourceVerificationLease>> {
+    original_source_require_current_boot_postgres(tx, binding)?;
+    original_source_reconcile_deferred_holds_postgres(tx, binding, now)?;
+    original_source_scan_lease_candidates(
+        tx,
+        |tx, cursor| original_source_lease_candidates_postgres(tx, binding, now, cursor),
+        |tx, enumerated| {
+            original_source_lock_lease_candidate_postgres(tx, binding, enumerated, now)
+        },
+        |tx, candidate| original_source_lease_candidate_decision_postgres(tx, binding, candidate),
+        |tx, candidate| original_source_defer_operational_hold_postgres(tx, candidate, now),
+        |tx, candidate, reason| {
+            original_source_supersede_lease_candidate_postgres(tx, candidate, reason, now)
+        },
+        |tx, candidate| {
+            original_source_claim_lease_candidate_postgres(
+                tx,
+                binding,
+                candidate,
+                lease_token,
+                lease_token_sha256,
+                runtime_session_token_sha256,
+                now,
+            )
+        },
+    )
+}
+
+pub(crate) fn probe_original_source_verification_leaseability_sqlite_tx(
+    tx: &mut rusqlite::Transaction<'_>,
+    binding: &OriginalSourceVerifierBinding,
+    now: i64,
+) -> ManagedCloudResult<bool> {
+    // Managed release timestamps have second precision, while assignments use
+    // millisecond DB time. Scan with the real lease path's clock so an already
+    // due assignment created in this second cannot be misclassified as idle.
+    let now =
+        now.max(original_source_db_now_sqlite(tx).map_err(|error| {
+            ManagedCloudRegistryError::Storage(anyhow::anyhow!(error.to_string()))
+        })?);
+    let lease_token = original_source_new_lease_token();
+    let lease_token_sha256 = original_source_sha256(lease_token.as_bytes());
+    let session_sha256 = original_source_sha256(binding.runtime_session_token.as_bytes());
+    original_source_lease_sqlite_tx(
+        tx,
+        binding,
+        &lease_token,
+        &lease_token_sha256,
+        &session_sha256,
+        now,
+    )
+    .map(|lease| lease.is_some())
+    .map_err(|error| ManagedCloudRegistryError::Storage(anyhow::anyhow!(error.to_string())))
+}
+
+pub(crate) fn probe_original_source_verification_leaseability_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    binding: &OriginalSourceVerifierBinding,
+    now: i64,
+) -> ManagedCloudResult<bool> {
+    let lease_token = original_source_new_lease_token();
+    let lease_token_sha256 = original_source_sha256(lease_token.as_bytes());
+    let session_sha256 = original_source_sha256(binding.runtime_session_token.as_bytes());
+    original_source_lease_postgres_tx(
+        tx,
+        binding,
+        &lease_token,
+        &lease_token_sha256,
+        &session_sha256,
+        now,
+    )
+    .map(|lease| lease.is_some())
+    .map_err(|error| ManagedCloudRegistryError::Storage(anyhow::anyhow!(error.to_string())))
+}
+
 pub fn lease_original_source_verification(
     pool: &DbPool,
     binding: &OriginalSourceVerifierBinding,
@@ -3077,29 +3378,13 @@ pub fn lease_original_source_verification(
             )
             .map_err(|_| OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable)?;
             let now = original_source_db_now_sqlite(&tx)?;
-            original_source_reconcile_deferred_holds_sqlite(&tx, binding, now)?;
-            let lease = original_source_scan_lease_candidates(
+            let lease = original_source_lease_sqlite_tx(
                 &mut tx,
-                |tx, cursor| original_source_lease_candidates_sqlite(tx, binding, now, cursor),
-                |_, enumerated| Ok(Some(enumerated.clone())),
-                |tx, candidate| {
-                    original_source_lease_candidate_decision_sqlite(tx, binding, candidate)
-                },
-                |tx, candidate| original_source_defer_operational_hold_sqlite(tx, candidate, now),
-                |tx, candidate, reason| {
-                    original_source_supersede_lease_candidate_sqlite(tx, candidate, reason, now)
-                },
-                |tx, candidate| {
-                    original_source_claim_lease_candidate_sqlite(
-                        tx,
-                        binding,
-                        candidate,
-                        &lease_token,
-                        &lease_token_sha256,
-                        &runtime_session_token_sha256,
-                        now,
-                    )
-                },
+                binding,
+                &lease_token,
+                &lease_token_sha256,
+                &runtime_session_token_sha256,
+                now,
             )?;
             tx.commit().map_err(original_source_storage)?;
             Ok(lease)
@@ -3109,7 +3394,9 @@ pub fn lease_original_source_verification(
             let mut tx = conn.transaction().map_err(original_source_storage)?;
             // Canonical cross-authority order: H -> exclusive M -> per-account D.
             lock_operational_hold_shared_postgres_tx(&mut tx).map_err(original_source_storage)?;
-            require_original_source_verifier_runtime_active_postgres_tx(
+            lock_managed_cloud_release_registry_exclusive_postgres_tx(&mut tx)
+                .map_err(|_| OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable)?;
+            require_original_source_verifier_runtime_active_postgres_tx_after_prelock(
                 &mut tx,
                 &binding.worker_id,
                 &binding.runtime_instance_id,
@@ -3119,31 +3406,13 @@ pub fn lease_original_source_verification(
             )
             .map_err(|_| OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable)?;
             let now = original_source_db_now_postgres(&mut tx)?;
-            original_source_reconcile_deferred_holds_postgres(&mut tx, binding, now)?;
-            let lease = original_source_scan_lease_candidates(
+            let lease = original_source_lease_postgres_tx(
                 &mut tx,
-                |tx, cursor| original_source_lease_candidates_postgres(tx, binding, now, cursor),
-                |tx, enumerated| {
-                    original_source_lock_lease_candidate_postgres(tx, binding, enumerated, now)
-                },
-                |tx, candidate| {
-                    original_source_lease_candidate_decision_postgres(tx, binding, candidate)
-                },
-                |tx, candidate| original_source_defer_operational_hold_postgres(tx, candidate, now),
-                |tx, candidate, reason| {
-                    original_source_supersede_lease_candidate_postgres(tx, candidate, reason, now)
-                },
-                |tx, candidate| {
-                    original_source_claim_lease_candidate_postgres(
-                        tx,
-                        binding,
-                        candidate,
-                        &lease_token,
-                        &lease_token_sha256,
-                        &runtime_session_token_sha256,
-                        now,
-                    )
-                },
+                binding,
+                &lease_token,
+                &lease_token_sha256,
+                &runtime_session_token_sha256,
+                now,
             )?;
             tx.commit().map_err(original_source_storage)?;
             Ok(lease)
@@ -3193,6 +3462,12 @@ pub fn heartbeat_original_source_verification(
                 &request.binding.runtime_authority_sha256,
             )
             .map_err(|_| OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable)?;
+            original_source_require_current_boot_sqlite(&tx, &request.binding)?;
+            original_source_require_attempt_boot_sqlite(
+                &tx,
+                &request.attempt_id,
+                &request.binding,
+            )?;
             let now = original_source_db_now_sqlite(&tx)?;
             let row = tx
                 .query_row(
@@ -3341,6 +3616,12 @@ pub fn heartbeat_original_source_verification(
                 &request.binding.runtime_authority_sha256,
             )
             .map_err(|_| OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable)?;
+            original_source_require_current_boot_postgres(&mut tx, &request.binding)?;
+            original_source_require_attempt_boot_postgres(
+                &mut tx,
+                &request.attempt_id,
+                &request.binding,
+            )?;
             let now = original_source_db_now_postgres(&mut tx)?;
             let (expected_account_id, expected_job_id) = original_source_attempt_identity_postgres(
                 &mut tx,
@@ -3890,16 +4171,9 @@ pub(crate) fn resolve_original_source_verification_projection_page_sqlite_tx_at_
             .collect());
     };
     let subjects = original_source_page_subjects(postings)?;
-    let trusted_job_ids = trusted_original_source_memberships_page_sqlite(
-        tx,
-        account_id,
-        subjects.values(),
-    )?;
-    let heads = original_source_verification_heads_page_sqlite(
-        tx,
-        account_id,
-        &trusted_job_ids,
-    )?;
+    let trusted_job_ids =
+        trusted_original_source_memberships_page_sqlite(tx, account_id, subjects.values())?;
+    let heads = original_source_verification_heads_page_sqlite(tx, account_id, &trusted_job_ids)?;
     original_source_page_projections(
         postings,
         subjects,
@@ -3988,14 +4262,16 @@ fn trusted_original_source_memberships_page_sqlite<'a>(
         .map_err(original_source_storage)?;
     Ok(rows
         .into_iter()
-        .filter_map(|(job_id, external_id, canonical_key, provider, source_key)| {
-            let subject = by_job.get(job_id.as_str())?;
-            (external_id == subject.canonical.provider_job
-                && canonical_key == subject.canonical.canonical_job_id
-                && provider == subject.canonical.provider_family
-                && source_key == subject.canonical.discovery_source_key)
-                .then_some(job_id)
-        })
+        .filter_map(
+            |(job_id, external_id, canonical_key, provider, source_key)| {
+                let subject = by_job.get(job_id.as_str())?;
+                (external_id == subject.canonical.provider_job
+                    && canonical_key == subject.canonical.canonical_job_id
+                    && provider == subject.canonical.provider_family
+                    && source_key == subject.canonical.discovery_source_key)
+                    .then_some(job_id)
+            },
+        )
         .collect())
 }
 
@@ -4018,7 +4294,10 @@ fn original_source_verification_heads_page_sqlite(
     let values = std::iter::once(account_id).chain(job_ids.iter().map(String::as_str));
     let mut statement = tx.prepare(&sql).map_err(original_source_storage)?;
     let rows = statement
-        .query_map(rusqlite::params_from_iter(values), original_source_head_from_sqlite)
+        .query_map(
+            rusqlite::params_from_iter(values),
+            original_source_head_from_sqlite,
+        )
         .map_err(original_source_storage)?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(original_source_storage)?;
@@ -4055,10 +4334,14 @@ fn original_source_page_projections(
         .enumerate()
         .map(|(index, _)| {
             let Some(subject) = subjects.get(&index) else {
-                return Ok(original_source_verification_unavailable_projection(true, db_time_ms));
+                return Ok(original_source_verification_unavailable_projection(
+                    true, db_time_ms,
+                ));
             };
             if !trusted_job_ids.contains(&subject.posting_id) {
-                return Ok(original_source_verification_unavailable_projection(true, db_time_ms));
+                return Ok(original_source_verification_unavailable_projection(
+                    true, db_time_ms,
+                ));
             }
             let Some((_, canonical_authority_json, authority_sha256)) = authority_binding.as_ref()
             else {
@@ -4227,16 +4510,9 @@ pub(crate) fn resolve_original_source_verification_projection_page_postgres_tx_a
             .collect());
     };
     let subjects = original_source_page_subjects(postings)?;
-    let trusted_job_ids = trusted_original_source_memberships_page_postgres(
-        tx,
-        account_id,
-        subjects.values(),
-    )?;
-    let heads = original_source_verification_heads_page_postgres(
-        tx,
-        account_id,
-        &trusted_job_ids,
-    )?;
+    let trusted_job_ids =
+        trusted_original_source_memberships_page_postgres(tx, account_id, subjects.values())?;
+    let heads = original_source_verification_heads_page_postgres(tx, account_id, &trusted_job_ids)?;
     original_source_page_projections(
         postings,
         subjects,
@@ -4354,7 +4630,8 @@ fn resolve_original_source_verification_projection_postgres_tx_with_authority_at
             db_time_ms,
         ));
     }
-    let Some(subject) = trusted_original_source_membership_postgres(tx, account_id, posting)? else {
+    let Some(subject) = trusted_original_source_membership_postgres(tx, account_id, posting)?
+    else {
         return Ok(original_source_verification_unavailable_projection(
             feature_active,
             db_time_ms,
@@ -5041,6 +5318,7 @@ fn original_source_load_lease_sqlite(
     session_sha256: &str,
     now: i64,
 ) -> OriginalSourceVerificationResult<OriginalSourceLeaseContext> {
+    original_source_require_attempt_boot_sqlite(tx, attempt_id, binding)?;
     let row = tx
         .query_row(
             "SELECT a.account_id, a.job_id, a.subject_sha256,
@@ -5125,6 +5403,7 @@ fn original_source_load_lease_postgres(
     session_sha256: &str,
     now: i64,
 ) -> OriginalSourceVerificationResult<OriginalSourceLeaseContext> {
+    original_source_require_attempt_boot_postgres(tx, attempt_id, binding)?;
     let row = tx
         .query_opt(
             "SELECT a.account_id, a.job_id, a.subject_sha256,
@@ -5341,6 +5620,7 @@ fn original_source_terminal_replay_sqlite(
 ) -> OriginalSourceVerificationResult<
     Option<OriginalSourceVerificationResult<OriginalSourceVerificationTerminal>>,
 > {
+    original_source_require_attempt_boot_sqlite(tx, attempt_id, binding)?;
     let row = tx
         .query_row(
             "SELECT e.completion_request_sha256, e.receipt_sha256,
@@ -5491,6 +5771,7 @@ fn original_source_terminal_replay_postgres(
 ) -> OriginalSourceVerificationResult<
     Option<OriginalSourceVerificationResult<OriginalSourceVerificationTerminal>>,
 > {
+    original_source_require_attempt_boot_postgres(tx, attempt_id, binding)?;
     let row = tx
         .query_opt(
             "SELECT e.completion_request_sha256, e.receipt_sha256,
@@ -5958,6 +6239,7 @@ fn original_source_complete_sqlite(
         &request.binding.runtime_authority_sha256,
     )
     .map_err(|_| OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable)?;
+    original_source_require_current_boot_sqlite(&tx, &request.binding)?;
     let now = original_source_db_now_sqlite(&tx)?;
     let lease = original_source_load_lease_sqlite(
         &tx,
@@ -6782,6 +7064,7 @@ fn original_source_complete_postgres(
         &request.binding.runtime_authority_sha256,
     )
     .map_err(|_| OriginalSourceVerificationError::ManagedRuntimeAuthorityUnavailable)?;
+    original_source_require_current_boot_postgres(&mut tx, &request.binding)?;
     let now = original_source_db_now_postgres(&mut tx)?;
     let (expected_account_id, expected_job_id) = original_source_attempt_identity_postgres(
         &mut tx,
@@ -7715,6 +7998,8 @@ mod original_source_verification_tests {
             runtime_instance_epoch: managed.runtime_instance_epoch,
             runtime_authority_sha256: managed.runtime_authority_sha256.clone(),
             runtime_session_token: managed.runtime_session_token.clone(),
+            boot_id: None,
+            boot_generation: None,
         };
         drop(managed);
         {
@@ -7774,6 +8059,307 @@ mod original_source_verification_tests {
         }
     }
 
+    #[test]
+    fn original_source_verifier_startup_leaseable_probe_rolls_back_every_claim_mutation() {
+        let managed = super::managed_cloud_release_authority_tests::
+            original_source_verifier_startup_test_fixture();
+        let database_path = managed.database_path.clone();
+        let (first_boot_id, first_generation): (String, i64) = managed
+            .pool
+            .get()
+            .expect("read bootstrap registration")
+            .query_row(
+                "SELECT boot_id,boot_generation
+                   FROM jobs_managed_cloud_source_verifier_boot_registrations
+                  WHERE runtime_instance_id=?1 ORDER BY boot_generation DESC LIMIT 1",
+                params![managed.request.runtime_instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("bootstrap boot registration");
+        let first = record_source_verifier_boot_startup(
+            &managed.pool,
+            &SourceVerifierBootStartupRequest {
+                session_token: managed.request.session_token.clone(),
+                startup_request_id: managed.request.startup_request_id.clone(),
+                boot_id: first_boot_id,
+                runtime_instance_id: managed.request.runtime_instance_id.clone(),
+                instance_epoch: managed.request.instance_epoch,
+                boot_generation: first_generation,
+                worker_id: managed.request.worker_id.clone(),
+                degraded_heartbeat_sequence: 1,
+            },
+        )
+        .expect("start first v3 boot for assignment authority");
+        assert_eq!(first.probe_result, "idle");
+
+        let account_id = format!("acct-phase628-{}", uuid::Uuid::new_v4().simple());
+        {
+            let connection = managed.pool.get().expect("v3 leaseable account connection");
+            connection
+                .execute(
+                    "INSERT INTO accounts(id,email,password_hash,trial_seconds_remaining)
+                     VALUES(?1,?2,'hash',0)",
+                    params![
+                        account_id,
+                        format!("{}@phase628.example.test", uuid::Uuid::new_v4().simple())
+                    ],
+                )
+                .expect("insert v3 leaseable account");
+        }
+        let posting = fixture_posting(
+            "greenhouse_import",
+            "https://boards.greenhouse.io/phase628/jobs/leaseable-job",
+            "leaseable-job",
+        );
+        insert_fixture_posting_source_for_account(
+            &managed.pool,
+            &account_id,
+            &posting,
+            "source-phase628-leaseable",
+            "greenhouse",
+            "phase628",
+        );
+        let assignment = {
+            let mut connection = managed.pool.get().expect("v3 assignment connection");
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin v3 assignment transaction");
+            let authority = sqlite_original_source_verification_authority_for_account_tx(
+                &transaction,
+                &account_id,
+            )
+            .expect("resolve v3 assignment authority")
+            .expect("v3 assignment authority is ready");
+            let assignment =
+                ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                    &transaction,
+                    &account_id,
+                    &posting,
+                    &authority,
+                )
+                .expect("schedule v3 leaseable assignment");
+            transaction.commit().expect("commit v3 assignment");
+            assignment
+        };
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let worker_id = format!("phase628-leaseable-worker-{suffix}");
+        let grant = issue_managed_cloud_runtime_grant(
+            &managed.pool,
+            &NewManagedCloudRuntimeGrant {
+                issuance_ref: format!("phase628-leaseable-issuance-{suffix}"),
+                scope: ManagedCloudScope {
+                    environment: "production".to_string(),
+                    region: "us-east-1".to_string(),
+                    channel: "general".to_string(),
+                },
+                activation_sha256: managed.request.activation_sha256.clone(),
+                manifest_sha256: managed.request.manifest_sha256.clone(),
+                component_id: "jobs-workflows".to_string(),
+                role: "original_source_verifier".to_string(),
+                expected_worker_id: worker_id.clone(),
+                authorization_ref: format!("phase628-leaseable-authority-{suffix}"),
+                created_by: "phase628-startup-test".to_string(),
+                ttl_ms: 15 * 60_000,
+            },
+        )
+        .expect("issue second v3 verifier grant");
+        let grant_token = grant.grant_token.clone().expect("second v3 verifier token");
+        let runtime_instance_id = format!("phase628-leaseable-instance-{suffix}");
+        let session_token = derive_managed_cloud_runtime_session_token(
+            &grant_token,
+            &grant.grant_id,
+            &runtime_instance_id,
+        )
+        .expect("derive second v3 verifier session");
+        let instance = claim_managed_cloud_runtime_grant(
+            &managed.pool,
+            &ClaimManagedCloudRuntimeGrant {
+                grant_id: grant.grant_id,
+                grant_token,
+                runtime_instance_id: runtime_instance_id.clone(),
+                worker_id: worker_id.clone(),
+                session_token: session_token.clone(),
+                runtime_identity_sha256: grant.expected_runtime_identity_sha256,
+            },
+        )
+        .expect("claim second v3 verifier runtime");
+        let boot_id = format!("phase628-leaseable-boot-{suffix}");
+        let registration = register_source_verifier_boot(
+            &managed.pool,
+            &SourceVerifierBootRegistrationRequest {
+                session_token: session_token.clone(),
+                registration_request_id: format!("phase628-leaseable-registration-{suffix}"),
+                boot_id: boot_id.clone(),
+                runtime_instance_id: runtime_instance_id.clone(),
+                instance_epoch: instance.instance_epoch,
+                worker_id: worker_id.clone(),
+                runtime_identity_sha256: instance.runtime_identity_sha256.clone(),
+                activation_sha256: instance.activation_sha256.clone(),
+                manifest_sha256: instance.manifest_sha256.clone(),
+                component_id: instance.component_id.clone(),
+                role: instance.role.clone(),
+            },
+        )
+        .expect("register second v3 verifier boot");
+        record_managed_cloud_runtime_heartbeat(
+            &managed.pool,
+            &ManagedCloudRuntimeHeartbeatInput {
+                runtime_instance_id: runtime_instance_id.clone(),
+                worker_id: worker_id.clone(),
+                session_token: session_token.clone(),
+                heartbeat_sequence: 1,
+                observed_head_revision: instance.head_revision,
+                observed_transition_sha256: instance.transition_sha256.clone(),
+                activation_sha256: instance.activation_sha256.clone(),
+                manifest_sha256: instance.manifest_sha256.clone(),
+                component_id: instance.component_id.clone(),
+                role: instance.role.clone(),
+                artifact_sha256: instance.artifact_sha256.clone(),
+                migration_set_sha256: instance.migration_set_sha256.clone(),
+                config_schema_sha256: instance.config_schema_sha256.clone(),
+                protocol_set_sha256: instance.protocol_set_sha256.clone(),
+                task_queue_sha256: instance.task_queue_sha256.clone(),
+                failure_converter_sha256: instance.failure_converter_sha256.clone(),
+                dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
+                health_state: "degraded".to_string(),
+                reason_code: Some("startup".to_string()),
+                boot_id: Some(boot_id.clone()),
+                boot_generation: Some(registration.boot_generation),
+            },
+        )
+        .expect("record second v3 degraded heartbeat");
+        let request = SourceVerifierBootStartupRequest {
+            startup_request_id: format!("osv-startup-{suffix}"),
+            boot_id,
+            runtime_instance_id,
+            worker_id,
+            session_token,
+            instance_epoch: instance.instance_epoch,
+            boot_generation: registration.boot_generation,
+            degraded_heartbeat_sequence: 1,
+        };
+        let binding = source_verifier_boot_probe_binding(&instance, &request)
+            .expect("bind the positive probe fixture");
+        {
+            let mut connection = managed.pool.get().expect("inspect positive probe fixture");
+            let transaction = connection.transaction().unwrap();
+            let now = original_source_db_now_sqlite(&transaction).unwrap();
+            let candidates =
+                original_source_lease_candidates_sqlite(&transaction, &binding, now, None)
+                    .expect("enumerate positive probe candidates");
+            assert_eq!(
+                candidates.len(),
+                1,
+                "fixture must expose exactly one due assignment"
+            );
+            assert_eq!(
+                original_source_lease_candidate_decision_sqlite(
+                    &transaction,
+                    &binding,
+                    &candidates[0]
+                )
+                .expect("evaluate positive probe candidate"),
+                OriginalSourceLeaseCandidateDecision::Lease,
+                "fixture must be genuinely leaseable before testing rollback"
+            );
+            transaction.rollback().unwrap();
+        }
+        let before = {
+            let connection = managed.pool.get().expect("read pre-probe mutation counts");
+            connection
+                .query_row(
+                    "SELECT assignment.state,assignment.attempt_count,
+                            (SELECT COUNT(*) FROM jobs_original_source_verification_attempts),
+                            (SELECT COUNT(*) FROM jobs_original_source_verification_events),
+                            (SELECT COUNT(*) FROM jobs_original_source_verification_attempt_boot_bindings)
+                       FROM jobs_original_source_verification_assignments assignment
+                      WHERE assignment.assignment_id=?1",
+                    params![assignment.assignment_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .expect("read pre-probe assignment")
+        };
+        let response = record_source_verifier_boot_startup(&managed.pool, &request)
+            .expect("authorize leaseable v3 startup");
+        assert_eq!(response.probe_result, "leaseable");
+        let after = {
+            let connection = managed.pool.get().expect("read post-probe mutation counts");
+            connection
+                .query_row(
+                    "SELECT assignment.state,assignment.attempt_count,
+                            (SELECT COUNT(*) FROM jobs_original_source_verification_attempts),
+                            (SELECT COUNT(*) FROM jobs_original_source_verification_events),
+                            (SELECT COUNT(*) FROM jobs_original_source_verification_attempt_boot_bindings)
+                       FROM jobs_original_source_verification_assignments assignment
+                      WHERE assignment.assignment_id=?1",
+                    params![assignment.assignment_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .expect("read post-probe assignment")
+        };
+        assert_eq!(
+            after, before,
+            "rollback-only probe must leave no claim mutation"
+        );
+        let binding = source_verifier_boot_probe_binding(&instance, &request)
+            .expect("bind real lease to the ready boot");
+        let lease = lease_original_source_verification(&managed.pool, &binding)
+            .expect("claim after rollback-only startup probe")
+            .expect("the probe left the assignment available");
+        let mut connection = managed.pool.get().expect("read immutable attempt boot");
+        let transaction = connection.transaction().unwrap();
+        assert!(transaction.execute(
+            "DELETE FROM jobs_original_source_verification_attempt_boot_bindings WHERE attempt_id=?1",
+            params![lease.attempt_id],
+        ).is_err(), "a live attempt binding cannot be deleted directly");
+        assert!(
+            transaction
+                .execute(
+                    "UPDATE jobs_original_source_verification_attempt_boot_bindings
+                SET boot_generation=boot_generation+1 WHERE attempt_id=?1",
+                    params![lease.attempt_id],
+                )
+                .is_err(),
+            "a live attempt binding cannot be rewritten"
+        );
+        original_source_require_attempt_boot_sqlite(&transaction, &lease.attempt_id, &binding)
+            .expect("attempt is bound to the claiming boot");
+        let mut replacement = binding.clone();
+        replacement.boot_id = Some("replacement-boot-for-attempt-check".to_string());
+        replacement.boot_generation = binding.boot_generation.map(|generation| generation + 1);
+        assert!(matches!(
+            original_source_require_attempt_boot_sqlite(
+                &transaction,
+                &lease.attempt_id,
+                &replacement
+            ),
+            Err(OriginalSourceVerificationError::LeaseLost)
+        ));
+        transaction.rollback().unwrap();
+        drop(connection);
+        drop(managed);
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-shm"));
+    }
+
     fn cleanup_public_original_source_lifecycle_fixture(
         fixture: PublicOriginalSourceLifecycleFixture,
     ) {
@@ -7788,19 +8374,35 @@ mod original_source_verification_tests {
         pool: &DbPool,
         binding: &OriginalSourceVerifierBinding,
     ) {
-        let current = {
-            let connection = pool.get().expect("load public verifier heartbeat");
-            connection
-                .query_row(
-                    &format!(
-                        "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
+        let current = match pool {
+            DbPool::Sqlite(_) => {
+                let connection = pool.get().expect("load public verifier heartbeat");
+                connection
+                    .query_row(
+                        &format!(
+                            "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
                            FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats
                           WHERE runtime_instance_id=?1"
-                    ),
-                    params![binding.runtime_instance_id],
-                    managed_cloud_runtime_heartbeat_from_sqlite,
-                )
-                .expect("public verifier heartbeat exists")
+                        ),
+                        params![binding.runtime_instance_id],
+                        managed_cloud_runtime_heartbeat_from_sqlite,
+                    )
+                    .expect("public verifier heartbeat exists")
+            }
+            DbPool::Postgres(_) => {
+                let mut connection = pool.get_pg().expect("load PostgreSQL verifier heartbeat");
+                let row = connection
+                    .query_one(
+                        &format!(
+                            "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
+                           FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+                          WHERE runtime_instance_id=$1"
+                        ),
+                        &[&binding.runtime_instance_id],
+                    )
+                    .expect("PostgreSQL verifier heartbeat exists");
+                managed_cloud_runtime_heartbeat_from_postgres(&row)
+            }
         };
         assert_eq!(current.worker_id, binding.worker_id);
         assert_eq!(current.instance_epoch, binding.runtime_instance_epoch);
@@ -7830,6 +8432,8 @@ mod original_source_verification_tests {
                 dependency_evidence_sha256: current.dependency_evidence_sha256,
                 health_state: current.health_state,
                 reason_code: current.reason_code,
+                boot_id: binding.boot_id.clone(),
+                boot_generation: binding.boot_generation,
             },
         )
         .expect("refresh exact public verifier runtime heartbeat");
@@ -7939,7 +8543,10 @@ mod original_source_verification_tests {
             runtime_instance_epoch: managed.runtime_instance_epoch,
             runtime_authority_sha256: managed.runtime_authority_sha256.clone(),
             runtime_session_token: managed.runtime_session_token.clone(),
+            boot_id: None,
+            boot_generation: None,
         };
+        refresh_public_original_source_runtime_heartbeat(pool, &binding);
         let lease = lease_original_source_verification(pool, &binding)
             .expect("lease public positive source verification")
             .expect("public positive source assignment is due");
@@ -9545,6 +10152,8 @@ mod original_source_verification_tests {
             runtime_instance_epoch: 1,
             runtime_authority_sha256: "d".repeat(64),
             runtime_session_token: "session-token-original-source-test-0001".to_string(),
+            boot_id: None,
+            boot_generation: None,
         };
         let mut conn = pool.get().unwrap();
         let mut tx = conn
@@ -9674,6 +10283,8 @@ mod original_source_verification_tests {
             runtime_instance_epoch: fixture.runtime_instance_epoch,
             runtime_authority_sha256: fixture.runtime_authority_sha256.clone(),
             runtime_session_token: fixture.runtime_session_token.clone(),
+            boot_id: None,
+            boot_generation: None,
         };
         {
             let conn = pool.get().expect("get strict-runtime fixture account");
@@ -9873,6 +10484,8 @@ mod original_source_verification_tests {
             runtime_instance_epoch: fixture.runtime_instance_epoch,
             runtime_authority_sha256: fixture.runtime_authority_sha256.clone(),
             runtime_session_token: fixture.runtime_session_token.clone(),
+            boot_id: None,
+            boot_generation: None,
         };
         {
             let conn = pool.get().expect("get held-prefix fixture account");
@@ -10354,9 +10967,11 @@ mod original_source_verification_tests {
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .expect("begin positive page projection");
         let db_time_ms: i64 = tx
-            .query_row("SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
             .expect("positive page database time");
         let projections = resolve_original_source_verification_projection_page_sqlite_tx_at_ms(
             &tx,
@@ -11231,8 +11846,17 @@ mod original_source_verification_tests {
         assert!(hold < managed);
         assert!(decision.contains("DeferOperationalHold"));
         assert!(decision.contains("managed_authority_revoked"));
+        let lease_decisions = source
+            .split_once("\nfn original_source_lease_sqlite_tx(")
+            .expect("SQLite lease decision")
+            .1
+            .split_once(
+                "\npub(crate) fn probe_original_source_verification_leaseability_sqlite_tx(",
+            )
+            .expect("bounded shared lease decisions")
+            .0;
         assert_eq!(
-            lease
+            lease_decisions
                 .matches("original_source_scan_lease_candidates(")
                 .count(),
             2

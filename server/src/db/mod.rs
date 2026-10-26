@@ -389,6 +389,9 @@ const SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY: &str = include_str!
 const SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE: &str = include_str!(
     "../../../infra/sqlite/server-runtime/064_jobs_source_verifier_heartbeat_boot_generation_fence.sql"
 );
+const SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql"
+);
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1752,6 +1755,8 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
     // 0064 - project the boot generation fence onto runtime heartbeats.
     SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+    // 0065 - bind prospective boot-protocol heartbeats to registered generations.
+    SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2996,6 +3001,11 @@ pub const JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID: &st
 const POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE: &str = include_str!(
     "../../../infra/postgres/server-runtime/042_jobs_source_verifier_heartbeat_boot_generation_fence.sql"
 );
+pub const JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID: &str =
+    "043_jobs_source_verifier_heartbeat_boot_bindings.sql";
+const POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql"
+);
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -3148,6 +3158,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID,
         POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+    ),
+    (
+        JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID,
+        POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS,
     ),
 ];
 
@@ -3451,6 +3465,8 @@ mod sqlite_migration_replay_tests {
     fn signed_job_integrity_migration_failure_restores_transaction_and_foreign_keys() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch("CREATE TABLE bluey_data_migrations(name TEXT PRIMARY KEY);")
+            .unwrap();
         let error = execute_sqlite_signed_job_integrity_migration(
             &mut conn,
             "PRAGMA foreign_keys=OFF;
@@ -6994,8 +7010,11 @@ mod postgres_migration_tests {
             .expect("workspace pagination index must exist before Jobs routes are served");
         assert_eq!(*postgres_sql, POSTGRES_JOBS_WORKSPACE_PAGINATION);
         assert_eq!(
-            MIGRATIONS.last().copied(),
-            Some(SQLITE_JOBS_WORKSPACE_PAGINATION)
+            MIGRATIONS
+                .iter()
+                .filter(|sql| **sql == SQLITE_JOBS_WORKSPACE_PAGINATION)
+                .count(),
+            1
         );
 
         let postgres_normalized = postgres_sql

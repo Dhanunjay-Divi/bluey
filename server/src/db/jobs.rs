@@ -2381,6 +2381,7 @@ include!("jobs/ats_certification_authority.rs");
 include!("jobs/ats_certification_page.rs");
 include!("jobs/managed_cloud_release_authority.rs");
 include!("jobs/original_source_verification.rs");
+include!("jobs/source_verifier_boot.rs");
 include!("jobs/job_integrity_authority.rs");
 include!("jobs/job_integrity_composition.rs");
 include!("jobs/browser_profile_snapshots.rs");

@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import {
-  generateKeyPairSync,
-  sign as signBytes,
-} from "node:crypto";
+import { generateKeyPairSync, sign as signBytes } from "node:crypto";
 import {
   copyFile,
   cp,
@@ -51,6 +48,7 @@ import {
   MANAGED_CLOUD_BASE_RUNTIME_ROLES,
   MANAGED_CLOUD_COMPONENTS,
   MANAGED_CLOUD_PROTOCOL_IDS,
+  MANAGED_CLOUD_RELEASE_V3_PROTOCOL_IDS,
   MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS,
   MANAGED_CLOUD_RUNTIME_CONTRACTS,
   sha256,
@@ -93,6 +91,8 @@ const PROTOCOL_VERSIONS = new Map([
   ["runner_result", 2],
   ["runtime_heartbeat", 1],
   ["source_verification", 1],
+  ["source_verifier_startup", 1],
+  ["source_verifier_boot", 1],
   ["workflow_cleanup", 3],
   ["workflow_command", 2],
 ]);
@@ -125,6 +125,33 @@ const SOURCE_VERIFICATION_PROTOCOL_PATHS = [
   "server/src/db/jobs/operational_holds.rs",
   "server/src/db/jobs/original_source_verification.rs",
   "server/src/jobs_ats_target.rs",
+];
+const SOURCE_VERIFIER_STARTUP_PROTOCOL_PATHS = [
+  "infra/postgres/server-runtime/040_jobs_original_source_verifier_startup_authority.sql",
+  "infra/sqlite/server-runtime/062_jobs_original_source_verifier_startup_authority.sql",
+  "jobs/automation/src/managed-cloud-runtime-client.ts",
+  "jobs/automation/src/worker-auth.ts",
+  "jobs/workflows/src/original-source-verification-runtime.ts",
+  "jobs/workflows/src/original-source-verifier.ts",
+  "server/src/api/jobs_managed_cloud_releases.rs",
+  "server/src/api/jobs_worker_auth.rs",
+  "server/src/db/jobs/managed_cloud_release_authority.rs",
+  "server/src/db/jobs/original_source_verification.rs",
+  "server/src/db/mod.rs",
+];
+const SOURCE_VERIFIER_BOOT_PROTOCOL_PATHS = [
+  "infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql",
+  "infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql",
+  "infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql",
+  "infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql",
+  "jobs/automation/src/managed-cloud-runtime-client.ts",
+  "jobs/automation/src/worker-auth.ts",
+  "jobs/workflows/src/original-source-verifier.ts",
+  "server/src/api/jobs.rs",
+  "server/src/api/jobs_worker_auth.rs",
+  "server/src/db/jobs/managed_cloud_release_authority.rs",
+  "server/src/db/jobs/source_verifier_boot.rs",
+  "server/src/db/mod.rs",
 ];
 
 async function temporaryDirectory(t, label) {
@@ -196,12 +223,14 @@ function portalArtifactManifest(portalBytes, overrides = {}) {
       mediaType: "application/vnd.oci.empty.v1+json",
       size: 2,
     },
-    layers: [{
-      annotations: { "org.opencontainers.image.title": "jobs-portal.tar" },
-      digest: "sha256:" + sha256(portalBytes),
-      mediaType: "application/vnd.bluey.jobs.portal.tar",
-      size: portalBytes.length,
-    }],
+    layers: [
+      {
+        annotations: { "org.opencontainers.image.title": "jobs-portal.tar" },
+        digest: "sha256:" + sha256(portalBytes),
+        mediaType: "application/vnd.bluey.jobs.portal.tar",
+        size: portalBytes.length,
+      },
+    ],
     mediaType: "application/vnd.oci.image.manifest.v1+json",
     schemaVersion: 2,
   };
@@ -215,20 +244,22 @@ function publicationWorkflowArtifacts({
   runId = 2001,
 } = {}) {
   return {
-    artifacts: [{
-      digest: "sha256:" + "b".repeat(64),
-      expired: false,
-      id: 4001,
-      name: "jobs-managed-cloud-publication-" + runId + "-" + attempt,
-      size_in_bytes: 4096,
-      workflow_run: {
-        head_branch: branch,
-        head_repository_id: repositoryId,
-        head_sha: SOURCE_COMMIT,
-        id: runId,
-        repository_id: repositoryId,
+    artifacts: [
+      {
+        digest: "sha256:" + "b".repeat(64),
+        expired: false,
+        id: 4001,
+        name: "jobs-managed-cloud-publication-" + runId + "-" + attempt,
+        size_in_bytes: 4096,
+        workflow_run: {
+          head_branch: branch,
+          head_repository_id: repositoryId,
+          head_sha: SOURCE_COMMIT,
+          id: runId,
+          repository_id: repositoryId,
+        },
       },
-    }],
+    ],
     total_count: 1,
   };
 }
@@ -281,26 +312,33 @@ function workflowsRuntime(overrides = {}) {
   };
 }
 
-async function writeOciFixture(path, {
-  extraBlob,
-  indexReferenceName,
-  layers = [
-    [
-      { name: "app", type: "5" },
-      {
-        body: "api-binary\n",
-        mode: 0o555,
-        name: "usr/local/bin/bluey-jobs-api",
-      },
+async function writeOciFixture(
+  path,
+  {
+    extraBlob,
+    indexReferenceName,
+    layers = [
+      [
+        { name: "app", type: "5" },
+        {
+          body: "api-binary\n",
+          mode: 0o555,
+          name: "usr/local/bin/bluey-jobs-api",
+        },
+      ],
     ],
-  ],
-  runtime = apiRuntime(),
-} = {}) {
+    runtime = apiRuntime(),
+  } = {},
+) {
   const exactLayers = layers.map((entries) => [...entries]);
-  if (!exactLayers.flat().some(
-    (entry) => entry.name ===
-      "app/.bluey/managed-cloud-runtime-measurement.json",
-  )) {
+  if (
+    !exactLayers
+      .flat()
+      .some(
+        (entry) =>
+          entry.name === "app/.bluey/managed-cloud-runtime-measurement.json",
+      )
+  ) {
     exactLayers[0].push({
       body: "{}\n",
       name: "app/.bluey/managed-cloud-runtime-measurement.json",
@@ -348,7 +386,10 @@ async function writeOciFixture(path, {
     JSON.stringify({ manifests: [indexDescriptor], schemaVersion: 2 }),
   );
   const outerEntries = [
-    { body: JSON.stringify({ imageLayoutVersion: "1.0.0" }), name: "oci-layout" },
+    {
+      body: JSON.stringify({ imageLayoutVersion: "1.0.0" }),
+      name: "oci-layout",
+    },
     { body: indexBytes, name: "index.json" },
     {
       body: manifestBytes,
@@ -383,10 +424,15 @@ function releaseFixture() {
       artifactKind: expected.artifactKind,
       artifactRef:
         expected.artifactKind === "oci_image"
-          ? "registry.example/bluey/" + expected.componentId +
-            "@sha256:" + artifactSha256
-          : "https://artifacts.example/releases/" + RELEASE_ID + "/" +
-            artifactSha256 + ".tar",
+          ? "registry.example/bluey/" +
+            expected.componentId +
+            "@sha256:" +
+            artifactSha256
+          : "https://artifacts.example/releases/" +
+            RELEASE_ID +
+            "/" +
+            artifactSha256 +
+            ".tar",
       artifactSha256,
       buildId: "build-" + expected.componentId,
       componentId: expected.componentId,
@@ -413,12 +459,14 @@ function releaseFixture() {
     audience: MANAGED_CLOUD_AUDIENCES.manifest,
     capabilities,
     components,
-    componentSetSha256: sha256(canonicalJsonBytes({
-      audience: MANAGED_CLOUD_AUDIENCES.componentInventory,
-      capabilities,
-      components,
-      version: 1,
-    })),
+    componentSetSha256: sha256(
+      canonicalJsonBytes({
+        audience: MANAGED_CLOUD_AUDIENCES.componentInventory,
+        capabilities,
+        components,
+        version: 1,
+      }),
+    ),
     configSchemaSha256,
     featureAuthority,
     featureAuthoritySha256: sha256(canonicalJsonBytes(featureAuthority)),
@@ -463,9 +511,10 @@ function successorReleaseFixture() {
       capability: "original_source_verifier",
       componentId: "jobs-workflows",
     },
-  ].sort((left, right) =>
-    left.componentId.localeCompare(right.componentId, "en") ||
-    left.capability.localeCompare(right.capability, "en"),
+  ].sort(
+    (left, right) =>
+      left.componentId.localeCompare(right.componentId, "en") ||
+      left.capability.localeCompare(right.capability, "en"),
   );
   manifest.protocols = MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS.map(
     (protocolId, index) => ({
@@ -474,12 +523,63 @@ function successorReleaseFixture() {
       schemaSha256: ((index + 1) % 10).toString(16).repeat(64),
     }),
   );
-  manifest.componentSetSha256 = sha256(canonicalJsonBytes({
-    audience: MANAGED_CLOUD_AUDIENCES.componentInventory,
-    capabilities: manifest.capabilities,
-    components: manifest.components,
-    version: 1,
-  }));
+  manifest.componentSetSha256 = sha256(
+    canonicalJsonBytes({
+      audience: MANAGED_CLOUD_AUDIENCES.componentInventory,
+      capabilities: manifest.capabilities,
+      components: manifest.components,
+      version: 1,
+    }),
+  );
+  return manifest;
+}
+
+function releaseV3Fixture() {
+  const manifest = successorReleaseFixture();
+  manifest.version = 3;
+  manifest.audience = MANAGED_CLOUD_AUDIENCES.manifestV3;
+  manifest.sqliteMigrationHead =
+    "065_jobs_source_verifier_heartbeat_boot_bindings.sql";
+  manifest.postgresMigrationHead =
+    "043_jobs_source_verifier_heartbeat_boot_bindings.sql";
+  manifest.featureAuthority = {
+    ...manifest.featureAuthority,
+    directDiscovery: true,
+    globalDiscovery: true,
+  };
+  manifest.featureAuthoritySha256 = sha256(
+    canonicalJsonBytes(manifest.featureAuthority),
+  );
+  manifest.capabilities = [
+    ...manifest.capabilities,
+    {
+      capability: "discovery_worker",
+      componentId: "jobs-workflows",
+    },
+    {
+      capability: "global_discovery_worker",
+      componentId: "jobs-workflows",
+    },
+  ].sort(
+    (left, right) =>
+      left.componentId.localeCompare(right.componentId, "en") ||
+      left.capability.localeCompare(right.capability, "en"),
+  );
+  manifest.protocols = MANAGED_CLOUD_RELEASE_V3_PROTOCOL_IDS.map(
+    (protocolId, index) => ({
+      protocolId,
+      protocolVersion: PROTOCOL_VERSIONS.get(protocolId),
+      schemaSha256: ((index + 2) % 10).toString(16).repeat(64),
+    }),
+  );
+  manifest.componentSetSha256 = sha256(
+    canonicalJsonBytes({
+      audience: MANAGED_CLOUD_AUDIENCES.componentInventory,
+      capabilities: manifest.capabilities,
+      components: manifest.components,
+      version: 1,
+    }),
+  );
   return manifest;
 }
 
@@ -524,72 +624,104 @@ function releaseContractFixture() {
     setSha256: builderSources.setSha256,
   };
   const protocolSources = new Map([
-    ["ats_certification", [
-      "jobs/automation/src/certified-submit-form.ts",
-      "server/src/db/jobs/ats_certification_authority.rs",
-    ]],
-    ["execution_lease", [
-      "jobs/runner/src/execution-lease.ts",
-      "server/src/db/jobs/execution_leases.rs",
-    ]],
-    ["gateway_command", [
-      "jobs/workflows/src/contracts.ts",
-      "jobs/workflows/src/gateway-service.ts",
-      "jobs/workflows/src/gateway.ts",
-      "server/src/jobs_workflow_dispatch.rs",
-    ]],
-    ["managed_cloud_release", [
-      "jobs/automation/src/managed-cloud-execution.ts",
-      "jobs/automation/src/managed-cloud-runtime-client.ts",
-      "jobs/automation/src/managed-cloud-runtime.ts",
-      "jobs/workflows/src/contracts.ts",
-      "jobs/workflows/src/gateway-cleanup-service.ts",
-      "jobs/workflows/src/gateway-service.ts",
-      "jobs/workflows/src/workflows.ts",
-      "server/src/db/jobs/managed_cloud_release_authority.rs",
-      "server/src/db/jobs/workflow_commands.rs",
-      "server/src/jobs_workflow_dispatch.rs",
-    ]],
-    ["object_evidence", [
-      "server/src/db/object_uploads.rs",
-      "server/src/db/jobs/evidence.rs",
-    ]],
-    ["runner_checkpoint", [
-      "jobs/runner/src/run-checkpoint-store.ts",
-      "server/src/db/jobs/execution_leases.rs",
-    ]],
-    ["runner_profile_snapshot", [
-      "jobs/runner/src/profile-snapshot-client.ts",
-      "server/src/db/jobs/browser_profile_snapshots.rs",
-    ]],
-    ["runner_result", [
-      "jobs/runner/src/result-store.ts",
-      "jobs/runner/src/submitted-result-recovery.ts",
-      "server/src/db/jobs/local_runner.rs",
-    ]],
-    ["runtime_heartbeat", [
-      "jobs/automation/src/managed-cloud-runtime-client.ts",
-      "jobs/automation/src/managed-cloud-runtime.ts",
-      "server/src/api/jobs_worker_auth.rs",
-      "server/src/jobs_managed_cloud_runtime.rs",
-    ]],
-    ["workflow_cleanup", [
-      "jobs/workflows/src/gateway-cleanup-service.ts",
-      "jobs/workflows/src/gateway.ts",
-      "server/src/jobs_workflow_cleanup.rs",
-    ]],
-    ["workflow_command", [
-      "jobs/workflows/src/contracts.ts",
-      "jobs/workflows/src/gateway-service.ts",
-      "jobs/workflows/src/gateway.ts",
-      "jobs/workflows/src/workflows.ts",
-      "server/src/db/jobs/workflow_commands.rs",
-      "server/src/jobs_workflow_dispatch.rs",
-    ]],
+    [
+      "ats_certification",
+      [
+        "jobs/automation/src/certified-submit-form.ts",
+        "server/src/db/jobs/ats_certification_authority.rs",
+      ],
+    ],
+    [
+      "execution_lease",
+      [
+        "jobs/runner/src/execution-lease.ts",
+        "server/src/db/jobs/execution_leases.rs",
+      ],
+    ],
+    [
+      "gateway_command",
+      [
+        "jobs/workflows/src/contracts.ts",
+        "jobs/workflows/src/gateway-service.ts",
+        "jobs/workflows/src/gateway.ts",
+        "server/src/jobs_workflow_dispatch.rs",
+      ],
+    ],
+    [
+      "managed_cloud_release",
+      [
+        "jobs/automation/src/managed-cloud-execution.ts",
+        "jobs/automation/src/managed-cloud-runtime-client.ts",
+        "jobs/automation/src/managed-cloud-runtime.ts",
+        "jobs/workflows/src/contracts.ts",
+        "jobs/workflows/src/gateway-cleanup-service.ts",
+        "jobs/workflows/src/gateway-service.ts",
+        "jobs/workflows/src/workflows.ts",
+        "server/src/db/jobs/managed_cloud_release_authority.rs",
+        "server/src/db/jobs/workflow_commands.rs",
+        "server/src/jobs_workflow_dispatch.rs",
+      ],
+    ],
+    [
+      "object_evidence",
+      ["server/src/db/object_uploads.rs", "server/src/db/jobs/evidence.rs"],
+    ],
+    [
+      "runner_checkpoint",
+      [
+        "jobs/runner/src/run-checkpoint-store.ts",
+        "server/src/db/jobs/execution_leases.rs",
+      ],
+    ],
+    [
+      "runner_profile_snapshot",
+      [
+        "jobs/runner/src/profile-snapshot-client.ts",
+        "server/src/db/jobs/browser_profile_snapshots.rs",
+      ],
+    ],
+    [
+      "runner_result",
+      [
+        "jobs/runner/src/result-store.ts",
+        "jobs/runner/src/submitted-result-recovery.ts",
+        "server/src/db/jobs/local_runner.rs",
+      ],
+    ],
+    [
+      "runtime_heartbeat",
+      [
+        "jobs/automation/src/managed-cloud-runtime-client.ts",
+        "jobs/automation/src/managed-cloud-runtime.ts",
+        "server/src/api/jobs_worker_auth.rs",
+        "server/src/jobs_managed_cloud_runtime.rs",
+      ],
+    ],
+    [
+      "workflow_cleanup",
+      [
+        "jobs/workflows/src/gateway-cleanup-service.ts",
+        "jobs/workflows/src/gateway.ts",
+        "server/src/jobs_workflow_cleanup.rs",
+      ],
+    ],
+    [
+      "workflow_command",
+      [
+        "jobs/workflows/src/contracts.ts",
+        "jobs/workflows/src/gateway-service.ts",
+        "jobs/workflows/src/gateway.ts",
+        "jobs/workflows/src/workflows.ts",
+        "server/src/db/jobs/workflow_commands.rs",
+        "server/src/jobs_workflow_dispatch.rs",
+      ],
+    ],
   ]);
   const protocols = MANAGED_CLOUD_PROTOCOL_IDS.map((protocolId, index) => {
-    const sources = sourceSet(protocolSources.get(protocolId),
-      ((index + 1) % 10).toString(16));
+    const sources = sourceSet(
+      protocolSources.get(protocolId),
+      ((index + 1) % 10).toString(16),
+    );
     return {
       protocolId,
       protocolVersion: PROTOCOL_VERSIONS.get(protocolId),
@@ -603,21 +735,27 @@ function releaseContractFixture() {
     schemaVersion: 1,
   };
   const migrationFiles = {
-    postgres: [sourceFile(
-      "infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql",
-      "b",
-    )],
-    sqlite: [sourceFile(
-      "infra/sqlite/server-runtime/056_jobs_canonical_taxonomy_authority.sql",
-      "c",
-    )],
+    postgres: [
+      sourceFile(
+        "infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql",
+        "b",
+      ),
+    ],
+    sqlite: [
+      sourceFile(
+        "infra/sqlite/server-runtime/056_jobs_canonical_taxonomy_authority.sql",
+        "c",
+      ),
+    ],
   };
   const migrationContract = {
     audience: MANAGED_CLOUD_AUDIENCES.migrationContract,
-    paritySha256: sha256(canonicalJsonBytes({
-      postgres: ["034_jobs_canonical_taxonomy_authority.sql"],
-      sqlite: ["056_jobs_canonical_taxonomy_authority.sql"],
-    })),
+    paritySha256: sha256(
+      canonicalJsonBytes({
+        postgres: ["034_jobs_canonical_taxonomy_authority.sql"],
+        sqlite: ["056_jobs_canonical_taxonomy_authority.sql"],
+      }),
+    ),
     postgres: {
       files: migrationFiles.postgres,
       head: "034_jobs_canonical_taxonomy_authority.sql",
@@ -640,7 +778,11 @@ function releaseContractFixture() {
   ]);
   const roleSources = [...roleSourcePaths].map(([role, paths], index) => {
     const sources = sourceSet(paths, (index + 4).toString(16));
-    return { role, sourceFiles: sources.files, sourceSetSha256: sources.setSha256 };
+    return {
+      role,
+      sourceFiles: sources.files,
+      sourceSetSha256: sources.setSha256,
+    };
   });
   const sharedRoles = ["jobs_api", "jobs_workflows", "managed_runner"];
   const jobsApiRoles = ["jobs_api"];
@@ -652,11 +794,36 @@ function releaseContractFixture() {
       jobsApiRoles,
       "boolean_true",
     ],
-    ["BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN", "configuration", sharedRoles, "https_url"],
-    ["BLUEY_JOBS_MANAGED_CLOUD_CHANNEL", "configuration", sharedRoles, "canonical_id"],
-    ["BLUEY_JOBS_MANAGED_CLOUD_ENVIRONMENT", "configuration", sharedRoles, "canonical_id"],
-    ["BLUEY_JOBS_MANAGED_CLOUD_HEARTBEAT_SECONDS", "configuration", sharedRoles, "positive_integer"],
-    ["BLUEY_JOBS_MANAGED_CLOUD_REGION", "configuration", sharedRoles, "canonical_id"],
+    [
+      "BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN",
+      "configuration",
+      sharedRoles,
+      "https_url",
+    ],
+    [
+      "BLUEY_JOBS_MANAGED_CLOUD_CHANNEL",
+      "configuration",
+      sharedRoles,
+      "canonical_id",
+    ],
+    [
+      "BLUEY_JOBS_MANAGED_CLOUD_ENVIRONMENT",
+      "configuration",
+      sharedRoles,
+      "canonical_id",
+    ],
+    [
+      "BLUEY_JOBS_MANAGED_CLOUD_HEARTBEAT_SECONDS",
+      "configuration",
+      sharedRoles,
+      "positive_integer",
+    ],
+    [
+      "BLUEY_JOBS_MANAGED_CLOUD_REGION",
+      "configuration",
+      sharedRoles,
+      "canonical_id",
+    ],
     ["BLUEY_JOBS_WORKER_SIGNING_KEY", "secret", sharedRoles, "secret_bytes"],
     [
       "BLUEY_JOBS_MANAGED_CLOUD_RUNTIME_ENABLED",
@@ -694,12 +861,7 @@ function releaseContractFixture() {
       jobsApiAndWorkflowsRoles,
       "canonical_id",
     ],
-    [
-      "BLUEY_JOBS_WORKFLOW_ORIGIN",
-      "configuration",
-      jobsApiRoles,
-      "https_url",
-    ],
+    ["BLUEY_JOBS_WORKFLOW_ORIGIN", "configuration", jobsApiRoles, "https_url"],
     [
       "BLUEY_JOBS_WORKFLOW_TOKEN",
       "secret",
@@ -735,18 +897,40 @@ function releaseContractFixture() {
       "WORKFLOW_CLEANUP_DISPATCHER",
       "WORKFLOW_COMMAND_DISPATCHER",
     ].flatMap((role) => [
-      [`BLUEY_JOBS_MANAGED_CLOUD_${role}_GRANT_ID`, "configuration", ["jobs_api"], "canonical_id"],
-      [`BLUEY_JOBS_MANAGED_CLOUD_${role}_GRANT_TOKEN`, "secret", ["jobs_api"], "secret_bytes"],
-      [`BLUEY_JOBS_MANAGED_CLOUD_${role}_RUNTIME_INSTANCE_ID`, "configuration", ["jobs_api"], "canonical_id"],
-      [`BLUEY_JOBS_MANAGED_CLOUD_${role}_WORKER_ID`, "configuration", ["jobs_api"], "canonical_id"],
+      [
+        `BLUEY_JOBS_MANAGED_CLOUD_${role}_GRANT_ID`,
+        "configuration",
+        ["jobs_api"],
+        "canonical_id",
+      ],
+      [
+        `BLUEY_JOBS_MANAGED_CLOUD_${role}_GRANT_TOKEN`,
+        "secret",
+        ["jobs_api"],
+        "secret_bytes",
+      ],
+      [
+        `BLUEY_JOBS_MANAGED_CLOUD_${role}_RUNTIME_INSTANCE_ID`,
+        "configuration",
+        ["jobs_api"],
+        "canonical_id",
+      ],
+      [
+        `BLUEY_JOBS_MANAGED_CLOUD_${role}_WORKER_ID`,
+        "configuration",
+        ["jobs_api"],
+        "canonical_id",
+      ],
     ]),
-  ].map(([name, classification, roles, valueType]) => ({
-    classification,
-    name,
-    required: true,
-    roles,
-    valueType,
-  })).sort((left, right) => left.name.localeCompare(right.name));
+  ]
+    .map(([name, classification, roles, valueType]) => ({
+      classification,
+      name,
+      required: true,
+      roles,
+      valueType,
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
   const configContract = {
     audience: MANAGED_CLOUD_AUDIENCES.configContract,
     roleSources,
@@ -758,11 +942,13 @@ function releaseContractFixture() {
     migrationSetSha256: sha256(canonicalJsonBytes(migrationContract)),
     postgresMigrationHead: migrationContract.postgres.head,
     protocolSetSha256: sha256(canonicalJsonBytes(protocolContract)),
-    protocols: protocols.map(({ protocolId, protocolVersion, schemaSha256 }) => ({
-      protocolId,
-      protocolVersion,
-      schemaSha256,
-    })),
+    protocols: protocols.map(
+      ({ protocolId, protocolVersion, schemaSha256 }) => ({
+        protocolId,
+        protocolVersion,
+        schemaSha256,
+      }),
+    ),
     sqliteMigrationHead: migrationContract.sqlite.head,
   };
   return {
@@ -791,19 +977,23 @@ function successorReleaseContractFixture() {
     sourceFiles: sources.files,
   });
   fixture.migrationContract.sqlite = {
-    files: [sourceFile(
-      "infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql",
-      "e",
-    )],
+    files: [
+      sourceFile(
+        "infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql",
+        "e",
+      ),
+    ],
     head: "057_jobs_original_source_verification_authority.sql",
     name: "sqlite",
     setSha256: "",
   };
   fixture.migrationContract.postgres = {
-    files: [sourceFile(
-      "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
-      "f",
-    )],
+    files: [
+      sourceFile(
+        "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
+        "f",
+      ),
+    ],
     head: "035_jobs_original_source_verification_authority.sql",
     name: "postgres",
     setSha256: "",
@@ -813,13 +1003,83 @@ function successorReleaseContractFixture() {
       canonicalJsonBytes(fixture.migrationContract[dialect].files),
     );
   }
-  fixture.migrationContract.paritySha256 = sha256(canonicalJsonBytes({
-    postgres: [fixture.migrationContract.postgres.head],
-    sqlite: [fixture.migrationContract.sqlite.head],
-  }));
+  fixture.migrationContract.paritySha256 = sha256(
+    canonicalJsonBytes({
+      postgres: [fixture.migrationContract.postgres.head],
+      sqlite: [fixture.migrationContract.sqlite.head],
+    }),
+  );
   fixture.manifest = {
     ...fixture.manifest,
     version: 2,
+    migrationSetSha256: sha256(canonicalJsonBytes(fixture.migrationContract)),
+    postgresMigrationHead: fixture.migrationContract.postgres.head,
+    protocolSetSha256: sha256(canonicalJsonBytes(fixture.protocolContract)),
+    protocols: fixture.protocolContract.protocols.map(
+      ({ protocolId, protocolVersion, schemaSha256 }) => ({
+        protocolId,
+        protocolVersion,
+        schemaSha256,
+      }),
+    ),
+    sqliteMigrationHead: fixture.migrationContract.sqlite.head,
+  };
+  return fixture;
+}
+
+function releaseV3ContractFixture() {
+  const fixture = successorReleaseContractFixture();
+  const startupSources = sourceSet(SOURCE_VERIFIER_STARTUP_PROTOCOL_PATHS, "1");
+  const bootSources = sourceSet(SOURCE_VERIFIER_BOOT_PROTOCOL_PATHS, "2");
+  fixture.protocolContract.schemaVersion = 3;
+  fixture.protocolContract.protocols.splice(10, 0, {
+    protocolId: "source_verifier_startup",
+    protocolVersion: 1,
+    schemaSha256: startupSources.setSha256,
+    sourceFiles: startupSources.files,
+  });
+  fixture.protocolContract.protocols.splice(11, 0, {
+    protocolId: "source_verifier_boot",
+    protocolVersion: 1,
+    schemaSha256: bootSources.setSha256,
+    sourceFiles: bootSources.files,
+  });
+  fixture.migrationContract.sqlite = {
+    files: [
+      sourceFile(
+        "infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql",
+        "3",
+      ),
+    ],
+    head: "065_jobs_source_verifier_heartbeat_boot_bindings.sql",
+    name: "sqlite",
+    setSha256: "",
+  };
+  fixture.migrationContract.postgres = {
+    files: [
+      sourceFile(
+        "infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql",
+        "4",
+      ),
+    ],
+    head: "043_jobs_source_verifier_heartbeat_boot_bindings.sql",
+    name: "postgres",
+    setSha256: "",
+  };
+  for (const dialect of ["postgres", "sqlite"]) {
+    fixture.migrationContract[dialect].setSha256 = sha256(
+      canonicalJsonBytes(fixture.migrationContract[dialect].files),
+    );
+  }
+  fixture.migrationContract.paritySha256 = sha256(
+    canonicalJsonBytes({
+      postgres: [fixture.migrationContract.postgres.head],
+      sqlite: [fixture.migrationContract.sqlite.head],
+    }),
+  );
+  fixture.manifest = {
+    ...fixture.manifest,
+    version: 3,
     migrationSetSha256: sha256(canonicalJsonBytes(fixture.migrationContract)),
     postgresMigrationHead: fixture.migrationContract.postgres.head,
     protocolSetSha256: sha256(canonicalJsonBytes(fixture.protocolContract)),
@@ -877,7 +1137,9 @@ function signedSet({
     signatures: keys
       .map(({ keyId, pair }) => ({
         keyId,
-        signature: signBytes(null, payload, pair.privateKey).toString("base64url"),
+        signature: signBytes(null, payload, pair.privateKey).toString(
+          "base64url",
+        ),
       }))
       .sort((left, right) => left.keyId.localeCompare(right.keyId)),
   };
@@ -986,16 +1248,25 @@ function runtimeMeasurementFixture({
   entries,
   roles,
 }) {
-  const roots = componentId === "jobs-api"
-    ? ["usr/local/bin/bluey-jobs-api"]
-    : componentId === "jobs-workflows"
-      ? ["app/automation", "app/workflows", "usr/local/bin/node"]
-      : ["app/automation", "app/runner", "ms-playwright", "usr/local/bin/node"];
+  const roots =
+    componentId === "jobs-api"
+      ? ["usr/local/bin/bluey-jobs-api"]
+      : componentId === "jobs-workflows"
+        ? ["app/automation", "app/workflows", "usr/local/bin/node"]
+        : [
+            "app/automation",
+            "app/runner",
+            "ms-playwright",
+            "usr/local/bin/node",
+          ];
   const measuredFiles = entries
-    .filter((entry) =>
-      (entry.type ?? "0") === "0" &&
-      Buffer.byteLength(entry.body ?? "") > 0 &&
-      roots.some((root) => entry.name === root || entry.name.startsWith(root + "/")),
+    .filter(
+      (entry) =>
+        (entry.type ?? "0") === "0" &&
+        Buffer.byteLength(entry.body ?? "") > 0 &&
+        roots.some(
+          (root) => entry.name === root || entry.name.startsWith(root + "/"),
+        ),
     )
     .map((entry) => ({
       path: entry.name,
@@ -1017,6 +1288,7 @@ function runtimeMeasurementFixture({
 }
 
 async function createAuthorizedCandidateFixture({
+  contractVersion = 2,
   label,
   releaseSequence,
   root,
@@ -1025,7 +1297,7 @@ async function createAuthorizedCandidateFixture({
   const repoRoot = join(import.meta.dirname, "../..");
   const fixtureRoot = join(root, label);
   const contracts = join(fixtureRoot, "contracts");
-  await createManagedCloudContracts(repoRoot, contracts, 2);
+  await createManagedCloudContracts(repoRoot, contracts, contractVersion);
   const contractHashes = {
     builder: await fileSha256(join(contracts, "builder-policy.json")),
     config: await fileSha256(join(contracts, "config-contract.json")),
@@ -1038,11 +1310,13 @@ async function createAuthorizedCandidateFixture({
   const specs = [
     {
       componentId: "jobs-api",
-      entries: [{
-        body: "api-binary\n",
-        mode: 0o555,
-        name: "usr/local/bin/bluey-jobs-api",
-      }],
+      entries: [
+        {
+          body: "api-binary\n",
+          mode: 0o555,
+          name: "usr/local/bin/bluey-jobs-api",
+        },
+      ],
       roles: [
         "jobs_api",
         "workflow_cleanup_dispatcher",
@@ -1096,6 +1370,9 @@ async function createAuthorizedCandidateFixture({
         { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
       ],
       roles: [
+        ...(contractVersion === 3
+          ? ["discovery_worker", "global_discovery_worker"]
+          : []),
         "original_source_verifier",
         "workflow_gateway",
         "workflow_worker",
@@ -1116,29 +1393,40 @@ async function createAuthorizedCandidateFixture({
     });
     const artifact = join(artifactRoot, spec.componentId + ".oci.tar");
     await writeOciFixture(artifact, {
-      layers: [[
-        ...spec.entries,
-        {
-          body: canonicalJsonBytes(measurement),
-          name: "app/.bluey/managed-cloud-runtime-measurement.json",
-        },
-      ]],
+      layers: [
+        [
+          ...spec.entries,
+          {
+            body: canonicalJsonBytes(measurement),
+            name: "app/.bluey/managed-cloud-runtime-measurement.json",
+          },
+        ],
+      ],
       runtime: spec.runtime,
     });
     const inventory = await inspectOciImageArchive(artifact, spec.componentId);
-    const inventoryFile = join(artifactRoot, spec.componentId + ".inventory.json");
+    const inventoryFile = join(
+      artifactRoot,
+      spec.componentId + ".inventory.json",
+    );
     const sbomFile = join(artifactRoot, spec.componentId + ".sbom.json");
-    const provenanceFile = join(artifactRoot, spec.componentId + ".provenance.json");
+    const provenanceFile = join(
+      artifactRoot,
+      spec.componentId + ".provenance.json",
+    );
     await writeCanonical(inventoryFile, inventory);
     await writeCanonical(sbomFile, createFileSbom(inventory));
-    await writeCanonical(provenanceFile, createArtifactProvenance({
-      artifactSha256: inventory.artifactSha256,
-      buildId,
-      builderPolicySha256: contractHashes.builder,
-      componentId: spec.componentId,
-      sourceCommit: SOURCE_COMMIT,
-      sourceDateEpoch,
-    }));
+    await writeCanonical(
+      provenanceFile,
+      createArtifactProvenance({
+        artifactSha256: inventory.artifactSha256,
+        buildId,
+        builderPolicySha256: contractHashes.builder,
+        componentId: spec.componentId,
+        sourceCommit: SOURCE_COMMIT,
+        sourceDateEpoch,
+      }),
+    );
     builds.push({
       architecture: "x86_64",
       artifactKind: "oci_image",
@@ -1165,18 +1453,24 @@ async function createAuthorizedCandidateFixture({
   );
   const portalInventoryFile = join(artifactRoot, "jobs-portal.inventory.json");
   const portalSbomFile = join(artifactRoot, "jobs-portal.sbom.json");
-  const portalProvenanceFile = join(artifactRoot, "jobs-portal.provenance.json");
+  const portalProvenanceFile = join(
+    artifactRoot,
+    "jobs-portal.provenance.json",
+  );
   const portalBuildId = `${releaseId}-jobs-portal`;
   await writeCanonical(portalInventoryFile, portalInventory);
   await writeCanonical(portalSbomFile, createFileSbom(portalInventory));
-  await writeCanonical(portalProvenanceFile, createArtifactProvenance({
-    artifactSha256: portalInventory.artifactSha256,
-    buildId: portalBuildId,
-    builderPolicySha256: contractHashes.builder,
-    componentId: "jobs-portal",
-    sourceCommit: SOURCE_COMMIT,
-    sourceDateEpoch,
-  }));
+  await writeCanonical(
+    portalProvenanceFile,
+    createArtifactProvenance({
+      artifactSha256: portalInventory.artifactSha256,
+      buildId: portalBuildId,
+      builderPolicySha256: contractHashes.builder,
+      componentId: "jobs-portal",
+      sourceCommit: SOURCE_COMMIT,
+      sourceDateEpoch,
+    }),
+  );
   builds.push({
     architecture: "wasm",
     artifactKind: "static_bundle",
@@ -1205,23 +1499,26 @@ async function createAuthorizedCandidateFixture({
     status: "completed",
   });
   const testEvidenceFile = join(fixtureRoot, "test-evidence.json");
-  await writeCanonical(testEvidenceFile, createManagedCloudCiEvidence({
-    defaultBranch: "main",
-    jobsCiRun: run(1001, ".github/workflows/jobs-ci.yml@main"),
-    observabilityRun: run(1002, ".github/workflows/observability-policy.yml"),
-    releaseContractSelfTestSha256: "b".repeat(64),
-    repository,
-    sourceCommit: SOURCE_COMMIT,
-  }));
+  await writeCanonical(
+    testEvidenceFile,
+    createManagedCloudCiEvidence({
+      defaultBranch: "main",
+      jobsCiRun: run(1001, ".github/workflows/jobs-ci.yml@main"),
+      observabilityRun: run(1002, ".github/workflows/observability-policy.yml"),
+      releaseContractSelfTestSha256: "b".repeat(64),
+      repository,
+      sourceCommit: SOURCE_COMMIT,
+    }),
+  );
   const descriptorFile = join(fixtureRoot, "release-descriptor.json");
   const publishedAtMs = Date.now() - 1_000;
   await writeCanonical(descriptorFile, {
-    audience: "bluey-jobs-managed-cloud-release-descriptor-v2",
+    audience: `bluey-jobs-managed-cloud-release-descriptor-v${contractVersion}`,
     builds,
     featureAuthority: {
       cloudDistribution: true,
-      directDiscovery: false,
-      globalDiscovery: false,
+      directDiscovery: contractVersion === 3,
+      globalDiscovery: contractVersion === 3,
       sourceVerification: true,
       workflowCleanup: true,
       workflowCommandDispatch: true,
@@ -1234,7 +1531,7 @@ async function createAuthorizedCandidateFixture({
     sourceCommit: SOURCE_COMMIT,
     sourceDateEpoch,
     testEvidenceFile,
-    version: 2,
+    version: contractVersion,
   });
   const candidate = join(fixtureRoot, "candidate");
   await assembleManagedCloudCandidate({
@@ -1245,14 +1542,20 @@ async function createAuthorizedCandidateFixture({
   });
   const manifestFile = join(candidate, "release-manifest.json");
   const releaseSignaturesFile = join(fixtureRoot, "release-signatures.json");
-  await writeCanonical(releaseSignaturesFile, signedSet({
-    id: `release-signatures-${label}`,
-    keys: [{ keyId: "release-active", pair: trust.pairs["release-active"] }],
-    role: "release",
-    signedAtMs: Date.now(),
-    targetAudience: MANAGED_CLOUD_AUDIENCES.manifestV2,
-    targetBytes: await readFile(manifestFile),
-  }));
+  await writeCanonical(
+    releaseSignaturesFile,
+    signedSet({
+      id: `release-signatures-${label}`,
+      keys: [{ keyId: "release-active", pair: trust.pairs["release-active"] }],
+      role: "release",
+      signedAtMs: Date.now(),
+      targetAudience:
+        contractVersion === 3
+          ? MANAGED_CLOUD_AUDIENCES.manifestV3
+          : MANAGED_CLOUD_AUDIENCES.manifestV2,
+      targetBytes: await readFile(manifestFile),
+    }),
+  );
   const trustBundleFile = join(fixtureRoot, "trust-bundle.json");
   await writeCanonical(trustBundleFile, trust.trustBundle);
   const authorized = join(fixtureRoot, "authorized");
@@ -1270,6 +1573,7 @@ async function createAuthorizedCandidateFixture({
 async function createRemotePromotionFixture({
   activationGeneration,
   channelSequence,
+  contractVersion = 2,
   expectedHeadRevision,
   expectedTransitionSha256,
   label,
@@ -1279,6 +1583,7 @@ async function createRemotePromotionFixture({
   trust,
 }) {
   const candidateFixture = await createAuthorizedCandidateFixture({
+    contractVersion,
     label,
     releaseSequence,
     root,
@@ -1295,7 +1600,11 @@ async function createRemotePromotionFixture({
     await readFile(join(authorized, "authorization-set.json"), "utf8"),
   );
   const nowMs = Date.now();
-  const scope = { channel: "shadow", environment: "staging", region: "us-east-1" };
+  const scope = {
+    channel: "shadow",
+    environment: "staging",
+    region: "us-east-1",
+  };
   const cohort = {
     accountIdSha256s: [],
     approvalRef: "test-only-shadow-approval",
@@ -1313,14 +1622,17 @@ async function createRemotePromotionFixture({
   const cohortFile = join(fixtureRoot, "cohort.json");
   await writeCanonical(cohortFile, cohort);
   const cohortSignaturesFile = join(fixtureRoot, "cohort-signatures.json");
-  await writeCanonical(cohortSignaturesFile, signedSet({
-    id: `cohort-signatures-${label}`,
-    keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
-    role: "promotion",
-    signedAtMs: nowMs - 400,
-    targetAudience: MANAGED_CLOUD_AUDIENCES.cohort,
-    targetBytes: await readFile(cohortFile),
-  }));
+  await writeCanonical(
+    cohortSignaturesFile,
+    signedSet({
+      id: `cohort-signatures-${label}`,
+      keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+      role: "promotion",
+      signedAtMs: nowMs - 400,
+      targetAudience: MANAGED_CLOUD_AUDIENCES.cohort,
+      targetBytes: await readFile(cohortFile),
+    }),
+  );
   const activationTimes = {
     expiresAtMs: nowMs + 10_000,
     issuedAtMs: nowMs - 1_000,
@@ -1339,7 +1651,10 @@ async function createRemotePromotionFixture({
   };
   const workflowsInventory = JSON.parse(
     await readFile(
-      join(authorized, "candidate/evidence/jobs-workflows.content-inventory.json"),
+      join(
+        authorized,
+        "candidate/evidence/jobs-workflows.content-inventory.json",
+      ),
       "utf8",
     ),
   );
@@ -1358,7 +1673,11 @@ async function createRemotePromotionFixture({
       ...evidenceEnvelope,
       audience: MANAGED_CLOUD_AUDIENCES.canaryEvidence,
       checks: deriveManagedCloudCanaryCheckIds(manifest.featureAuthority).map(
-        (checkId) => ({ checkId, evidenceSha256: "1".repeat(64), status: "pass" }),
+        (checkId) => ({
+          checkId,
+          evidenceSha256: "1".repeat(64),
+          status: "pass",
+        }),
       ),
     },
     "cleanup-authority.json": {
@@ -1415,7 +1734,10 @@ async function createRemotePromotionFixture({
   const activation = {
     activationGeneration,
     activationId: `activation-${label}`,
-    audience: MANAGED_CLOUD_AUDIENCES.activationV2,
+    audience:
+      contractVersion === 3
+        ? MANAGED_CLOUD_AUDIENCES.activationV3
+        : MANAGED_CLOUD_AUDIENCES.activationV2,
     canaryEvidenceSha256: await fileSha256(join(evidence, "canary.json")),
     channelSequence,
     cleanupAuthoritySha256: "2".repeat(64),
@@ -1449,7 +1771,7 @@ async function createRemotePromotionFixture({
     taskQueueSha256,
     temporalNamespaceSha256: sha256(Buffer.from("bluey-test")),
     trustGeneration: 1,
-    version: 2,
+    version: contractVersion,
   };
   const activationFile = join(fixtureRoot, "activation.json");
   await writeCanonical(activationFile, activation);
@@ -1457,14 +1779,20 @@ async function createRemotePromotionFixture({
     fixtureRoot,
     "activation-signatures.json",
   );
-  await writeCanonical(activationSignaturesFile, signedSet({
-    id: `activation-signatures-${label}`,
-    keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
-    role: "promotion",
-    signedAtMs: nowMs,
-    targetAudience: MANAGED_CLOUD_AUDIENCES.activationV2,
-    targetBytes: await readFile(activationFile),
-  }));
+  await writeCanonical(
+    activationSignaturesFile,
+    signedSet({
+      id: `activation-signatures-${label}`,
+      keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+      role: "promotion",
+      signedAtMs: nowMs,
+      targetAudience:
+        contractVersion === 3
+          ? MANAGED_CLOUD_AUDIENCES.activationV3
+          : MANAGED_CLOUD_AUDIENCES.activationV2,
+      targetBytes: await readFile(activationFile),
+    }),
+  );
   const publication = join(fixtureRoot, "publication");
   const publicationPlanFile = join(publication, "publication-plan.json");
   const plan = await createManagedCloudArtifactPublicationPlan({
@@ -1477,7 +1805,8 @@ async function createRemotePromotionFixture({
   const publicationReadback = join(fixtureRoot, "publication-readback");
   await mkdir(publicationReadback);
   for (const component of MANAGED_CLOUD_COMPONENTS) {
-    const extension = component.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+    const extension =
+      component.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
     await copyFile(
       join(authorized, "candidate/payloads", component.componentId + extension),
       join(publicationReadback, component.componentId + extension),
@@ -1489,14 +1818,13 @@ async function createRemotePromotionFixture({
   const portalReadbackBytes = await readFile(
     join(publicationReadback, "jobs-portal.tar"),
   );
-  const portalManifestBytes = canonicalJsonBytes(portalArtifactManifest(
-    portalReadbackBytes,
-    {
+  const portalManifestBytes = canonicalJsonBytes(
+    portalArtifactManifest(portalReadbackBytes, {
       annotations: {
         "org.opencontainers.image.created": plan.portalManifestCreatedAt,
       },
-    },
-  ));
+    }),
+  );
   await writeFile(
     join(publicationReadback, "jobs-portal.oci-manifest.json"),
     portalManifestBytes,
@@ -1528,20 +1856,24 @@ async function createRemotePromotionFixture({
     status: "completed",
   };
   const jobs = {
-    jobs: [{
-      conclusion: "success",
-      head_sha: SOURCE_COMMIT,
-      id: workflowRunId + 1,
-      name: "publish",
-      run_attempt: workflowRunAttempt,
-      run_id: workflowRunId,
-      status: "completed",
-      steps: [{
+    jobs: [
+      {
         conclusion: "success",
-        name: "Upload the remote publication receipt only",
+        head_sha: SOURCE_COMMIT,
+        id: workflowRunId + 1,
+        name: "publish",
+        run_attempt: workflowRunAttempt,
+        run_id: workflowRunId,
         status: "completed",
-      }],
-    }],
+        steps: [
+          {
+            conclusion: "success",
+            name: "Upload the remote publication receipt only",
+            status: "completed",
+          },
+        ],
+      },
+    ],
     total_count: 1,
   };
   const workflowEvidence = createManagedCloudPublicationWorkflowEvidence({
@@ -1552,16 +1884,22 @@ async function createRemotePromotionFixture({
     publication: publicationSet,
     run,
   });
-  const workflowEvidenceFile = join(fixtureRoot, "publication-workflow-evidence.json");
+  const workflowEvidenceFile = join(
+    fixtureRoot,
+    "publication-workflow-evidence.json",
+  );
   await writeCanonical(workflowEvidenceFile, workflowEvidence);
   const preflightFile = join(fixtureRoot, "publication-preflight.json");
-  await writeCanonical(preflightFile, createManagedCloudPublicationPreflightDocument({
-    plan,
-    publication: publicationSet,
-    publicationPlanSha256: await fileSha256(publicationPlanFile),
-    publicationSetSha256: await fileSha256(publicationSetFile),
-    workflowEvidence,
-  }));
+  await writeCanonical(
+    preflightFile,
+    createManagedCloudPublicationPreflightDocument({
+      plan,
+      publication: publicationSet,
+      publicationPlanSha256: await fileSha256(publicationPlanFile),
+      publicationSetSha256: await fileSha256(publicationSetFile),
+      workflowEvidence,
+    }),
+  );
   const promotion = join(fixtureRoot, "promotion-v2");
   const promotionSet = await promoteManagedCloudCandidate({
     activationFile,
@@ -1601,9 +1939,13 @@ async function createHistoricalPromotionFixture(remoteFixture, output) {
     join(output, "authorized-candidate"),
     { recursive: true },
   );
-  await cp(join(remoteFixture.promotion, "evidence"), join(output, "evidence"), {
-    recursive: true,
-  });
+  await cp(
+    join(remoteFixture.promotion, "evidence"),
+    join(output, "evidence"),
+    {
+      recursive: true,
+    },
+  );
   const candidateSet = JSON.parse(
     await readFile(
       join(output, "authorized-candidate/candidate/candidate-set.json"),
@@ -1673,67 +2015,77 @@ test("release-v1 validates the exact artifacts, capabilities, migrations, and pr
   const manifest = releaseFixture();
   assert.equal(validateReleaseManifest(manifest), manifest);
   assert.throws(
-    () => validateReleaseManifest({
-      ...manifest,
-      capabilities: manifest.capabilities.map((item) =>
-        item.capability === "portal_static"
-          ? { ...item, capability: "jobs_portal" }
-          : item,
-      ),
-    }),
+    () =>
+      validateReleaseManifest({
+        ...manifest,
+        capabilities: manifest.capabilities.map((item) =>
+          item.capability === "portal_static"
+            ? { ...item, capability: "jobs_portal" }
+            : item,
+        ),
+      }),
     /capability mapping/,
   );
   assert.throws(
-    () => validateReleaseManifest({
-      ...manifest,
-      protocols: manifest.protocols.map((item) =>
-        item.protocolId === "runner_result"
-          ? { ...item, protocolVersion: 1 }
-          : item,
-      ),
-    }),
+    () =>
+      validateReleaseManifest({
+        ...manifest,
+        protocols: manifest.protocols.map((item) =>
+          item.protocolId === "runner_result"
+            ? { ...item, protocolVersion: 1 }
+            : item,
+        ),
+      }),
     /protocols/,
   );
   assert.throws(
-    () => validateReleaseManifest({
-      ...manifest,
-      sqliteMigrationHead: "056_jobs_canonical_taxonomy_authority",
-    }),
+    () =>
+      validateReleaseManifest({
+        ...manifest,
+        sqliteMigrationHead: "056_jobs_canonical_taxonomy_authority",
+      }),
     /migration heads/,
   );
   assert.throws(
-    () => validateReleaseManifest({
-      ...manifest,
-      manifestId: "m".repeat(128 * 1024),
-    }),
+    () =>
+      validateReleaseManifest({
+        ...manifest,
+        manifestId: "m".repeat(128 * 1024),
+      }),
     /128 KiB/,
   );
   for (const feature of ["directDiscovery", "globalDiscovery"]) {
     assert.throws(
-      () => validateReleaseManifest({
-        ...manifest,
-        featureAuthority: {
-          ...manifest.featureAuthority,
-          [feature]: true,
-        },
-      }),
+      () =>
+        validateReleaseManifest({
+          ...manifest,
+          featureAuthority: {
+            ...manifest.featureAuthority,
+            [feature]: true,
+          },
+        }),
       /reserves conditional discovery/,
     );
   }
-  const portal = manifest.components.find((item) => item.componentId === "jobs-portal");
+  const portal = manifest.components.find(
+    (item) => item.componentId === "jobs-portal",
+  );
   assert.throws(
-    () => validateReleaseManifest({
-      ...manifest,
-      components: manifest.components.map((item) =>
-        item.componentId === "jobs-portal"
-          ? {
-              ...item,
-              artifactRef:
-                "https://artifacts.example/releases/" + RELEASE_ID + "/portal.tar",
-            }
-          : item,
-      ),
-    }),
+    () =>
+      validateReleaseManifest({
+        ...manifest,
+        components: manifest.components.map((item) =>
+          item.componentId === "jobs-portal"
+            ? {
+                ...item,
+                artifactRef:
+                  "https://artifacts.example/releases/" +
+                  RELEASE_ID +
+                  "/portal.tar",
+              }
+            : item,
+        ),
+      }),
     /content-addressed/,
   );
   assert.match(portal.artifactRef, new RegExp(portal.artifactSha256));
@@ -1742,10 +2094,10 @@ test("release-v1 validates the exact artifacts, capabilities, migrations, and pr
 test("release-v2 binds source verification capability, protocol, role, and entrypoint", () => {
   const manifest = successorReleaseFixture();
   assert.equal(validateReleaseManifest(manifest), manifest);
-  assert.deepEqual(deriveRequiredRuntimeRoles(manifest.featureAuthority), [
-    ...MANAGED_CLOUD_BASE_RUNTIME_ROLES,
-    "original_source_verifier",
-  ].sort());
+  assert.deepEqual(
+    deriveRequiredRuntimeRoles(manifest.featureAuthority),
+    [...MANAGED_CLOUD_BASE_RUNTIME_ROLES, "original_source_verifier"].sort(),
+  );
   assert.deepEqual(
     deriveManagedCloudCanaryCheckIds(manifest.featureAuthority),
     [...CANARY_CHECK_IDS, "original-source-verifier-readiness"].sort(),
@@ -1757,11 +2109,13 @@ test("release-v2 binds source verification capability, protocol, role, and entry
     ).filter((path) => path.includes("original-source")),
     ["app/workflows/dist/original-source-verifier.js"],
   );
-  assert.doesNotThrow(() => deriveManagedCloudRuntimeIdentitySha256(
-    "a".repeat(64),
-    "jobs-workflows",
-    "original_source_verifier",
-  ));
+  assert.doesNotThrow(() =>
+    deriveManagedCloudRuntimeIdentitySha256(
+      "a".repeat(64),
+      "jobs-workflows",
+      "original_source_verifier",
+    ),
+  );
 
   const versionOneEnabled = releaseFixture();
   versionOneEnabled.featureAuthority.sourceVerification = true;
@@ -1771,17 +2125,17 @@ test("release-v2 binds source verification capability, protocol, role, and entry
     invalid.featureAuthoritySha256 = sha256(
       canonicalJsonBytes(invalid.featureAuthority),
     );
-    assert.throws(() => validateReleaseManifest(invalid), /v1=false or v2=true/);
+    assert.throws(
+      () => validateReleaseManifest(invalid),
+      /v1=false or v2=true/,
+    );
   }
 
   const missingCapability = structuredClone(manifest);
   missingCapability.capabilities = missingCapability.capabilities.filter(
     (entry) => entry.capability !== "original_source_verifier",
   );
-  assert.throws(
-    () => validateReleaseManifest(missingCapability),
-    /capabilit/,
-  );
+  assert.throws(() => validateReleaseManifest(missingCapability), /capabilit/);
 
   const wrongProtocol = structuredClone(manifest);
   wrongProtocol.protocols.find(
@@ -1794,12 +2148,348 @@ test("release-v2 binds source verification capability, protocol, role, and entry
 
   const contracts = successorReleaseContractFixture();
   assert.equal(validateManagedCloudReleaseContracts(contracts), true);
-  contracts.protocolContract.protocols.find(
-    (entry) => entry.protocolId === "source_verification",
-  ).sourceFiles.pop();
+  contracts.protocolContract.protocols
+    .find((entry) => entry.protocolId === "source_verification")
+    .sourceFiles.pop();
   assert.throws(
     () => validateManagedCloudReleaseContracts(contracts),
     /required source paths/,
+  );
+});
+
+test("release-v1 and v2 preserve their historical canonical fixture bytes", () => {
+  const releaseV1 = releaseFixture();
+  const releaseV2 = successorReleaseFixture();
+  assert.equal(
+    sha256(canonicalJsonBytes(releaseV1)),
+    "2c8598c721b40595ba3bf9f72d8873f3eb8a86fb2f559775966b041c5cec2848",
+  );
+  assert.equal(
+    sha256(canonicalJsonBytes(releaseV2)),
+    "e4eaa40b864b15c4c6e8135c3c2dc1601f10b3ab3a11ae413b50dcd6a6614a34",
+  );
+  assert.equal(
+    sha256(canonicalJsonBytes(releaseContractFixture())),
+    "0ff2cd59129ca3c0089a9841276a2e3b888b51f8d02b7c256ed37113911bd59a",
+  );
+  assert.equal(
+    sha256(canonicalJsonBytes(successorReleaseContractFixture())),
+    "52455ce26c1129a24619c2fdb1c12e7d25d0c53cce16ebd838757b9cdf1f1083",
+  );
+  assert.deepEqual(
+    [releaseV1, releaseV2].map((manifest) => ({
+      audience: manifest.audience,
+      featureAuthority: manifest.featureAuthority,
+      postgresMigrationHead: manifest.postgresMigrationHead,
+      protocolOrdinals: manifest.protocols.map((entry) => entry.protocolId),
+      sqliteMigrationHead: manifest.sqliteMigrationHead,
+      version: manifest.version,
+    })),
+    [
+      {
+        audience: MANAGED_CLOUD_AUDIENCES.manifest,
+        featureAuthority: {
+          cloudDistribution: true,
+          directDiscovery: false,
+          globalDiscovery: false,
+          sourceVerification: false,
+          workflowCleanup: true,
+          workflowCommandDispatch: true,
+        },
+        postgresMigrationHead: "034_jobs_canonical_taxonomy_authority.sql",
+        protocolOrdinals: MANAGED_CLOUD_PROTOCOL_IDS,
+        sqliteMigrationHead: "056_jobs_canonical_taxonomy_authority.sql",
+        version: 1,
+      },
+      {
+        audience: MANAGED_CLOUD_AUDIENCES.manifestV2,
+        featureAuthority: {
+          cloudDistribution: true,
+          directDiscovery: false,
+          globalDiscovery: false,
+          sourceVerification: true,
+          workflowCleanup: true,
+          workflowCommandDispatch: true,
+        },
+        postgresMigrationHead:
+          "035_jobs_original_source_verification_authority.sql",
+        protocolOrdinals: MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS,
+        sqliteMigrationHead:
+          "057_jobs_original_source_verification_authority.sql",
+        version: 2,
+      },
+    ],
+  );
+});
+
+test("release-v3 exactly binds discovery, verifier startup, migrations, and nine roles", () => {
+  const manifest = releaseV3Fixture();
+  assert.equal(validateReleaseManifest(manifest), manifest);
+  assert.equal(manifest.audience, "bluey-jobs-managed-cloud-release-v3");
+  assert.deepEqual(MANAGED_CLOUD_PROTOCOL_IDS, [
+    "ats_certification",
+    "execution_lease",
+    "gateway_command",
+    "managed_cloud_release",
+    "object_evidence",
+    "runner_checkpoint",
+    "runner_profile_snapshot",
+    "runner_result",
+    "runtime_heartbeat",
+    "workflow_cleanup",
+    "workflow_command",
+  ]);
+  assert.deepEqual(MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS, [
+    ...MANAGED_CLOUD_PROTOCOL_IDS.slice(0, 9),
+    "source_verification",
+    ...MANAGED_CLOUD_PROTOCOL_IDS.slice(9),
+  ]);
+  assert.deepEqual(MANAGED_CLOUD_RELEASE_V3_PROTOCOL_IDS, [
+    ...MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS.slice(0, 10),
+    "source_verifier_startup",
+    "source_verifier_boot",
+    ...MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS.slice(10),
+  ]);
+  assert.deepEqual(
+    deriveRequiredRuntimeRoles(manifest.featureAuthority),
+    [
+      ...MANAGED_CLOUD_BASE_RUNTIME_ROLES,
+      "discovery_worker",
+      "global_discovery_worker",
+      "original_source_verifier",
+    ].sort(),
+  );
+  assert.deepEqual(
+    manifest.capabilities.filter(
+      (entry) => entry.componentId === "jobs-workflows",
+    ),
+    [
+      "discovery_worker",
+      "global_discovery_worker",
+      "original_source_verifier",
+      "workflow_gateway",
+      "workflow_worker",
+    ].map((capability) => ({ capability, componentId: "jobs-workflows" })),
+  );
+  assert.deepEqual(
+    deriveManagedCloudCanaryCheckIds(manifest.featureAuthority),
+    [
+      ...CANARY_CHECK_IDS,
+      "discovery-worker-readiness",
+      "global-discovery-worker-readiness",
+      "original-source-verifier-readiness",
+    ].sort(),
+  );
+  assert.deepEqual(
+    deriveManagedCloudRequiredRuntimePaths(
+      "jobs-workflows",
+      manifest.capabilities,
+    ),
+    [
+      "app/.bluey/managed-cloud-runtime-measurement.json",
+      "app/workflows/dist/discovery-worker.js",
+      "app/workflows/dist/failure-converter.js",
+      "app/workflows/dist/gateway.js",
+      "app/workflows/dist/global-discovery-worker.js",
+      "app/workflows/dist/original-source-verifier.js",
+      "app/workflows/dist/worker.js",
+      "usr/local/bin/node",
+    ],
+  );
+
+  const contracts = releaseV3ContractFixture();
+  assert.equal(validateManagedCloudReleaseContracts(contracts), true);
+  assert.equal(contracts.builderPolicy.schemaVersion, 2);
+  assert.equal(
+    validateManagedCloudPublicationBuilderPolicy(contracts.builderPolicy),
+    true,
+  );
+  assert.deepEqual(
+    contracts.protocolContract.protocols
+      .find((entry) => entry.protocolId === "source_verifier_startup")
+      .sourceFiles.map((entry) => entry.path),
+    SOURCE_VERIFIER_STARTUP_PROTOCOL_PATHS,
+  );
+  assert.deepEqual(
+    contracts.protocolContract.protocols
+      .find((entry) => entry.protocolId === "source_verifier_boot")
+      .sourceFiles.map((entry) => entry.path),
+    SOURCE_VERIFIER_BOOT_PROTOCOL_PATHS,
+  );
+
+  for (const [label, mutate, expected] of [
+    [
+      "v2 audience",
+      (value) => {
+        value.audience = MANAGED_CLOUD_AUDIENCES.manifestV2;
+      },
+      /audience or version/,
+    ],
+    [
+      "v2 migration heads",
+      (value) => {
+        value.sqliteMigrationHead =
+          "057_jobs_original_source_verification_authority.sql";
+      },
+      /migration heads/,
+    ],
+    [
+      "v2 postgres migration head",
+      (value) => {
+        value.postgresMigrationHead =
+          "035_jobs_original_source_verification_authority.sql";
+      },
+      /migration heads/,
+    ],
+    [
+      "disabled direct discovery",
+      (value) => {
+        value.featureAuthority.directDiscovery = false;
+        value.featureAuthoritySha256 = sha256(
+          canonicalJsonBytes(value.featureAuthority),
+        );
+      },
+      /Release-v3 requires direct and global discovery/,
+    ],
+    [
+      "disabled global discovery",
+      (value) => {
+        value.featureAuthority.globalDiscovery = false;
+        value.featureAuthoritySha256 = sha256(
+          canonicalJsonBytes(value.featureAuthority),
+        );
+      },
+      /Release-v3 requires direct and global discovery/,
+    ],
+    [
+      "disabled source verification",
+      (value) => {
+        value.featureAuthority.sourceVerification = false;
+        value.featureAuthoritySha256 = sha256(
+          canonicalJsonBytes(value.featureAuthority),
+        );
+      },
+      /release v3 also requires true/,
+    ],
+    [
+      "missing global discovery capability",
+      (value) => {
+        value.capabilities = value.capabilities.filter(
+          (entry) => entry.capability !== "global_discovery_worker",
+        );
+      },
+      /capabilit/,
+    ],
+    [
+      "startup protocol omission",
+      (value) => {
+        value.protocols = value.protocols.filter(
+          (entry) => entry.protocolId !== "source_verifier_startup",
+        );
+      },
+      /bind exactly|protocol/,
+    ],
+    [
+      "boot protocol omission",
+      (value) => {
+        value.protocols = value.protocols.filter(
+          (entry) => entry.protocolId !== "source_verifier_boot",
+        );
+      },
+      /bind exactly|protocol/,
+    ],
+  ]) {
+    const mutated = structuredClone(manifest);
+    mutate(mutated);
+    assert.throws(
+      () => validateReleaseManifest(mutated),
+      expected,
+      `${label} must not cross the v3 contract boundary`,
+    );
+  }
+
+  const v2WithStartup = successorReleaseFixture();
+  v2WithStartup.protocols.splice(10, 0, {
+    protocolId: "source_verifier_startup",
+    protocolVersion: 1,
+    schemaSha256: "a".repeat(64),
+  });
+  assert.throws(
+    () => validateReleaseManifest(v2WithStartup),
+    /bind exactly|protocol/,
+  );
+
+  const wrongStartupSources = releaseV3ContractFixture();
+  wrongStartupSources.protocolContract.protocols
+    .find((entry) => entry.protocolId === "source_verifier_startup")
+    .sourceFiles.pop();
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(wrongStartupSources),
+    /required source paths/,
+  );
+
+  const wrongBootSources = releaseV3ContractFixture();
+  wrongBootSources.protocolContract.protocols
+    .find((entry) => entry.protocolId === "source_verifier_boot")
+    .sourceFiles.pop();
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(wrongBootSources),
+    /required source paths/,
+  );
+
+  const missingStartupSigner = releaseV3ContractFixture();
+  const startupSignerSources =
+    missingStartupSigner.protocolContract.protocols.find(
+      (entry) => entry.protocolId === "source_verifier_startup",
+    ).sourceFiles;
+  const startupSignerIndex = startupSignerSources.findIndex(
+    (entry) => entry.path === "jobs/automation/src/worker-auth.ts",
+  );
+  assert.notEqual(startupSignerIndex, -1, "startup signer fixture must exist");
+  startupSignerSources.splice(startupSignerIndex, 1);
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(missingStartupSigner),
+    /required source paths/,
+  );
+
+  const wrongStartupVersion = releaseV3ContractFixture();
+  wrongStartupVersion.protocolContract.protocols.find(
+    (entry) => entry.protocolId === "source_verifier_startup",
+  ).protocolVersion = 2;
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(wrongStartupVersion),
+    /identity\/version set is not exact/,
+  );
+
+  const wrongBootVersion = releaseV3ContractFixture();
+  wrongBootVersion.protocolContract.protocols.find(
+    (entry) => entry.protocolId === "source_verifier_boot",
+  ).protocolVersion = 2;
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(wrongBootVersion),
+    /identity\/version set is not exact/,
+  );
+
+  const v2ProtocolContract = releaseV3ContractFixture();
+  v2ProtocolContract.protocolContract.schemaVersion = 2;
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(v2ProtocolContract),
+    /one exact version/,
+  );
+
+  const builderV3 = releaseV3ContractFixture();
+  builderV3.builderPolicy.schemaVersion = 3;
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(builderV3),
+    /build-once contract/,
+  );
+  const legacyBuilderV3 = releaseV3ContractFixture();
+  legacyBuilderV3.builderPolicy = structuredClone(
+    releaseContractFixture().builderPolicy,
+  );
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(legacyBuilderV3),
+    /requires builder policy generation v2/,
   );
 });
 
@@ -1857,8 +2547,8 @@ test("release contracts prove full source sets without configured runtime identi
   );
 
   const apiRuntimeDisabled = structuredClone(fixture);
-  apiRuntimeDisabled.configContract.variables.find((variable) =>
-    variable.name === "BLUEY_JOBS_MANAGED_CLOUD_RUNTIME_ENABLED"
+  apiRuntimeDisabled.configContract.variables.find(
+    (variable) => variable.name === "BLUEY_JOBS_MANAGED_CLOUD_RUNTIME_ENABLED",
   ).roles = ["jobs_workflows", "managed_runner"];
   assert.throws(
     () => validateManagedCloudReleaseContracts(apiRuntimeDisabled),
@@ -1866,8 +2556,9 @@ test("release contracts prove full source sets without configured runtime identi
   );
 
   const reconciliationOptional = structuredClone(fixture);
-  reconciliationOptional.configContract.variables.find((variable) =>
-    variable.name === "BLUEY_JOBS_WORKFLOW_COMMAND_RECONCILIATION_ENABLED"
+  reconciliationOptional.configContract.variables.find(
+    (variable) =>
+      variable.name === "BLUEY_JOBS_WORKFLOW_COMMAND_RECONCILIATION_ENABLED",
   ).required = false;
   assert.throws(
     () => validateManagedCloudReleaseContracts(reconciliationOptional),
@@ -1911,11 +2602,13 @@ test("runtime identity is role-separated and derived from measured artifact byte
   assert.notEqual(gateway, worker);
   assert.equal(
     gateway,
-    sha256(Buffer.concat([
-      Buffer.from("bluey-jobs-managed-cloud-runtime-identity-v1\0"),
-      Buffer.from(measurementSha256),
-      Buffer.from("\0jobs-workflows\0workflow_gateway"),
-    ])),
+    sha256(
+      Buffer.concat([
+        Buffer.from("bluey-jobs-managed-cloud-runtime-identity-v1\0"),
+        Buffer.from(measurementSha256),
+        Buffer.from("\0jobs-workflows\0workflow_gateway"),
+      ]),
+    ),
   );
 });
 
@@ -1966,10 +2659,9 @@ test("release-v2 runtime measurement binds the exact verifier role and entrypoin
         type: "file",
       },
       ...measuredFiles.map((file) => ({ ...file, sizeBytes: 1, type: "file" })),
-    ].sort((left, right) => Buffer.compare(
-      Buffer.from(left.path),
-      Buffer.from(right.path),
-    )),
+    ].sort((left, right) =>
+      Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)),
+    ),
   };
   const runtimeIdentities = roles.map((role) => ({
     role,
@@ -2008,12 +2700,15 @@ test("release-v2 runtime measurement binds the exact verifier role and entrypoin
 
   const missingVerifierRole = roles.slice(1);
   assert.throws(
-    () => validateManagedCloudRuntimeMeasurement(
-      { ...measurement, roles: missingVerifierRole },
-      sha256(canonicalJsonBytes({ ...measurement, roles: missingVerifierRole })),
-      runtimeIdentities.slice(1),
-      context,
-    ),
+    () =>
+      validateManagedCloudRuntimeMeasurement(
+        { ...measurement, roles: missingVerifierRole },
+        sha256(
+          canonicalJsonBytes({ ...measurement, roles: missingVerifierRole }),
+        ),
+        runtimeIdentities.slice(1),
+        context,
+      ),
     /not exact/,
   );
 });
@@ -2048,10 +2743,9 @@ test("runtime measurement accepts 512 exact files and rejects 513", () => {
         type: "file",
       },
       ...measuredFiles.map((file) => ({ ...file, sizeBytes: 1, type: "file" })),
-    ].sort((left, right) => Buffer.compare(
-      Buffer.from(left.path),
-      Buffer.from(right.path),
-    )),
+    ].sort((left, right) =>
+      Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)),
+    ),
   };
   const runtimeIdentities = measurement.roles.map((role) => ({
     role,
@@ -2088,25 +2782,26 @@ test("runtime measurement accepts 512 exact files and rejects 513", () => {
     ],
   };
   assert.throws(
-    () => validateManagedCloudRuntimeMeasurement(
-      overflow,
-      sha256(canonicalJsonBytes(overflow)),
-      runtimeIdentities,
-      {
-        ...context,
-        inventory: {
-          entries: [
-            ...inventory.entries,
-            {
-              path: "app/workflows/dist/overflow.js",
-              sha256: "f".repeat(64),
-              sizeBytes: 1,
-              type: "file",
-            },
-          ],
+    () =>
+      validateManagedCloudRuntimeMeasurement(
+        overflow,
+        sha256(canonicalJsonBytes(overflow)),
+        runtimeIdentities,
+        {
+          ...context,
+          inventory: {
+            entries: [
+              ...inventory.entries,
+              {
+                path: "app/workflows/dist/overflow.js",
+                sha256: "f".repeat(64),
+                sizeBytes: 1,
+                type: "file",
+              },
+            ],
+          },
         },
-      },
-    ),
+      ),
     /file set is invalid/,
   );
 });
@@ -2121,30 +2816,28 @@ test("filesystem runtime measurement rejects a symbolic-link root", async (t) =>
     join(root, "usr/local/bin/bluey-jobs-api"),
   );
   await assert.rejects(
-    () => createRuntimeMeasurementFromFilesystem({
-      buildId: "managed-cloud-611-jobs-api",
-      componentId: "jobs-api",
-      configSchemaSha256: "c".repeat(64),
-      migrationSetSha256: "d".repeat(64),
-      protocolSetSha256: "e".repeat(64),
-      roles: [
-        "jobs_api",
-        "workflow_cleanup_dispatcher",
-        "workflow_command_dispatcher",
-      ],
-      root,
-      sourceCommit: SOURCE_COMMIT,
-    }),
+    () =>
+      createRuntimeMeasurementFromFilesystem({
+        buildId: "managed-cloud-611-jobs-api",
+        componentId: "jobs-api",
+        configSchemaSha256: "c".repeat(64),
+        migrationSetSha256: "d".repeat(64),
+        protocolSetSha256: "e".repeat(64),
+        roles: [
+          "jobs_api",
+          "workflow_cleanup_dispatcher",
+          "workflow_command_dispatcher",
+        ],
+        root,
+        sourceCommit: SOURCE_COMMIT,
+      }),
     /runtime measurement roots may not contain symbolic links/,
   );
 });
 
 test("task queue and failure-converter bytes retain shared digest goldens", () => {
   assert.equal(
-    deriveManagedCloudTaskQueueSha256(
-      "bluey-prod",
-      "bluey-jobs-applications",
-    ),
+    deriveManagedCloudTaskQueueSha256("bluey-prod", "bluey-jobs-applications"),
     "1551b746f88eded4598f4e0817382253d97bd1d8aa8bcc74b4f0339bd118cfb0",
   );
   assert.equal(
@@ -2177,30 +2870,31 @@ test("inventory import transport is exact, canonical, and capped at 12 MiB", () 
       const runtime = MANAGED_CLOUD_RUNTIME_CONTRACTS[component.componentId];
       const requiredPaths = runtime
         ? [
-          ...runtime.requiredPaths,
-          ...(component.componentId === "jobs-runner"
-            ? [
-              "ms-playwright/chromium_headless_shell-1/" +
-                "chrome-headless-shell-linux64/chrome-headless-shell",
-            ]
-            : []),
-        ]
+            ...runtime.requiredPaths,
+            ...(component.componentId === "jobs-runner"
+              ? [
+                  "ms-playwright/chromium_headless_shell-1/" +
+                    "chrome-headless-shell-linux64/chrome-headless-shell",
+                ]
+              : []),
+          ]
         : ["index.html"];
-      const entries = requiredPaths.map((path) => ({
-        mode:
-          path === "usr/local/bin/node" ||
-          path === "usr/local/bin/bluey-jobs-api" ||
-          path.endsWith("/chrome-headless-shell")
-            ? "0555"
-            : "0444",
-        path,
-        sha256: "1".repeat(64),
-        sizeBytes: 1,
-        type: "file",
-      })).sort((left, right) => Buffer.compare(
-        Buffer.from(left.path),
-        Buffer.from(right.path),
-      ));
+      const entries = requiredPaths
+        .map((path) => ({
+          mode:
+            path === "usr/local/bin/node" ||
+            path === "usr/local/bin/bluey-jobs-api" ||
+            path.endsWith("/chrome-headless-shell")
+              ? "0555"
+              : "0444",
+          path,
+          sha256: "1".repeat(64),
+          sizeBytes: 1,
+          type: "file",
+        }))
+        .sort((left, right) =>
+          Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)),
+        );
       const inventory = {
         artifactKind: component.artifactKind,
         artifactSha256: "1".repeat(64),
@@ -2209,13 +2903,13 @@ test("inventory import transport is exact, canonical, and capped at 12 MiB", () 
         entries,
         runtime: runtime
           ? {
-            cmd: [...runtime.cmd],
-            environment: [...runtime.requiredEnvironment].sort(),
-            entrypoint: [...runtime.entrypoint],
-            exposedPorts: [...runtime.exposedPorts],
-            user: runtime.runtimeUser,
-            workingDirectory: runtime.workingDirectory,
-          }
+              cmd: [...runtime.cmd],
+              environment: [...runtime.requiredEnvironment].sort(),
+              entrypoint: [...runtime.entrypoint],
+              exposedPorts: [...runtime.exposedPorts],
+              user: runtime.runtimeUser,
+              workingDirectory: runtime.workingDirectory,
+            }
           : null,
         version: 1,
       };
@@ -2229,17 +2923,19 @@ test("inventory import transport is exact, canonical, and capped at 12 MiB", () 
   assert.equal(validated.decoded.size, 4);
   assert.ok(validated.totalBytes > 0);
   assert.throws(
-    () => validateManagedCloudInventoryAttachments({
-      ...attachments,
-      "jobs-api": attachments["jobs-api"] + "=",
-    }),
+    () =>
+      validateManagedCloudInventoryAttachments({
+        ...attachments,
+        "jobs-api": attachments["jobs-api"] + "=",
+      }),
     /base64url/,
   );
   assert.throws(
-    () => validateManagedCloudInventoryAttachments({
-      ...attachments,
-      "jobs-api": attachments["jobs-runner"],
-    }),
+    () =>
+      validateManagedCloudInventoryAttachments({
+        ...attachments,
+        "jobs-api": attachments["jobs-runner"],
+      }),
     /component identity/,
   );
   const oversized = canonicalJsonBytes({
@@ -2250,10 +2946,11 @@ test("inventory import transport is exact, canonical, and capped at 12 MiB", () 
     version: 1,
   }).toString("base64url");
   assert.throws(
-    () => validateManagedCloudInventoryAttachments({
-      ...attachments,
-      "jobs-api": oversized,
-    }),
+    () =>
+      validateManagedCloudInventoryAttachments({
+        ...attachments,
+        "jobs-api": oversized,
+      }),
     /exceed 12 MiB/,
   );
 });
@@ -2296,13 +2993,14 @@ test("union root authorization satisfies overlapping anchor and policy threshold
     targetBytes,
   });
   assert.throws(
-    () => verifyManagedCloudSignatureSet({
-      expectedRole: "release",
-      expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.manifest,
-      expectedTargetBytes: targetBytes,
-      policy: active,
-      signatureSet: revokedExtra,
-    }),
+    () =>
+      verifyManagedCloudSignatureSet({
+        expectedRole: "release",
+        expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.manifest,
+        expectedTargetBytes: targetBytes,
+        policy: active,
+        signatureSet: revokedExtra,
+      }),
     /role, state, or generation/,
   );
 
@@ -2314,13 +3012,14 @@ test("union root authorization satisfies overlapping anchor and policy threshold
     })),
   };
   assert.throws(
-    () => verifyManagedCloudSignatureSet({
-      expectedRole: "release",
-      expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.manifest,
-      expectedTargetBytes: targetBytes,
-      policy: active,
-      signatureSet: tooManySignatures,
-    }),
+    () =>
+      verifyManagedCloudSignatureSet({
+        expectedRole: "release",
+        expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.manifest,
+        expectedTargetBytes: targetBytes,
+        policy: active,
+        signatureSet: tooManySignatures,
+      }),
     /at most 32/,
   );
 
@@ -2330,10 +3029,11 @@ test("union root authorization satisfies overlapping anchor and policy threshold
     keyId: "anchor-overflow-" + index.toString().padStart(2, "0"),
   }));
   assert.throws(
-    () => validateManagedCloudTrustBundle(
-      rootOverflow,
-      sha256(canonicalJsonBytes(rootOverflow.rootAnchor)),
-    ),
+    () =>
+      validateManagedCloudTrustBundle(
+        rootOverflow,
+        sha256(canonicalJsonBytes(rootOverflow.rootAnchor)),
+      ),
     /at most 32/,
   );
 
@@ -2341,10 +3041,7 @@ test("union root authorization satisfies overlapping anchor and policy threshold
   preIssued.policies[0].authorization.signedAtMs =
     preIssued.policies[0].policy.issuedAtMs - 1;
   assert.throws(
-    () => validateManagedCloudTrustBundle(
-      preIssued,
-      fixture.rootAnchorSha256,
-    ),
+    () => validateManagedCloudTrustBundle(preIssued, fixture.rootAnchorSha256),
     /inside every required policy window/,
   );
 });
@@ -2392,16 +3089,17 @@ test("trust rotation rejects authorization after predecessor policy expiry", () 
     trustGeneration: 2,
   });
   assert.throws(
-    () => validateManagedCloudTrustBundle(
-      {
-        ...fixture.trustBundle,
-        policies: [
-          { authorization: predecessorAuthorization, policy: predecessor },
-          { authorization: successorAuthorization, policy: successor },
-        ],
-      },
-      fixture.rootAnchorSha256,
-    ),
+    () =>
+      validateManagedCloudTrustBundle(
+        {
+          ...fixture.trustBundle,
+          policies: [
+            { authorization: predecessorAuthorization, policy: predecessor },
+            { authorization: successorAuthorization, policy: successor },
+          ],
+        },
+        fixture.rootAnchorSha256,
+      ),
     /inside every required policy window/,
   );
 });
@@ -2472,15 +3170,24 @@ test("trust rotation evaluates predecessor keys at predecessor generation", () =
 test("static bundle inspection rejects ambiguous archives and non-file index", async (t) => {
   const root = await temporaryDirectory(t, "static-gate");
   const good = join(root, "portal.tar");
-  await writeFile(good, tarArchive([{ body: "<main>Bluey</main>\n", name: "index.html" }]));
+  await writeFile(
+    good,
+    tarArchive([{ body: "<main>Bluey</main>\n", name: "index.html" }]),
+  );
   const inspected = await inspectStaticBundleArchive(good);
   assert.equal(inspected.entries[0].path, "index.html");
 
   const trailing = join(root, "trailing.tar");
-  const trailingBytes = Buffer.concat([await readFile(good), Buffer.alloc(512)]);
+  const trailingBytes = Buffer.concat([
+    await readFile(good),
+    Buffer.alloc(512),
+  ]);
   trailingBytes[trailingBytes.length - 1] = 1;
   await writeFile(trailing, trailingBytes);
-  await assert.rejects(() => inspectStaticBundleArchive(trailing), /nonzero bytes/);
+  await assert.rejects(
+    () => inspectStaticBundleArchive(trailing),
+    /nonzero bytes/,
+  );
 
   const badMagic = join(root, "bad-magic.tar");
   const badMagicBytes = Buffer.from(await readFile(good));
@@ -2552,16 +3259,18 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
 
   const symlinkBinary = join(root, "symlink-binary.oci.tar");
   await writeOciFixture(symlinkBinary, {
-    layers: [[
-      { name: "app", type: "5" },
-      { body: "api", mode: 0o555, name: "app/api" },
-      {
-        linkTarget: "/app/api",
-        mode: 0o555,
-        name: "usr/local/bin/bluey-jobs-api",
-        type: "2",
-      },
-    ]],
+    layers: [
+      [
+        { name: "app", type: "5" },
+        { body: "api", mode: 0o555, name: "app/api" },
+        {
+          linkTarget: "/app/api",
+          mode: 0o555,
+          name: "usr/local/bin/bluey-jobs-api",
+          type: "2",
+        },
+      ],
+    ],
   });
   await assert.rejects(
     () => inspectOciImageArchive(symlinkBinary, "jobs-api"),
@@ -2588,25 +3297,29 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
   ];
   const exactVerifier = join(root, "exact-source-verifier.oci.tar");
   await writeOciFixture(exactVerifier, {
-    layers: [[
-      ...workflowsPaths,
-      {
-        body: "original-source-verifier\n",
-        name: "app/workflows/dist/original-source-verifier.js",
-      },
-    ]],
+    layers: [
+      [
+        ...workflowsPaths,
+        {
+          body: "original-source-verifier\n",
+          name: "app/workflows/dist/original-source-verifier.js",
+        },
+      ],
+    ],
     runtime: workflowsRuntime(),
   });
   const exactVerifierInventory = await inspectOciImageArchive(
     exactVerifier,
     "jobs-workflows",
   );
-  assert.ok(exactVerifierInventory.entries.some(
-    (entry) =>
-      entry.path === "app/workflows/dist/original-source-verifier.js" &&
-      entry.type === "file" &&
-      entry.sizeBytes > 0,
-  ));
+  assert.ok(
+    exactVerifierInventory.entries.some(
+      (entry) =>
+        entry.path === "app/workflows/dist/original-source-verifier.js" &&
+        entry.type === "file" &&
+        entry.sizeBytes > 0,
+    ),
+  );
 
   for (const [label, verifierPath] of [
     ["renamed", "app/workflows/dist/original_source_verifier.js"],
@@ -2614,10 +3327,9 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
   ]) {
     const fixture = join(root, `${label}-source-verifier.oci.tar`);
     await writeOciFixture(fixture, {
-      layers: [[
-        ...workflowsPaths,
-        { body: "source-verifier\n", name: verifierPath },
-      ]],
+      layers: [
+        [...workflowsPaths, { body: "source-verifier\n", name: verifierPath }],
+      ],
       runtime: workflowsRuntime(),
     });
     await assert.rejects(
@@ -2628,10 +3340,12 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
 
   const emptyVerifier = join(root, "empty-source-verifier.oci.tar");
   await writeOciFixture(emptyVerifier, {
-    layers: [[
-      ...workflowsPaths,
-      { body: "", name: "app/workflows/dist/original-source-verifier.js" },
-    ]],
+    layers: [
+      [
+        ...workflowsPaths,
+        { body: "", name: "app/workflows/dist/original-source-verifier.js" },
+      ],
+    ],
     runtime: workflowsRuntime(),
   });
   await assert.rejects(
@@ -2654,26 +3368,37 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
     "chrome-headless-shell-linux64/chrome-headless-shell";
   const headlessRunner = join(root, "headless-runner.oci.tar");
   await writeOciFixture(headlessRunner, {
-    layers: [[
-      ...runnerPaths,
-      { body: "headless\n", mode: 0o555, name: headlessExecutable },
-      { body: "ffmpeg\n", mode: 0o555, name: "ms-playwright/ffmpeg-1/ffmpeg" },
-    ]],
+    layers: [
+      [
+        ...runnerPaths,
+        { body: "headless\n", mode: 0o555, name: headlessExecutable },
+        {
+          body: "ffmpeg\n",
+          mode: 0o555,
+          name: "ms-playwright/ffmpeg-1/ffmpeg",
+        },
+      ],
+    ],
     runtime: runnerRuntime(),
   });
 
-  const symlinkedMeasuredRunner = join(root, "symlinked-measured-runner.oci.tar");
+  const symlinkedMeasuredRunner = join(
+    root,
+    "symlinked-measured-runner.oci.tar",
+  );
   await writeOciFixture(symlinkedMeasuredRunner, {
-    layers: [[
-      ...runnerPaths,
-      { body: "headless\n", mode: 0o555, name: headlessExecutable },
-      { body: "shared-runtime\n", name: "opt/shared-runtime.js" },
-      {
-        linkTarget: "/opt/shared-runtime.js",
-        name: "app/automation/dist/linked-runtime.js",
-        type: "2",
-      },
-    ]],
+    layers: [
+      [
+        ...runnerPaths,
+        { body: "headless\n", mode: 0o555, name: headlessExecutable },
+        { body: "shared-runtime\n", name: "opt/shared-runtime.js" },
+        {
+          linkTarget: "/opt/shared-runtime.js",
+          name: "app/automation/dist/linked-runtime.js",
+          type: "2",
+        },
+      ],
+    ],
     runtime: runnerRuntime(),
   });
   await assert.rejects(
@@ -2684,22 +3409,28 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
     headlessRunner,
     "jobs-runner",
   );
-  assert.ok(runnerInventory.entries.some(
-    (entry) => entry.path === headlessExecutable,
-  ));
+  assert.ok(
+    runnerInventory.entries.some((entry) => entry.path === headlessExecutable),
+  );
 
   const fullChromiumRunner = join(root, "full-chromium-runner.oci.tar");
   await writeOciFixture(fullChromiumRunner, {
-    layers: [[
-      ...runnerPaths,
-      {
-        body: "chrome\n",
-        mode: 0o555,
-        name: "ms-playwright/chromium-1/chrome-linux/chrome",
-      },
-      { body: "headless\n", mode: 0o555, name: headlessExecutable },
-      { body: "ffmpeg\n", mode: 0o555, name: "ms-playwright/ffmpeg-1/ffmpeg" },
-    ]],
+    layers: [
+      [
+        ...runnerPaths,
+        {
+          body: "chrome\n",
+          mode: 0o555,
+          name: "ms-playwright/chromium-1/chrome-linux/chrome",
+        },
+        { body: "headless\n", mode: 0o555, name: headlessExecutable },
+        {
+          body: "ffmpeg\n",
+          mode: 0o555,
+          name: "ms-playwright/ffmpeg-1/ffmpeg",
+        },
+      ],
+    ],
     runtime: runnerRuntime(),
   });
   await assert.rejects(
@@ -2709,11 +3440,17 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
 
   const nonExecutableRunner = join(root, "non-executable-runner.oci.tar");
   await writeOciFixture(nonExecutableRunner, {
-    layers: [[
-      ...runnerPaths,
-      { body: "headless\n", mode: 0o444, name: headlessExecutable },
-      { body: "ffmpeg\n", mode: 0o555, name: "ms-playwright/ffmpeg-1/ffmpeg" },
-    ]],
+    layers: [
+      [
+        ...runnerPaths,
+        { body: "headless\n", mode: 0o444, name: headlessExecutable },
+        {
+          body: "ffmpeg\n",
+          mode: 0o555,
+          name: "ms-playwright/ffmpeg-1/ffmpeg",
+        },
+      ],
+    ],
     runtime: runnerRuntime(),
   });
   await assert.rejects(
@@ -2738,7 +3475,10 @@ test("portal manifest transport admits 32768 bytes and leaves no 32769-byte part
   exactBytes.set(Buffer.from("{}\n"));
   assert.deepEqual(
     await captureManagedCloudPortalManifestStream({
-      input: Readable.from([exactBytes.subarray(0, 17), exactBytes.subarray(17)]),
+      input: Readable.from([
+        exactBytes.subarray(0, 17),
+        exactBytes.subarray(17),
+      ]),
       outputFile: exactPath,
     }),
     { sizeBytes: 32 * 1024 },
@@ -2747,10 +3487,11 @@ test("portal manifest transport admits 32768 bytes and leaves no 32769-byte part
 
   const oversizedPath = join(root, "oversized.json");
   await assert.rejects(
-    () => captureManagedCloudPortalManifestStream({
-      input: Readable.from([Buffer.alloc(32 * 1024), Buffer.from("x")]),
-      outputFile: oversizedPath,
-    }),
+    () =>
+      captureManagedCloudPortalManifestStream({
+        input: Readable.from([Buffer.alloc(32 * 1024), Buffer.from("x")]),
+        outputFile: oversizedPath,
+      }),
     /exceeds its 32768-byte limit/,
   );
   await assert.rejects(() => readFile(oversizedPath), /ENOENT/);
@@ -2778,11 +3519,12 @@ test("publication API captures enforce every fixed transport cap atomically", as
     assert.deepEqual(await readFile(exactPath), exact);
     const oversizedPath = join(root, kind + "-oversized.json");
     await assert.rejects(
-      () => captureManagedCloudPublicationApiStream({
-        input: Readable.from([Buffer.alloc(maximumBytes), Buffer.from("x")]),
-        kind,
-        outputFile: oversizedPath,
-      }),
+      () =>
+        captureManagedCloudPublicationApiStream({
+          input: Readable.from([Buffer.alloc(maximumBytes), Buffer.from("x")]),
+          kind,
+          outputFile: oversizedPath,
+        }),
       new RegExp(`exceeds its ${maximumBytes}-byte limit`),
     );
     await assert.rejects(() => readFile(oversizedPath), /ENOENT/);
@@ -2793,7 +3535,10 @@ test("publication API captures enforce every fixed transport cap atomically", as
 test("failed API producer removes a completed run capture and its partial", async (t) => {
   const root = await temporaryDirectory(t, "failed-api-producer");
   const output = join(root, "run.json");
-  const gateScript = join(import.meta.dirname, "managed-cloud-release-gate.mjs");
+  const gateScript = join(
+    import.meta.dirname,
+    "managed-cloud-release-gate.mjs",
+  );
   const shell = [
     "set -o pipefail",
     'if ! { printf "{}\\n"; exit 23; } | "$1" "$2" publication-api-capture \\',
@@ -2805,14 +3550,15 @@ test("failed API producer removes a completed run capture and its partial", asyn
     "exit 99",
   ].join("\\n");
   await assert.rejects(
-    () => execFileAsync("bash", [
-      "-c",
-      shell,
-      "bluey-capture-test",
-      process.execPath,
-      gateScript,
-      output,
-    ]),
+    () =>
+      execFileAsync("bash", [
+        "-c",
+        shell,
+        "bluey-capture-test",
+        process.execPath,
+        gateScript,
+        output,
+      ]),
     /Command failed/,
   );
   await assert.rejects(() => readFile(output), /ENOENT/);
@@ -2828,49 +3574,53 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
   const workflowsPath = join(readback, "jobs-workflows.oci.tar");
   await writeOciFixture(workflowsPath, {
     indexReferenceName: "publication-run-1",
-    layers: [[
-      { body: "automation\n", name: "app/automation/dist/index.js" },
-      { body: "discovery\n", name: "app/workflows/dist/discovery-worker.js" },
-      { body: "failure\n", name: "app/workflows/dist/failure-converter.js" },
-      { body: "gateway\n", name: "app/workflows/dist/gateway.js" },
-      {
-        body: "global-discovery\n",
-        name: "app/workflows/dist/global-discovery-worker.js",
-      },
-      {
-        body: "source-verifier\n",
-        name: "app/workflows/dist/original-source-verifier.js",
-      },
-      { body: "worker\n", name: "app/workflows/dist/worker.js" },
-      { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
-    ]],
+    layers: [
+      [
+        { body: "automation\n", name: "app/automation/dist/index.js" },
+        { body: "discovery\n", name: "app/workflows/dist/discovery-worker.js" },
+        { body: "failure\n", name: "app/workflows/dist/failure-converter.js" },
+        { body: "gateway\n", name: "app/workflows/dist/gateway.js" },
+        {
+          body: "global-discovery\n",
+          name: "app/workflows/dist/global-discovery-worker.js",
+        },
+        {
+          body: "source-verifier\n",
+          name: "app/workflows/dist/original-source-verifier.js",
+        },
+        { body: "worker\n", name: "app/workflows/dist/worker.js" },
+        { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
+      ],
+    ],
     runtime: workflowsRuntime(),
   });
   const runnerPath = join(readback, "jobs-runner.oci.tar");
   await writeOciFixture(runnerPath, {
     indexReferenceName: "publication-run-1",
-    layers: [[
-      { body: "automation\n", name: "app/automation/dist/index.js" },
-      { body: "runner\n", name: "app/runner/dist/server.js" },
-      {
-        body: "native-addon\n",
-        mode: 0o555,
-        name: "app/runner/dist/native/bluey_jobs_runner_native_storage.node",
-      },
-      { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
-      {
-        body: "headless\n",
-        mode: 0o555,
-        name:
-          "ms-playwright/chromium_headless_shell-1/" +
-          "chrome-headless-shell-linux64/chrome-headless-shell",
-      },
-      {
-        body: "ffmpeg\n",
-        mode: 0o555,
-        name: "ms-playwright/ffmpeg-1/ffmpeg",
-      },
-    ]],
+    layers: [
+      [
+        { body: "automation\n", name: "app/automation/dist/index.js" },
+        { body: "runner\n", name: "app/runner/dist/server.js" },
+        {
+          body: "native-addon\n",
+          mode: 0o555,
+          name: "app/runner/dist/native/bluey_jobs_runner_native_storage.node",
+        },
+        { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
+        {
+          body: "headless\n",
+          mode: 0o555,
+          name:
+            "ms-playwright/chromium_headless_shell-1/" +
+            "chrome-headless-shell-linux64/chrome-headless-shell",
+        },
+        {
+          body: "ffmpeg\n",
+          mode: 0o555,
+          name: "ms-playwright/ffmpeg-1/ffmpeg",
+        },
+      ],
+    ],
     runtime: runnerRuntime(),
   });
   const portalPath = join(readback, "jobs-portal.tar");
@@ -2887,9 +3637,10 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
   const artifacts = [];
   for (const component of MANAGED_CLOUD_COMPONENTS) {
     const path = paths.get(component.componentId);
-    const inventory = component.artifactKind === "oci_image"
-      ? await inspectOciImageArchive(path, component.componentId)
-      : await inspectStaticBundleArchive(path, component.componentId);
+    const inventory =
+      component.artifactKind === "oci_image"
+        ? await inspectOciImageArchive(path, component.componentId)
+        : await inspectStaticBundleArchive(path, component.componentId);
     const bytes = await readFile(path);
     const repository =
       "ghcr.io/dhanunjay-divi/bluey-jobs-" +
@@ -2898,15 +3649,20 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
       artifactKind: component.artifactKind,
       artifactSha256: inventory.artifactSha256,
       candidatePayloadPath:
-        "payloads/" + component.componentId +
+        "payloads/" +
+        component.componentId +
         (component.artifactKind === "oci_image" ? ".oci.tar" : ".tar"),
       candidatePayloadSha256: sha256(bytes),
       candidatePayloadSizeBytes: bytes.length,
       componentId: component.componentId,
-      signedArtifactRef: component.artifactKind === "oci_image"
-        ? repository + "@sha256:" + inventory.artifactSha256
-        : "https://artifacts.bluey.sh/jobs/releases/" +
-          RELEASE_ID + "/" + inventory.artifactSha256 + ".tar",
+      signedArtifactRef:
+        component.artifactKind === "oci_image"
+          ? repository + "@sha256:" + inventory.artifactSha256
+          : "https://artifacts.bluey.sh/jobs/releases/" +
+            RELEASE_ID +
+            "/" +
+            inventory.artifactSha256 +
+            ".tar",
       publicationRepository: repository,
       publicationTagRef: repository + ":" + RELEASE_ID,
     });
@@ -2920,7 +3676,8 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
   const portalManifestPath = join(readback, "jobs-portal.oci-manifest.json");
   await writeFile(portalManifestPath, portalManifestBytes);
   const portalRegistryRef =
-    portalArtifact.publicationRepository + "@sha256:" +
+    portalArtifact.publicationRepository +
+    "@sha256:" +
     sha256(portalManifestBytes);
   const plan = {
     adapter: "remote_registry_readback_v1",
@@ -2966,22 +3723,23 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
     records.find((item) => item.componentId === "jobs-runner")
       .publishedManifestDigest,
     "sha256:" +
-      artifacts.find((item) => item.componentId === "jobs-runner").artifactSha256,
+      artifacts.find((item) => item.componentId === "jobs-runner")
+        .artifactSha256,
   );
-  const portalRecord = records.find((item) => item.componentId === "jobs-portal");
+  const portalRecord = records.find(
+    (item) => item.componentId === "jobs-portal",
+  );
   assert.match(portalRecord.signedArtifactRef, /^https:\/\//);
-  assert.equal(
-    portalRecord.publishedRegistryRef,
-    portalRegistryRef,
-  );
+  assert.equal(portalRecord.publishedRegistryRef, portalRegistryRef);
   await assert.rejects(
-    () => inspectManagedCloudArtifactPublicationReadback({
-      plan,
-      portalRegistryRef:
-        "ghcr.io/other/bluey-jobs-portal@sha256:" +
-        portalRegistryRef.slice(portalRegistryRef.indexOf("sha256:") + 7),
-      readbackDirectory: readback,
-    }),
+    () =>
+      inspectManagedCloudArtifactPublicationReadback({
+        plan,
+        portalRegistryRef:
+          "ghcr.io/other/bluey-jobs-portal@sha256:" +
+          portalRegistryRef.slice(portalRegistryRef.indexOf("sha256:") + 7),
+        readbackDirectory: readback,
+      }),
     /controlled repository/,
   );
   assert.throws(
@@ -2991,7 +3749,10 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
   for (const [label, mutate, expected] of [
     [
       "extra-layer",
-      (manifest) => ({ ...manifest, layers: [...manifest.layers, manifest.layers[0]] }),
+      (manifest) => ({
+        ...manifest,
+        layers: [...manifest.layers, manifest.layers[0]],
+      }),
       /exactly one layer/,
     ],
     [
@@ -3014,7 +3775,9 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
       "layer-media-type",
       (manifest) => ({
         ...manifest,
-        layers: [{ ...manifest.layers[0], mediaType: "application/octet-stream" }],
+        layers: [
+          { ...manifest.layers[0], mediaType: "application/octet-stream" },
+        ],
       }),
       /exact candidate tar/,
     ],
@@ -3022,10 +3785,12 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
       "layer-title",
       (manifest) => ({
         ...manifest,
-        layers: [{
-          ...manifest.layers[0],
-          annotations: { "org.opencontainers.image.title": "other.tar" },
-        }],
+        layers: [
+          {
+            ...manifest.layers[0],
+            annotations: { "org.opencontainers.image.title": "other.tar" },
+          },
+        ],
       }),
       /exact candidate tar/,
     ],
@@ -3045,16 +3810,19 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
       /deterministic plan value/,
     ],
   ]) {
-    const mutatedBytes = canonicalJsonBytes(mutate(structuredClone(portalManifest)));
+    const mutatedBytes = canonicalJsonBytes(
+      mutate(structuredClone(portalManifest)),
+    );
     await writeFile(portalManifestPath, mutatedBytes);
     const mutatedRef =
       portalArtifact.publicationRepository + "@sha256:" + sha256(mutatedBytes);
     await assert.rejects(
-      () => inspectManagedCloudArtifactPublicationReadback({
-        plan,
-        portalRegistryRef: mutatedRef,
-        readbackDirectory: readback,
-      }),
+      () =>
+        inspectManagedCloudArtifactPublicationReadback({
+          plan,
+          portalRegistryRef: mutatedRef,
+          readbackDirectory: readback,
+        }),
       expected,
       label,
     );
@@ -3079,61 +3847,67 @@ test("remote publication readback binds OCI digests, portal bytes, and runner na
   const oversizedManifest = Buffer.alloc(32 * 1024 + 1, 0x20);
   await writeFile(portalManifestPath, oversizedManifest);
   await assert.rejects(
-    () => execFileAsync(process.execPath, [
-      gateScript,
-      "publication-portal-manifest",
-      "--plan",
-      planFile,
-      "--portal-registry-ref",
-      portalArtifact.publicationRepository + "@sha256:" +
-        sha256(oversizedManifest),
-      "--manifest",
-      portalManifestPath,
-    ]),
+    () =>
+      execFileAsync(process.execPath, [
+        gateScript,
+        "publication-portal-manifest",
+        "--plan",
+        planFile,
+        "--portal-registry-ref",
+        portalArtifact.publicationRepository +
+          "@sha256:" +
+          sha256(oversizedManifest),
+        "--manifest",
+        portalManifestPath,
+      ]),
     /invalid byte length/,
   );
   await writeFile(portalManifestPath, portalManifestBytes);
   await writeFile(join(portalDownload, "unexpected"), "extra\n");
   await assert.rejects(
-    () => stageManagedCloudPortalArtifactReadback({
-      downloadDirectory: portalDownload,
-      manifestFile: portalManifestPath,
-      outputFile: join(root, "extra-output.tar"),
-      plan,
-      portalRegistryRef,
-    }),
+    () =>
+      stageManagedCloudPortalArtifactReadback({
+        downloadDirectory: portalDownload,
+        manifestFile: portalManifestPath,
+        outputFile: join(root, "extra-output.tar"),
+        plan,
+        portalRegistryRef,
+      }),
     /exact flat regular-file set/,
   );
   await rm(join(portalDownload, "unexpected"));
   await mkdir(join(portalDownload, "unexpected-directory"));
   await assert.rejects(
-    () => stageManagedCloudPortalArtifactReadback({
-      downloadDirectory: portalDownload,
-      manifestFile: portalManifestPath,
-      outputFile: join(root, "directory-output.tar"),
-      plan,
-      portalRegistryRef,
-    }),
+    () =>
+      stageManagedCloudPortalArtifactReadback({
+        downloadDirectory: portalDownload,
+        manifestFile: portalManifestPath,
+        outputFile: join(root, "directory-output.tar"),
+        plan,
+        portalRegistryRef,
+      }),
     /exact flat regular-file set/,
   );
   await rm(join(portalDownload, "unexpected-directory"), { recursive: true });
   await writeFile(join(readback, "unexpected"), "not remote authority\n");
   await assert.rejects(
-    () => inspectManagedCloudArtifactPublicationReadback({
-      plan,
-      portalRegistryRef,
-      readbackDirectory: readback,
-    }),
+    () =>
+      inspectManagedCloudArtifactPublicationReadback({
+        plan,
+        portalRegistryRef,
+        readbackDirectory: readback,
+      }),
     /exact flat regular-file set/,
   );
   await rm(join(readback, "unexpected"));
   await mkdir(join(readback, "unexpected-directory"));
   await assert.rejects(
-    () => inspectManagedCloudArtifactPublicationReadback({
-      plan,
-      portalRegistryRef,
-      readbackDirectory: readback,
-    }),
+    () =>
+      inspectManagedCloudArtifactPublicationReadback({
+        plan,
+        portalRegistryRef,
+        readbackDirectory: readback,
+      }),
     /exact flat regular-file set/,
   );
 });
@@ -3176,14 +3950,15 @@ test("publication plan and generated receipt share fail-closed schema keys", () 
     { sourceCommit: "f".repeat(40) },
   ]) {
     assert.throws(
-      () => validateManagedCloudPublicationRuntimeIdentity({
-        defaultBranch: plan.sourceDefaultBranch,
-        plan,
-        repository: plan.sourceRepository,
-        repositoryId: String(plan.sourceRepositoryId),
-        sourceCommit: plan.sourceCommit,
-        ...mutation,
-      }),
+      () =>
+        validateManagedCloudPublicationRuntimeIdentity({
+          defaultBranch: plan.sourceDefaultBranch,
+          plan,
+          repository: plan.sourceRepository,
+          repositoryId: String(plan.sourceRepositoryId),
+          sourceCommit: plan.sourceCommit,
+          ...mutation,
+        }),
       /exact GitHub runtime identity/,
     );
   }
@@ -3211,10 +3986,11 @@ test("publication plan and generated receipt share fail-closed schema keys", () 
   });
   assert.equal(validateManagedCloudPublicationSetShape(publication), true);
   assert.throws(
-    () => validateManagedCloudPublicationSetShape({
-      ...publication,
-      publishedAtMs: publication.attestedAtMs,
-    }),
+    () =>
+      validateManagedCloudPublicationSetShape({
+        ...publication,
+        publishedAtMs: publication.attestedAtMs,
+      }),
     /must contain exactly/,
   );
 });
@@ -3267,7 +4043,8 @@ test("publication preflight is canonical, bounded, and retry-stable", () => {
       artifactKind: component.artifactKind,
       artifactSha256,
       candidatePayloadPath:
-        "payloads/" + component.componentId +
+        "payloads/" +
+        component.componentId +
         (component.artifactKind === "oci_image" ? ".oci.tar" : ".tar"),
       candidatePayloadSha256: String(index + 5).repeat(64),
       candidatePayloadSizeBytes: 10_000 + index,
@@ -3277,8 +4054,11 @@ test("publication preflight is canonical, bounded, and retry-stable", () => {
       signedArtifactRef:
         component.artifactKind === "oci_image"
           ? publicationRepository + "@sha256:" + artifactSha256
-          : "https://artifacts.bluey.sh/jobs/releases/" + RELEASE_ID +
-            "/" + artifactSha256 + ".tar",
+          : "https://artifacts.bluey.sh/jobs/releases/" +
+            RELEASE_ID +
+            "/" +
+            artifactSha256 +
+            ".tar",
     };
   });
   const plan = {
@@ -3301,9 +4081,10 @@ test("publication preflight is canonical, bounded, and retry-stable", () => {
     version: 1,
   };
   const publicationArtifacts = artifacts.map((artifact, index) => {
-    const publishedManifestDigest = artifact.artifactKind === "oci_image"
-      ? "sha256:" + artifact.artifactSha256
-      : "sha256:" + ["9", "a", "b", "c"][index].repeat(64);
+    const publishedManifestDigest =
+      artifact.artifactKind === "oci_image"
+        ? "sha256:" + artifact.artifactSha256
+        : "sha256:" + ["9", "a", "b", "c"][index].repeat(64);
     return {
       componentId: artifact.componentId,
       publishedManifestDigest,
@@ -3326,25 +4107,32 @@ test("publication preflight is canonical, bounded, and retry-stable", () => {
     head_sha: SOURCE_COMMIT,
     id: 2001,
     path: ".github/workflows/jobs-managed-cloud-release.yml@release/stable",
-    repository: { full_name: plan.sourceRepository, id: plan.sourceRepositoryId },
+    repository: {
+      full_name: plan.sourceRepository,
+      id: plan.sourceRepositoryId,
+    },
     run_attempt: 1,
     status: "completed",
   };
   const jobs = {
-    jobs: [{
-      conclusion: "success",
-      head_sha: SOURCE_COMMIT,
-      id: 3001,
-      name: "publish",
-      run_attempt: 1,
-      run_id: 2001,
-      status: "completed",
-      steps: [{
+    jobs: [
+      {
         conclusion: "success",
-        name: "Upload the remote publication receipt only",
+        head_sha: SOURCE_COMMIT,
+        id: 3001,
+        name: "publish",
+        run_attempt: 1,
+        run_id: 2001,
         status: "completed",
-      }],
-    }],
+        steps: [
+          {
+            conclusion: "success",
+            name: "Upload the remote publication receipt only",
+            status: "completed",
+          },
+        ],
+      },
+    ],
     total_count: 1,
   };
   const workflowEvidence = createManagedCloudPublicationWorkflowEvidence({
@@ -3381,8 +4169,7 @@ test("publication preflight is canonical, bounded, and retry-stable", () => {
   );
   const wrongRef = structuredClone(preflight);
   wrongRef.artifacts[0].publishedRegistryRef =
-    "ghcr.io/other/jobs-api@" +
-    wrongRef.artifacts[0].publishedManifestDigest;
+    "ghcr.io/other/jobs-api@" + wrongRef.artifacts[0].publishedManifestDigest;
   assert.throws(
     () => validateManagedCloudPublicationPreflightDocument(wrongRef),
     /outside its exact authority/,
@@ -3392,10 +4179,11 @@ test("publication preflight is canonical, bounded, and retry-stable", () => {
   wrongRun.workflowEvidence.artifactName =
     "jobs-managed-cloud-publication-2002-1";
   assert.throws(
-    () => validateManagedCloudPublicationPreflightDocument(wrongRun, {
-      plan,
-      publication,
-    }),
+    () =>
+      validateManagedCloudPublicationPreflightDocument(wrongRun, {
+        plan,
+        publication,
+      }),
     /exact publication set/,
   );
   const oversized = structuredClone(preflight);
@@ -3424,35 +4212,33 @@ test("release-v1 assembly rejects a three-role workflows verifier image", async 
     measuredFiles: [],
     migrationSetSha256: await contractSha256("migration-contract.json"),
     protocolSetSha256: await contractSha256("protocol-contract.json"),
-    roles: [
-      "original_source_verifier",
-      "workflow_gateway",
-      "workflow_worker",
-    ],
+    roles: ["original_source_verifier", "workflow_gateway", "workflow_worker"],
     sourceCommit: SOURCE_COMMIT,
     version: 1,
   };
   const artifact = join(root, "jobs-workflows.oci.tar");
   await writeOciFixture(artifact, {
-    layers: [[
-      {
-        body: canonicalJsonBytes(measurement),
-        name: "app/.bluey/managed-cloud-runtime-measurement.json",
-      },
-      { body: "discovery\n", name: "app/workflows/dist/discovery-worker.js" },
-      { body: "failure\n", name: "app/workflows/dist/failure-converter.js" },
-      { body: "gateway\n", name: "app/workflows/dist/gateway.js" },
-      {
-        body: "global-discovery\n",
-        name: "app/workflows/dist/global-discovery-worker.js",
-      },
-      {
-        body: "original-source-verifier\n",
-        name: "app/workflows/dist/original-source-verifier.js",
-      },
-      { body: "worker\n", name: "app/workflows/dist/worker.js" },
-      { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
-    ]],
+    layers: [
+      [
+        {
+          body: canonicalJsonBytes(measurement),
+          name: "app/.bluey/managed-cloud-runtime-measurement.json",
+        },
+        { body: "discovery\n", name: "app/workflows/dist/discovery-worker.js" },
+        { body: "failure\n", name: "app/workflows/dist/failure-converter.js" },
+        { body: "gateway\n", name: "app/workflows/dist/gateway.js" },
+        {
+          body: "global-discovery\n",
+          name: "app/workflows/dist/global-discovery-worker.js",
+        },
+        {
+          body: "original-source-verifier\n",
+          name: "app/workflows/dist/original-source-verifier.js",
+        },
+        { body: "worker\n", name: "app/workflows/dist/worker.js" },
+        { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
+      ],
+    ],
     runtime: workflowsRuntime(),
   });
   const inventory = await inspectOciImageArchive(artifact, "jobs-workflows");
@@ -3509,12 +4295,13 @@ test("release-v1 assembly rejects a three-role workflows verifier image", async 
     version: 1,
   });
   await assert.rejects(
-    () => assembleManagedCloudCandidate({
-      contractsDirectory: contracts,
-      descriptorFile,
-      outputDirectory: join(root, "candidate"),
-      repoRoot,
-    }),
+    () =>
+      assembleManagedCloudCandidate({
+        contractsDirectory: contracts,
+        descriptorFile,
+        outputDirectory: join(root, "candidate"),
+        repoRoot,
+      }),
     /source-verifier entrypoint does not match release authority/,
   );
 });
@@ -3526,7 +4313,11 @@ test("release-v2 activation evidence requires verifier readiness and exact readb
   const manifest = successorReleaseFixture();
   const manifestSha256 = sha256(canonicalJsonBytes(manifest));
   const nowMs = Date.now();
-  const scope = { channel: "shadow", environment: "staging", region: "us-east-1" };
+  const scope = {
+    channel: "shadow",
+    environment: "staging",
+    region: "us-east-1",
+  };
   const activation = {
     expiresAtMs: nowMs + 30_000,
     featureAuthority: manifest.featureAuthority,
@@ -3545,13 +4336,17 @@ test("release-v2 activation evidence requires verifier readiness and exact readb
   const converterSha256 = sha256(Buffer.from("deployed converter\n"));
   const workflowsInventoryFile = join(root, "workflows-inventory.json");
   await writeCanonical(workflowsInventoryFile, {
-    entries: [{
-      path: "app/workflows/dist/failure-converter.js",
-      sha256: converterSha256,
-      type: "file",
-    }],
+    entries: [
+      {
+        path: "app/workflows/dist/failure-converter.js",
+        sha256: converterSha256,
+        type: "file",
+      },
+    ],
   });
-  const portal = manifest.components.find((item) => item.componentId === "jobs-portal");
+  const portal = manifest.components.find(
+    (item) => item.componentId === "jobs-portal",
+  );
   const taskQueueSha256 = deriveManagedCloudTaskQueueSha256(
     "bluey-prod",
     "bluey-jobs-applications",
@@ -3560,11 +4355,13 @@ test("release-v2 activation evidence requires verifier readiness and exact readb
     "canary.json": {
       ...common,
       audience: MANAGED_CLOUD_AUDIENCES.canaryEvidence,
-      checks: deriveManagedCloudCanaryCheckIds(manifest.featureAuthority).map((checkId) => ({
-        checkId,
-        evidenceSha256: "1".repeat(64),
-        status: "pass",
-      })),
+      checks: deriveManagedCloudCanaryCheckIds(manifest.featureAuthority).map(
+        (checkId) => ({
+          checkId,
+          evidenceSha256: "1".repeat(64),
+          status: "pass",
+        }),
+      ),
     },
     "cleanup-authority.json": {
       ...common,
@@ -3717,15 +4514,23 @@ test("promotion and rollback authority preserves v1 readback and emits only v2",
   assert.equal(from.promotionSet.version, 2);
   assert.equal(from.promotionSet.audience, MANAGED_CLOUD_AUDIENCES.promotionV2);
   assert.equal(
-    (await validateManagedCloudPromotion(from.promotion, trust.rootAnchorSha256))
-      .promotionGeneration,
+    (
+      await validateManagedCloudPromotion(
+        from.promotion,
+        trust.rootAnchorSha256,
+      )
+    ).promotionGeneration,
     2,
   );
   const historicalFrom = join(root, "historical-from");
   await createHistoricalPromotionFixture(from, historicalFrom);
   assert.equal(
-    (await validateManagedCloudPromotion(historicalFrom, trust.rootAnchorSha256))
-      .promotionGeneration,
+    (
+      await validateManagedCloudPromotion(
+        historicalFrom,
+        trust.rootAnchorSha256,
+      )
+    ).promotionGeneration,
     1,
   );
 
@@ -3767,14 +4572,17 @@ test("promotion and rollback authority preserves v1 readback and emits only v2",
   );
   await writeCanonical(rollbackV2File, rollbackV2);
   const rollbackV2Signatures = join(root, "rollback-v2-signatures.json");
-  await writeCanonical(rollbackV2Signatures, signedSet({
-    id: "rollback-v2-signatures",
-    keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
-    role: "promotion",
-    signedAtMs: rollbackV2.issuedAtMs,
-    targetAudience: MANAGED_CLOUD_AUDIENCES.rollbackV2,
-    targetBytes: await readFile(rollbackV2File),
-  }));
+  await writeCanonical(
+    rollbackV2Signatures,
+    signedSet({
+      id: "rollback-v2-signatures",
+      keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+      role: "promotion",
+      signedAtMs: rollbackV2.issuedAtMs,
+      targetAudience: MANAGED_CLOUD_AUDIENCES.rollbackV2,
+      targetBytes: await readFile(rollbackV2File),
+    }),
+  );
   const rollbackV2Root = join(root, "rollback-v2");
   const emittedRollback = await createManagedCloudRollback({
     expectedRootAnchorSha256: trust.rootAnchorSha256,
@@ -3792,15 +4600,16 @@ test("promotion and rollback authority preserves v1 readback and emits only v2",
     2,
   );
   await assert.rejects(
-    () => createManagedCloudRollback({
-      expectedRootAnchorSha256: trust.rootAnchorSha256,
-      fromPromotionDirectory: historicalFrom,
-      outputDirectory: join(root, "forbidden-v1-create"),
-      rollbackFile: rollbackV2File,
-      rollbackSignatureSetFile: rollbackV2Signatures,
-      toPromotionDirectory: historicalTo,
-    }),
-    /requires two remote promotion v2 inputs/,
+    () =>
+      createManagedCloudRollback({
+        expectedRootAnchorSha256: trust.rootAnchorSha256,
+        fromPromotionDirectory: historicalFrom,
+        outputDirectory: join(root, "forbidden-v1-create"),
+        rollbackFile: rollbackV2File,
+        rollbackSignatureSetFile: rollbackV2Signatures,
+        toPromotionDirectory: historicalTo,
+      }),
+    /requires two remote promotion generation-v2 inputs/,
   );
 
   const rollbackV1 = rollbackDocument(
@@ -3819,14 +4628,17 @@ test("promotion and rollback authority preserves v1 readback and emits only v2",
   const rollbackV1File = join(rollbackV1Root, "rollback.json");
   await writeCanonical(rollbackV1File, rollbackV1);
   const rollbackV1Signatures = join(rollbackV1Root, "rollback-signatures.json");
-  await writeCanonical(rollbackV1Signatures, signedSet({
-    id: "rollback-v1-signatures",
-    keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
-    role: "promotion",
-    signedAtMs: rollbackV1.issuedAtMs,
-    targetAudience: MANAGED_CLOUD_AUDIENCES.rollback,
-    targetBytes: await readFile(rollbackV1File),
-  }));
+  await writeCanonical(
+    rollbackV1Signatures,
+    signedSet({
+      id: "rollback-v1-signatures",
+      keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+      role: "promotion",
+      signedAtMs: rollbackV1.issuedAtMs,
+      targetAudience: MANAGED_CLOUD_AUDIENCES.rollback,
+      targetBytes: await readFile(rollbackV1File),
+    }),
+  );
   await writeCanonical(join(rollbackV1Root, "rollback-set.json"), {
     audience: MANAGED_CLOUD_AUDIENCES.rollbackSet,
     fromPromotionSha256: await fileSha256(
@@ -3881,9 +4693,156 @@ test("promotion and rollback authority preserves v1 readback and emits only v2",
   );
 });
 
+test("release-v3 publication, promotion, and rollback retain generation-v2 schemas", async (t) => {
+  const root = await temporaryDirectory(t, "release-v3-publication");
+  const trust = trustFixture();
+  const from = await createRemotePromotionFixture({
+    activationGeneration: 3,
+    channelSequence: 3,
+    contractVersion: 3,
+    expectedHeadRevision: 0,
+    expectedTransitionSha256: null,
+    label: "release-v3-from",
+    predecessorActivationSha256: null,
+    releaseSequence: 300,
+    root,
+    trust,
+  });
+  const validatedFrom = await validateManagedCloudPromotion(
+    from.promotion,
+    trust.rootAnchorSha256,
+  );
+  assert.equal(validatedFrom.authorized.manifest.version, 3);
+  assert.equal(
+    validatedFrom.authorized.manifest.audience,
+    MANAGED_CLOUD_AUDIENCES.manifestV3,
+  );
+  assert.equal(validatedFrom.activation.version, 3);
+  assert.equal(
+    validatedFrom.activation.audience,
+    MANAGED_CLOUD_AUDIENCES.activationV3,
+  );
+  assert.equal(validatedFrom.promotion.version, 2);
+  assert.equal(
+    validatedFrom.promotion.audience,
+    MANAGED_CLOUD_AUDIENCES.promotionV2,
+  );
+  assert.equal(validatedFrom.promotionGeneration, 2);
+  const builderPolicy = JSON.parse(
+    await readFile(
+      join(from.authorized, "candidate/builder-policy.json"),
+      "utf8",
+    ),
+  );
+  const testEvidence = JSON.parse(
+    await readFile(
+      join(from.authorized, "candidate/test-evidence.json"),
+      "utf8",
+    ),
+  );
+  const publicationPlan = JSON.parse(
+    await readFile(
+      join(from.fixtureRoot, "publication/publication-plan.json"),
+      "utf8",
+    ),
+  );
+  const publicationSet = JSON.parse(
+    await readFile(
+      join(from.fixtureRoot, "publication/publication-set.json"),
+      "utf8",
+    ),
+  );
+  const portalReadback = JSON.parse(
+    await readFile(
+      join(from.fixtureRoot, "activation-evidence/portal-readback.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(builderPolicy.schemaVersion, 2);
+  assert.equal(builderPolicy.audience, MANAGED_CLOUD_AUDIENCES.builderPolicyV2);
+  assert.equal(testEvidence.version, 2);
+  assert.equal(testEvidence.audience, MANAGED_CLOUD_AUDIENCES.testEvidenceV2);
+  assert.equal(publicationPlan.version, 1);
+  assert.equal(
+    publicationPlan.audience,
+    MANAGED_CLOUD_AUDIENCES.publicationPlan,
+  );
+  assert.equal(publicationSet.version, 1);
+  assert.equal(publicationSet.audience, MANAGED_CLOUD_AUDIENCES.publicationSet);
+  assert.equal(portalReadback.version, 1);
+  assert.equal(
+    portalReadback.audience,
+    MANAGED_CLOUD_AUDIENCES.portalReadbackEvidenceV2,
+  );
+
+  const to = await createRemotePromotionFixture({
+    activationGeneration: 4,
+    channelSequence: 4,
+    contractVersion: 3,
+    expectedHeadRevision: 3,
+    expectedTransitionSha256: "9".repeat(64),
+    label: "release-v3-target",
+    predecessorActivationSha256: await fileSha256(from.activationFile),
+    releaseSequence: 250,
+    root,
+    trust,
+  });
+  const rollbackFile = join(root, "release-v3-rollback.json");
+  const rollback = {
+    audience: MANAGED_CLOUD_AUDIENCES.rollbackV2,
+    evidenceSha256: "8".repeat(64),
+    expectedHeadRevision: 3,
+    expectedTransitionSha256: "9".repeat(64),
+    fromActivationSha256: from.promotionSet.activationSha256,
+    fromManifestSha256: from.promotionSet.manifestSha256,
+    issuedAtMs: Date.now(),
+    reasonRef: "test-only-release-v3-regression",
+    rollbackGeneration: 2,
+    rollbackId: "rollback-release-v3",
+    scope: { channel: "shadow", environment: "staging", region: "us-east-1" },
+    toActivationSha256: to.promotionSet.activationSha256,
+    toManifestSha256: to.promotionSet.manifestSha256,
+    trustGeneration: 1,
+    version: 2,
+  };
+  await writeCanonical(rollbackFile, rollback);
+  const signaturesFile = join(root, "release-v3-rollback-signatures.json");
+  await writeCanonical(
+    signaturesFile,
+    signedSet({
+      id: "release-v3-rollback-signatures",
+      keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+      role: "promotion",
+      signedAtMs: rollback.issuedAtMs,
+      targetAudience: MANAGED_CLOUD_AUDIENCES.rollbackV2,
+      targetBytes: await readFile(rollbackFile),
+    }),
+  );
+  const rollbackRoot = join(root, "release-v3-rollback");
+  const rollbackSet = await createManagedCloudRollback({
+    expectedRootAnchorSha256: trust.rootAnchorSha256,
+    fromPromotionDirectory: from.promotion,
+    outputDirectory: rollbackRoot,
+    rollbackFile,
+    rollbackSignatureSetFile: signaturesFile,
+    toPromotionDirectory: to.promotion,
+  });
+  assert.equal(rollbackSet.version, 2);
+  assert.equal(rollbackSet.audience, MANAGED_CLOUD_AUDIENCES.rollbackSetV2);
+  assert.equal(
+    (await validateManagedCloudRollback(rollbackRoot, trust.rootAnchorSha256))
+      .rollbackSet.version,
+    2,
+  );
+});
+
 test("rollback uses a monotonic successor activation over older verified bytes", () => {
   const nowMs = Date.now();
-  const scope = { channel: "canary", environment: "production", region: "us-east-1" };
+  const scope = {
+    channel: "canary",
+    environment: "production",
+    region: "us-east-1",
+  };
   const from = {
     activation: { activationGeneration: 10, channelSequence: 20, scope },
     authorized: { manifest: { releaseSequence: 200 } },
@@ -3923,31 +4882,25 @@ test("rollback uses a monotonic successor activation over older verified bytes",
     scope,
   );
   assert.throws(
-    () => validateManagedCloudRollbackSuccessor(
-      rollback,
-      from,
-      {
+    () =>
+      validateManagedCloudRollbackSuccessor(rollback, from, {
         ...to,
         activation: {
           ...to.activation,
           predecessorActivationSha256: "6".repeat(64),
         },
-      },
-    ),
+      }),
     /successor activation over older release bytes/,
   );
   assert.throws(
-    () => validateManagedCloudRollbackSuccessor(
-      rollback,
-      from,
-      {
+    () =>
+      validateManagedCloudRollbackSuccessor(rollback, from, {
         ...to,
         authorized: {
           ...to.authorized,
           manifest: { releaseSequence: 201 },
         },
-      },
-    ),
+      }),
     /successor activation over older release bytes/,
   );
 });
@@ -3975,27 +4928,29 @@ test("activation window is contained by cohort, trust, and portal readback", () 
     true,
   );
   assert.throws(
-    () => validateManagedCloudActivationWindow(
-      activation,
-      { ...cohort, expiresAtMs: activation.expiresAtMs - 1 },
-      policy,
-    ),
+    () =>
+      validateManagedCloudActivationWindow(
+        activation,
+        { ...cohort, expiresAtMs: activation.expiresAtMs - 1 },
+        policy,
+      ),
     /validity window/,
   );
   assert.throws(
-    () => validateManagedCloudActivationWindow(
-      activation,
-      cohort,
-      { ...policy, expiresAtMs: activation.expiresAtMs - 1 },
-    ),
+    () =>
+      validateManagedCloudActivationWindow(activation, cohort, {
+        ...policy,
+        expiresAtMs: activation.expiresAtMs - 1,
+      }),
     /validity window/,
   );
   assert.throws(
-    () => validateManagedCloudActivationWindow(
-      { ...activation, portalReadbackTtlMs: 32_999 },
-      cohort,
-      policy,
-    ),
+    () =>
+      validateManagedCloudActivationWindow(
+        { ...activation, portalReadbackTtlMs: 32_999 },
+        cohort,
+        policy,
+      ),
     /validity window/,
   );
 });
@@ -4034,30 +4989,40 @@ test("release-v2 CI evidence requires two successful exact-tip default-branch ru
   assert.equal(evidence.defaultBranch, "main");
   assert.equal("default_branch" in repositoryRecord, false);
   assert.equal(evidence.audience, MANAGED_CLOUD_AUDIENCES.testEvidenceV2);
+  assert.equal(
+    validateManagedCloudTestEvidence(evidence, SOURCE_COMMIT, 3),
+    evidence,
+  );
+  assert.throws(
+    () => validateManagedCloudTestEvidence(evidence, SOURCE_COMMIT, 1),
+    /must contain exactly|does not bind the candidate source/,
+  );
   assert.deepEqual(
     evidence.ciRuns.map((item) => item.checkId),
     ["jobs-ci", "observability-policy"],
   );
   assert.throws(
-    () => createManagedCloudCiEvidence({
-      defaultBranch: "main",
-      jobsCiRun: { ...jobsCiRun, event: "pull_request" },
-      observabilityRun,
-      releaseContractSelfTestSha256: "b".repeat(64),
-      repository,
-      sourceCommit: SOURCE_COMMIT,
-    }),
+    () =>
+      createManagedCloudCiEvidence({
+        defaultBranch: "main",
+        jobsCiRun: { ...jobsCiRun, event: "pull_request" },
+        observabilityRun,
+        releaseContractSelfTestSha256: "b".repeat(64),
+        repository,
+        sourceCommit: SOURCE_COMMIT,
+      }),
     /exact-tip default-branch push run/,
   );
   assert.throws(
-    () => createManagedCloudCiEvidence({
-      defaultBranch: "main",
-      jobsCiRun,
-      observabilityRun: { ...observabilityRun, head_sha: "c".repeat(40) },
-      releaseContractSelfTestSha256: "b".repeat(64),
-      repository,
-      sourceCommit: SOURCE_COMMIT,
-    }),
+    () =>
+      createManagedCloudCiEvidence({
+        defaultBranch: "main",
+        jobsCiRun,
+        observabilityRun: { ...observabilityRun, head_sha: "c".repeat(40) },
+        releaseContractSelfTestSha256: "b".repeat(64),
+        repository,
+        sourceCommit: SOURCE_COMMIT,
+      }),
     /exact-tip default-branch push run/,
   );
   const storedBranchDrift = structuredClone(evidence);
@@ -4095,25 +5060,27 @@ test("release-v2 CI evidence requires two successful exact-tip default-branch ru
     slashBranchEvidence,
   );
   assert.throws(
-    () => createManagedCloudCiEvidence({
-      defaultBranch: "release..main",
-      jobsCiRun,
-      observabilityRun,
-      releaseContractSelfTestSha256: "b".repeat(64),
-      repository,
-      sourceCommit: SOURCE_COMMIT,
-    }),
+    () =>
+      createManagedCloudCiEvidence({
+        defaultBranch: "release..main",
+        jobsCiRun,
+        observabilityRun,
+        releaseContractSelfTestSha256: "b".repeat(64),
+        repository,
+        sourceCommit: SOURCE_COMMIT,
+      }),
     /canonical Git branch name/,
   );
   assert.throws(
-    () => createManagedCloudCiEvidence({
-      defaultBranch: "release/main",
-      jobsCiRun,
-      observabilityRun,
-      releaseContractSelfTestSha256: "b".repeat(64),
-      repository,
-      sourceCommit: SOURCE_COMMIT,
-    }),
+    () =>
+      createManagedCloudCiEvidence({
+        defaultBranch: "release/main",
+        jobsCiRun,
+        observabilityRun,
+        releaseContractSelfTestSha256: "b".repeat(64),
+        repository,
+        sourceCommit: SOURCE_COMMIT,
+      }),
     /exact-tip default-branch push run/,
   );
 });
@@ -4149,11 +5116,13 @@ test("promotion binds the successful exact-source publication workflow job", () 
     run_attempt: 1,
     run_id: 2001,
     status: "completed",
-    steps: [{
-      conclusion: "success",
-      name: "Upload the remote publication receipt only",
-      status: "completed",
-    }],
+    steps: [
+      {
+        conclusion: "success",
+        name: "Upload the remote publication receipt only",
+        status: "completed",
+      },
+    ],
   };
   const jobs = { jobs: [publishJob], total_count: 1 };
   const artifacts = publicationWorkflowArtifacts();
@@ -4175,87 +5144,95 @@ test("promotion binds the successful exact-source publication workflow job", () 
     "workflow_declared_settings_not_attested",
   );
   assert.throws(
-    () => createManagedCloudPublicationWorkflowEvidence({
-      artifacts,
-      defaultBranch: "main",
-      jobs,
-      plan,
-      publication,
-      run: { ...run, head_sha: "c".repeat(40) },
-    }),
+    () =>
+      createManagedCloudPublicationWorkflowEvidence({
+        artifacts,
+        defaultBranch: "main",
+        jobs,
+        plan,
+        publication,
+        run: { ...run, head_sha: "c".repeat(40) },
+      }),
     /successful exact-source workflow dispatch/,
   );
   assert.throws(
-    () => createManagedCloudPublicationWorkflowEvidence({
-      artifacts: {
-        artifacts: [
-          ...artifacts.artifacts,
-          { ...artifacts.artifacts[0], id: 4002 },
-        ],
-        total_count: 2,
-      },
-      defaultBranch: "main",
-      jobs,
-      plan,
-      publication,
-      run,
-    }),
+    () =>
+      createManagedCloudPublicationWorkflowEvidence({
+        artifacts: {
+          artifacts: [
+            ...artifacts.artifacts,
+            { ...artifacts.artifacts[0], id: 4002 },
+          ],
+          total_count: 2,
+        },
+        defaultBranch: "main",
+        jobs,
+        plan,
+        publication,
+        run,
+      }),
     /exactly one attempt-qualified receipt/,
   );
   assert.throws(
-    () => createManagedCloudPublicationWorkflowEvidence({
-      artifacts: {
-        artifacts: [{
-          ...artifacts.artifacts[0],
-          size_in_bytes: 1024 * 1024 + 1,
-        }],
-        total_count: 1,
-      },
-      defaultBranch: "main",
-      jobs,
-      plan,
-      publication,
-      run,
-    }),
+    () =>
+      createManagedCloudPublicationWorkflowEvidence({
+        artifacts: {
+          artifacts: [
+            {
+              ...artifacts.artifacts[0],
+              size_in_bytes: 1024 * 1024 + 1,
+            },
+          ],
+          total_count: 1,
+        },
+        defaultBranch: "main",
+        jobs,
+        plan,
+        publication,
+        run,
+      }),
     /exceeds the 1 MiB receipt limit/,
   );
   assert.throws(
-    () => createManagedCloudPublicationWorkflowEvidence({
-      artifacts,
-      defaultBranch: "main",
-      jobs: {
-        jobs: [{ ...publishJob, conclusion: "failure" }],
-        total_count: 1,
-      },
-      plan,
-      publication,
-      run,
-    }),
+    () =>
+      createManagedCloudPublicationWorkflowEvidence({
+        artifacts,
+        defaultBranch: "main",
+        jobs: {
+          jobs: [{ ...publishJob, conclusion: "failure" }],
+          total_count: 1,
+        },
+        plan,
+        publication,
+        run,
+      }),
     /did not complete successfully/,
   );
   assert.throws(
-    () => createManagedCloudPublicationWorkflowEvidence({
-      artifacts,
-      defaultBranch: "main",
-      jobs: {
-        jobs: [{ ...publishJob, run_attempt: 2 }],
-        total_count: 1,
-      },
-      plan,
-      publication,
-      run,
-    }),
+    () =>
+      createManagedCloudPublicationWorkflowEvidence({
+        artifacts,
+        defaultBranch: "main",
+        jobs: {
+          jobs: [{ ...publishJob, run_attempt: 2 }],
+          total_count: 1,
+        },
+        plan,
+        publication,
+        run,
+      }),
     /did not complete successfully/,
   );
   assert.throws(
-    () => createManagedCloudPublicationWorkflowEvidence({
-      artifacts,
-      defaultBranch: "other",
-      jobs,
-      plan,
-      publication,
-      run,
-    }),
+    () =>
+      createManagedCloudPublicationWorkflowEvidence({
+        artifacts,
+        defaultBranch: "other",
+        jobs,
+        plan,
+        publication,
+        run,
+      }),
     /successful exact-source workflow dispatch/,
   );
 });
@@ -4267,13 +5244,38 @@ test("release workflow statically proves build-once and protected authorization"
   );
   assert.equal(await validateManagedCloudWorkflowContract(workflow), true);
   const text = await readFile(workflow, "utf8");
-  assert.match(text, /directDiscovery: false/);
-  assert.match(text, /globalDiscovery: false/);
+  assert.match(text, /directDiscovery: true/);
+  assert.match(text, /globalDiscovery: true/);
   assert.match(text, /sourceVerification: true/);
-  assert.match(text, /bluey-jobs-managed-cloud-release-descriptor-v2/);
+  assert.match(text, /bluey-jobs-managed-cloud-release-descriptor-v3/);
   assert.match(
     text,
-    /BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=original_source_verifier,workflow_gateway,workflow_worker/,
+    new RegExp(
+      "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=discovery_worker," +
+        "global_discovery_worker,original_source_verifier," +
+        "workflow_gateway,workflow_worker",
+    ),
+  );
+  const workflowsDockerfile = await readFile(
+    new URL("../workflows/Dockerfile", import.meta.url),
+    "utf8",
+  );
+  const exactWorkflowRoles =
+    "discovery_worker,global_discovery_worker,original_source_verifier," +
+    "workflow_gateway,workflow_worker";
+  assert.deepEqual(
+    [
+      ...workflowsDockerfile.matchAll(
+        /^ARG BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=([^\r\n]+)$/gm,
+      ),
+    ].map((match) => match[1]),
+    [exactWorkflowRoles, exactWorkflowRoles],
+  );
+  assert.deepEqual(
+    [...text.matchAll(/BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=([a-z_,]+)/g)].map(
+      (match) => match[1],
+    ),
+    [exactWorkflowRoles],
   );
   assert.equal(
     text.split(
@@ -4288,9 +5290,8 @@ test("release workflow statically proves build-once and protected authorization"
   );
   assert.equal(text.split("github.ref_type == 'branch'").length - 1, 6);
   assert.equal(
-    text.split(
-      "github.ref_name == github.event.repository.default_branch",
-    ).length - 1,
+    text.split("github.ref_name == github.event.repository.default_branch")
+      .length - 1,
     6,
   );
   assert.equal(text.split("actions: read").length - 1, 6);
@@ -4307,13 +5308,18 @@ test("release workflow statically proves build-once and protected authorization"
   );
   assert.doesNotMatch(text, /`ghcr\.io\/bluey\//);
   assert.doesNotMatch(text, /local_fixture/);
+  assert.doesNotMatch(text, /directDiscovery: false/);
+  assert.doesNotMatch(text, /globalDiscovery: false/);
   assert.doesNotMatch(text, /sourceVerification: false/);
   assert.doesNotMatch(text, /bluey-jobs-managed-cloud-release-descriptor-v1/);
+  assert.doesNotMatch(text, /bluey-jobs-managed-cloud-release-descriptor-v2/);
   for (const contract of Object.values(MANAGED_CLOUD_RUNTIME_CONTRACTS)) {
-    assert.ok(contract.requiredEnvironment.some((item) => item === "PATH=" + SAFE_PATH));
+    assert.ok(
+      contract.requiredEnvironment.some((item) => item === "PATH=" + SAFE_PATH),
+    );
   }
 
-  const root = await temporaryDirectory(t, "managed-cloud-v2-workflow-guard");
+  const root = await temporaryDirectory(t, "managed-cloud-v3-workflow-guard");
   const mutateMarkedSection = (workflowText, marker, mutate) => {
     const begin = `# RELEASE-GATE: ${marker}-BEGIN`;
     const end = `# RELEASE-GATE: ${marker}-END`;
@@ -4321,8 +5327,14 @@ test("release workflow statically proves build-once and protected authorization"
     const finish = workflowText.indexOf(end);
     const section = workflowText.slice(start, finish);
     const mutatedSection = mutate(section);
-    assert.notEqual(mutatedSection, section, `${marker} mutation must alter its section`);
-    return workflowText.slice(0, start) + mutatedSection + workflowText.slice(finish);
+    assert.notEqual(
+      mutatedSection,
+      section,
+      `${marker} mutation must alter its section`,
+    );
+    return (
+      workflowText.slice(0, start) + mutatedSection + workflowText.slice(finish)
+    );
   };
   const mutateNamedStep = (section, name, mutate) => {
     const marker = `      - name: ${name}`;
@@ -4337,7 +5349,11 @@ test("release workflow statically proves build-once and protected authorization"
     const finish = next < 0 ? section.length : next;
     const step = section.slice(start, finish);
     const mutatedStep = mutate(step);
-    assert.notEqual(mutatedStep, step, `${name} mutation must alter only that step`);
+    assert.notEqual(
+      mutatedStep,
+      step,
+      `${name} mutation must alter only that step`,
+    );
     return section.slice(0, start) + mutatedStep + section.slice(finish);
   };
   const permissionContracts = new Map([
@@ -4345,16 +5361,25 @@ test("release workflow statically proves build-once and protected authorization"
     ["VERIFY-NO-REBUILD", ["actions: read", "contents: read"]],
     ["AUTHORIZE-NO-REBUILD", ["actions: read", "contents: read"]],
     ["PUBLISH-REMOTE", ["actions: read", "contents: read", "packages: write"]],
-    ["PROMOTE-NO-REBUILD", ["actions: read", "contents: read", "packages: read"]],
+    [
+      "PROMOTE-NO-REBUILD",
+      ["actions: read", "contents: read", "packages: read"],
+    ],
     ["ROLLBACK-NO-REBUILD", ["actions: read", "contents: read"]],
   ]);
   for (const [marker, permissions] of permissionContracts) {
     for (const permission of permissions) {
       const mutated = mutateMarkedSection(text, marker, (section) =>
-        section.replace(`      ${permission}`, `      ${permission.split(":")[0]}: none`),
+        section.replace(
+          `      ${permission}`,
+          `      ${permission.split(":")[0]}: none`,
+        ),
       );
       const label = permission.replace(/[: ]/g, "-");
-      const path = join(root, `${marker.toLowerCase()}-${label}-permission.yml`);
+      const path = join(
+        root,
+        `${marker.toLowerCase()}-${label}-permission.yml`,
+      );
       await writeFile(path, mutated);
       await assert.rejects(
         () => validateManagedCloudWorkflowContract(path),
@@ -4387,7 +5412,11 @@ test("release workflow statically proves build-once and protected authorization"
     ["widened-packages", "permissions:\n  contents: read\n  packages: read"],
   ]) {
     const mutated = text.replace("permissions:\n  contents: read", replacement);
-    assert.notEqual(mutated, text, `${label} mutation must alter global permissions`);
+    assert.notEqual(
+      mutated,
+      text,
+      `${label} mutation must alter global permissions`,
+    );
     const path = join(root, `${label}-global-permissions.yml`);
     await writeFile(path, mutated);
     await assert.rejects(
@@ -4396,23 +5425,35 @@ test("release workflow statically proves build-once and protected authorization"
     );
   }
   for (const [label, original, replacement] of [
-    ["contract", "--version 2", "--version 1"],
-    ["descriptor", "release-descriptor-v2", "release-descriptor-v1"],
+    ["contract", "--version 3", "--version 2"],
+    ["descriptor", "release-descriptor-v3", "release-descriptor-v2"],
+    ["descriptor-version", "version: 3", "version: 2"],
+    ["self-test", "release-gate-tests-v3", "release-gate-tests-v2"],
     ["feature", "sourceVerification: true", "sourceVerification: false"],
     [
       "runtime-role",
-      "original_source_verifier,workflow_gateway,workflow_worker",
-      "workflow_gateway,workflow_worker",
+      exactWorkflowRoles,
+      "global_discovery_worker,original_source_verifier,workflow_gateway,workflow_worker",
     ],
-    ["discovery", "directDiscovery: false", "directDiscovery: true"],
+    [
+      "runtime-role-extra",
+      exactWorkflowRoles,
+      exactWorkflowRoles + ",unexpected_worker",
+    ],
+    ["direct-discovery", "directDiscovery: true", "directDiscovery: false"],
+    ["global-discovery", "globalDiscovery: true", "globalDiscovery: false"],
   ]) {
     const mutated = text.replace(original, replacement);
-    assert.notEqual(mutated, text, `${label} mutation must alter the workflow fixture`);
+    assert.notEqual(
+      mutated,
+      text,
+      `${label} mutation must alter the workflow fixture`,
+    );
     const path = join(root, `${label}.yml`);
     await writeFile(path, mutated);
     await assert.rejects(
       () => validateManagedCloudWorkflowContract(path),
-      /exact source-verification v2 candidate/,
+      /exact release-v3 discovery and source-verifier candidate/,
     );
   }
 
@@ -4424,18 +5465,18 @@ test("release workflow statically proves build-once and protected authorization"
       "release/prepared/observability-run.json",
     ],
   ]) {
-    const endpoint =
-      `gh api "/repos/$GITHUB_REPOSITORY/actions/runs/${runId}"`;
+    const endpoint = `gh api "/repos/$GITHUB_REPOSITORY/actions/runs/${runId}"`;
     const directRedirect = mutateMarkedSection(
       text,
       "CANDIDATE-BUILD",
-      (section) => section.replace(
-        `${endpoint} \\\n` +
-          "            | node jobs/scripts/managed-cloud-release-gate.mjs " +
-          "publication-api-capture \\\n" +
-          `                --kind run --out ${output}`,
-        `${endpoint} > ${output}`,
-      ),
+      (section) =>
+        section.replace(
+          `${endpoint} \\\n` +
+            "            | node jobs/scripts/managed-cloud-release-gate.mjs " +
+            "publication-api-capture \\\n" +
+            `                --kind run --out ${output}`,
+          `${endpoint} > ${output}`,
+        ),
     );
     assert.notEqual(
       directRedirect,
@@ -4452,10 +5493,11 @@ test("release workflow statically proves build-once and protected authorization"
     const bypassCapture = mutateMarkedSection(
       text,
       "CANDIDATE-BUILD",
-      (section) => section.replace(
-        `--kind run --out ${output}`,
-        `--kind run-unbounded --out ${output}`,
-      ),
+      (section) =>
+        section.replace(
+          `--kind run --out ${output}`,
+          `--kind run-unbounded --out ${output}`,
+        ),
     );
     assert.notEqual(
       bypassCapture,
@@ -4510,7 +5552,8 @@ test("release workflow statically proves build-once and protected authorization"
     missingCandidateCapturePipefail,
   );
   await assert.rejects(
-    () => validateManagedCloudWorkflowContract(missingCandidateCapturePipefailPath),
+    () =>
+      validateManagedCloudWorkflowContract(missingCandidateCapturePipefailPath),
     /exact-tip CI capture step must enable pipefail/,
   );
 
@@ -4548,11 +5591,7 @@ test("release workflow statically proves build-once and protected authorization"
       "Number.isSafeInteger(Number(value))",
       "Number.isInteger(Number(value))",
     ],
-    [
-      "latest-publication-attempt",
-      '/attempts/$PUBLICATION_RUN_ATTEMPT"',
-      '"',
-    ],
+    ["latest-publication-attempt", '/attempts/$PUBLICATION_RUN_ATTEMPT"', '"'],
     [
       "unchecked-publication-artifact",
       "publication-artifact-select",
@@ -4579,12 +5618,14 @@ test("release workflow statically proves build-once and protected authorization"
       "--publication-workflow-evidence unchecked.json",
     ],
   ]) {
-    const mutated = mutateMarkedSection(
-      text,
-      "PROMOTE-NO-REBUILD",
-      (section) => section.replace(original, replacement),
+    const mutated = mutateMarkedSection(text, "PROMOTE-NO-REBUILD", (section) =>
+      section.replace(original, replacement),
     );
-    assert.notEqual(mutated, text, `${label} mutation must alter the workflow fixture`);
+    assert.notEqual(
+      mutated,
+      text,
+      `${label} mutation must alter the workflow fixture`,
+    );
     const path = join(root, `${label}.yml`);
     await writeFile(path, mutated);
     await assert.rejects(
@@ -4620,7 +5661,11 @@ test("release workflow statically proves build-once and protected authorization"
     ],
   ]) {
     const mutated = text.replace(original, replacement);
-    assert.notEqual(mutated, text, `${label} mutation must alter the workflow fixture`);
+    assert.notEqual(
+      mutated,
+      text,
+      `${label} mutation must alter the workflow fixture`,
+    );
     const path = join(root, `${label}.yml`);
     await writeFile(path, mutated);
     await assert.rejects(
@@ -4724,10 +5769,12 @@ test("release workflow statically proves build-once and protected authorization"
         `${marker} must contain manifest-only validation`,
       );
       const block = section.slice(start, finish);
-      return section.replace(block, "").replace(
-        'oras pull "$PORTAL_REGISTRY_REF" --output portal-download',
-        'oras pull "$PORTAL_REGISTRY_REF" --output portal-download' + block,
-      );
+      return section
+        .replace(block, "")
+        .replace(
+          'oras pull "$PORTAL_REGISTRY_REF" --output portal-download',
+          'oras pull "$PORTAL_REGISTRY_REF" --output portal-download' + block,
+        );
     });
     const lateManifestPath = join(
       root,
@@ -4742,10 +5789,11 @@ test("release workflow statically proves build-once and protected authorization"
   const missingCreatedAnnotation = mutateMarkedSection(
     text,
     "PUBLISH-REMOTE",
-    (section) => section.replace(
-      '--annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT"',
-      '--annotation "org.opencontainers.image.created=$UNBOUND_NOW"',
-    ),
+    (section) =>
+      section.replace(
+        '--annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT"',
+        '--annotation "org.opencontainers.image.created=$UNBOUND_NOW"',
+      ),
   );
   const missingCreatedAnnotationPath = join(
     root,
@@ -4759,10 +5807,11 @@ test("release workflow statically proves build-once and protected authorization"
   const rawPromotionReceipt = mutateMarkedSection(
     text,
     "PROMOTE-NO-REBUILD",
-    (section) => section.replace(
-      'const preflight=require("./publication-preflight.json");',
-      'const preflight=require("./publication/publication-plan.json");',
-    ),
+    (section) =>
+      section.replace(
+        'const preflight=require("./publication-preflight.json");',
+        'const preflight=require("./publication/publication-plan.json");',
+      ),
   );
   const rawPromotionReceiptPath = join(root, "raw-promotion-receipt.yml");
   await writeFile(rawPromotionReceiptPath, rawPromotionReceipt);
@@ -4773,10 +5822,8 @@ test("release workflow statically proves build-once and protected authorization"
   const missingPromotionPreflight = mutateMarkedSection(
     text,
     "PROMOTE-NO-REBUILD",
-    (section) => section.replace(
-      "publication-preflight \\",
-      "publication-unchecked \\",
-    ),
+    (section) =>
+      section.replace("publication-preflight \\", "publication-unchecked \\"),
   );
   const missingPromotionPreflightPath = join(
     root,
@@ -4788,16 +5835,20 @@ test("release workflow statically proves build-once and protected authorization"
     /Promotion must independently read back|Promotion preflight must pass/,
   );
   for (const [marker, expected] of [
-    ["CANDIDATE-BUILD", /controlled namespaces and successful exact-tip CI evidence/],
+    [
+      "CANDIDATE-BUILD",
+      /controlled namespaces and successful exact-tip CI evidence/,
+    ],
     ["PROMOTE-NO-REBUILD", /Promotion must independently read back/],
   ]) {
     const missingDefaultBranchInput = mutateMarkedSection(
       text,
       marker,
-      (section) => section.replaceAll(
-        '--default-branch "$DEFAULT_BRANCH"',
-        "--default-branch main",
-      ),
+      (section) =>
+        section.replaceAll(
+          '--default-branch "$DEFAULT_BRANCH"',
+          "--default-branch main",
+        ),
     );
     const missingDefaultBranchInputPath = join(
       root,
@@ -4819,7 +5870,11 @@ test("release workflow statically proves build-once and protected authorization"
     ["node-wrong-patch", "node-version: 22.23.2", "node-version: 22.23.1"],
   ]) {
     const mutated = text.replace(original, replacement);
-    assert.notEqual(mutated, text, `${label} mutation must alter the workflow fixture`);
+    assert.notEqual(
+      mutated,
+      text,
+      `${label} mutation must alter the workflow fixture`,
+    );
     const path = join(root, `${label}.yml`);
     await writeFile(path, mutated);
     await assert.rejects(
@@ -4841,7 +5896,11 @@ test("release workflow statically proves build-once and protected authorization"
     ],
   ]) {
     const mutated = text.replace(original, replacement);
-    assert.notEqual(mutated, text, `${label} mutation must alter the workflow fixture`);
+    assert.notEqual(
+      mutated,
+      text,
+      `${label} mutation must alter the workflow fixture`,
+    );
     const path = join(root, `${label}.yml`);
     await writeFile(path, mutated);
     await assert.rejects(

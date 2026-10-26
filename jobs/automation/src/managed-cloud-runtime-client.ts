@@ -127,12 +127,20 @@ export interface ManagedCloudRuntimeInstance {
   nextHeartbeatSequence: number;
   claimedAtMs: number;
   replayed: boolean;
+  /** Present only after source-verifier boot registration. */
+  bootId?: string;
+  /** Present only after source-verifier boot registration. */
+  bootGeneration?: number;
 }
 
 export type ManagedCloudRuntimeObservation = ManagedCloudHealth & {
   dependencyEvidenceSha256: string;
   taskQueueSha256: string;
   failureConverterSha256: string;
+  /** Boot fence for original-source-verifier heartbeats only. */
+  bootId?: string;
+  /** Boot fence for original-source-verifier heartbeats only. */
+  bootGeneration?: number;
 };
 
 export interface ManagedCloudRuntimeHeartbeat {
@@ -215,6 +223,15 @@ export interface ManagedCloudRuntimeApi {
 
 export interface ManagedCloudOriginalSourceVerifierStartupApi
   extends ManagedCloudRuntimeApi {
+  registerSourceVerifierBoot?(
+    instance: ManagedCloudRuntimeInstance,
+  ): Promise<SourceVerifierBootRegistrationResult>;
+  sourceVerifierBootStartup?(
+    instance: ManagedCloudRuntimeInstance,
+    bootGeneration: number,
+    expectedDegradedHeartbeatSequence: number,
+  ): Promise<SourceVerifierBootStartupResult>;
+  /** Legacy endpoint retained solely for explicitly non-boot callers. */
   originalSourceVerifierStartup(
     instance: ManagedCloudRuntimeInstance,
     expectedDegradedHeartbeatSequence: number,
@@ -252,17 +269,37 @@ export function sourceVerifierBootStartupRequestId(): string {
 }
 
 export interface SourceVerifierBootRegistrationResult {
+  registrationRequestId: string;
   bootId: string;
+  runtimeInstanceId: string;
+  instanceEpoch: number;
+  workerId: string;
+  runtimeIdentitySha256: string;
+  activationSha256: string;
+  manifestSha256: string;
+  componentId: string;
+  role: "original_source_verifier";
   bootGeneration: number;
+  protocolId: "source_verifier_boot";
+  protocolVersion: 1;
   registeredAtMs: number;
 }
 
 export interface SourceVerifierBootStartupResult {
+  startupRequestId: string;
+  bootId: string;
+  runtimeInstanceId: string;
+  instanceEpoch: number;
+  workerId: string;
   bootGeneration: number;
   degradedHeartbeatSequence: number;
   readyHeartbeatSequence: number;
-  probeResult: string;
+  probeResult: ManagedCloudOriginalSourceVerifierProbeResult;
+  protocolId: "source_verifier_boot";
+  protocolVersion: 1;
   startupAtMs: number;
+  /** Derived from the boot-bound canonical authority, not a response field. */
+  startupAuthoritySha256: string;
 }
 
 function requireSourceVerifierIdentity(
@@ -276,64 +313,156 @@ function requireSourceVerifierIdentity(
   }
 }
 
+function bootHeartbeatFence(
+  instance: ManagedCloudRuntimeInstance,
+  observation: ManagedCloudRuntimeObservation,
+): { bootId?: string; bootGeneration?: number } {
+  const bootId = observation.bootId ?? instance.bootId;
+  const bootGeneration = observation.bootGeneration ?? instance.bootGeneration;
+  if (bootId === undefined && bootGeneration === undefined) return {};
+  requireSourceVerifierIdentity(instance);
+  if (
+    typeof bootId !== "string" ||
+    !TOKEN_ID.test(bootId) ||
+    typeof bootGeneration !== "number" ||
+    !Number.isSafeInteger(bootGeneration) ||
+    bootGeneration < 1
+  ) {
+    throw new Error("Source-verifier boot heartbeat fence is invalid");
+  }
+  return { bootId, bootGeneration };
+}
+
+function decimalInteger(value: unknown, label: string, minimum: number): number {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(`Source-verifier boot ${label} is invalid`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+    throw new Error(`Source-verifier boot ${label} is invalid`);
+  }
+  return parsed;
+}
+
 function parseSourceVerifierBootRegistration(
   value: unknown,
+  input: Record<string, unknown>,
 ): SourceVerifierBootRegistrationResult {
-  if (typeof value !== "object" || value === null) {
-    throw new Error("Source-verifier boot registration response is invalid");
+  const row = exactRecord(value, [
+    "activationSha256", "bootGeneration", "bootId", "componentId", "instanceEpoch",
+    "manifestSha256", "protocolId", "protocolVersion", "registeredAtMs",
+    "registrationRequestId", "role", "runtimeIdentitySha256", "runtimeInstanceId", "workerId",
+  ]);
+  if (row.protocolId !== "source_verifier_boot" || row.protocolVersion !== "1") {
+    throw new Error("Source-verifier boot registration protocol is invalid");
   }
-  const record = value as Record<string, unknown>;
-  const bootId = record.bootId;
-  const bootGeneration = Number(record.bootGeneration);
-  const registeredAtMs = Number(record.registeredAtMs);
-  if (typeof bootId !== "string" || !bootId.trim()) {
-    throw new Error("Source-verifier boot registration is missing a boot id");
+  const role = runtimeRole(row.role);
+  if (role !== "original_source_verifier") {
+    throw new Error("Source-verifier boot registration role is invalid");
   }
-  if (!Number.isSafeInteger(bootGeneration) || bootGeneration < 1) {
-    throw new Error("Source-verifier boot generation is invalid");
-  }
-  if (!Number.isSafeInteger(registeredAtMs) || registeredAtMs < 0) {
-    throw new Error("Source-verifier boot registration time is invalid");
-  }
-  return { bootId, bootGeneration, registeredAtMs };
+  const result: SourceVerifierBootRegistrationResult = {
+    registrationRequestId: tokenId(row.registrationRequestId, "registration request"),
+    bootId: tokenId(row.bootId, "boot"),
+    runtimeInstanceId: routeId(row.runtimeInstanceId, "runtime instance"),
+    instanceEpoch: decimalInteger(row.instanceEpoch, "instance epoch", 1),
+    workerId: workerId(row.workerId),
+    runtimeIdentitySha256: requiredSha256(row.runtimeIdentitySha256, "runtime identity"),
+    activationSha256: requiredSha256(row.activationSha256, "activation"),
+    manifestSha256: requiredSha256(row.manifestSha256, "manifest"),
+    componentId: tokenId(row.componentId, "component"),
+    role,
+    bootGeneration: decimalInteger(row.bootGeneration, "generation", 1),
+    protocolId: "source_verifier_boot",
+    protocolVersion: 1,
+    registeredAtMs: decimalInteger(row.registeredAtMs, "registration time", 0),
+  };
+  assertBootResponseBindings(result as unknown as Record<string, unknown>, input, ["sessionToken"]);
+  return result;
 }
 
 function parseSourceVerifierBootStartup(
   value: unknown,
+  input: Record<string, unknown>,
 ): SourceVerifierBootStartupResult {
-  if (typeof value !== "object" || value === null) {
-    throw new Error("Source-verifier boot startup response is invalid");
+  const row = exactRecord(value, [
+    "bootGeneration", "bootId", "degradedHeartbeatSequence", "instanceEpoch", "probeResult",
+    "protocolId", "protocolVersion", "readyHeartbeatSequence", "runtimeInstanceId", "startupAtMs",
+    "startupRequestId", "workerId",
+  ]);
+  if (row.protocolId !== "source_verifier_boot" || row.protocolVersion !== "1") {
+    throw new Error("Source-verifier boot startup protocol is invalid");
   }
-  const record = value as Record<string, unknown>;
-  const bootGeneration = Number(record.bootGeneration);
-  const degradedHeartbeatSequence = Number(record.degradedHeartbeatSequence);
-  const readyHeartbeatSequence = Number(record.readyHeartbeatSequence);
-  const probeResult = record.probeResult;
-  const startupAtMs = Number(record.startupAtMs);
-  if (!Number.isSafeInteger(bootGeneration) || bootGeneration < 1) {
-    throw new Error("Source-verifier boot startup generation is invalid");
-  }
-  if (
-    !Number.isSafeInteger(degradedHeartbeatSequence) ||
-    degradedHeartbeatSequence < 1 ||
-    readyHeartbeatSequence !== degradedHeartbeatSequence + 1
-  ) {
-    throw new Error("Source-verifier boot startup sequence is inconsistent");
-  }
-  if (probeResult !== "idle" && probeResult !== "leaseable") {
-    throw new Error("Source-verifier boot startup probe result is invalid");
-  }
-  if (!Number.isSafeInteger(startupAtMs) || startupAtMs < 0) {
-    throw new Error("Source-verifier boot startup time is invalid");
-  }
-  return {
+  const degradedHeartbeatSequence = decimalInteger(row.degradedHeartbeatSequence, "degraded heartbeat sequence", 1);
+  const readyHeartbeatSequence = decimalInteger(row.readyHeartbeatSequence, "ready heartbeat sequence", 1);
+  const probeResult = originalSourceVerifierProbeResult(row.probeResult);
+  const bootGeneration = decimalInteger(row.bootGeneration, "generation", 1);
+  const runtimeInstanceId = routeId(row.runtimeInstanceId, "runtime instance");
+  const instanceEpoch = decimalInteger(row.instanceEpoch, "instance epoch", 1);
+  const result: SourceVerifierBootStartupResult = {
+    startupRequestId: tokenId(row.startupRequestId, "startup request"),
+    bootId: tokenId(row.bootId, "boot"),
+    runtimeInstanceId,
+    instanceEpoch,
+    workerId: workerId(row.workerId),
     bootGeneration,
     degradedHeartbeatSequence,
     readyHeartbeatSequence,
     probeResult,
-    startupAtMs,
+    protocolId: "source_verifier_boot",
+    protocolVersion: 1,
+    startupAtMs: decimalInteger(row.startupAtMs, "startup time", 0),
+    startupAuthoritySha256: createHash("sha256")
+      .update("startup-authority\u001f")
+      .update(runtimeInstanceId)
+      .update("\u001f")
+      .update(String(instanceEpoch))
+      .update("\u001f")
+      .update(String(bootGeneration))
+      .update("\u001f")
+      .update(String(degradedHeartbeatSequence))
+      .digest("hex"),
   };
+  if (readyHeartbeatSequence !== degradedHeartbeatSequence + 1) {
+    throw new Error("Source-verifier boot startup sequence is inconsistent");
+  }
+  assertBootResponseBindings(result as unknown as Record<string, unknown>, input, ["sessionToken"]);
+  return result;
 }
+
+function assertBootResponseBindings(
+  response: Record<string, unknown>,
+  input: Record<string, unknown>,
+  omitted: string[],
+): void {
+  for (const [key, expected] of Object.entries(input)) {
+    if (omitted.includes(key)) continue;
+    if (response[key] !== expected) {
+      throw new Error("Source-verifier boot response identity is inconsistent");
+    }
+  }
+}
+
+async function retrySourceVerifierBootRequest<T>(operation: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableSourceVerifierBootError(error) || attempt === 3) break;
+    }
+  }
+  throw lastError;
+}
+
+function isRetryableSourceVerifierBootError(error: unknown): boolean {
+  return error instanceof Error && (
+    error.message === "Managed-cloud runtime API unavailable" ||
+    error.message === "Managed-cloud runtime API timed out" ||
+    error.message === "Managed-cloud runtime API transient failure"
+  );
+}
+
 
 export class ManagedCloudRuntimeApiClient {
   private readonly config: ManagedCloudRuntimeConfig;
@@ -393,6 +522,7 @@ export class ManagedCloudRuntimeApiClient {
         "Managed-cloud runtime dependency evidence is inconsistent",
       );
     }
+    const bootFence = bootHeartbeatFence(instance, observation);
     const input = {
       runtimeInstanceId: instance.runtimeInstanceId,
       workerId: instance.workerId,
@@ -413,6 +543,7 @@ export class ManagedCloudRuntimeApiClient {
       dependencyEvidenceSha256,
       healthState: observation.healthState,
       reasonCode: observation.reasonCode,
+      ...bootFence,
     };
     const path = `/api/jobs/internal/managed-cloud/runtime-instances/${instance.runtimeInstanceId}/heartbeats`;
     const value = await this.request(path, input);
@@ -475,20 +606,24 @@ export class ManagedCloudRuntimeApiClient {
   ): Promise<SourceVerifierBootRegistrationResult> {
     requireSourceVerifierIdentity(instance);
     assertManagedCloudRuntimeMeasurement(this.config);
-    const path = `/api/jobs/internal/managed-cloud/runtime-instances/${instance.runtimeInstanceId}/source-verifier-boot-registration`;
-    const value = await this.request(path, {
+    const path =
+      `/api/jobs/internal/managed-cloud/runtime-instances/${instance.runtimeInstanceId}` +
+      "/source-verifier-boot-registration";
+    const input = {
       registrationRequestId: sourceVerifierBootRegistrationRequestId(),
       bootId: sourceVerifierBootId(),
       runtimeInstanceId: instance.runtimeInstanceId,
       instanceEpoch: instance.instanceEpoch,
       workerId: instance.workerId,
+      sessionToken: this.config.sessionToken,
       runtimeIdentitySha256: instance.runtimeIdentitySha256,
       activationSha256: instance.activationSha256,
       manifestSha256: instance.manifestSha256,
       componentId: instance.componentId,
       role: instance.role,
-    });
-    return parseSourceVerifierBootRegistration(value);
+    };
+    const value = await this.requestSourceVerifierBoot(path, input);
+    return parseSourceVerifierBootRegistration(value, input);
   }
 
   async sourceVerifierBootStartup(
@@ -502,17 +637,29 @@ export class ManagedCloudRuntimeApiClient {
       expectedDegradedHeartbeatSequence,
       "degraded heartbeat sequence",
     );
-    const path = `/api/jobs/internal/managed-cloud/runtime-instances/${instance.runtimeInstanceId}/source-verifier-boot-startup`;
-    const value = await this.request(path, {
+    const generation = positiveInteger(bootGeneration, "boot generation");
+    const path =
+      `/api/jobs/internal/managed-cloud/runtime-instances/${instance.runtimeInstanceId}` +
+      "/source-verifier-boot-startup";
+    const input = {
       startupRequestId: sourceVerifierBootStartupRequestId(),
       bootId: sourceVerifierBootId(),
       runtimeInstanceId: instance.runtimeInstanceId,
       instanceEpoch: instance.instanceEpoch,
-      bootGeneration,
+      bootGeneration: generation,
       workerId: instance.workerId,
+      sessionToken: this.config.sessionToken,
       degradedHeartbeatSequence: degradedSequence,
-    });
-    return parseSourceVerifierBootStartup(value);
+    };
+    const value = await this.requestSourceVerifierBoot(path, input);
+    return parseSourceVerifierBootStartup(value, input);
+  }
+
+  private async requestSourceVerifierBoot(
+    path: string,
+    input: Record<string, unknown>,
+  ): Promise<unknown> {
+    return retrySourceVerifierBootRequest(() => this.request(path, input));
   }
 
   private async request(path: string, input: unknown): Promise<unknown> {
@@ -548,6 +695,9 @@ export class ManagedCloudRuntimeApiClient {
       );
     } finally {
       clearTimeout(timer);
+    }
+    if (response.status === 502 || response.status === 503 || response.status === 504) {
+      throw new Error("Managed-cloud runtime API transient failure");
     }
     if (
       response.status !== 200 ||

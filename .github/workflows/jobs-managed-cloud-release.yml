@@ -128,10 +128,10 @@ jobs:
           node jobs/scripts/managed-cloud-release-gate.mjs contracts \
             --repo "$GITHUB_WORKSPACE" \
             --out "$GITHUB_WORKSPACE/release/contracts" \
-            --version 2
+            --version 3
           node --test jobs/scripts/managed-cloud-release-gate.test.mjs
           printf '%s\n%s\n' \
-            bluey-jobs-managed-cloud-release-gate-tests-v2 \
+            bluey-jobs-managed-cloud-release-gate-tests-v3 \
             "$GITHUB_SHA" \
             > release/prepared/release-gate-tests.log
       - name: Bind successful exact-tip CI instead of synthetic candidate evidence
@@ -202,7 +202,7 @@ jobs:
             --build-arg "BLUEY_JOBS_MIGRATION_SET_SHA256=$MIGRATION_SET_SHA256" \
             --build-arg "BLUEY_JOBS_PROTOCOL_SET_SHA256=$PROTOCOL_SET_SHA256" \
             --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
-            --build-arg "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=original_source_verifier,workflow_gateway,workflow_worker" \
+            --build-arg "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=discovery_worker,global_discovery_worker,original_source_verifier,workflow_gateway,workflow_worker" \
             --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
             --output type=oci,dest=release/oci/jobs-workflows,tar=false,compression=uncompressed,force-compression=true \
             --file jobs/workflows/Dockerfile jobs
@@ -283,7 +283,7 @@ jobs:
             readFileSync(`release/prepared/${id}.content-inventory.json`, "utf8"),
           );
           const descriptor = {
-            audience: "bluey-jobs-managed-cloud-release-descriptor-v2",
+            audience: "bluey-jobs-managed-cloud-release-descriptor-v3",
             builds: components.map((componentId) => {
               const value = inventory(componentId);
               const oci = value.artifactKind === "oci_image";
@@ -304,8 +304,8 @@ jobs:
             }),
             featureAuthority: {
               cloudDistribution: true,
-              directDiscovery: false,
-              globalDiscovery: false,
+              directDiscovery: true,
+              globalDiscovery: true,
               sourceVerification: true,
               workflowCleanup: true,
               workflowCommandDispatch: true,
@@ -318,7 +318,7 @@ jobs:
             sourceCommit: process.env.GITHUB_SHA,
             sourceDateEpoch: Number(process.env.SOURCE_DATE_EPOCH),
             testEvidenceFile: "release/prepared/test-evidence.json",
-            version: 2,
+            version: 3,
           };
           writeFileSync("release/prepared/release-descriptor.json", JSON.stringify(descriptor));
           NODE

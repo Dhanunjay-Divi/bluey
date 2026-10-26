@@ -8,6 +8,7 @@ import {
   checkPhase614MigrationRegistration,
   checkPhase614BMigrationRegistration,
   checkPhase621MigrationRegistration,
+  checkPhase628MigrationRegistration,
   compareJobsSchemas,
 } from "./check-jobs-schema-parity.mjs";
 import {
@@ -1035,25 +1036,34 @@ function testDependencySecurityWorkflowGuard() {
       `${marker} must bind the default branch and Node before release evidence`,
     );
   }
+  const exactWorkflowRoles =
+    "discovery_worker,global_discovery_worker,original_source_verifier," +
+    "workflow_gateway,workflow_worker";
+  const workflowRoleAssignments = (source) => [
+    ...source.matchAll(/BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=([a-z_,]+)/g),
+  ].map((match) => match[1]);
   for (const required of [
-    "--version 2",
-    "bluey-jobs-managed-cloud-release-gate-tests-v2",
-    "bluey-jobs-managed-cloud-release-descriptor-v2",
+    "--version 3",
+    "version: 3",
+    "bluey-jobs-managed-cloud-release-gate-tests-v3",
+    "bluey-jobs-managed-cloud-release-descriptor-v3",
     "sourceVerification: true",
-    "directDiscovery: false",
-    "globalDiscovery: false",
-    "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=" +
-      "original_source_verifier,workflow_gateway,workflow_worker",
+    "directDiscovery: true",
+    "globalDiscovery: true",
+    "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=" + exactWorkflowRoles,
   ]) {
     assert(
       managedRelease.includes(required),
-      `Managed-cloud candidate is missing the release-v2 source-verifier binding: ${required}`,
+      `Managed-cloud candidate is missing the release-v3 authority binding: ${required}`,
     );
   }
   assert(
     !managedRelease.includes("sourceVerification: false") &&
-      !managedRelease.includes("bluey-jobs-managed-cloud-release-descriptor-v1"),
-    "Managed-cloud candidate must not silently fall back to release v1",
+      !managedRelease.includes("directDiscovery: false") &&
+      !managedRelease.includes("globalDiscovery: false") &&
+      !managedRelease.includes("bluey-jobs-managed-cloud-release-descriptor-v1") &&
+      !managedRelease.includes("bluey-jobs-managed-cloud-release-descriptor-v2"),
+    "Managed-cloud candidate must not silently fall back from release v3",
   );
   assert.equal(
     managedRelease.split("packages: write").length - 1,
@@ -1111,14 +1121,59 @@ function testDependencySecurityWorkflowGuard() {
     path.join(repoRoot, "jobs/workflows/Dockerfile"),
     "utf8",
   );
-  assert.equal(
-    workflowsDockerfile.split(
-      "ARG BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=" +
-        "original_source_verifier,workflow_gateway,workflow_worker",
-    ).length - 1,
-    2,
-    "The workflows build and runtime stages must default to the exact release-v2 role set",
+  assert.deepEqual(
+    [
+      ...workflowsDockerfile.matchAll(
+        /^ARG BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=([^\r\n]+)$/gm,
+      ),
+    ].map((match) => match[1]),
+    [exactWorkflowRoles, exactWorkflowRoles],
+    "The workflows build and runtime stages must default to the exact release-v3 role set",
   );
+  assert.deepEqual(
+    workflowRoleAssignments(managedRelease),
+    [exactWorkflowRoles],
+    "Workflow and Docker must share the exact five-role workflows authority",
+  );
+  for (const [label, original, replacement] of [
+    ["contract", "--version 3", "--version 2"],
+    ["descriptor", "release-descriptor-v3", "release-descriptor-v2"],
+    ["descriptor version", "version: 3", "version: 2"],
+    ["self-test", "release-gate-tests-v3", "release-gate-tests-v2"],
+    ["direct discovery", "directDiscovery: true", "directDiscovery: false"],
+    ["global discovery", "globalDiscovery: true", "globalDiscovery: false"],
+    ["source verifier", "sourceVerification: true", "sourceVerification: false"],
+    [
+      "workflows role",
+      exactWorkflowRoles,
+      "global_discovery_worker,original_source_verifier,workflow_gateway,workflow_worker",
+    ],
+    [
+      "extra workflows role",
+      exactWorkflowRoles,
+      exactWorkflowRoles + ",unexpected_worker",
+    ],
+  ]) {
+    const mutated = managedRelease.replace(original, replacement);
+    assert.notEqual(mutated, managedRelease, `${label} mutation must alter workflow`);
+    const retainsRequiredAuthority = [
+      "--version 3",
+      "version: 3",
+      "bluey-jobs-managed-cloud-release-gate-tests-v3",
+      "bluey-jobs-managed-cloud-release-descriptor-v3",
+      "sourceVerification: true",
+      "directDiscovery: true",
+      "globalDiscovery: true",
+      "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=" + exactWorkflowRoles,
+    ].every((required) => mutated.includes(required));
+    const retainsExactRoles =
+      JSON.stringify(workflowRoleAssignments(mutated)) ===
+      JSON.stringify([exactWorkflowRoles]);
+    assert(
+      !(retainsRequiredAuthority && retainsExactRoles),
+      `${label} mutation must break release-v3 authority`,
+    );
+  }
 }
 
 function testBuiltPortalPublicBetaTruth() {
@@ -3031,6 +3086,14 @@ function assertPhase614BDriftRejected({
   );
 }
 
+function assertSourceVerifierStartupMigrationRegistration(migrationRunner) {
+  assert.deepEqual(
+    checkPhase628MigrationRegistration(migrationRunner),
+    [],
+    "SQLite/Postgres source-verifier migrations must have exact declarations and array registrations",
+  );
+}
+
 function testSchemaParity() {
   const sqlite = [
     jobsParitySchema("INTEGER"),
@@ -3045,6 +3108,27 @@ function testSchemaParity() {
       path.join(
         repoRoot,
         "infra/sqlite/server-runtime/058_jobs_signed_job_integrity_authority.sql",
+      ),
+      "utf8",
+    ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/sqlite/server-runtime/062_jobs_original_source_verifier_startup_authority.sql",
+      ),
+      "utf8",
+    ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql",
+      ),
+      "utf8",
+    ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql",
       ),
       "utf8",
     ),
@@ -3065,8 +3149,49 @@ function testSchemaParity() {
       ),
       "utf8",
     ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/postgres/server-runtime/040_jobs_original_source_verifier_startup_authority.sql",
+      ),
+      "utf8",
+    ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql",
+      ),
+      "utf8",
+    ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql",
+      ),
+      "utf8",
+    ),
   ].join("\n");
   assert.deepEqual(compareJobsSchemas(sqlite, postgres), []);
+  const bootColumnDrift = sqlite.replace(
+    "boot_generation                 INTEGER NOT NULL",
+    "boot_generation_drift           INTEGER NOT NULL",
+  );
+  assert(
+    compareJobsSchemas(bootColumnDrift, postgres).some((issue) =>
+      issue.includes("jobs_managed_cloud_source_verifier_boot_registrations"),
+    ),
+    "boot registration column drift must fail schema parity",
+  );
+  const bootForeignKeyDrift = sqlite.replaceAll(
+    "REFERENCES jobs_managed_cloud_source_verifier_boot_registrations(boot_id)",
+    "REFERENCES jobs_managed_cloud_source_verifier_boot_registrations_drift(boot_id)",
+  );
+  assert(
+    compareJobsSchemas(bootForeignKeyDrift, postgres).some((issue) =>
+      issue.includes("jobs_managed_cloud_source_verifier_heartbeat_boot_bindings"),
+    ),
+    "boot heartbeat binding foreign-key drift must fail schema parity",
+  );
 
   for (const mutation of [
     {
@@ -3460,6 +3585,25 @@ function testSchemaParity() {
     path.join(repoRoot, "server/src/db/mod.rs"),
     "utf8",
   );
+  assertSourceVerifierStartupMigrationRegistration(migrationRunner);
+  for (const [index, migrationName] of [
+    "062_jobs_original_source_verifier_startup_authority.sql",
+    "040_jobs_original_source_verifier_startup_authority.sql",
+    "063_jobs_source_verifier_boot_generation_authority.sql",
+    "041_jobs_source_verifier_boot_generation_authority.sql",
+    "065_jobs_source_verifier_heartbeat_boot_bindings.sql",
+    "043_jobs_source_verifier_heartbeat_boot_bindings.sql",
+  ].entries()) {
+    const missingStartupMigration = migrationRunner.replace(
+      migrationName,
+      `removed-source-verifier-startup-${index}.sql`,
+    );
+    assert.throws(
+      () => assertSourceVerifierStartupMigrationRegistration(missingStartupMigration),
+      /migration runner must/i,
+      `Removing either ${migrationName} binding must fail its structural guard`,
+    );
+  }
   assert.deepEqual(checkPhase613MigrationRegistration(migrationRunner), []);
   assert.deepEqual(checkPhase614MigrationRegistration(migrationRunner), []);
   assert.deepEqual(checkPhase614BMigrationRegistration(migrationRunner), []);

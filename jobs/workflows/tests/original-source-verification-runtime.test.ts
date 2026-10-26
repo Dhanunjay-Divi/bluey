@@ -202,32 +202,38 @@ function managedHeartbeat(
 
 function managedStartup() {
   return {
-    version: 1 as const,
-    audience:
-      "bluey-jobs-managed-cloud-original-source-verifier-startup-v1" as const,
-    startupRequestId: "osv-startup-" + "d".repeat(64),
+    startupRequestId: "startboot-" + "d".repeat(32),
+    bootId: "boot-" + "e".repeat(32),
     runtimeInstanceId: MANAGED_INSTANCE.runtimeInstanceId,
     workerId: MANAGED_INSTANCE.workerId,
     instanceEpoch: MANAGED_INSTANCE.instanceEpoch,
+    bootGeneration: 7,
+    degradedHeartbeatSequence: MANAGED_INSTANCE.nextHeartbeatSequence,
+    readyHeartbeatSequence: MANAGED_INSTANCE.nextHeartbeatSequence + 1,
+    probeResult: "idle" as const,
+    protocolId: "source_verifier_boot" as const,
+    protocolVersion: 1 as const,
+    startupAuthoritySha256: "e".repeat(64),
+    startupAtMs: 1_750_000_002_000,
+  };
+}
+
+function bootRegistration() {
+  return {
+    registrationRequestId: "regboot-" + "d".repeat(32),
+    bootId: "boot-" + "e".repeat(32),
+    runtimeInstanceId: MANAGED_INSTANCE.runtimeInstanceId,
+    instanceEpoch: MANAGED_INSTANCE.instanceEpoch,
+    workerId: MANAGED_INSTANCE.workerId,
     runtimeIdentitySha256: MANAGED_INSTANCE.runtimeIdentitySha256,
-    observedHeadRevision: MANAGED_INSTANCE.headRevision,
-    observedTransitionSha256: MANAGED_INSTANCE.transitionSha256,
     activationSha256: MANAGED_INSTANCE.activationSha256,
     manifestSha256: MANAGED_INSTANCE.manifestSha256,
     componentId: MANAGED_INSTANCE.componentId,
     role: "original_source_verifier" as const,
-    artifactSha256: MANAGED_INSTANCE.artifactSha256,
-    migrationSetSha256: MANAGED_INSTANCE.migrationSetSha256,
-    configSchemaSha256: MANAGED_INSTANCE.configSchemaSha256,
-    protocolSetSha256: MANAGED_INSTANCE.protocolSetSha256,
-    taskQueueSha256: MANAGED_INSTANCE.taskQueueSha256,
-    failureConverterSha256: MANAGED_INSTANCE.failureConverterSha256,
-    dependencyEvidenceSha256: MANAGED_INSTANCE.dependencyEvidenceSha256,
-    degradedHeartbeatSequence: MANAGED_INSTANCE.nextHeartbeatSequence,
-    readyHeartbeatSequence: MANAGED_INSTANCE.nextHeartbeatSequence + 1,
-    probeResult: "idle" as const,
-    startupAuthoritySha256: "e".repeat(64),
-    startupAtMs: 1_750_000_002_000,
+    bootGeneration: 7,
+    protocolId: "source_verifier_boot" as const,
+    protocolVersion: 1 as const,
+    registeredAtMs: 1_750_000_002_000,
   };
 }
 
@@ -312,6 +318,37 @@ describe("original-source verification API", () => {
     expect(requests.every((request) => request.init.redirect === "error")).toBe(
       true,
     );
+  });
+
+  it("propagates one validated boot identity while preserving legacy omission", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fetcher: OriginalSourceVerificationApiFetch = async (_input, init = {}) => {
+      bodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      if (bodies.length === 1) return authoritativeResponse(lease());
+      if (bodies.length === 2) return authoritativeResponse(heartbeat(1));
+      return authoritativeResponse(terminal());
+    };
+    const client = new OriginalSourceVerificationApiClient({
+      origin: "https://jobs.internal",
+      signingKey: SIGNING_KEY,
+      binding: {
+        ...BINDING,
+        boot_id: "boot-" + "d".repeat(32),
+        boot_generation: 7,
+      },
+      fetch: fetcher,
+    });
+    const claimed = await client.lease();
+    await client.heartbeat(claimed!, 1);
+    await client.complete(claimed!, terminalRequestId(claimed!), closedObservation());
+    const bootBinding = {
+        ...BINDING,
+        boot_id: "boot-" + "d".repeat(32),
+        boot_generation: 7,
+    };
+    expect(bodies.map((body) => body.binding)).toEqual([bootBinding, bootBinding, bootBinding]);
+    expect(BINDING).not.toHaveProperty("boot_id");
+    expect(BINDING).not.toHaveProperty("boot_generation");
   });
 
   it("retries terminal response loss with byte-identical request identity", async () => {
@@ -523,6 +560,14 @@ describe("original-source verifier runtime", () => {
     expect(binding.runtime_authority_sha256).toBe(
       "34f63a889abc29ec7e865e2c398f63530cb1308ce1c43f9a13d36e493c2351ea",
     );
+    const bootBinding = originalSourceVerifierBinding(
+      { ...instance, bootId: "boot-" + "d".repeat(32), bootGeneration: 7 } as never,
+      BINDING.runtime_session_token,
+    );
+    expect(bootBinding).toMatchObject({
+      boot_id: "boot-" + "d".repeat(32),
+      boot_generation: 7,
+    });
     expect(() =>
       originalSourceVerifierBinding(
         { ...instance, role: "workflow_worker" } as never,
@@ -542,7 +587,7 @@ describe("original-source verifier runtime", () => {
       claim: async () => MANAGED_INSTANCE,
       registerSourceVerifierBoot: async () => {
         order.push("register-boot");
-        return { bootGeneration: 7 };
+        return bootRegistration();
       },
       heartbeat: async (_instance, sequence, observation) => {
         order.push(
@@ -557,8 +602,8 @@ describe("original-source verifier runtime", () => {
             : null,
         );
       },
-      originalSourceVerifierStartup: async (_instance, sequence) => {
-        order.push(`startup:${sequence}`);
+      sourceVerifierBootStartup: async (_instance, generation, sequence) => {
+        order.push(`startup:${generation}:${sequence}`);
         return managedStartup();
       },
     };
@@ -588,7 +633,7 @@ describe("original-source verifier runtime", () => {
           observation.healthState === "ready" ? "ready" : "degraded",
           observation.reasonCode === "startup" ? "startup" : null,
         ),
-      originalSourceVerifierStartup: async () => managedStartup(),
+      sourceVerifierBootStartup: async () => managedStartup(),
     };
     await expect(
       establishOriginalSourceVerifierStartup(
@@ -599,7 +644,7 @@ describe("original-source verifier runtime", () => {
     ).rejects.toThrow(/boot generation is invalid/);
   });
 
-  it("remains compatible with a runtime api that cannot register a boot", async () => {
+  it("rejects a runtime api without complete boot authority", async () => {
     const order: string[] = [];
     const runtimeApi: ManagedCloudOriginalSourceVerifierStartupApi = {
       claim: async () => MANAGED_INSTANCE,
@@ -611,17 +656,16 @@ describe("original-source verifier runtime", () => {
           observation.reasonCode === "startup" ? "startup" : null,
         );
       },
-      originalSourceVerifierStartup: async () => managedStartup(),
+      originalSourceVerifierStartup: async () => managedStartup() as never,
     };
-    const established = await establishOriginalSourceVerifierStartup(
-      runtimeApi,
-      MANAGED_INSTANCE,
-      MANAGED_OBSERVATION,
-    );
-    expect(order[0]).toBe(
-      `heartbeat:${MANAGED_INSTANCE.nextHeartbeatSequence}`,
-    );
-    expect(established.bootGeneration).toBeUndefined();
+    await expect(
+      establishOriginalSourceVerifierStartup(
+        runtimeApi,
+        MANAGED_INSTANCE,
+        MANAGED_OBSERVATION,
+      ),
+    ).rejects.toThrow(/requires boot startup authority/);
+    expect(order).toEqual([]);
   });
 
   it("orders degraded startup, one readiness CAS, one poll, then sequence N+2", async () => {
@@ -647,8 +691,9 @@ describe("original-source verifier runtime", () => {
             : null,
         );
       },
-      originalSourceVerifierStartup: async (_instance, sequence) => {
-        order.push(`startup:${sequence}`);
+      registerSourceVerifierBoot: async () => bootRegistration(),
+      sourceVerifierBootStartup: async (_instance, generation, sequence) => {
+        order.push(`startup:${generation}:${sequence}`);
         return managedStartup();
       },
     };
@@ -693,7 +738,7 @@ describe("original-source verifier runtime", () => {
     expect(order).toEqual([
       "claim",
       "managed:11:degraded:startup",
-      "startup:11",
+      "startup:7:11",
       "worker-poll",
       "managed:13:ready:null",
     ]);
@@ -713,8 +758,9 @@ describe("original-source verifier runtime", () => {
           observation.reasonCode === "startup" ? "startup" : "probe_failed",
         );
       },
-      originalSourceVerifierStartup: async (_instance, sequence) => {
-        order.push(`startup:${sequence}`);
+      registerSourceVerifierBoot: async () => bootRegistration(),
+      sourceVerifierBootStartup: async (_instance, generation, sequence) => {
+        order.push(`startup:${generation}:${sequence}`);
         throw new Error("probe rejected");
       },
     };
@@ -729,12 +775,11 @@ describe("original-source verifier runtime", () => {
         );
         workerStarted();
       })(),
-    ).rejects.toThrow("startup probe failed");
+    ).rejects.toThrow("boot startup failed");
     expect(workerStarted).not.toHaveBeenCalled();
     expect(order).toEqual([
       "managed:11:degraded:startup",
-      "startup:11",
-      "managed:12:degraded:probe_failed",
+      "startup:7:11",
     ]);
   });
 
@@ -752,7 +797,8 @@ describe("original-source verifier runtime", () => {
         }
         return managedHeartbeat(sequence, "degraded", "startup");
       },
-      originalSourceVerifierStartup: startup,
+      registerSourceVerifierBoot: async () => bootRegistration(),
+      sourceVerifierBootStartup: startup,
     };
 
     await expect(
@@ -761,9 +807,9 @@ describe("original-source verifier runtime", () => {
         MANAGED_INSTANCE,
         MANAGED_OBSERVATION,
       ),
-    ).rejects.toThrow("probe-failure acknowledgement failed");
+    ).rejects.toThrow("boot startup failed");
     expect(startup).toHaveBeenCalledTimes(1);
-    expect(heartbeatCalls).toEqual([11, 12]);
+    expect(heartbeatCalls).toEqual([11]);
   });
 
   it("starts one verifier poll alongside the immediate managed-runtime report", async () => {

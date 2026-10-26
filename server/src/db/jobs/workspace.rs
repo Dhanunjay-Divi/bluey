@@ -201,8 +201,8 @@ fn decode_jobs_match_cursor(
     }
     validate_data_encryption_config()?;
     let plain = decrypt_payload(value).map_err(|_| anyhow::anyhow!(INVALID_JOBS_MATCH_CURSOR))?;
-    let cursor: JobsMatchCursorV1 = serde_json::from_str(&plain)
-        .map_err(|_| anyhow::anyhow!(INVALID_JOBS_MATCH_CURSOR))?;
+    let cursor: JobsMatchCursorV1 =
+        serde_json::from_str(&plain).map_err(|_| anyhow::anyhow!(INVALID_JOBS_MATCH_CURSOR))?;
     let account_sha256 = private_lookup_hash(JOBS_MATCH_CURSOR_PURPOSE, account_id)?;
     let decoded_at_ms = now_ms();
     let valid_expiry = cursor
@@ -411,14 +411,12 @@ fn current_authority_posting_representations_once(
                 PostingRepresentationSelection::Page {
                     include_application_context: true,
                     ..
-                } => {
-                    load_application_context_jobs_sqlite(
-                        &tx,
-                        account_id,
-                        &inputs.applications,
-                        &loaded.postings,
-                    )?
-                }
+                } => load_application_context_jobs_sqlite(
+                    &tx,
+                    account_id,
+                    &inputs.applications,
+                    &loaded.postings,
+                )?,
                 _ => LoadedApplicationContextJobs {
                     jobs: Vec::new(),
                     fallback_batch_count: 0,
@@ -428,20 +426,16 @@ fn current_authority_posting_representations_once(
             let matches_page = representation_page_info(account_id, &loaded)?;
             let candidate_count = loaded.candidate_count;
             let LoadedRepresentationPostings {
-                postings, discovery, ..
-            } = loaded;
-            let matches = represent_posting_page_from_inputs_sqlite_with_discovery(
-                &tx,
-                account_id,
                 postings,
                 discovery,
-                &inputs,
-                db_time_ms,
+                ..
+            } = loaded;
+            let matches = represent_posting_page_from_inputs_sqlite_with_discovery(
+                &tx, account_id, postings, discovery, &inputs, db_time_ms,
             )?;
             let application_jobs = application_context.jobs;
             let application_context_count = application_jobs.len();
-            let application_context_fallback_batch_count =
-                application_context.fallback_batch_count;
+            let application_context_fallback_batch_count = application_context.fallback_batch_count;
             tx.commit()?;
             Ok(WorkspaceRepresentation {
                 profile: inputs.profile,
@@ -480,14 +474,12 @@ fn current_authority_posting_representations_once(
                 PostingRepresentationSelection::Page {
                     include_application_context: true,
                     ..
-                } => {
-                    load_application_context_jobs_postgres(
-                        &mut tx,
-                        account_id,
-                        &inputs.applications,
-                        &loaded.postings,
-                    )?
-                }
+                } => load_application_context_jobs_postgres(
+                    &mut tx,
+                    account_id,
+                    &inputs.applications,
+                    &loaded.postings,
+                )?,
                 _ => LoadedApplicationContextJobs {
                     jobs: Vec::new(),
                     fallback_batch_count: 0,
@@ -497,20 +489,16 @@ fn current_authority_posting_representations_once(
             let matches_page = representation_page_info(account_id, &loaded)?;
             let candidate_count = loaded.candidate_count;
             let LoadedRepresentationPostings {
-                postings, discovery, ..
-            } = loaded;
-            let matches = represent_posting_page_from_inputs_postgres_with_discovery(
-                &mut tx,
-                account_id,
                 postings,
                 discovery,
-                &inputs,
-                db_time_ms,
+                ..
+            } = loaded;
+            let matches = represent_posting_page_from_inputs_postgres_with_discovery(
+                &mut tx, account_id, postings, discovery, &inputs, db_time_ms,
             )?;
             let application_jobs = application_context.jobs;
             let application_context_count = application_jobs.len();
-            let application_context_fallback_batch_count =
-                application_context.fallback_batch_count;
+            let application_context_fallback_batch_count = application_context.fallback_batch_count;
             if posting_representation_mutable_inputs_sha256_postgres(&mut tx, account_id)?
                 != mutable_inputs_sha256
             {
@@ -559,12 +547,7 @@ fn represent_posting_page_from_inputs_sqlite(
 ) -> Result<Vec<JobPosting>> {
     let discovery = load_discovery_authorities_sqlite(tx, account_id, &postings)?;
     represent_posting_page_from_inputs_sqlite_with_discovery(
-        tx,
-        account_id,
-        postings,
-        discovery,
-        inputs,
-        db_time_ms,
+        tx, account_id, postings, discovery, inputs, db_time_ms,
     )
 }
 
@@ -611,12 +594,7 @@ fn represent_posting_page_from_inputs_postgres(
 ) -> Result<Vec<JobPosting>> {
     let discovery = load_discovery_authorities_postgres(tx, account_id, &postings)?;
     represent_posting_page_from_inputs_postgres_with_discovery(
-        tx,
-        account_id,
-        postings,
-        discovery,
-        inputs,
-        db_time_ms,
+        tx, account_id, postings, discovery, inputs, db_time_ms,
     )
 }
 
@@ -957,10 +935,7 @@ fn represent_posting_page_sqlite(
     db_time_ms: i64,
 ) -> Result<Vec<JobPosting>> {
     let projections = resolve_composed_job_integrity_projection_page_sqlite_tx_at_ms(
-        tx,
-        account_id,
-        &postings,
-        db_time_ms,
+        tx, account_id, &postings, db_time_ms,
     )?;
     postings
         .into_iter()
@@ -991,10 +966,7 @@ fn represent_posting_page_postgres(
 ) -> Result<Vec<JobPosting>> {
     let projections =
         resolve_composed_job_integrity_projection_page_postgres_tx_after_prelock_at_ms(
-            tx,
-            account_id,
-            &postings,
-            db_time_ms,
+            tx, account_id, &postings, db_time_ms,
         )?;
     let mut represented = Vec::with_capacity(postings.len());
     for (posting, projection) in postings.into_iter().zip(projections) {
@@ -1249,11 +1221,8 @@ fn load_representation_postings_sqlite(
             // continuation cursor, which preserves both bounded work and traversal.
             let candidate_scan_limit = limit + 1;
             let fetch_limit = candidate_scan_limit + 1;
-            let mut selected = Vec::<(
-                JobPosting,
-                JobsMatchPageKey,
-                Vec<JobDiscoveryAuthority>,
-            )>::new();
+            let mut selected =
+                Vec::<(JobPosting, JobsMatchPageKey, Vec<JobDiscoveryAuthority>)>::new();
             // Keep the first-page and continuation predicates separate so the
             // continuation is an actual range seek on the composite index,
             // rather than an `OR parameter IS NULL` filter over sorted history.
@@ -1437,11 +1406,8 @@ fn load_representation_postings_postgres(
             // candidate window plus look-ahead, never a history-length scan.
             let candidate_scan_limit = limit + 1;
             let fetch_limit = candidate_scan_limit + 1;
-            let mut selected = Vec::<(
-                JobPosting,
-                JobsMatchPageKey,
-                Vec<JobDiscoveryAuthority>,
-            )>::new();
+            let mut selected =
+                Vec::<(JobPosting, JobsMatchPageKey, Vec<JobDiscoveryAuthority>)>::new();
             let rows = if let Some(after) = after {
                 tx.query(
                     "SELECT id,posting_json,match_score,updated_at_ms
@@ -1602,19 +1568,12 @@ fn posting_is_interactive(
         || discovery.iter().any(|authority| {
             authority.source_status == "active"
                 && matches!(authority.source_health.as_str(), "waiting" | "healthy")
-                && matches!(
-                    authority.membership_status.as_str(),
-                    "active" | "unknown"
-                )
+                && matches!(authority.membership_status.as_str(), "active" | "unknown")
         })
 }
 
 fn finish_loaded_representation_page(
-    mut selected: Vec<(
-        JobPosting,
-        JobsMatchPageKey,
-        Vec<JobDiscoveryAuthority>,
-    )>,
+    mut selected: Vec<(JobPosting, JobsMatchPageKey, Vec<JobDiscoveryAuthority>)>,
     candidate_count: usize,
     limit: usize,
     scanned_after: Option<JobsMatchPageKey>,
@@ -1744,12 +1703,7 @@ fn export_current_authority_posting_representations_once(
                 let next_id = postings.last().map(|posting| posting.id.clone());
                 let discovery = load_discovery_authorities_sqlite(&tx, account_id, &postings)?;
                 represented.extend(represent_posting_page_from_inputs_sqlite_with_discovery(
-                    &tx,
-                    account_id,
-                    postings,
-                    discovery,
-                    &inputs,
-                    db_time_ms,
+                    &tx, account_id, postings, discovery, &inputs, db_time_ms,
                 )?);
                 after_id = next_id;
             }
@@ -1794,12 +1748,7 @@ fn export_current_authority_posting_representations_once(
                 let discovery =
                     load_discovery_authorities_postgres(&mut tx, account_id, &postings)?;
                 represented.extend(represent_posting_page_from_inputs_postgres_with_discovery(
-                    &mut tx,
-                    account_id,
-                    postings,
-                    discovery,
-                    &inputs,
-                    db_time_ms,
+                    &mut tx, account_id, postings, discovery, &inputs, db_time_ms,
                 )?);
                 after_id = next_id;
             }
@@ -2218,12 +2167,10 @@ mod workspace_representation_tests {
             "fn compose_job_integrity_page_after_sources_sqlite(",
             "fn compose_job_integrity_page_after_sources_postgres(",
         );
-        assert!(sqlite_composition.contains(
-            "resolve_current_job_integrity_authority_page_sqlite_tx_at_ms("
-        ));
-        assert!(!sqlite_composition.contains(
-            "resolve_current_job_integrity_authority_sqlite_tx_at_ms("
-        ));
+        assert!(sqlite_composition
+            .contains("resolve_current_job_integrity_authority_page_sqlite_tx_at_ms("));
+        assert!(!sqlite_composition
+            .contains("resolve_current_job_integrity_authority_sqlite_tx_at_ms("));
         let postgres_composition = section(
             composition,
             "fn compose_job_integrity_page_after_sources_postgres(",
@@ -2272,7 +2219,12 @@ mod workspace_representation_tests {
     fn postgres_workspace_explain_fixture_covers_first_and_deep_tied_keysets() {
         let fixture = include_str!("../../../tests/fixtures/jobs_workspace_postgres_explain.sql");
         assert!(fixture.contains("generate_series(0, 5499)"));
-        assert_eq!(fixture.matches("EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)").count(), 2);
+        assert_eq!(
+            fixture
+                .matches("EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)")
+                .count(),
+            2
+        );
         assert!(fixture.contains("idx_jobs_postings_account_workspace_page"));
         assert!(fixture.contains("((-match_score), (-updated_at_ms), id)"));
         assert!(fixture.contains("'phase626-workspace-4999'"));
@@ -2295,14 +2247,10 @@ mod workspace_representation_tests {
         .expect("encode a valid persisted tiebreaker above the removed arbitrary bound");
         assert!(encoded.len() <= 2_048);
         assert_eq!(
-            decode_jobs_match_cursor(
-                Some(&encoded),
-                account_id,
-                JOBS_WORKSPACE_DEFAULT_PAGE_SIZE,
-            )
-            .expect("decode exact persisted tiebreaker")
-            .expect("cursor key")
-            .job_id,
+            decode_jobs_match_cursor(Some(&encoded), account_id, JOBS_WORKSPACE_DEFAULT_PAGE_SIZE,)
+                .expect("decode exact persisted tiebreaker")
+                .expect("cursor key")
+                .job_id,
             exact_id
         );
 
@@ -2480,26 +2428,89 @@ mod workspace_representation_tests {
                 &profile,
                 &preferences,
             );
-        let first_authority =
-            production_positive_authority_fixture::install_production_positive_job_authorities(
-                pool,
-                account_id,
-                &first,
-                &managed,
-                "acme.com",
-                "source-positive-export-000",
-            );
-        let mut ids = vec![first_authority.posting.id];
+        let mut postings = vec![first];
         for index in 1..102 {
             let input = posting_for_index(index);
-            let posting = production_positive_authority_fixture::
-                save_production_positive_verified_import_with_runtime(
+            let source = discovery_source_input_from_verified_import(
+                &input.source,
+                &input.canonical_url,
+                &input.company,
+                &input.track_id,
+            )
+            .expect("derive source-positive export discovery source")
+            .expect("greenhouse import must derive a discovery source");
+            postings.push(
+                save_verified_import_posting_with_source(
                     pool,
                     account_id,
                     &input,
+                    &source,
                     &profile,
                     &preferences,
-                );
+                )
+                .expect("save source-positive export verified import"),
+            );
+        }
+        let last = postings
+            .last()
+            .expect("source-positive postings include last")
+            .clone();
+        production_positive_authority_fixture::save_production_positive_verified_import_with_runtime(
+            pool,
+            account_id,
+            &last,
+            &profile,
+            &preferences,
+        );
+        let postings = list_postings(pool, account_id)
+            .expect("reload source-positive export postings after full snapshot");
+        assert_eq!(
+            postings.len(),
+            102,
+            "full public discovery snapshot must contain 102 postings"
+        );
+        // Batch publication makes all 102 assignments due together. Consume
+        // them in the real scheduler's FIFO order, not workspace rank order.
+        let assignment_job_ids = match pool {
+            DbPool::Sqlite(_) => {
+                let connection = pool.get().expect("read export fixture lease order");
+                let mut statement = connection
+                    .prepare(
+                        "SELECT job_id FROM jobs_original_source_verification_assignments
+                  WHERE account_id=?1 AND state='pending'
+                  ORDER BY next_attempt_at_ms,created_at_ms,assignment_id",
+                    )
+                    .expect("prepare export fixture lease order");
+                let rows = statement
+                    .query_map(params![account_id], |row| row.get::<_, String>(0))
+                    .expect("read export fixture assignment jobs");
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .expect("collect export fixture lease order")
+            }
+            DbPool::Postgres(_) => pool
+                .get_pg()
+                .expect("read PostgreSQL export fixture lease order")
+                .query(
+                    "SELECT job_id FROM jobs_original_source_verification_assignments
+                      WHERE account_id=$1 AND state='pending'
+                      ORDER BY next_attempt_at_ms,created_at_ms,assignment_id",
+                    &[&account_id],
+                )
+                .expect("read PostgreSQL export fixture assignment jobs")
+                .into_iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect(),
+        };
+        assert_eq!(assignment_job_ids.len(), 102);
+        let mut postings_by_id = postings
+            .into_iter()
+            .map(|posting| (posting.id.clone(), posting))
+            .collect::<BTreeMap<_, _>>();
+        let mut ids = Vec::with_capacity(postings_by_id.len());
+        for (index, job_id) in assignment_job_ids.iter().enumerate() {
+            let posting = postings_by_id
+                .remove(job_id)
+                .expect("every due assignment belongs to the published fixture");
             let authority =
                 production_positive_authority_fixture::install_production_positive_job_authorities(
                     pool,
@@ -2511,6 +2522,7 @@ mod workspace_representation_tests {
                 );
             ids.push(authority.posting.id);
         }
+        assert!(postings_by_id.is_empty());
         ids.sort();
         ids
     }
@@ -2543,7 +2555,10 @@ mod workspace_representation_tests {
             );
             assert_eq!(posting.discovery_evidence.scam_risk_status, "clear");
             assert_eq!(
-                posting.discovery_evidence.canonical_employer_domain.as_deref(),
+                posting
+                    .discovery_evidence
+                    .canonical_employer_domain
+                    .as_deref(),
                 Some("acme.com")
             );
             assert_eq!(
@@ -2587,7 +2602,9 @@ mod workspace_representation_tests {
             ACCOUNT_EXPORT_REPRESENTATION_PAGE_SIZE,
             JOBS_WORKSPACE_MAX_PAGE_SIZE
         );
-        assert!(ACCOUNT_EXPORT_REPRESENTATION_PAGE_SIZE <= JOBS_WORKSPACE_MAX_PAGE_SIZE + 1);
+        const {
+            assert!(ACCOUNT_EXPORT_REPRESENTATION_PAGE_SIZE <= JOBS_WORKSPACE_MAX_PAGE_SIZE + 1);
+        }
     }
 
     #[test]
@@ -2853,9 +2870,8 @@ mod workspace_representation_tests {
             posting.id = format!("application-context-{index:04}");
             posting.external_id = posting.id.clone();
             posting.title = format!("Current role {index:04}");
-            posting.canonical_url = format!(
-                "https://boards.greenhouse.io/acme/jobs/application-context-{index:04}"
-            );
+            posting.canonical_url =
+                format!("https://boards.greenhouse.io/acme/jobs/application-context-{index:04}");
             posting.canonical_key = canonical_job_key(&posting);
             if index == 50 {
                 posting.availability_status = "expired".to_string();
@@ -2943,10 +2959,7 @@ mod workspace_representation_tests {
         assert_eq!(load.workspace.matches.len(), 50);
         assert_eq!(load.workspace.application_jobs.len(), 501);
         assert_eq!(load.diagnostics.application_context_count, 501);
-        assert_eq!(
-            load.diagnostics.application_context_fallback_batch_count,
-            1
-        );
+        assert_eq!(load.diagnostics.application_context_fallback_batch_count, 1);
         assert_eq!(
             load.workspace
                 .application_jobs
@@ -3121,10 +3134,9 @@ mod workspace_representation_tests {
                 )
                 .expect("prepare workspace page query plan");
             statement
-                .query_map(
-                    params!["acct-representation-bound", 52_i64],
-                    |row| row.get::<_, String>(3),
-                )
+                .query_map(params!["acct-representation-bound", 52_i64], |row| {
+                    row.get::<_, String>(3)
+                })
                 .expect("explain workspace page query")
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .expect("collect workspace page query plan")
@@ -3159,9 +3171,9 @@ mod workspace_representation_tests {
                 .expect("collect workspace continuation query plan")
         };
         for query_plan in [first_page_query_plan, continuation_query_plan] {
-            assert!(query_plan.iter().any(|detail| {
-                detail.contains("idx_jobs_postings_account_workspace_page")
-            }));
+            assert!(query_plan
+                .iter()
+                .any(|detail| { detail.contains("idx_jobs_postings_account_workspace_page") }));
             assert!(!query_plan
                 .iter()
                 .any(|detail| detail.contains("USE TEMP B-TREE")));
@@ -3274,10 +3286,7 @@ mod workspace_representation_tests {
             Some(&first_cursor),
         )
         .expect_err("cursor page-size changes must fail closed");
-        assert_eq!(
-            mismatched_size_error.to_string(),
-            INVALID_JOBS_MATCH_CURSOR
-        );
+        assert_eq!(mismatched_size_error.to_string(), INVALID_JOBS_MATCH_CURSOR);
         let issued_at_ms = now_ms() - JOBS_MATCH_CURSOR_TTL_MS - 1;
         let expired_cursor = to_json(
             &JobsMatchCursorV1 {
@@ -3306,10 +3315,7 @@ mod workspace_representation_tests {
             Some(&expired_cursor),
         )
         .expect_err("expired cursor must fail closed");
-        assert_eq!(
-            expired_cursor_error.to_string(),
-            INVALID_JOBS_MATCH_CURSOR
-        );
+        assert_eq!(expired_cursor_error.to_string(), INVALID_JOBS_MATCH_CURSOR);
         let limit_error = list_current_posting_representation_page(
             &pool,
             "acct-representation-bound",
@@ -3318,7 +3324,9 @@ mod workspace_representation_tests {
             None,
         )
         .expect_err("oversized page must fail closed");
-        assert!(limit_error.to_string().contains("page size must be between"));
+        assert!(limit_error
+            .to_string()
+            .contains("page size must be between"));
 
         let detail = get_current_posting_representation(
             &pool,
@@ -3347,10 +3355,7 @@ mod workspace_representation_tests {
             .workspace
             .as_ref()
             .expect("profile workspace export");
-        assert_eq!(
-            workspace.matches.len(),
-            5_500
-        );
+        assert_eq!(workspace.matches.len(), 5_500);
         assert!(workspace
             .matches
             .windows(2)
@@ -3397,9 +3402,7 @@ mod workspace_representation_tests {
         // history merely to fill 50 visible rows. It returns a cursor at the
         // bounded candidate-window boundary and makes progress on the next
         // request instead.
-        let sparse_scan_conn = pool
-            .get()
-            .expect("sparse interactive-window connection");
+        let sparse_scan_conn = pool.get().expect("sparse interactive-window connection");
         for index in 0..=JOBS_WORKSPACE_DEFAULT_PAGE_SIZE {
             let posting_id = format!("bounded-posting-{index:04}");
             let raw = sparse_scan_conn
@@ -3410,9 +3413,8 @@ mod workspace_representation_tests {
                     |row| row.get::<_, String>(0),
                 )
                 .expect("load sparse interactive-window posting");
-            let mut posting =
-                parse_json::<JobPosting>(raw, "sparse interactive-window posting")
-                    .expect("parse sparse interactive-window posting");
+            let mut posting = parse_json::<JobPosting>(raw, "sparse interactive-window posting")
+                .expect("parse sparse interactive-window posting");
             posting.availability_status = "expired".to_string();
             sparse_scan_conn
                 .execute(
@@ -3626,11 +3628,11 @@ mod workspace_representation_tests {
             )
             .expect("insert PostgreSQL source-positive export account");
 
-        let result = (|| -> Result<()> {
+        let result: Result<()> = {
             let ids = install_source_positive_export_fixture(&pool, &account_id, &email);
             assert_source_positive_export(&pool, &account_id, &email, &ids);
             Ok(())
-        })();
+        };
 
         pool.get_pg()
             .expect("PostgreSQL source-positive export cleanup connection")

@@ -31,7 +31,9 @@ export interface JobsWorkerAuthInput {
   nonce?: string;
 }
 
-export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<string, string> {
+export function createJobsWorkerAuthHeaders(
+  input: JobsWorkerAuthInput,
+): Record<string, string> {
   const method = input.method.toUpperCase();
   const scope = jobsWorkerScope(method, input.path);
   if (!scope || input.path.includes("?") || input.path.includes("#")) {
@@ -39,7 +41,9 @@ export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<
   }
   assertIdentifier(input.workerId, 3, 128, "worker ID");
   if (Buffer.byteLength(input.signingKey, "utf8") < 32) {
-    throw new Error("BLUEY_JOBS_WORKER_SIGNING_KEY must contain at least 32 bytes");
+    throw new Error(
+      "BLUEY_JOBS_WORKER_SIGNING_KEY must contain at least 32 bytes",
+    );
   }
 
   const timestamp = input.timestamp ?? Math.floor(Date.now() / 1_000);
@@ -49,12 +53,17 @@ export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<
   const nonce = input.nonce ?? randomBytes(16).toString("hex");
   assertIdentifier(nonce, 24, 128, "nonce");
 
-  const contentSha256 = createHash("sha256").update(input.body ?? "").digest("hex");
-  const managedCloudOrigin = scope === "managed-cloud-runtime"
-    ? normalizeManagedCloudWorkerOrigin(input.origin)
-    : undefined;
+  const contentSha256 = createHash("sha256")
+    .update(input.body ?? "")
+    .digest("hex");
+  const managedCloudOrigin =
+    scope === "managed-cloud-runtime"
+      ? normalizeManagedCloudWorkerOrigin(input.origin)
+      : undefined;
   if (scope !== "managed-cloud-runtime" && input.origin !== undefined) {
-    throw new Error("Bluey Jobs worker origin is only valid for managed-cloud runtime requests");
+    throw new Error(
+      "Bluey Jobs worker origin is only valid for managed-cloud runtime requests",
+    );
   }
   const canonical = [
     managedCloudOrigin ? MANAGED_CLOUD_SIGNATURE_VERSION : SIGNATURE_VERSION,
@@ -68,7 +77,9 @@ export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<
     input.path,
     contentSha256,
   ].join("\n");
-  const signature = createHmac("sha256", input.signingKey).update(canonical).digest("hex");
+  const signature = createHmac("sha256", input.signingKey)
+    .update(canonical)
+    .digest("hex");
 
   return {
     "x-bluey-jobs-worker-id": input.workerId,
@@ -84,8 +95,14 @@ export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<
   };
 }
 
-export function normalizeManagedCloudWorkerOrigin(value: string | undefined): string {
-  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+export function normalizeManagedCloudWorkerOrigin(
+  value: string | undefined,
+): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value !== value.trim()
+  ) {
     throw new Error("Bluey Jobs managed-cloud worker origin is required");
   }
   let url: URL;
@@ -94,23 +111,37 @@ export function normalizeManagedCloudWorkerOrigin(value: string | undefined): st
   } catch {
     throw new Error("Bluey Jobs managed-cloud worker origin is invalid");
   }
-  const loopbackHttp = url.protocol === "http:"
-    && ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
-  if ((url.protocol !== "https:" && !loopbackHttp)
-    || url.username
-    || url.password
-    || url.search
-    || url.hash
-    || !["", "/"].includes(url.pathname)) {
+  const loopbackHttp =
+    url.protocol === "http:" &&
+    ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
+  if (
+    (url.protocol !== "https:" && !loopbackHttp) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !["", "/"].includes(url.pathname)
+  ) {
     throw new Error("Bluey Jobs managed-cloud worker origin is invalid");
   }
   url.pathname = "";
   return url.toString().replace(/\/$/, "");
 }
 
-export function jobsWorkerScope(method: string, path: string): JobsWorkerScope | undefined {
-  if (method.toUpperCase() !== "POST" || !path.startsWith("/api/jobs/internal/")) return undefined;
-  if (/^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/materialize$/.test(path)) {
+export function jobsWorkerScope(
+  method: string,
+  path: string,
+): JobsWorkerScope | undefined {
+  if (
+    method.toUpperCase() !== "POST" ||
+    !path.startsWith("/api/jobs/internal/")
+  )
+    return undefined;
+  if (
+    /^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/materialize$/.test(
+      path,
+    )
+  ) {
     return "workflow-command-materialize";
   }
   const workflowExecution =
@@ -120,17 +151,26 @@ export function jobsWorkerScope(method: string, path: string): JobsWorkerScope |
   if (workflowExecution.test(path) || interventionPublish.test(path)) {
     return "workflow-command-execution";
   }
-  if (/^\/api\/jobs\/internal\/managed-cloud\/runtime-grants\/[A-Za-z0-9_-]{20,128}\/claim$/.test(path)
-    || /^\/api\/jobs\/internal\/managed-cloud\/runtime-instances\/[A-Za-z0-9_-]{20,128}\/heartbeats$/.test(path)) {
+  if (
+    /^\/api\/jobs\/internal\/managed-cloud\/runtime-grants\/[A-Za-z0-9_-]{20,128}\/claim$/.test(
+      path,
+    ) ||
+    /^\/api\/jobs\/internal\/managed-cloud\/runtime-instances\/[A-Za-z0-9_-]{20,128}\/(?:heartbeats|original-source-verifier-startup|source-verifier-boot-registration|source-verifier-boot-startup)$/.test(
+      path,
+    )
+  ) {
     return "managed-cloud-runtime";
   }
-  if (path === "/api/jobs/internal/original-source-verifications/lease"
-    || ORIGINAL_SOURCE_ASSIGNMENT_ROUTE.test(path)) {
+  if (
+    path === "/api/jobs/internal/original-source-verifications/lease" ||
+    ORIGINAL_SOURCE_ASSIGNMENT_ROUTE.test(path)
+  ) {
     return "original-source-verification";
   }
   if (path.includes("/runner-volumes/")) return "runner-volume";
   if (path.includes("/execution-leases/")) return "execution";
-  if (path.includes("/discovery/") || path.includes("/global-discovery/")) return "discovery";
+  if (path.includes("/discovery/") || path.includes("/global-discovery/"))
+    return "discovery";
   if (path.endsWith("/receipt")) return "receipt";
   if (path.endsWith("/interventions")) return "intervention";
   if (path.endsWith("/state")) return "application-state";
@@ -138,7 +178,12 @@ export function jobsWorkerScope(method: string, path: string): JobsWorkerScope |
   return undefined;
 }
 
-function assertIdentifier(value: string, minimum: number, maximum: number, label: string): void {
+function assertIdentifier(
+  value: string,
+  minimum: number,
+  maximum: number,
+  label: string,
+): void {
   const bytes = Buffer.byteLength(value, "utf8");
   if (bytes < minimum || bytes > maximum || !SAFE_IDENTIFIER.test(value)) {
     throw new Error(`Bluey Jobs worker ${label} is invalid`);

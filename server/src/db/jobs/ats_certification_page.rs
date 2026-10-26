@@ -2183,7 +2183,7 @@ mod ats_certification_page_tests {
             connection
                 .execute(
                     &format!(
-                        "UPDATE jobs_ats_certification_manifests SET {count_column}=2
+                        "UPDATE jobs_ats_certification_manifests SET {count_column}={count_column}+1
                           WHERE manifest_sha256=?1"
                     ),
                     params![installed.manifest_sha256],
@@ -2868,11 +2868,11 @@ mod ats_certification_page_tests {
                 value.status.status == "active" && value.active_binding.is_some()
             })
         }));
-        // Trust, heads, canary membership, evidence, layouts, runtimes, one
-        // global revocation flag, exact page revocations, quarantine, and
-        // circuits are ten bounded reads. The former scalar loop performs
-        // hundreds here.
-        assert_eq!(PAGE_SELECTS.load(Ordering::Relaxed), 10);
+        // Trust, heads, evidence, layouts, runtimes, one global revocation
+        // flag, exact page revocations, quarantine, and circuits are nine
+        // bounded reads. General-channel fixtures have no canary membership
+        // query. The former scalar loop performs hundreds here.
+        assert_eq!(PAGE_SELECTS.load(Ordering::Relaxed), 9);
 
         for posting in [&postings[0], &postings[49]] {
             let scalar = resolve_ats_certification_for_posting(

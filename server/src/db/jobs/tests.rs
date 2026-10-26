@@ -13161,6 +13161,8 @@ mod tests {
         let pool = test_pool();
         let profile = default_profile("jobs@example.com");
         save_profile(&pool, "acct-jobs", &profile).expect("save packet effect profile");
+        save_preferences(&pool, "acct-jobs", &JobPreferences::default())
+            .expect("persist packet effect preferences before preparation");
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
@@ -13202,7 +13204,7 @@ mod tests {
         let error = commit_packet(&pool, "acct-jobs", &application.id)
             .expect_err("inactive current Track must reject packet metering");
 
-        assert!(error.to_string().contains("Career Track"));
+        assert!(error.to_string().contains("effect eligibility"));
         assert_eq!(packet_overage_effect_snapshot(&pool, &posting.id), before);
     }
 
@@ -13238,7 +13240,7 @@ mod tests {
         let before = packet_overage_effect_snapshot(&pool, &posting.id);
         let mut preferences = get_preferences(&pool, "acct-jobs").unwrap();
         preferences.excluded_companies.push(posting.company.clone());
-        pool.get()
+        let updated = pool.get()
             .unwrap()
             .execute(
                 "UPDATE jobs_preferences SET preferences_json=?2
@@ -13249,6 +13251,7 @@ mod tests {
                 ],
             )
             .unwrap();
+        assert_eq!(updated, 1, "the current preference authority must actually change");
 
         let error = commit_packet(&pool, "acct-jobs", &application.id)
             .expect_err("current company exclusion must reject packet metering");
