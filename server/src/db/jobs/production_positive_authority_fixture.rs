@@ -188,6 +188,44 @@ pub(crate) fn install_production_positive_job_authorities_for_runner(
     suffix: &str,
     runner_kind: &str,
 ) -> ProductionPositiveAuthorityFixture {
+    let (runtime_target, surface) =
+        production_positive_runtime_surface(account_id, suffix, runner_kind);
+    install_production_positive_job_authorities_with_runtime_surface(
+        pool,
+        account_id,
+        posting,
+        managed,
+        canonical_employer_domain,
+        suffix,
+        runtime_target,
+        surface,
+    )
+}
+
+pub(crate) fn install_production_positive_verified_source_job_authorities(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    canonical_employer_domain: &str,
+    suffix: &str,
+) -> ProductionPositiveAuthorityFixture {
+    let (runtime_target, surface) =
+        production_positive_runtime_surface(account_id, suffix, "local");
+    install_production_positive_job_authorities_from_verified_source(
+        pool,
+        account_id,
+        posting,
+        canonical_employer_domain,
+        runtime_target,
+        surface,
+    )
+}
+
+fn production_positive_runtime_surface(
+    account_id: &str,
+    suffix: &str,
+    runner_kind: &str,
+) -> (AtsCertificationRuntimeTarget, AtsObservedSurface) {
     assert!(matches!(runner_kind, "local" | "cloud"));
     let fixture_sha256 = ats_certification_sha256(
         format!("phase614b-production-positive:{account_id}:{suffix}:{runner_kind}").as_bytes(),
@@ -238,16 +276,7 @@ pub(crate) fn install_production_positive_job_authorities_for_runner(
         },
         _ => unreachable!("runner kind was validated above"),
     };
-    install_production_positive_job_authorities_with_runtime_surface(
-        pool,
-        account_id,
-        posting,
-        managed,
-        canonical_employer_domain,
-        suffix,
-        runtime_target,
-        surface,
-    )
+    (runtime_target, surface)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -264,6 +293,24 @@ pub(crate) fn install_production_positive_job_authorities_with_runtime_surface(
     original_source_verification_tests::complete_public_original_source_positive_fixture(
         pool, posting, managed, suffix,
     );
+    install_production_positive_job_authorities_from_verified_source(
+        pool,
+        account_id,
+        posting,
+        canonical_employer_domain,
+        runtime_target,
+        surface,
+    )
+}
+
+pub(crate) fn install_production_positive_job_authorities_from_verified_source(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    canonical_employer_domain: &str,
+    runtime_target: AtsCertificationRuntimeTarget,
+    surface: AtsObservedSurface,
+) -> ProductionPositiveAuthorityFixture {
     let source = resolve_original_source_verification_projection(pool, account_id, posting)
         .expect("resolve production-positive original-source authority");
     assert!(source.feature_active);

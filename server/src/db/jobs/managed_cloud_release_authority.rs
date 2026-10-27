@@ -18838,6 +18838,15 @@ pub(crate) fn commit_source_verifier_boot_ready_sqlite_tx(
     Ok(())
 }
 
+// Keep the bound i64 sequence explicit: an uncast `$3-1` is inferred as int4
+// before the BIGINT assignment target can constrain PostgreSQL's parameter type.
+const SOURCE_VERIFIER_BOOT_READY_POSTGRES_UPDATE: &str =
+    "UPDATE jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+        SET heartbeat_sequence=$3::BIGINT,health_state='ready',reason_code=NULL,heartbeat_at_ms=$4
+      WHERE runtime_instance_id=$1 AND instance_epoch=$2
+        AND heartbeat_sequence=$3::BIGINT-1 AND health_state='degraded'
+        AND reason_code='startup'";
+
 /// PostgreSQL counterpart. The startup path owns H -> M -> instance -> boot
 /// head before calling this helper; this function intentionally takes no new
 /// locks so it cannot invert the readiness probe's global order.
@@ -18862,11 +18871,7 @@ pub(crate) fn commit_source_verifier_boot_ready_postgres_tx(
     .map_err(managed_cloud_storage)?;
     let changed = tx
         .execute(
-            "UPDATE jobs_managed_cloud_original_source_verifier_runtime_heartbeats
-            SET heartbeat_sequence=$3,health_state='ready',reason_code=NULL,heartbeat_at_ms=$4
-          WHERE runtime_instance_id=$1 AND instance_epoch=$2
-            AND heartbeat_sequence=$3-1 AND health_state='degraded'
-            AND reason_code='startup'",
+            SOURCE_VERIFIER_BOOT_READY_POSTGRES_UPDATE,
             &[
                 &request.runtime_instance_id,
                 &request.instance_epoch,
@@ -19259,6 +19264,27 @@ pub fn record_managed_cloud_runtime_heartbeat(
 #[cfg_attr(feature = "integration-test-support", allow(dead_code))]
 pub(crate) mod managed_cloud_release_authority_tests {
     use super::*;
+
+    fn configured_postgres_url(test_name: &str) -> Option<String> {
+        match std::env::var("BLUEY_TEST_POSTGRES_URL") {
+            Ok(database_url) => Some(database_url),
+            Err(_) if std::env::var("BLUEY_JOBS_REQUIRE_POSTGRES_TESTS").as_deref() == Ok("1") => {
+                panic!(
+                    "{test_name} requires BLUEY_TEST_POSTGRES_URL when \
+                     BLUEY_JOBS_REQUIRE_POSTGRES_TESTS=1"
+                );
+            }
+            Err(_) => {
+                eprintln!("SKIP {test_name}: BLUEY_TEST_POSTGRES_URL is unavailable");
+                None
+            }
+        }
+    }
+
+    pub(crate) fn postgres_boot_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
 
     fn managed_cloud_test_feature_for_version(
         version: i64,
@@ -21219,7 +21245,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
         }
     }
 
-    fn install_original_source_verifier_startup_request(
+    pub(crate) fn install_original_source_verifier_startup_request(
         pool: &DbPool,
     ) -> ManagedCloudOriginalSourceVerifierStartupRequest {
         let now_ms = managed_cloud_test_db_now(pool);
@@ -21358,6 +21384,53 @@ pub(crate) mod managed_cloud_release_authority_tests {
             task_queue_sha256: instance.task_queue_sha256,
             failure_converter_sha256: instance.failure_converter_sha256,
             dependency_evidence_sha256: instance.dependency_evidence_sha256,
+        }
+    }
+
+    pub(crate) fn source_verifier_boot_binding_for_test(
+        pool: &DbPool,
+        request: &SourceVerifierBootStartupRequest,
+    ) -> OriginalSourceVerifierBinding {
+        let instance = crate::db::run_blocking_db(|| match pool {
+            DbPool::Sqlite(_) => pool
+                .get()
+                .expect("get SQLite boot binding fixture connection")
+                .query_row(
+                    &format!(
+                        "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS} FROM {} \
+                         WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.instances
+                    ),
+                    params![request.runtime_instance_id, request.instance_epoch],
+                    |row| {
+                        managed_cloud_runtime_instance_from_sqlite(row)
+                            .map(|(instance, _)| instance)
+                    },
+                )
+                .expect("load SQLite boot binding fixture instance"),
+            DbPool::Postgres(_) => pool
+                .get_pg()
+                .expect("get PostgreSQL boot binding fixture connection")
+                .query_one(
+                    &format!(
+                        "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS} FROM {} \
+                         WHERE runtime_instance_id=$1 AND instance_epoch=$2",
+                        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.instances
+                    ),
+                    &[&request.runtime_instance_id, &request.instance_epoch],
+                )
+                .map(|row| managed_cloud_runtime_instance_from_postgres(&row).0)
+                .expect("load PostgreSQL boot binding fixture instance"),
+        });
+        OriginalSourceVerifierBinding {
+            worker_id: request.worker_id.clone(),
+            runtime_instance_id: request.runtime_instance_id.clone(),
+            runtime_instance_epoch: request.instance_epoch,
+            runtime_authority_sha256: original_source_verifier_runtime_authority_sha256(&instance)
+                .expect("derive boot binding runtime authority"),
+            runtime_session_token: request.session_token.clone(),
+            boot_id: Some(request.boot_id.clone()),
+            boot_generation: Some(request.boot_generation),
         }
     }
 
@@ -21545,16 +21618,51 @@ pub(crate) mod managed_cloud_release_authority_tests {
     #[test]
     fn postgres_original_source_verifier_startup_is_atomic_and_replays_under_concurrency_when_configured(
     ) {
-        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
-            eprintln!(
-                "SKIP postgres_original_source_verifier_startup_is_atomic_and_replays_under_concurrency_when_configured: \
-                 BLUEY_TEST_POSTGRES_URL is unavailable"
-            );
+        let Some(database_url) = configured_postgres_url(
+            "postgres_original_source_verifier_startup_is_atomic_and_replays_under_concurrency_when_configured",
+        ) else {
             return;
         };
+        let _guard = postgres_boot_test_lock()
+            .lock()
+            .expect("lock PostgreSQL boot regression tests");
         let pool = crate::db::open_postgres_pool(&database_url)
             .expect("open PostgreSQL verifier startup test pool");
         crate::db::run_migrations(&pool).expect("apply PostgreSQL verifier startup migrations");
+        {
+            let mut connection = pool
+                .get_pg()
+                .expect("prepare real PostgreSQL boot-ready update");
+            let statement = connection
+                .prepare(SOURCE_VERIFIER_BOOT_READY_POSTGRES_UPDATE)
+                .expect("prepare production boot-ready statement");
+            assert_eq!(
+                statement.params(),
+                &[
+                    postgres::types::Type::TEXT,
+                    postgres::types::Type::INT8,
+                    postgres::types::Type::INT8,
+                    postgres::types::Type::INT8,
+                ],
+                "ready-sequence arithmetic must not infer an int4 parameter"
+            );
+            let missing_instance = format!("phase629-query-type-{}", uuid::Uuid::new_v4().simple());
+            let wide_sequence = i64::from(i32::MAX) + 1;
+            assert_eq!(
+                connection
+                    .execute(
+                        &statement,
+                        &[
+                            &missing_instance,
+                            &1_i64,
+                            &wide_sequence,
+                            &managed_cloud_test_db_now(&pool)
+                        ],
+                    )
+                    .expect("bind real i64 boot-ready parameters beyond the int4 range"),
+                0
+            );
+        }
         let fixture_request = install_original_source_verifier_startup_request(&pool);
         let boot_id = format!("phase628-pg-boot-{}", uuid::Uuid::new_v4().simple());
         let registration = register_source_verifier_boot(
@@ -21684,10 +21792,343 @@ pub(crate) mod managed_cloud_release_authority_tests {
         let mut changed = request.clone();
         changed.degraded_heartbeat_sequence = 3;
         assert!(record_source_verifier_boot_startup(&pool, &changed).is_err());
-        let mut second_id = request;
+        let mut second_id = request.clone();
         second_id.startup_request_id =
             format!("osv-startup-second-{}", uuid::Uuid::new_v4().simple());
         assert!(record_source_verifier_boot_startup(&pool, &second_id).is_err());
+
+        let mut bad_session = second_id.clone();
+        bad_session.startup_request_id =
+            format!("osv-startup-session-{}", uuid::Uuid::new_v4().simple());
+        bad_session.session_token = format!("bad-session-{}", uuid::Uuid::new_v4().simple());
+        assert!(record_source_verifier_boot_startup(&pool, &bad_session).is_err());
+
+        let replacement_boot_id =
+            format!("phase629-pg-replacement-{}", uuid::Uuid::new_v4().simple());
+        let replacement = register_source_verifier_boot(
+            &pool,
+            &SourceVerifierBootRegistrationRequest {
+                session_token: fixture_request.session_token.clone(),
+                registration_request_id: format!(
+                    "phase629-pg-replacement-registration-{}",
+                    uuid::Uuid::new_v4().simple()
+                ),
+                boot_id: replacement_boot_id.clone(),
+                runtime_instance_id: fixture_request.runtime_instance_id.clone(),
+                instance_epoch: fixture_request.instance_epoch,
+                worker_id: fixture_request.worker_id.clone(),
+                runtime_identity_sha256: fixture_request.runtime_identity_sha256.clone(),
+                activation_sha256: fixture_request.activation_sha256.clone(),
+                manifest_sha256: fixture_request.manifest_sha256.clone(),
+                component_id: fixture_request.component_id.clone(),
+                role: fixture_request.role.clone(),
+            },
+        )
+        .expect("register replacement PostgreSQL boot");
+        assert!(replacement.boot_generation > registration.boot_generation);
+        let replay = record_source_verifier_boot_startup(&pool, &request)
+            .expect("committed startup remains an exact read-only replay");
+        assert_eq!(
+            replay.canonical_response_base64url,
+            response.canonical_response_base64url
+        );
+        let mut stale_boot = request.clone();
+        stale_boot.boot_id = replacement_boot_id;
+        stale_boot.boot_generation = replacement.boot_generation;
+        assert!(record_source_verifier_boot_startup(&pool, &stale_boot).is_err());
+        assert!(record_managed_cloud_runtime_heartbeat(
+            &pool,
+            &ManagedCloudRuntimeHeartbeatInput {
+                runtime_instance_id: fixture_request.runtime_instance_id.clone(),
+                worker_id: fixture_request.worker_id.clone(),
+                session_token: fixture_request.session_token.clone(),
+                heartbeat_sequence: 4,
+                observed_head_revision: fixture_request.observed_head_revision,
+                observed_transition_sha256: fixture_request.observed_transition_sha256.clone(),
+                activation_sha256: fixture_request.activation_sha256.clone(),
+                manifest_sha256: fixture_request.manifest_sha256.clone(),
+                component_id: fixture_request.component_id.clone(),
+                role: fixture_request.role.clone(),
+                artifact_sha256: fixture_request.artifact_sha256.clone(),
+                migration_set_sha256: fixture_request.migration_set_sha256.clone(),
+                config_schema_sha256: fixture_request.config_schema_sha256.clone(),
+                protocol_set_sha256: fixture_request.protocol_set_sha256.clone(),
+                task_queue_sha256: fixture_request.task_queue_sha256.clone(),
+                failure_converter_sha256: fixture_request.failure_converter_sha256.clone(),
+                dependency_evidence_sha256: fixture_request.dependency_evidence_sha256.clone(),
+                health_state: "ready".to_string(),
+                reason_code: None,
+                boot_id: Some(request.boot_id.clone()),
+                boot_generation: Some(request.boot_generation),
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn postgres_source_verifier_boot_migrations_replay_once_and_install_fences_when_configured() {
+        let Some(database_url) = configured_postgres_url(
+            "postgres_source_verifier_boot_migrations_replay_once_and_install_fences_when_configured",
+        ) else {
+            return;
+        };
+        let _guard = postgres_boot_test_lock()
+            .lock()
+            .expect("lock PostgreSQL boot regression tests");
+        let pool = crate::db::open_postgres_pool(&database_url)
+            .expect("open PostgreSQL boot migration test pool");
+        crate::db::run_migrations(&pool).expect("apply PostgreSQL boot migrations once");
+        crate::db::run_migrations(&pool).expect("replay PostgreSQL boot migrations");
+        let mut connection = pool
+            .get_pg()
+            .expect("get PostgreSQL boot migration assertion connection");
+        for migration in [
+            crate::db::JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID,
+            crate::db::JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID,
+            crate::db::JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID,
+            crate::db::JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID,
+        ] {
+            let count: i64 = connection
+                .query_one(
+                    "SELECT COUNT(*) FROM bluey_schema_migrations WHERE version=$1",
+                    &[&migration],
+                )
+                .expect("read PostgreSQL migration ledger")
+                .get(0);
+            assert_eq!(count, 1, "migration ledger must contain {migration} once");
+        }
+        for table in [
+            "jobs_managed_cloud_source_verifier_boot_registrations",
+            "jobs_managed_cloud_source_verifier_boot_generation_heads",
+            "jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+            "jobs_original_source_verification_attempt_boot_bindings",
+        ] {
+            let present: bool = connection
+                .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+                .expect("read PostgreSQL boot table catalog")
+                .get(0);
+            assert!(present, "required boot table {table} must be installed");
+        }
+        for (trigger, table, function) in [
+            (
+                "trg_jobs_osv_attempt_boot_binding_guard",
+                "jobs_original_source_verification_attempt_boot_bindings",
+                "jobs_osv_attempt_boot_binding_guard",
+            ),
+            (
+                "trg_jobs_osv_boot_binding_insert",
+                "jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+                "jobs_osv_boot_binding_guard",
+            ),
+            (
+                "trg_jobs_osv_boot_heartbeat",
+                "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+                "jobs_osv_boot_heartbeat_guard",
+            ),
+            (
+                "trg_jobs_osv_boot_startup_requires_degraded",
+                "jobs_managed_cloud_source_verifier_boot_startup_authorities",
+                "jobs_osv_boot_startup_requires_degraded",
+            ),
+            (
+                "trg_jobs_managed_cloud_original_source_verifier_runtime_heartbeats_sequence",
+                "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+                "bluey_jobs_guard_osv_heartbeat_sequence",
+            ),
+        ] {
+            // PostgreSQL folds these ASCII DDL identifiers to NAMEDATALEN-1 bytes.
+            let catalog_trigger_name = &trigger[..trigger.len().min(63)];
+            let enabled: bool = connection
+                .query_one(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pg_trigger catalog_trigger
+                        JOIN pg_class relation ON relation.oid=catalog_trigger.tgrelid
+                        JOIN pg_namespace catalog_schema ON catalog_schema.oid=relation.relnamespace
+                        JOIN pg_proc catalog_function ON catalog_function.oid=catalog_trigger.tgfoid
+                         WHERE catalog_trigger.tgname=$1 AND catalog_trigger.tgenabled='O'
+                           AND NOT catalog_trigger.tgisinternal AND relation.oid=to_regclass($2)
+                           AND catalog_schema.nspname=current_schema() AND catalog_function.proname=$3
+                           AND catalog_function.pronamespace=catalog_schema.oid AND catalog_function.pronargs=0
+                    )",
+                    &[&catalog_trigger_name, &table, &function],
+                )
+                .expect("read PostgreSQL boot trigger catalog")
+                .get(0);
+            assert!(enabled, "required boot trigger {trigger} must be enabled");
+        }
+        let sequence_function: String = connection
+            .query_one(
+                "SELECT pg_get_functiondef(catalog_function.oid) FROM pg_proc catalog_function
+               JOIN pg_namespace catalog_schema ON catalog_schema.oid=catalog_function.pronamespace
+              WHERE catalog_schema.nspname=current_schema()
+                AND catalog_function.proname='bluey_jobs_guard_osv_heartbeat_sequence'
+                AND catalog_function.pronargs=0",
+                &[],
+            )
+            .expect("read installed PostgreSQL 043 replacement function")
+            .get(0);
+        assert!(
+            sequence_function
+                .contains("jobs_managed_cloud_manifest_source_verifier_boot_protocols"),
+            "043 must replace the historical heartbeat sequence guard"
+        );
+        let manifest_check = connection
+            .query_one(
+                "SELECT convalidated,pg_get_constraintdef(oid) FROM pg_constraint
+              WHERE conrelid=to_regclass('jobs_managed_cloud_manifests')
+                AND conname='jobs_managed_cloud_manifests_capability_count_check' AND contype='c'",
+                &[],
+            )
+            .expect("read exact PostgreSQL manifest capability CHECK");
+        assert!(manifest_check.get::<_, bool>(0));
+        let definition: String = manifest_check.get(1);
+        for required in [
+            "capability_count = 10",
+            "direct_discovery_enabled",
+            "global_discovery_enabled",
+            "source_verification_enabled",
+        ] {
+            assert!(
+                definition.contains(required),
+                "missing manifest CHECK clause: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_original_source_verifier_v2_direct_ready_and_refresh_remain_nonboot_when_configured(
+    ) {
+        let Some(database_url) = configured_postgres_url(
+            "postgres_original_source_verifier_v2_direct_ready_and_refresh_remain_nonboot_when_configured",
+        ) else {
+            return;
+        };
+        let _guard = postgres_boot_test_lock()
+            .lock()
+            .expect("serialize PostgreSQL v2 compatibility");
+        let pool = crate::db::open_postgres_pool(&database_url)
+            .expect("open PostgreSQL v2 compatibility pool");
+        crate::db::run_migrations(&pool).expect("apply migrations including PostgreSQL 043");
+        let now = managed_cloud_test_db_now(&pool);
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        // A separate signed scope keeps this historical v2 authority independent from the
+        // default scope's current v3 head. No production authority or feature flag is altered.
+        let scope = ManagedCloudScope {
+            environment: "production".to_string(),
+            region: format!("phase629-v2-{suffix}"),
+            channel: "general".to_string(),
+        };
+        let (activation_sha256, manifest_sha256) = install_valid_original_source_managed_head(
+            &pool,
+            2,
+            now,
+            300_000,
+            24 * 60 * 60_000,
+            scope.clone(),
+            &format!("phase629-pg-v2-{suffix}"),
+        );
+        let worker_id = format!("phase629-v2-worker-{suffix}");
+        let grant = issue_managed_cloud_runtime_grant(
+            &pool,
+            &NewManagedCloudRuntimeGrant {
+                issuance_ref: format!("phase629-v2-issuance-{suffix}"),
+                scope,
+                activation_sha256,
+                manifest_sha256,
+                component_id: "jobs-workflows".to_string(),
+                role: "original_source_verifier".to_string(),
+                expected_worker_id: worker_id.clone(),
+                authorization_ref: format!("phase629-v2-authority-{suffix}"),
+                created_by: "phase629-pg-v2-compatibility".to_string(),
+                ttl_ms: 15 * 60_000,
+            },
+        )
+        .expect("issue real signed-scope v2 PostgreSQL runtime grant");
+        let grant_token = grant
+            .grant_token
+            .clone()
+            .expect("new v2 PostgreSQL runtime token");
+        let runtime_instance_id = format!("phase629-v2-instance-{suffix}");
+        let session_token = derive_managed_cloud_runtime_session_token(
+            &grant_token,
+            &grant.grant_id,
+            &runtime_instance_id,
+        )
+        .expect("derive v2 PostgreSQL runtime session");
+        let instance = claim_managed_cloud_runtime_grant(
+            &pool,
+            &ClaimManagedCloudRuntimeGrant {
+                grant_id: grant.grant_id,
+                grant_token,
+                runtime_instance_id,
+                worker_id,
+                session_token: session_token.clone(),
+                runtime_identity_sha256: grant.expected_runtime_identity_sha256,
+            },
+        )
+        .expect("claim v2 PostgreSQL runtime grant");
+        let mut input = ManagedCloudRuntimeHeartbeatInput {
+            runtime_instance_id: instance.runtime_instance_id.clone(),
+            worker_id: instance.worker_id.clone(),
+            session_token,
+            heartbeat_sequence: 1,
+            observed_head_revision: instance.head_revision,
+            observed_transition_sha256: instance.transition_sha256.clone(),
+            activation_sha256: instance.activation_sha256.clone(),
+            manifest_sha256: instance.manifest_sha256.clone(),
+            component_id: instance.component_id.clone(),
+            role: instance.role.clone(),
+            artifact_sha256: instance.artifact_sha256.clone(),
+            migration_set_sha256: instance.migration_set_sha256.clone(),
+            config_schema_sha256: instance.config_schema_sha256.clone(),
+            protocol_set_sha256: instance.protocol_set_sha256.clone(),
+            task_queue_sha256: instance.task_queue_sha256.clone(),
+            failure_converter_sha256: instance.failure_converter_sha256.clone(),
+            dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
+            health_state: "ready".to_string(),
+            reason_code: None,
+            boot_id: None,
+            boot_generation: None,
+        };
+        let first = record_managed_cloud_runtime_heartbeat(&pool, &input)
+            .expect("PostgreSQL 043 preserves legacy v2 direct-ready first heartbeat");
+        assert_eq!(
+            (first.heartbeat_sequence, first.health_state.as_str()),
+            (1, "ready")
+        );
+        assert!(!first.replayed);
+        input.heartbeat_sequence = 2;
+        let refresh = record_managed_cloud_runtime_heartbeat(&pool, &input)
+            .expect("PostgreSQL 043 preserves legacy v2 ready-to-ready refresh");
+        assert_eq!(
+            (refresh.heartbeat_sequence, refresh.health_state.as_str()),
+            (2, "ready")
+        );
+        assert!(!refresh.replayed);
+        let row = pool.get_pg().unwrap().query_one(
+            "SELECT
+                (SELECT COUNT(*) FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols
+                  WHERE manifest_sha256=$1),
+                (SELECT COUNT(*) FROM jobs_managed_cloud_source_verifier_boot_registrations
+                  WHERE runtime_instance_id=$2),
+                (SELECT COUNT(*) FROM jobs_managed_cloud_source_verifier_heartbeat_boot_bindings
+                  WHERE runtime_instance_id=$2),
+                (SELECT COUNT(*) FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit
+                  WHERE runtime_instance_id=$2 AND health_state='ready'),
+                (SELECT COUNT(*) FROM bluey_schema_migrations WHERE version=$3)",
+            &[&instance.manifest_sha256, &instance.runtime_instance_id,
+              &crate::db::JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID],
+        ).expect("assert v2 refresh remains genuinely nonboot after migration 043");
+        assert_eq!(
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, i64>(2)
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(row.get::<_, i64>(3), 2);
+        assert_eq!(row.get::<_, i64>(4), 1);
     }
 
     #[test]

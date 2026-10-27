@@ -469,10 +469,28 @@ fn registry_api_error(error: ManagedCloudRegistryError) -> ApiError {
             StatusCode::CONFLICT,
             "The managed-cloud authority conflicts with current state.".to_string(),
         ),
-        ManagedCloudRegistryError::Storage(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "The managed-cloud authority operation failed.".to_string(),
-        ),
+        ManagedCloudRegistryError::Storage(error) => {
+            let boot_transition_conflict = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<postgres::Error>())
+                .and_then(postgres::Error::as_db_error)
+                .is_some_and(|database_error| {
+                    database_error.code() == &postgres::error::SqlState::RAISE_EXCEPTION
+                        && database_error.message()
+                            == "source-verifier boot heartbeat transition is unauthorized"
+                });
+            if boot_transition_conflict {
+                (
+                    StatusCode::CONFLICT,
+                    "The managed-cloud authority conflicts with current state.".to_string(),
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "The managed-cloud authority operation failed.".to_string(),
+                )
+            }
+        }
     }
 }
 
@@ -482,6 +500,265 @@ mod tests {
     use axum::{body::Body, http::Request};
     use base64::Engine;
     use tower::ServiceExt;
+
+    #[test]
+    fn postgres_boot_routes_with_authenticated_extension_persist_and_replay_when_configured() {
+        let database_url = match std::env::var("BLUEY_TEST_POSTGRES_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("BLUEY_JOBS_REQUIRE_POSTGRES_TESTS").as_deref() == Ok("1") => {
+                panic!("PostgreSQL boot HTTP regression requires BLUEY_TEST_POSTGRES_URL");
+            }
+            Err(_) => {
+                eprintln!(
+                    "SKIP PostgreSQL boot HTTP regression: BLUEY_TEST_POSTGRES_URL is unavailable"
+                );
+                return;
+            }
+        };
+        let _guard = jobs::managed_cloud_release_authority_tests::postgres_boot_test_lock()
+            .lock()
+            .expect("serialize PostgreSQL boot HTTP fixture");
+        let pool =
+            crate::db::open_postgres_pool(&database_url).expect("open actual HTTP PostgreSQL pool");
+        crate::db::run_migrations(&pool).expect("migrate actual HTTP PostgreSQL pool");
+        let fixture = jobs::managed_cloud_release_authority_tests::
+            install_original_source_verifier_startup_request(&pool);
+        let state = postgres_runtime_test_state(pool.clone(), database_url);
+        // This boundary test deliberately injects an already-authenticated worker identity.
+        // It exercises real Axum routing/JSON/handlers/PostgreSQL, not fleet HMAC or sockets.
+        let app = worker_router()
+            .with_state(state)
+            .layer(Extension(JobsWorkerIdentity {
+                worker_id: fixture.worker_id.clone(),
+                scope: MANAGED_CLOUD_RUNTIME_SCOPE.to_string(),
+            }));
+        // Keep the shared synchronous fixture lock outside the async test future.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build bounded Axum test runtime");
+        runtime.block_on(async {
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let base = format!("/api/jobs/internal/managed-cloud/runtime-instances/{}", fixture.runtime_instance_id);
+            let registration_path = format!("{base}/source-verifier-boot-registration");
+            let heartbeat_path = format!("{base}/heartbeats");
+            let startup_path = format!("{base}/source-verifier-boot-startup");
+            let registration = jobs::SourceVerifierBootRegistrationRequest {
+                session_token: fixture.session_token.clone(),
+                registration_request_id: format!("phase629-http-registration-{suffix}"),
+                boot_id: format!("phase629-http-boot-{suffix}"),
+                runtime_instance_id: fixture.runtime_instance_id.clone(),
+                instance_epoch: fixture.instance_epoch, worker_id: fixture.worker_id.clone(),
+                runtime_identity_sha256: fixture.runtime_identity_sha256.clone(),
+                activation_sha256: fixture.activation_sha256.clone(),
+                manifest_sha256: fixture.manifest_sha256.clone(),
+                component_id: fixture.component_id.clone(), role: fixture.role.clone(),
+            };
+            let (status, headers, registration_bytes) = post_runtime_json(
+                &app, &registration_path, serde_json::to_value(&registration).unwrap(),
+            ).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_runtime_headers(&headers);
+            let registered: serde_json::Value = serde_json::from_slice(&registration_bytes).unwrap();
+            let generation: i64 = registered["bootGeneration"].as_str().unwrap().parse().unwrap();
+            assert!(generation > 1, "HTTP registration replaces the fixture's bootstrap boot");
+            let mut heartbeat = serde_json::json!({
+                "runtimeInstanceId": fixture.runtime_instance_id, "workerId": fixture.worker_id,
+                "sessionToken": fixture.session_token, "heartbeatSequence": 2,
+                "observedHeadRevision": fixture.observed_head_revision,
+                "observedTransitionSha256": fixture.observed_transition_sha256,
+                "activationSha256": fixture.activation_sha256, "manifestSha256": fixture.manifest_sha256,
+                "componentId": fixture.component_id, "role": fixture.role, "artifactSha256": fixture.artifact_sha256,
+                "migrationSetSha256": fixture.migration_set_sha256, "configSchemaSha256": fixture.config_schema_sha256,
+                "protocolSetSha256": fixture.protocol_set_sha256, "taskQueueSha256": fixture.task_queue_sha256,
+                "failureConverterSha256": fixture.failure_converter_sha256,
+                "dependencyEvidenceSha256": fixture.dependency_evidence_sha256,
+                "healthState": "ready", "reasonCode": null,
+                "bootId": registration.boot_id, "bootGeneration": generation,
+            });
+            let before_forged_ready = postgres_runtime_snapshot(&pool, &fixture.runtime_instance_id);
+            let direct_input: ManagedCloudRuntimeHeartbeatInput =
+                serde_json::from_value(heartbeat.clone()).expect("decode exact forged HTTP heartbeat");
+            let error = jobs::record_managed_cloud_runtime_heartbeat(&pool, &direct_input)
+                .expect_err("real PostgreSQL trigger must reject forged bound readiness");
+            let ManagedCloudRegistryError::Storage(storage_error) = error else {
+                panic!("expected PostgreSQL trigger denial, got {error:?}");
+            };
+            let database_error = storage_error.chain()
+                .find_map(|cause| cause.downcast_ref::<postgres::Error>())
+                .and_then(postgres::Error::as_db_error)
+                .expect("forged readiness must expose the actual PostgreSQL trigger error");
+            assert_eq!(database_error.code(), &postgres::error::SqlState::RAISE_EXCEPTION);
+            assert_eq!(database_error.message(), "source-verifier boot heartbeat transition is unauthorized");
+            assert_eq!(postgres_runtime_snapshot(&pool, &fixture.runtime_instance_id), before_forged_ready,
+                "direct trigger denial must roll back tentative boot binding and heartbeat changes");
+            assert_eq!(post_runtime_json(&app, &heartbeat_path, heartbeat.clone()).await.0, StatusCode::CONFLICT);
+            let mut unbound = heartbeat.clone();
+            unbound["bootId"] = serde_json::Value::Null;
+            unbound["bootGeneration"] = serde_json::Value::Null;
+            assert_eq!(post_runtime_json(&app, &heartbeat_path, unbound).await.0, StatusCode::CONFLICT);
+            assert_eq!(postgres_runtime_snapshot(&pool, &fixture.runtime_instance_id), before_forged_ready);
+
+            heartbeat["healthState"] = serde_json::json!("degraded");
+            heartbeat["reasonCode"] = serde_json::json!("startup");
+            let (status, headers, _) = post_runtime_json(&app, &heartbeat_path, heartbeat).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_runtime_headers(&headers);
+            let startup = jobs::SourceVerifierBootStartupRequest {
+                session_token: fixture.session_token.clone(),
+                startup_request_id: format!("phase629-http-startup-{suffix}"),
+                boot_id: registration.boot_id.clone(), runtime_instance_id: fixture.runtime_instance_id.clone(),
+                instance_epoch: fixture.instance_epoch, boot_generation: generation,
+                worker_id: fixture.worker_id.clone(), degraded_heartbeat_sequence: 2,
+            };
+            let startup_json = serde_json::to_value(&startup).unwrap();
+            let before_forged_result = postgres_runtime_snapshot(&pool, &fixture.runtime_instance_id);
+            let mut forged_result = startup_json.clone();
+            forged_result["probeResult"] = serde_json::json!("leaseable");
+            assert_eq!(post_runtime_json(&app, &startup_path, forged_result).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(postgres_runtime_snapshot(&pool, &fixture.runtime_instance_id), before_forged_result);
+            let (status, headers, startup_bytes) = post_runtime_json(&app, &startup_path, startup_json.clone()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_runtime_headers(&headers);
+            let response: serde_json::Value = serde_json::from_slice(&startup_bytes).unwrap();
+            assert_eq!(response["readyHeartbeatSequence"], "3");
+            assert_eq!(response["probeResult"], "idle");
+            crate::db::run_blocking_db(|| {
+                let mut connection = pool.get_pg().unwrap();
+                let row = connection.query_one(
+                    "SELECT heartbeat.heartbeat_sequence,heartbeat.health_state,
+                            head.current_boot_generation,head.ready_boot_generation,
+                            startup.canonical_response_base64url,
+                            (SELECT COUNT(*) FROM jobs_managed_cloud_source_verifier_boot_startup_authorities
+                              WHERE runtime_instance_id=$1),
+                            (SELECT COUNT(*) FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit
+                              WHERE runtime_instance_id=$1)
+                       FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats heartbeat
+                       JOIN jobs_managed_cloud_source_verifier_boot_generation_heads head
+                         ON head.runtime_instance_id=heartbeat.runtime_instance_id
+                        AND head.instance_epoch=heartbeat.instance_epoch
+                       JOIN jobs_managed_cloud_source_verifier_boot_startup_authorities startup
+                         ON startup.runtime_instance_id=head.runtime_instance_id AND startup.boot_id=$2
+                      WHERE heartbeat.runtime_instance_id=$1",
+                    &[&fixture.runtime_instance_id, &registration.boot_id],
+                ).expect("read HTTP-published PostgreSQL startup authority");
+                assert_eq!((row.get::<_, i64>(0), row.get::<_, String>(1).as_str()), (3, "ready"));
+                assert_eq!((row.get::<_, i64>(2), row.get::<_, i64>(3)), (generation, generation));
+                assert_eq!(row.get::<_, i64>(5), 1);
+                assert_eq!(row.get::<_, i64>(6), 3);
+                let stored: String = row.get(4);
+                assert_eq!(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(stored).unwrap(), startup_bytes);
+            });
+            let before_replay = postgres_runtime_snapshot(&pool, &fixture.runtime_instance_id);
+            let (status, headers, replay_bytes) = post_runtime_json(&app, &startup_path, startup_json).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_runtime_headers(&headers);
+            assert_eq!(replay_bytes, startup_bytes);
+            assert_eq!(postgres_runtime_snapshot(&pool, &fixture.runtime_instance_id), before_replay);
+        });
+    }
+
+    fn postgres_runtime_test_state(pool: crate::db::DbPool, database_url: String) -> AppState {
+        use crate::config::{Config, ServerDbBackend, TrialAbuseConfig, UpstreamKeys};
+        AppState {
+            pool,
+            config: std::sync::Arc::new(Config {
+                port: 0,
+                db_path: std::path::PathBuf::new(),
+                db_backend: ServerDbBackend::Postgres,
+                database_url: Some(database_url),
+                jwt_secret: "phase629-http-test-only-secret".to_string(),
+                public_url: "http://localhost".to_string(),
+                stripe_secret_key: None,
+                stripe_webhook_secret: None,
+                upstream: UpstreamKeys::default(),
+                upstream_spend_guard: None,
+                smtp: None,
+                admin_emails: Vec::new(),
+                trial_abuse: TrialAbuseConfig::default(),
+                turnstile_site_key: None,
+                turnstile_secret_key: None,
+                require_turnstile: false,
+                object_storage: None,
+                log_storage: None,
+            }),
+            rate_limiters: crate::rate_limit::RateLimiters::default(),
+            provider_health: crate::provider_health::ProviderHealth::default(),
+        }
+    }
+
+    async fn post_runtime_json(
+        app: &Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes =
+            axum::body::to_bytes(response.into_body(), MANAGED_CLOUD_RUNTIME_BODY_LIMIT_BYTES)
+                .await
+                .expect("read bounded HTTP response")
+                .to_vec();
+        (status, headers, bytes)
+    }
+
+    fn assert_runtime_headers(headers: &axum::http::HeaderMap) {
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    }
+
+    fn postgres_runtime_snapshot(pool: &crate::db::DbPool, runtime_id: &str) -> Vec<String> {
+        crate::db::run_blocking_db(|| {
+            let mut connection = pool.get_pg().unwrap();
+            [
+                "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+                "jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit",
+                "jobs_managed_cloud_source_verifier_boot_registrations",
+                "jobs_managed_cloud_source_verifier_boot_generation_heads",
+                "jobs_managed_cloud_source_verifier_boot_startup_authorities",
+                "jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+            ]
+            .iter()
+            .map(|table| {
+                connection
+                    .query_one(
+                        &format!(
+                "SELECT COALESCE(jsonb_agg(to_jsonb(item) ORDER BY to_jsonb(item)::text),'[]')::text
+                   FROM {table} item WHERE runtime_instance_id=$1",
+            ),
+                        &[&runtime_id],
+                    )
+                    .expect("snapshot exact HTTP runtime authority rows")
+                    .get(0)
+            })
+            .collect()
+        })
+    }
+
+    #[test]
+    fn unrelated_storage_errors_keep_internal_server_error_without_message_matching() {
+        for message in [
+            "source-verifier boot heartbeat transition is unauthorized",
+            "unrelated database connection failure",
+        ] {
+            let response =
+                registry_api_error(ManagedCloudRegistryError::Storage(anyhow::anyhow!(message)));
+            assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(response.1, "The managed-cloud authority operation failed.");
+        }
+    }
 
     #[test]
     fn runtime_worker_identity_must_match_authenticated_extension() {

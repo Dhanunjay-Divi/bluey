@@ -8360,6 +8360,472 @@ mod original_source_verification_tests {
         let _ = std::fs::remove_file(database_path.with_extension("sqlite3-shm"));
     }
 
+    #[test]
+    fn postgres_boot_leaseable_probe_attempt_fences_replay_and_cascades_when_configured() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            if std::env::var("BLUEY_JOBS_REQUIRE_POSTGRES_TESTS").as_deref() == Ok("1") {
+                panic!("postgres boot binding regression requires BLUEY_TEST_POSTGRES_URL");
+            }
+            eprintln!(
+                "SKIP postgres boot binding regression: BLUEY_TEST_POSTGRES_URL is unavailable"
+            );
+            return;
+        };
+        let _guard = super::managed_cloud_release_authority_tests::postgres_boot_test_lock()
+            .lock()
+            .expect("serialize PostgreSQL boot lifecycle fixtures");
+        let pool =
+            db::open_postgres_pool(&database_url).expect("open PostgreSQL boot binding pool");
+        db::run_migrations(&pool).expect("migrate PostgreSQL boot binding pool");
+        let fixture = super::managed_cloud_release_authority_tests::
+            install_original_source_verifier_startup_request(&pool);
+        let bootstrap_startup = postgres_fixture_boot_startup_request(&pool, &fixture);
+        assert_eq!(
+            record_source_verifier_boot_startup(&pool, &bootstrap_startup)
+                .expect("start initial PostgreSQL authority")
+                .probe_result,
+            "idle"
+        );
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct-phase629-pg-{suffix}");
+        let email = format!("{suffix}@phase629.example.test");
+        pool.get_pg()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts(id,email,password_hash,trial_seconds_remaining)
+                 VALUES($1,$2,'hash',0)",
+                &[&account_id, &email],
+            )
+            .expect("insert synthetic PostgreSQL account");
+        let identity = ensure_primary_application_identity(&pool, &account_id, &email)
+            .expect("create public application identity");
+        let track_id = format!("track-phase629-{suffix}");
+        upsert_track(
+            &pool,
+            &account_id,
+            &CareerTrack {
+                id: track_id.clone(),
+                name: "Software engineering".to_string(),
+                role: "Software Engineer".to_string(),
+                locations: vec!["New York, NY".to_string()],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: Some(identity.id),
+                policy: CareerTrackPolicy {
+                    role_family: "software_engineering".to_string(),
+                    ..CareerTrackPolicy::default()
+                },
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .expect("create public PostgreSQL career track");
+        let profile = default_profile(&email);
+        let mut postings = Vec::new();
+        for index in 0..2 {
+            let external_id = format!("phase629-{suffix}-{index}");
+            let mut posting = fixture_posting(
+                "greenhouse_import",
+                &format!("https://boards.greenhouse.io/phase629{suffix}{index}/jobs/{external_id}"),
+                &external_id,
+            );
+            posting.track_id = track_id.clone();
+            posting.posted_at_ms = Some(now_ms().saturating_sub(60_000));
+            postings.push(super::production_positive_authority_fixture::
+                save_production_positive_verified_import_with_runtime(
+                    &pool, &account_id, &posting, &profile, &JobPreferences::default(),
+                ));
+        }
+        let fixture = super::managed_cloud_release_authority_tests::
+            install_original_source_verifier_startup_request(&pool);
+        let startup = postgres_fixture_boot_startup_request(&pool, &fixture);
+        let binding =
+            super::managed_cloud_release_authority_tests::source_verifier_boot_binding_for_test(
+                &pool, &startup,
+            );
+        let pending = pool.get_pg().unwrap().query_one(
+            "SELECT COUNT(*),SUM(attempt_count)::BIGINT FROM jobs_original_source_verification_assignments
+              WHERE account_id=$1 AND state='pending'",
+            &[&account_id],
+        ).expect("assert real unclaimed assignments before positive probe");
+        assert_eq!(pending.get::<_, i64>(0), 2);
+        assert_eq!(pending.get::<_, i64>(1), 0);
+        let before = postgres_original_source_account_snapshot(&pool, &account_id);
+        let response = record_source_verifier_boot_startup(&pool, &startup)
+            .expect("probe genuinely leaseable PostgreSQL assignments");
+        assert_eq!(response.probe_result, "leaseable");
+        assert_eq!(
+            postgres_original_source_account_snapshot(&pool, &account_id),
+            before,
+            "leaseable probe rolls back every assignment, attempt, event and companion byte"
+        );
+        let first = lease_original_source_verification(&pool, &binding)
+            .expect("lease first PostgreSQL source assignment")
+            .expect("real imported assignment is due");
+        let first_posting = postings
+            .iter()
+            .find(|posting| {
+                original_source_canonical_subject(posting)
+                    .unwrap()
+                    .canonical_subject_json
+                    == first.canonical_subject_json
+            })
+            .expect("first lease belongs to synthetic import");
+        assert_eq!(first.fence, 1);
+        {
+            let mut connection = pool.get_pg().unwrap();
+            let row = connection
+                .query_one(
+                    "SELECT COUNT(*),MIN(binding.boot_id),MIN(binding.boot_generation),
+                        MIN(binding.runtime_instance_id),MIN(binding.runtime_instance_epoch)
+                   FROM jobs_original_source_verification_attempt_boot_bindings binding
+                   JOIN jobs_original_source_verification_attempts attempt USING(attempt_id)
+                  WHERE attempt.assignment_id=$1 AND attempt.attempt_id=$2",
+                    &[&first.assignment_id, &first.attempt_id],
+                )
+                .expect("read immutable real PostgreSQL attempt binding");
+            assert_eq!(row.get::<_, i64>(0), 1);
+            assert_eq!(row.get::<_, String>(1), startup.boot_id);
+            assert_eq!(row.get::<_, i64>(2), startup.boot_generation);
+            assert_eq!(row.get::<_, String>(3), startup.runtime_instance_id);
+            assert_eq!(row.get::<_, i64>(4), startup.instance_epoch);
+            for statement in [
+                "UPDATE jobs_original_source_verification_attempt_boot_bindings
+                    SET boot_generation=boot_generation+1 WHERE attempt_id=$1",
+                "DELETE FROM jobs_original_source_verification_attempt_boot_bindings WHERE attempt_id=$1",
+                "DELETE FROM jobs_original_source_verification_attempts WHERE attempt_id=$1",
+            ] {
+                let mut transaction = connection.transaction().unwrap();
+                let error = transaction.execute(statement, &[&first.attempt_id])
+                    .expect_err("direct mutation must be rejected by the authority fence");
+                assert!(error.as_db_error().expect("authority trigger database error")
+                    .message().contains("immutable"), "unexpected mutation failure: {error}");
+                transaction.rollback().expect("rollback independent rejected mutation");
+            }
+        }
+        let completion = public_positive_source_completion_request(
+            first_posting,
+            &first,
+            binding.clone(),
+            &fixture.runtime_identity_sha256,
+            &suffix,
+        );
+        let terminal = complete_original_source_verification(&pool, &completion)
+            .expect("publish real PostgreSQL source verification");
+        assert!(!terminal.replayed);
+        assert_eq!(terminal.head.as_ref().unwrap().result, "verified_open");
+        let positive = super::production_positive_authority_fixture::
+            install_production_positive_verified_source_job_authorities(
+                &pool, &account_id, first_posting, "acme.com", &suffix,
+            );
+        assert!(positive.source.integrity_binding.is_some());
+        assert_eq!(positive.ats.status.status, "active");
+        assert_eq!(
+            positive.composed.job_integrity.status,
+            JobIntegrityResolutionStatus::Verified
+        );
+        let live = lease_original_source_verification(&pool, &binding)
+            .expect("lease second PostgreSQL source assignment")
+            .expect("second real imported assignment is due");
+        assert_ne!(first.assignment_id, live.assignment_id);
+        let live_posting = postings
+            .iter()
+            .find(|posting| {
+                original_source_canonical_subject(posting)
+                    .unwrap()
+                    .canonical_subject_json
+                    == live.canonical_subject_json
+            })
+            .expect("live lease belongs to synthetic import");
+        let live_completion = public_positive_source_completion_request(
+            live_posting,
+            &live,
+            binding.clone(),
+            &fixture.runtime_identity_sha256,
+            &format!("{suffix}-live"),
+        );
+        let replacement_id = format!("phase629-replacement-{suffix}");
+        let replacement = register_source_verifier_boot(
+            &pool,
+            &SourceVerifierBootRegistrationRequest {
+                session_token: fixture.session_token.clone(),
+                registration_request_id: format!("phase629-replacement-register-{suffix}"),
+                boot_id: replacement_id.clone(),
+                runtime_instance_id: fixture.runtime_instance_id.clone(),
+                instance_epoch: fixture.instance_epoch,
+                worker_id: fixture.worker_id.clone(),
+                runtime_identity_sha256: fixture.runtime_identity_sha256.clone(),
+                activation_sha256: fixture.activation_sha256.clone(),
+                manifest_sha256: fixture.manifest_sha256.clone(),
+                component_id: fixture.component_id.clone(),
+                role: fixture.role.clone(),
+            },
+        )
+        .expect("advance PostgreSQL boot generation head");
+        assert!(replacement.boot_generation > startup.boot_generation);
+        let mut replacement_heartbeat = ManagedCloudRuntimeHeartbeatInput {
+            runtime_instance_id: fixture.runtime_instance_id.clone(),
+            worker_id: fixture.worker_id.clone(),
+            session_token: fixture.session_token.clone(),
+            heartbeat_sequence: 3,
+            observed_head_revision: fixture.observed_head_revision,
+            observed_transition_sha256: fixture.observed_transition_sha256.clone(),
+            activation_sha256: fixture.activation_sha256.clone(),
+            manifest_sha256: fixture.manifest_sha256.clone(),
+            component_id: fixture.component_id.clone(),
+            role: fixture.role.clone(),
+            artifact_sha256: fixture.artifact_sha256.clone(),
+            migration_set_sha256: fixture.migration_set_sha256.clone(),
+            config_schema_sha256: fixture.config_schema_sha256.clone(),
+            protocol_set_sha256: fixture.protocol_set_sha256.clone(),
+            task_queue_sha256: fixture.task_queue_sha256.clone(),
+            failure_converter_sha256: fixture.failure_converter_sha256.clone(),
+            dependency_evidence_sha256: fixture.dependency_evidence_sha256.clone(),
+            health_state: "ready".to_string(),
+            reason_code: None,
+            boot_id: Some(replacement_id.clone()),
+            boot_generation: Some(replacement.boot_generation),
+        };
+        let mut unbound_ready = replacement_heartbeat.clone();
+        unbound_ready.boot_id = None;
+        unbound_ready.boot_generation = None;
+        assert!(
+            record_managed_cloud_runtime_heartbeat(&pool, &unbound_ready).is_err(),
+            "release-v3 cannot use a legacy unbound ready heartbeat"
+        );
+        assert!(
+            record_managed_cloud_runtime_heartbeat(&pool, &replacement_heartbeat).is_err(),
+            "replacement cannot become ready without its startup authority"
+        );
+        replacement_heartbeat.health_state = "degraded".to_string();
+        replacement_heartbeat.reason_code = Some("probe_failed".to_string());
+        record_managed_cloud_runtime_heartbeat(&pool, &replacement_heartbeat)
+            .expect("record replacement probe-failed heartbeat");
+        let mut replacement_startup = SourceVerifierBootStartupRequest {
+            session_token: fixture.session_token.clone(),
+            startup_request_id: format!("phase629-replacement-startup-{suffix}"),
+            boot_id: replacement_id.clone(),
+            runtime_instance_id: fixture.runtime_instance_id.clone(),
+            instance_epoch: fixture.instance_epoch,
+            boot_generation: replacement.boot_generation,
+            worker_id: fixture.worker_id.clone(),
+            degraded_heartbeat_sequence: 3,
+        };
+        assert!(
+            record_source_verifier_boot_startup(&pool, &replacement_startup).is_err(),
+            "probe_failed is not a startup-ready predecessor"
+        );
+        replacement_heartbeat.heartbeat_sequence = 4;
+        replacement_heartbeat.reason_code = Some("startup".to_string());
+        record_managed_cloud_runtime_heartbeat(&pool, &replacement_heartbeat)
+            .expect("record exact replacement startup predecessor");
+        assert!(
+            record_source_verifier_boot_startup(&pool, &replacement_startup).is_err(),
+            "startup must bind the current predecessor sequence"
+        );
+        replacement_startup.degraded_heartbeat_sequence = 4;
+        let replacement_ready = record_source_verifier_boot_startup(&pool, &replacement_startup)
+            .expect("replacement boot completes its own startup before old-attempt fencing");
+        assert_eq!(replacement_ready.ready_heartbeat_sequence, 5);
+        let mut replacement_binding = binding.clone();
+        replacement_binding.boot_id = Some(replacement_id);
+        replacement_binding.boot_generation = Some(replacement.boot_generation);
+        let before_fenced_calls = postgres_original_source_account_snapshot(&pool, &account_id);
+        for attempted_binding in [&binding, &replacement_binding] {
+            assert!(
+                heartbeat_original_source_verification(
+                    &pool,
+                    &OriginalSourceVerificationHeartbeatRequest {
+                        binding: attempted_binding.clone(),
+                        assignment_id: live.assignment_id.clone(),
+                        attempt_id: live.attempt_id.clone(),
+                        fence: live.fence,
+                        lease_token: live.lease_token.clone(),
+                        heartbeat_sequence: 1,
+                    }
+                )
+                .is_err(),
+                "neither a stale boot nor its replacement may heartbeat the old lease"
+            );
+            let mut request = live_completion.clone();
+            request.binding = attempted_binding.clone();
+            assert!(
+                complete_original_source_verification(&pool, &request).is_err(),
+                "neither boot may publish a new terminal response for the old attempt"
+            );
+        }
+        {
+            let mut connection = pool.get_pg().unwrap();
+            let mut transaction = connection.transaction().unwrap();
+            let (session_sha256, lease_sha256) =
+                original_source_binding_hashes(&replacement_binding, &live.lease_token).unwrap();
+            let now = original_source_db_now_postgres(&mut transaction).unwrap();
+            assert!(matches!(
+                original_source_load_lease_postgres(
+                    &mut transaction,
+                    &live.assignment_id,
+                    &live.attempt_id,
+                    &account_id,
+                    &live_posting.id,
+                    live.fence,
+                    &replacement_binding,
+                    &lease_sha256,
+                    &session_sha256,
+                    now,
+                ),
+                Err(OriginalSourceVerificationError::LeaseLost)
+            ));
+            transaction.rollback().unwrap();
+        }
+        let replay = complete_original_source_verification(&pool, &completion)
+            .expect("exact old-binding terminal replay survives head advance");
+        assert!(replay.replayed);
+        assert_eq!(replay.head, terminal.head);
+        assert_eq!(replay.receipt_sha256, terminal.receipt_sha256);
+        let mut changed = completion.clone();
+        changed.request_id = format!("phase629-new-old-generation-{suffix}");
+        assert!(complete_original_source_verification(&pool, &changed).is_err());
+        let mut changed = completion.clone();
+        changed.binding = replacement_binding;
+        assert!(complete_original_source_verification(&pool, &changed).is_err());
+        assert_eq!(
+            postgres_original_source_account_snapshot(&pool, &account_id),
+            before_fenced_calls,
+            "rejected old-generation writes and exact terminal replay are read-only"
+        );
+        // Authenticated conflicting response-loss retries retain their historical quarantine
+        // semantics even after boot replacement. They may not publish a second source receipt.
+        let mut conflicting = public_positive_source_completion_request(
+            first_posting,
+            &first,
+            binding.clone(),
+            &fixture.runtime_identity_sha256,
+            &format!("{suffix}-conflicting-observation"),
+        );
+        conflicting.request_id = completion.request_id.clone();
+        assert!(matches!(
+            complete_original_source_verification(&pool, &conflicting),
+            Err(OriginalSourceVerificationError::ConflictingReplay)
+        ));
+        let conflict_state = pool
+            .get_pg()
+            .unwrap()
+            .query_one(
+                "SELECT assignment.state,
+                    (SELECT COUNT(*) FROM jobs_original_source_verification_receipts
+                      WHERE assignment_id=assignment.assignment_id),
+                    (SELECT COUNT(*) FROM jobs_original_source_verification_events
+                      WHERE assignment_id=assignment.assignment_id AND event_kind='quarantined'),
+                    (SELECT COUNT(*) FROM jobs_original_source_verification_attempts
+                      WHERE assignment_id=assignment.assignment_id)
+               FROM jobs_original_source_verification_assignments assignment
+              WHERE assignment.assignment_id=$1",
+                &[&first.assignment_id],
+            )
+            .expect("read exact expected conflicting-replay quarantine");
+        assert_eq!(conflict_state.get::<_, String>(0), "quarantined");
+        assert_eq!(conflict_state.get::<_, i64>(1), 1);
+        assert_eq!(conflict_state.get::<_, i64>(2), 1);
+        assert_eq!(conflict_state.get::<_, i64>(3), 1);
+        {
+            let mut connection = pool.get_pg().unwrap();
+            // Parent posting deletion is the authorized cascade; direct child deletion above is not.
+            assert_eq!(
+                connection
+                    .execute(
+                        "DELETE FROM jobs_postings WHERE account_id=$1 AND id=$2",
+                        &[&account_id, &first_posting.id],
+                    )
+                    .expect("delete exact synthetic posting parent"),
+                1
+            );
+            assert_eq!(connection.query_one(
+                "SELECT (SELECT COUNT(*) FROM jobs_original_source_verification_attempts WHERE attempt_id=$1),
+                        (SELECT COUNT(*) FROM jobs_original_source_verification_attempt_boot_bindings WHERE attempt_id=$1)",
+                &[&first.attempt_id],
+            ).map(|row| (row.get::<_, i64>(0),row.get::<_, i64>(1))).unwrap(), (0,0));
+            assert_eq!(connection.query_one(
+                "SELECT (SELECT COUNT(*) FROM jobs_original_source_verification_attempts WHERE attempt_id=$1),
+                        (SELECT COUNT(*) FROM jobs_original_source_verification_attempt_boot_bindings WHERE attempt_id=$1)",
+                &[&live.attempt_id],
+            ).map(|row| (row.get::<_, i64>(0),row.get::<_, i64>(1))).unwrap(), (1,1),
+                "deleting one posting must preserve the unrelated live attempt and companion");
+            assert_eq!(
+                connection
+                    .execute("DELETE FROM accounts WHERE id=$1", &[&account_id])
+                    .expect("delete exact synthetic account parent"),
+                1
+            );
+            assert_eq!(connection.query_one(
+                "SELECT (SELECT COUNT(*) FROM jobs_original_source_verification_attempts WHERE attempt_id=$1),
+                        (SELECT COUNT(*) FROM jobs_original_source_verification_attempt_boot_bindings WHERE attempt_id=$1)",
+                &[&live.attempt_id],
+            ).map(|row| (row.get::<_, i64>(0),row.get::<_, i64>(1))).unwrap(), (0,0));
+        }
+    }
+
+    fn postgres_fixture_boot_startup_request(
+        pool: &DbPool,
+        fixture: &ManagedCloudOriginalSourceVerifierStartupRequest,
+    ) -> SourceVerifierBootStartupRequest {
+        let bootstrap = pool
+            .get_pg()
+            .expect("read PostgreSQL bootstrap boot")
+            .query_one(
+                "SELECT boot_id,boot_generation FROM jobs_managed_cloud_source_verifier_boot_registrations
+                  WHERE runtime_instance_id=$1 ORDER BY boot_generation DESC LIMIT 1",
+                &[&fixture.runtime_instance_id],
+            )
+            .expect("read PostgreSQL bootstrap boot row");
+        let boot_id: String = bootstrap.get(0);
+        let boot_generation: i64 = bootstrap.get(1);
+        SourceVerifierBootStartupRequest {
+            session_token: fixture.session_token.clone(),
+            startup_request_id: format!("phase629-pg-binding-{}", uuid::Uuid::new_v4().simple()),
+            boot_id,
+            runtime_instance_id: fixture.runtime_instance_id.clone(),
+            instance_epoch: fixture.instance_epoch,
+            boot_generation,
+            worker_id: fixture.worker_id.clone(),
+            degraded_heartbeat_sequence: 1,
+        }
+    }
+
+    fn postgres_original_source_account_snapshot(pool: &DbPool, account_id: &str) -> Vec<String> {
+        let mut connection = pool.get_pg().unwrap();
+        [
+            "SELECT COALESCE(jsonb_agg(to_jsonb(item) ORDER BY item.assignment_id),'[]')::text
+               FROM jobs_original_source_verification_assignments item WHERE account_id=$1",
+            "SELECT COALESCE(jsonb_agg(to_jsonb(item) ORDER BY item.attempt_id),'[]')::text
+               FROM jobs_original_source_verification_attempts item WHERE account_id=$1",
+            "SELECT COALESCE(jsonb_agg(to_jsonb(item) ORDER BY item.event_id),'[]')::text
+               FROM jobs_original_source_verification_events item
+               JOIN jobs_original_source_verification_assignments assignment USING(assignment_id)
+              WHERE assignment.account_id=$1",
+            "SELECT COALESCE(jsonb_agg(to_jsonb(binding) ORDER BY binding.attempt_id),'[]')::text
+               FROM jobs_original_source_verification_attempt_boot_bindings binding
+               JOIN jobs_original_source_verification_attempts attempt USING(attempt_id)
+              WHERE attempt.account_id=$1",
+            "SELECT COALESCE(jsonb_agg(to_jsonb(item) ORDER BY item.observation_id),'[]')::text
+               FROM jobs_original_source_verification_observations item WHERE account_id=$1",
+            "SELECT COALESCE(jsonb_agg(to_jsonb(item) ORDER BY item.receipt_id),'[]')::text
+               FROM jobs_original_source_verification_receipts item WHERE account_id=$1",
+            "SELECT COALESCE(jsonb_agg(to_jsonb(item) ORDER BY item.transition_id),'[]')::text
+               FROM jobs_original_source_verification_transitions item WHERE account_id=$1",
+            "SELECT COALESCE(jsonb_agg(to_jsonb(item) ORDER BY item.job_id),'[]')::text
+               FROM jobs_original_source_verification_heads item WHERE account_id=$1",
+        ]
+        .iter()
+        .map(|query| {
+            connection
+                .query_one(*query, &[&account_id])
+                .expect("snapshot complete PostgreSQL source lifecycle rows")
+                .get(0)
+        })
+        .collect()
+    }
+
     fn cleanup_public_original_source_lifecycle_fixture(
         fixture: PublicOriginalSourceLifecycleFixture,
     ) {
@@ -8550,6 +9016,26 @@ mod original_source_verification_tests {
         let lease = lease_original_source_verification(pool, &binding)
             .expect("lease public positive source verification")
             .expect("public positive source assignment is due");
+        let request = public_positive_source_completion_request(
+            posting,
+            &lease,
+            binding,
+            &managed.runtime_identity_sha256,
+            request_suffix,
+        );
+        let terminal = complete_original_source_verification(pool, &request)
+            .expect("complete public positive source verification");
+        assert_eq!(terminal.state, "idle");
+        terminal.head.expect("public positive source head")
+    }
+
+    fn public_positive_source_completion_request(
+        posting: &JobPosting,
+        lease: &OriginalSourceVerificationLease,
+        binding: OriginalSourceVerifierBinding,
+        runtime_identity_sha256: &str,
+        request_suffix: &str,
+    ) -> OriginalSourceVerificationCompletionRequest {
         let subject: OriginalSourceComparisonSubject =
             serde_json::from_str(&lease.canonical_subject_json)
                 .expect("parse public positive source subject");
@@ -8592,7 +9078,7 @@ mod original_source_verification_tests {
             ),
             parser_version,
             parser_digest,
-            worker_runtime_identity_sha256: managed.runtime_identity_sha256.clone(),
+            worker_runtime_identity_sha256: runtime_identity_sha256.to_string(),
             provider_record_id: Some(subject.provider_record_id),
             company: Some(posting.company.clone()),
             title: Some(posting.title.clone()),
@@ -8606,21 +9092,15 @@ mod original_source_verification_tests {
         });
         let observation = serde_json::from_value(serde_json::to_value(observation).unwrap())
             .expect("convert public positive source observation");
-        let terminal = complete_original_source_verification(
-            pool,
-            &OriginalSourceVerificationCompletionRequest {
-                binding,
-                assignment_id: lease.assignment_id,
-                attempt_id: lease.attempt_id,
-                fence: lease.fence,
-                lease_token: lease.lease_token,
-                request_id: format!("public-positive-source-{request_suffix}"),
-                observation,
-            },
-        )
-        .expect("complete public positive source verification");
-        assert_eq!(terminal.state, "idle");
-        terminal.head.expect("public positive source head")
+        OriginalSourceVerificationCompletionRequest {
+            binding,
+            assignment_id: lease.assignment_id.clone(),
+            attempt_id: lease.attempt_id.clone(),
+            fence: lease.fence,
+            lease_token: lease.lease_token.clone(),
+            request_id: format!("public-positive-source-{request_suffix}"),
+            observation,
+        }
     }
 
     fn public_unreachable_observation(

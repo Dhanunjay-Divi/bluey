@@ -613,7 +613,10 @@ fn local_submit_public_beta_prelock_precedes_discovery_and_fresh_effect_only() {
         let position = postgres
             .find(operation)
             .unwrap_or_else(|| panic!("missing local submit operation {operation}"));
-        assert!(position >= previous, "local submit public-beta order inverted");
+        assert!(
+            position >= previous,
+            "local submit public-beta order inverted"
+        );
         previous = position;
     }
 }
@@ -3127,15 +3130,17 @@ pub fn finalize_local_side_effect_unknown(
                         row.get::<_, String>(2),
                     )
                 });
-            if tx
+            // Lock existing capacity before sampling effect time: a lock wait must not
+            // let an expired reservation extend using a stale pre-lock timestamp.
+            let capacity_exists = tx
                 .query_opt(
                     "SELECT run_id FROM jobs_submission_evidence_capacity
                       WHERE account_id = $1 AND application_id = $2 AND run_id = $3
                         AND runner = 'local' FOR UPDATE",
                     &[&account_id, &application_id, &run_id],
                 )?
-                .is_none()
-            {
+                .is_some();
+            if !capacity_exists && !matches!(ticket_status.as_str(), "claimed" | "needs_input") {
                 anyhow::bail!("local submission evidence capacity is missing")
             }
             let now = local_run_claim_db_now_postgres(&mut tx)?;
@@ -3314,6 +3319,8 @@ fn retain_local_unknown_capacity_postgres_tx(
     now: i64,
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
 ) -> Result<()> {
+    // Pre-click claimed/needs_input may reserve capacity. Click-started and terminal
+    // replay must extend an exact existing reservation instead of manufacturing one.
     if matches!(ticket_status, "claimed" | "needs_input") {
         crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(tx, capacity)?;
     }

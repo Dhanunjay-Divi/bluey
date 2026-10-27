@@ -1662,11 +1662,36 @@ fn local_authority_fixture(pool: &DbPool, label: &str) -> LocalAuthorityFixture 
     {
         let mut conn = pool.get_pg().expect("get PostgreSQL fixture connection");
         conn.execute(
-            "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
-             VALUES ($1, $2, 'hash', 0)",
+            "INSERT INTO accounts (
+                id, email, password_hash, trial_seconds_remaining, email_verified_at
+             ) VALUES ($1, $2, 'hash', 0, '2026-08-30T00:00:00Z')",
             &[&account_id, &email],
         )
         .expect("insert PostgreSQL authority account");
+        conn.execute(
+            "UPDATE jobs_public_beta_cohorts
+                SET state = 'closed_to_new', hard_cap = 10000
+              WHERE id = 'public-v1'",
+            &[],
+        )
+        .expect("configure retained PostgreSQL public-beta cohort for fixture");
+        conn.execute(
+            "INSERT INTO jobs_public_beta_enrollments (
+                cohort_id, account_id, source, admitted_at_ms
+             ) VALUES ('public-v1', $1, 'admin', 1)",
+            &[&account_id],
+        )
+        .expect("enroll PostgreSQL authority fixture in public beta");
+        conn.execute(
+            "UPDATE jobs_public_beta_cohorts
+                SET assigned_count = (
+                    SELECT COUNT(*) FROM jobs_public_beta_enrollments
+                     WHERE cohort_id = 'public-v1'
+                )
+              WHERE id = 'public-v1'",
+            &[],
+        )
+        .expect("reconcile PostgreSQL public-beta fixture roster count");
     }
 
     let identity = ensure_primary_application_identity(pool, &account_id, &email)
@@ -2542,11 +2567,21 @@ fn cleanup(pool: &DbPool, fixture: &LocalAuthorityFixture) {
     .expect("remove PostgreSQL fixture deletion fence");
     conn.execute("DELETE FROM accounts WHERE id = $1", &[&fixture.account_id])
         .expect("delete PostgreSQL authority fixture");
+    conn.execute(
+        "UPDATE jobs_public_beta_cohorts
+            SET assigned_count = (
+                SELECT COUNT(*) FROM jobs_public_beta_enrollments
+                 WHERE cohort_id = 'public-v1'
+            )
+          WHERE id = 'public-v1'",
+        &[],
+    )
+    .expect("reconcile PostgreSQL public-beta fixture roster after cleanup");
 }
 
 #[test]
 #[serial_test::serial]
-fn postgres_execution_lease_claim_observes_account_write_fence_first() {
+fn postgres_execution_lease_claim_rejects_deleting_account_without_creating_lease() {
     let Some(pool) = postgres_pool() else {
         return;
     };
@@ -2573,13 +2608,7 @@ fn postgres_execution_lease_claim_observes_account_write_fence_first() {
         "fenced-postgres-worker",
     )
     .unwrap_err();
-    match error {
-        ExecutionLeaseError::Storage(error) => assert!(matches!(
-            error.downcast_ref::<crate::db::object_uploads::UploadControlError>(),
-            Some(crate::db::object_uploads::UploadControlError::AccountDeleting)
-        )),
-        other => panic!("expected PostgreSQL account-deletion fence, got {other:?}"),
-    }
+    assert!(matches!(error, ExecutionLeaseError::Conflict));
     let lease_count: i64 = pool
         .get_pg()
         .expect("get PostgreSQL claim-fence assertion connection")
@@ -2826,7 +2855,39 @@ fn postgres_local_run_claim_and_submit_recheck_current_authority() {
         .expect("check consumed PostgreSQL provider approval"),
         "the composite Greenhouse authorize-submit gate should now pass"
     );
-
+    let committed_snapshot = |label: &str| {
+        let row = pool
+            .get_pg()
+            .unwrap_or_else(|error| panic!("get PostgreSQL {label} snapshot connection: {error}"))
+            .query_one(
+                "SELECT
+                    (SELECT COALESCE(jsonb_agg(to_jsonb(ticket) ORDER BY ticket.id), '[]'::jsonb)::text
+                       FROM jobs_local_run_tickets ticket WHERE ticket.id = $1),
+                    (SELECT COALESCE(jsonb_agg(to_jsonb(application) ORDER BY application.id), '[]'::jsonb)::text
+                       FROM jobs_applications application WHERE application.account_id = $2 AND application.id = $3),
+                    (SELECT COALESCE(jsonb_agg(to_jsonb(attempt) ORDER BY attempt.application_id), '[]'::jsonb)::text
+                       FROM jobs_attempt_reservations attempt WHERE attempt.account_id = $2 AND attempt.application_id = $3),
+                    (SELECT COALESCE(jsonb_agg(to_jsonb(capacity) ORDER BY capacity.run_id), '[]'::jsonb)::text
+                       FROM jobs_submission_evidence_capacity capacity
+                      WHERE capacity.account_id = $2 AND capacity.application_id = $3 AND capacity.run_id = $1),
+                    (SELECT COALESCE(jsonb_agg(to_jsonb(action) ORDER BY action.id), '[]'::jsonb)::text
+                       FROM jobs_local_run_resume_actions action
+                      WHERE action.account_id = $2 AND action.application_id = $3 AND action.run_id = $1),
+                    (SELECT COALESCE(jsonb_agg(to_jsonb(intervention) ORDER BY intervention.id), '[]'::jsonb)::text
+                       FROM jobs_interventions intervention
+                      WHERE intervention.account_id = $2 AND intervention.application_id = $3)",
+                &[&live.run_id, &live.account_id, &live.application.id],
+            )
+            .unwrap_or_else(|error| panic!("read PostgreSQL {label} replay snapshot: {error}"));
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, String>(3),
+            row.get::<_, String>(4),
+            row.get::<_, String>(5),
+        )
+    };
     pool.get_pg()
         .expect("get PostgreSQL final identity deletion connection")
         .execute(
@@ -2834,18 +2895,89 @@ fn postgres_local_run_claim_and_submit_recheck_current_authority() {
             &[&live.account_id, &live.identity_id],
         )
         .expect("delete live PostgreSQL application identity");
-    assert!(!local_run_submit_authorized(
+    let before_identity_deletion = committed_snapshot("post-identity-deletion");
+    assert!(local_run_submit_authorized(
         &pool,
         &live.run_id,
         &live.ticket_hash,
         &live_proof,
         &live_capacity,
     )
-    .expect("recheck identity-deleted PostgreSQL submit authority"));
+    .expect("replay identity-deleted PostgreSQL submit authority"));
+    assert_eq!(
+        committed_snapshot("post-identity-deletion replay"),
+        before_identity_deletion,
+        "an exact click-started replay must not republish ticket, application, attempt, capacity, approval, or intervention rows"
+    );
 
     cleanup(&pool, &claim_gate);
     cleanup(&pool, &deleted_identity);
     cleanup(&pool, &live);
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_local_unknown_click_started_missing_capacity_is_rejected_without_mutation() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let fixture = local_authority_fixture(&pool, "unknown-click-started-missing-capacity");
+    assert!(
+        claim_authorized_local_run_ticket(&pool, &fixture.run_id, &fixture.ticket_hash)
+            .expect("claim PostgreSQL local run")
+            .is_some()
+    );
+    reserve_application_attempt(&pool, &fixture.account_id, &fixture.application.id, "local")
+        .expect("reserve PostgreSQL local attempt");
+    enter_running_state(&pool, &fixture);
+    let capacity = local_submission_capacity(&fixture);
+    let receipt = json!({ "status": "side_effect_unknown", "issues": [] });
+    let snapshot = |label: &str| {
+        let row = pool.get_pg().unwrap_or_else(|error| {
+            panic!("get PostgreSQL {label} missing-capacity snapshot connection: {error}")
+        }).query_one(
+            "SELECT
+                (SELECT COALESCE(jsonb_agg(to_jsonb(ticket) ORDER BY ticket.id), '[]'::jsonb)::text FROM jobs_local_run_tickets ticket WHERE ticket.id=$1),
+                (SELECT COALESCE(jsonb_agg(to_jsonb(application) ORDER BY application.id), '[]'::jsonb)::text FROM jobs_applications application WHERE application.account_id=$2 AND application.id=$3),
+                (SELECT COALESCE(jsonb_agg(to_jsonb(attempt) ORDER BY attempt.application_id), '[]'::jsonb)::text FROM jobs_attempt_reservations attempt WHERE attempt.account_id=$2 AND attempt.application_id=$3),
+                (SELECT COALESCE(jsonb_agg(to_jsonb(session) ORDER BY session.id), '[]'::jsonb)::text FROM jobs_browser_sessions session WHERE session.account_id=$2 AND session.id=$1),
+                (SELECT COALESCE(jsonb_agg(to_jsonb(capacity) ORDER BY capacity.run_id), '[]'::jsonb)::text FROM jobs_submission_evidence_capacity capacity WHERE capacity.account_id=$2 AND capacity.application_id=$3 AND capacity.run_id=$1)",
+            &[&fixture.run_id, &fixture.account_id, &fixture.application.id],
+        ).unwrap_or_else(|error| panic!("read PostgreSQL {label} missing-capacity snapshot: {error}"));
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, String>(3),
+            row.get::<_, String>(4),
+        )
+    };
+    let mut connection = pool
+        .get_pg()
+        .expect("get PostgreSQL synthetic corruption connection");
+    // SYNTHETIC inconsistent legacy/corruption state: an irreversible marker without capacity.
+    assert_eq!(connection.execute(
+        "UPDATE jobs_local_run_tickets SET status='click_started' WHERE id=$1 AND status='claimed'",
+        &[&fixture.run_id],
+    ).expect("mark synthetic click-started ticket"), 1);
+    let before = snapshot("pre-finalize");
+    assert!(before.4 == "[]");
+    let error = finalize_local_side_effect_unknown(
+        &pool,
+        &fixture.account_id,
+        &fixture.application.id,
+        &fixture.run_id,
+        &fixture.ticket_hash,
+        &capacity,
+        receipt,
+        &running_session(&fixture),
+    )
+    .expect_err("click-started state without capacity must reject");
+    assert!(error
+        .to_string()
+        .contains("local submission evidence capacity is missing"));
+    assert_eq!(snapshot("post-finalize"), before);
+    cleanup(&pool, &fixture);
 }
 
 #[test]
