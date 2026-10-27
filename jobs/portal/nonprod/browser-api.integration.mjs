@@ -16,13 +16,19 @@ import { chromium } from "playwright";
 const LIMIT_MS = 180_000;
 const OPERATION_MS = 10_000;
 const children = [];
-const result = { version: 1, tests: 1, passed: 0, failed: [], binaries: [], requests: { jobs: 0, account: 0 } };
+const EXPECTED_CASES = ["profile_reload", "onboarding_complete", "preference_track_reload", "auth_isolation", "effect_availability"];
+const result = { version: 2, cases: [], tests: EXPECTED_CASES.length, passed: 0, failed: [], binaries: [], requests: { jobs: 0, account: 0 } };
 let outputRoot;
 let liveBrowser;
 let liveProxy;
 let stage = "preflight";
 
 function fail(code) { throw new Error(code); }
+function passCase(name) {
+  assert.equal(EXPECTED_CASES[result.cases.length], name, "case_order");
+  result.cases.push(name); result.passed += 1;
+  process.stdout.write(`${JSON.stringify({ event: "browser_case_passed", case: name })}\n`);
+}
 function within(root, target) { const value = relative(root, target); return value === "" || (!value.startsWith("..") && !resolve(root, target).startsWith("..")); }
 function required(name) { const value = process.env[name]; if (!value) fail(`missing_${name.toLowerCase()}`); return value; }
 function onlyLoopbackPostgres(value) {
@@ -118,6 +124,17 @@ function getJson(url, token) {
     request.on("error", (error) => finish(reject, error)); request.end();
   });
 }
+function putJson(url, token, body) {
+  return new Promise((resolveRequest, reject) => {
+    const encoded = JSON.stringify(body); let settled = false;
+    const finish = (callback, value) => { if (!settled) { settled = true; clearTimeout(timer); callback(value); } };
+    const request = httpRequest(url, { method: "PUT", headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "content-length": Buffer.byteLength(encoded) } }, (response) => {
+      response.resume(); response.on("end", () => finish(resolveRequest, response.statusCode));
+    });
+    const timer = setTimeout(() => { request.destroy(); finish(reject, new Error("http_timeout")); }, OPERATION_MS);
+    request.on("error", (error) => finish(reject, error)); request.end(encoded);
+  });
+}
 async function waitFor(url, token) {
   const deadline = Date.now() + OPERATION_MS;
   while (Date.now() < deadline) {
@@ -131,14 +148,18 @@ async function waitFor(url, token) {
   }
   fail("service_not_ready");
 }
-async function seed(psql, database, accountId, email) {
+async function seed(psql, database, accountId, email, isolatedAccountId, isolatedEmail) {
   const sql = `
 INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining, email_verified_at)
 VALUES ('${accountId}', '${email}', 'fixture-only', 0, now());
-UPDATE jobs_public_beta_cohorts SET state = 'closed_to_new', hard_cap = 1
+INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining, email_verified_at)
+VALUES ('${isolatedAccountId}', '${isolatedEmail}', 'fixture-only', 0, now());
+UPDATE jobs_public_beta_cohorts SET state = 'closed_to_new', hard_cap = 2
 WHERE id = 'public-v1';
 INSERT INTO jobs_public_beta_enrollments (cohort_id, account_id, source, admitted_at_ms)
 VALUES ('public-v1', '${accountId}', 'admin', 1);
+INSERT INTO jobs_public_beta_enrollments (cohort_id, account_id, source, admitted_at_ms)
+VALUES ('public-v1', '${isolatedAccountId}', 'admin', 1);
 UPDATE jobs_public_beta_cohorts SET assigned_count = (
   SELECT COUNT(*) FROM jobs_public_beta_enrollments WHERE cohort_id = 'public-v1'
 ) WHERE id = 'public-v1';`;
@@ -225,6 +246,8 @@ async function main() {
   const purgePolicy = fixturePurgeSigningPolicy();
   const accountId = `ui_fixture_${randomUUID()}`;
   const email = `ui-fixture-${randomUUID()}@example.test`;
+  const isolatedAccountId = `ui_isolated_${randomUUID()}`;
+  const isolatedEmail = `ui-isolated-${randomUUID()}@example.test`;
   const common = {
     PATH: process.env.PATH, HOME: childHome, TMPDIR: childTmp, TMP: childTmp, TEMP: childTmp,
     SQLITE_TMPDIR: childTmp, LANG: "C", TZ: "UTC",
@@ -251,7 +274,7 @@ async function main() {
   child(sharedBinary, [], { ...common, BLUEY_API_HOST: "127.0.0.1", BLUEY_PORT: String(accountPort) }, "bluey-server");
   await waitFor(`http://127.0.0.1:${accountPort}/health`);
   stage = "seed";
-  await seed(psql, database, accountId, email);
+  await seed(psql, database, accountId, email, isolatedAccountId, isolatedEmail);
   const token = fixtureToken(accountId, secret);
   const proxy = proxyServer(dist, jobsPort, accountPort); liveProxy = proxy; const portalPort = await listen(proxy);
   const browser = await withTimeout(chromium.launch({ headless: true }), "browser_launch"); liveBrowser = browser;
@@ -278,15 +301,109 @@ async function main() {
     stage = "persistence";
     await page.reload({ waitUntil: "networkidle", timeout: OPERATION_MS });
     await page.getByRole("heading", { name: "Work history" }).waitFor({ timeout: OPERATION_MS });
+    passCase("profile_reload");
+    stage = "employment_entry";
+    await page.getByRole("button", { name: "Add role" }).click();
+    await page.getByLabel("Company").fill("Synthetic Systems");
+    await page.getByLabel("Title").fill("Software Engineer");
+    await page.getByLabel("Location").fill("New York, NY");
+    await page.getByLabel("Start").fill("2022-01");
+    await page.getByLabel("Highlights (one per line)").fill("Built synthetic test systems");
+    await page.getByRole("button", { name: "Continue" }).click();
+    await page.getByRole("heading", { name: "Education and skills" }).waitFor({ timeout: OPERATION_MS });
+    stage = "skills_entry";
+    await page.getByLabel("Skills").fill("TypeScript"); await page.getByLabel("Skills").press("Enter");
+    await page.getByRole("button", { name: "Continue" }).click();
+    await page.getByRole("heading", { name: "Where should Bluey look?" }).waitFor({ timeout: OPERATION_MS });
+    stage = "search_preferences";
+    await page.getByLabel("Target roles").fill("Software Engineer"); await page.getByLabel("Target roles").press("Enter");
+    await page.getByLabel("Target locations").fill("New York, NY"); await page.getByLabel("Target locations").press("Enter");
+    await page.getByRole("checkbox", { name: "Full-time" }).setChecked(true);
+    await page.getByRole("checkbox", { name: "W-2" }).setChecked(true); await page.getByRole("checkbox", { name: "C2C" }).setChecked(true);
+    await page.getByRole("button", { name: "Continue" }).click();
+    await page.getByRole("heading", { name: "How should Bluey work?" }).waitFor({ timeout: OPERATION_MS });
+    stage = "review_defaults";
+    await page.getByRole("button", { name: /Review first/ }).click();
+    await page.getByRole("button", { name: "Continue" }).click();
+    await page.getByRole("heading", { name: "Your first Career Track is ready" }).waitFor({ timeout: OPERATION_MS });
+    stage = "onboarding_completion";
+    await page.getByRole("button", { name: "Find my matches" }).click();
+    await page.waitForURL(/\/jobs\/matches/, { timeout: OPERATION_MS });
+    passCase("onboarding_complete");
+    stage = "completed_workspace_reload";
+    await page.reload({ waitUntil: "networkidle", timeout: OPERATION_MS });
+    await page.getByRole("heading", { name: "Matches" }).waitFor({ timeout: OPERATION_MS });
     assert.ok(result.requests.jobs >= 2, "workspace_requests"); assert.ok(result.requests.account >= 1, "account_request");
     assert.equal(pageErrors, 0, "portal_page_errors"); assert.equal(serverErrors, 0, "portal_server_errors");
     const workspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token);
     assert.equal(workspace.profile.full_name, "Synthetic Candidate", "profile_persisted");
     assert.equal(workspace.matches.length, 0, "empty_matches");
+    assert.equal(workspace.profile.onboarding_complete, true, "onboarding_persisted");
+    assert.equal(workspace.profile.employment.length, 1, "employment_count_persisted");
+    const employment = workspace.profile.employment[0];
+    assert.equal(employment.company, "Synthetic Systems", "employment_company_persisted"); assert.equal(employment.title, "Software Engineer", "employment_title_persisted");
+    assert.equal(employment.location, "New York, NY", "employment_location_persisted"); assert.equal(employment.start_date, "2022-01", "employment_start_persisted");
+    assert.equal(employment.end_date, "", "employment_end_persisted"); assert.deepEqual(employment.highlights, ["Built synthetic test systems"], "employment_highlights_persisted");
+    assert.deepEqual(workspace.preferences.desired_roles, ["Software Engineer"], "target_role_persisted");
+    assert.deepEqual(workspace.preferences.desired_locations, ["New York, NY"], "target_location_persisted");
+    assert.equal(workspace.profile.default_submission_mode, "review_first", "review_first_persisted");
+    assert.deepEqual(workspace.preferences.employment_types, ["full_time"], "employment_type_persisted");
+    assert.deepEqual([...workspace.preferences.engagement_types].sort(), ["c2c", "w2"], "engagement_preferences_persisted");
+    assert.equal(workspace.tracks.length, 1, "track_persisted");
+    assert.equal(workspace.tracks[0].role, "Software Engineer", "track_role_binding");
+    assert.deepEqual(workspace.tracks[0].locations, ["New York, NY"], "track_location_binding"); passCase("preference_track_reload");
+    stage = "account_isolation";
+    assert.equal(await get(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`), 401, "unauthenticated_denied");
+    const firstSnapshot = structuredClone({ profile: workspace.profile, preferences: workspace.preferences, tracks: workspace.tracks, applications: workspace.applications });
+    const isolatedToken = fixtureToken(isolatedAccountId, secret);
+    const isolatedWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, isolatedToken);
+    assert.notEqual(isolatedWorkspace.profile.full_name, "Synthetic Candidate", "isolated_profile_no_leak");
+    assert.deepEqual(isolatedWorkspace.profile.employment, [], "isolated_employment_no_leak");
+    assert.deepEqual(isolatedWorkspace.preferences.desired_roles, [], "isolated_roles_no_leak");
+    assert.deepEqual(isolatedWorkspace.preferences.desired_locations, [], "isolated_locations_no_leak");
+    assert.equal(isolatedWorkspace.tracks.length, 0, "isolated_tracks_no_leak"); assert.equal(isolatedWorkspace.applications.length, 0, "isolated_applications_no_leak");
+    const isolatedProfile = { ...isolatedWorkspace.profile, full_name: "Isolated Candidate", email: isolatedEmail, phone: "555-0101", current_location: "Boston, MA", headline: "QA Engineer" };
+    assert.equal(await putJson(`http://127.0.0.1:${jobsPort}/api/jobs/profile`, isolatedToken, isolatedProfile), 200, "isolated_profile_update");
+    const isolatedAfterUpdate = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, isolatedToken);
+    assert.equal(isolatedAfterUpdate.profile.full_name, "Isolated Candidate", "isolated_profile_readback");
+    const firstAfterIsolation = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token);
+    assert.deepEqual({ profile: firstAfterIsolation.profile, preferences: firstAfterIsolation.preferences, tracks: firstAfterIsolation.tracks, applications: firstAfterIsolation.applications }, firstSnapshot, "first_tenant_families_unchanged"); passCase("auth_isolation");
+    assert.deepEqual(workspace.applications, [], "no_fabricated_applications"); assert.deepEqual(workspace.interventions, [], "no_fabricated_interventions");
+    assert.deepEqual(workspace.browser_sessions, [], "no_fabricated_browser_sessions"); assert.deepEqual(workspace.auto_submit_authorizations, [], "no_fabricated_auto_submit_authorizations");
+    assert.equal(workspace.profile.source_resume_name, "", "no_source_resume");
+    assert.equal(workspace.runner_availability.cloud.available, false, "cloud_unavailable");
+    assert.equal(workspace.runner_availability.cloud.distribution_enabled, false, "cloud_distribution_disabled");
+    assert.equal(workspace.runner_availability.auto_submit_available, false, "auto_submit_unavailable");
+    for (const route of ["applications", "automation", "settings"]) {
+      stage = `view_${route}`;
+      await page.goto(`http://127.0.0.1:${portalPort}/jobs/${route}`, { waitUntil: "networkidle" });
+      assert.equal(pageErrors, 0, `${route}_page_errors`); assert.equal(serverErrors, 0, `${route}_server_errors`);
+      if (route === "applications") await page.getByRole("heading", { name: "No applications here" }).waitFor({ timeout: OPERATION_MS });
+      if (route === "automation") {
+        const locked = page.locator(".runner-option.locked");
+        assert.equal(await locked.count(), 1, "cloud_effect_locked");
+        await locked.getByText(workspace.runner_availability.cloud.reason, { exact: true }).waitFor({ timeout: OPERATION_MS });
+        assert.equal(await page.getByRole("button", { name: "Start cloud automation" }).count(), 0, "no_start_action");
+        assert.equal(await page.locator(".active-browser-run").count(), 0, "no_active_run");
+      }
+      if (route === "settings") {
+        await page.getByText("Source resume required", { exact: true }).waitFor({ timeout: OPERATION_MS });
+        await page.getByText("Canonical policy review required", { exact: true }).waitFor({ timeout: OPERATION_MS });
+        assert.equal(await page.getByRole("button", { name: "Enable Auto-submit" }).isDisabled(), true, "auto_submit_disabled");
+      }
+    }
+    const afterNavigation = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token);
+    assert.deepEqual(afterNavigation.applications, [], "navigation_created_no_application");
+    assert.deepEqual(afterNavigation.browser_sessions, [], "navigation_created_no_run");
+    assert.deepEqual(afterNavigation.interventions, [], "navigation_created_no_intervention");
+    assert.deepEqual(afterNavigation.auto_submit_authorizations, [], "navigation_created_no_authorization");
+    passCase("effect_availability");
     await context.close();
   } finally { await browser.close(); liveBrowser = undefined; await new Promise((resolveClose) => proxy.close(resolveClose)); liveProxy = undefined; }
   stage = "cleanup"; await stopChildren();
-  result.passed = 1;
+  assert.equal(result.passed, result.tests, "all_cases_passed");
+  assert.ok(Number.isInteger(result.requests.jobs) && result.requests.jobs > 0, "jobs_request_count");
+  assert.ok(Number.isInteger(result.requests.account) && result.requests.account > 0, "account_request_count");
 }
 
 let totalTimer;
@@ -300,13 +417,13 @@ try {
   if (liveBrowser) await liveBrowser.close().catch(() => {});
   if (liveProxy) await new Promise((resolveClose) => liveProxy.close(resolveClose));
   try { stage = "cleanup"; await stopChildren(); } catch { result.failed.push("cleanup_failure"); }
-  process.stdout.write(`${JSON.stringify({ version: 1, passed: 0, stage: brokenStage, failure: code })}\n`);
+  process.stdout.write(`${JSON.stringify({ version: 2, passed: 0, stage: brokenStage, failure: code })}\n`);
 } finally {
   clearTimeout(totalTimer);
   if (result.failed.length === 0 && result.passed === result.tests && outputRoot) {
     const output = join(outputRoot, "browser-api-result.json");
     await writeFile(output, `${JSON.stringify(result)}\n`, { flag: "wx", mode: 0o600 }); await chmod(output, 0o600);
-    process.stdout.write(`${JSON.stringify({ version: 1, passed: result.passed, tests: result.tests })}\n`);
+    process.stdout.write(`${JSON.stringify({ version: 2, passed: result.passed, tests: result.tests })}\n`);
   }
 }
 if (result.failed.length) process.exitCode = 1;

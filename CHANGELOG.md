@@ -5,6 +5,9 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs: extend isolated browser/API/PostgreSQL qualification through six-step
+  onboarding, exact saved search policy, tenant isolation and disabled-effect
+  views; reject incomplete or ambiguous runtime reports in the normal test gate.
 - Jobs: keep deterministic Temporal workflow imports separate from browser,
   network and document activity code. Add a real SDK bundle regression and
   isolated workflow-service/browser-API qualification; no production actions enabled.

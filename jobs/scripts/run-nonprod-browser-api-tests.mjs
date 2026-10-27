@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertBrowserApiReport } from "./nonprod-browser-api-report.mjs";
 
 assert.equal(process.argv.length, 2);
 const root = realpathSync(process.env.BLUEY_TEST_RUN_ROOT || "/missing-owned-root");
@@ -43,9 +44,14 @@ function snapshot(path) {
     sourceHashes.set(path, createHash("sha256").update(readFileSync(path)).digest("hex"));
   }
 }
-for (const path of ["portal/src", "portal/index.html", "portal/package.json", "package-lock.json"]) {
+for (const path of ["portal/src", "portal/index.html", "portal/package.json", "package.json", "package-lock.json"]) {
   snapshot(join(jobs, path));
 }
+for (const path of [
+  "portal/nonprod/browser-api.integration.mjs",
+  "scripts/run-nonprod-browser-api-tests.mjs",
+  "scripts/nonprod-browser-api-report.mjs",
+]) snapshot(join(jobs, path));
 const artifacts = [];
 for (const name of ["bluey-jobs-api", "bluey-server"]) {
   const binary = join(process.env.CARGO_TARGET_DIR, "debug", name);
@@ -90,19 +96,13 @@ try {
   assert(!interrupted);
   assert.deepEqual(closed, { code: 0, signal: null });
   const path = join(root, "browser-api-result.json");
-  assert(lstatSync(path).isFile() && !lstatSync(path).isSymbolicLink());
-  assert(lstatSync(path).size < 64 * 1024);
+  const reportInfo = lstatSync(path);
+  assert(reportInfo.isFile() && !reportInfo.isSymbolicLink());
+  assert.equal(reportInfo.uid, process.getuid());
+  assert.equal(reportInfo.mode & 0o777, 0o600);
+  assert(reportInfo.size > 0 && reportInfo.size < 64 * 1024);
   const report = JSON.parse(readFileSync(path, "utf8"));
-  assert(report.tests > 0 && report.tests === report.passed);
-  assert.deepEqual(report.failed, []);
-  assert.equal(report.binaries.length, 2);
-  for (const binary of report.binaries) {
-    assert.equal(binary.code, 0);
-    assert.equal(binary.signal, null);
-    assert(Number.isSafeInteger(binary.pid) && binary.pid > 1);
-    assert.throws(() => process.kill(binary.pid, 0), (error) => error.code === "ESRCH");
-  }
-  assert(report.requests.jobs > 0 && report.requests.account > 0);
+  assertBrowserApiReport(report);
   for (const [path, digest] of sourceHashes) {
     assert.equal(createHash("sha256").update(readFileSync(path)).digest("hex"), digest,
       "portal source changed during browser qualification");
