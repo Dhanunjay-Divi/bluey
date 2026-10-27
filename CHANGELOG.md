@@ -5,6 +5,11 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs: keep deterministic Temporal workflow imports separate from browser,
+  network and document activity code. Add a real SDK bundle regression and
+  isolated workflow-service/browser-API qualification; no production actions enabled.
+- Jobs: recover omitted visibility chain identity only through exact-run Temporal
+  Describe, with bounded reads and unchanged conflicting-identity/absence fences.
 - Jobs: fix PostgreSQL boot-ready heartbeat sequence inference with explicit
   BIGINT bindings. Add disposable PostgreSQL 17/pgvector validation and real
   configured migration, concurrent startup, legacy readiness, boot lease/replay
