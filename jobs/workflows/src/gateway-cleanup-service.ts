@@ -171,8 +171,48 @@ export function createTemporalCleanupClient(client: WorkflowClient): TemporalCle
         pageSize,
         nextPageToken,
       });
+      const rows = response.executions ?? [];
+      if (!Array.isArray(rows) || rows.length > WORKFLOW_CLEANUP_PAGE_SIZE) {
+        throw new Error("Invalid Temporal visibility page");
+      }
+      const executions = rows.map(rawExecution);
+      const bindings = executions.map((visible) => {
+        if (visible.firstExecutionRunId === undefined || visible.firstExecutionRunId === null
+          || visible.firstExecutionRunId === "") {
+          const { workflowId, runId, workflowType } = visible;
+          if ((workflowType !== LEGACY_WORKFLOW_TYPE && workflowType !== WORKFLOW_TYPE_V2)
+            || !workflowIdForType(workflowId, workflowType) || !opaqueId(runId, 128)) {
+            throw new Error("Invalid Temporal visibility execution identity");
+          }
+          return { workflowId, runId, workflowType } as const;
+        }
+        return undefined;
+      });
+      // Validate all missing-root lookup identities before extra RPCs. Hydrate in ordered batches
+      // within the caller's deadline context; a failed batch prevents later batches.
+      for (let offset = 0; offset < executions.length; offset += 8) {
+        await Promise.all(executions.slice(offset, offset + 8).map(async (visible, index) => {
+          const binding = bindings[offset + index];
+          if (!binding) return;
+          const { workflowId, runId, workflowType } = binding;
+          // Visibility can omit the chain root. Resolve only this exact observed run,
+          // never a caller-proposed root or an unbound current/latest execution.
+          const description = await client.workflowService.describeWorkflowExecution({
+            namespace,
+            execution: { workflowId, runId },
+          });
+          const exact = validateExecution(rawExecution(description.workflowExecutionInfo), workflowType,
+            { workflowId, runId });
+          if (!exact || exact.firstExecutionRunId === null) {
+            throw new Error("Temporal visibility execution root is unavailable");
+          }
+          visible.firstExecutionRunId = exact.firstExecutionRunId;
+        }));
+      }
+      // Keep visibility's original memo, status, and time. Existing nonempty roots
+      // remain untouched and must pass the service's exact identity checks.
       return {
-        executions: (response.executions ?? []).map(rawExecution),
+        executions,
         ...(response.nextPageToken && response.nextPageToken.length > 0
           ? { nextPageToken: response.nextPageToken }
           : {}),

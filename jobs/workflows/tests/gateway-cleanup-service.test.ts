@@ -1,10 +1,12 @@
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   WorkflowNotFoundError,
   type WorkflowClient,
 } from "@temporalio/client";
+import { temporal } from "@temporalio/proto";
 import {
   MANAGED_CLOUD_RELEASE_MEMO_KEY,
   managedCloudReleaseMemoBytes,
@@ -239,6 +241,43 @@ function execution(
 
 function notFound(runId?: string): WorkflowNotFoundError {
   return new WorkflowNotFoundError("private not-found detail", WORKFLOW_ID, runId);
+}
+
+type ProviderWorkflowInfo = temporal.api.workflow.v1.IWorkflowExecutionInfo;
+
+function providerInfo(override: Partial<ProviderWorkflowInfo> = {}): ProviderWorkflowInfo {
+  return {
+    execution: { workflowId: WORKFLOW_ID, runId: RUN_A },
+    firstRunId: RUN_A,
+    type: { name: "applicationWorkflowV2" },
+    status: 1,
+    startTime: { seconds: 1, nanos: 0 },
+    memo: { fields: rawMemo() as Record<string, temporal.api.common.v1.IPayload> },
+    ...override,
+  };
+}
+
+function providerAdapter(infos: ProviderWorkflowInfo[]) {
+  const Response = temporal.api.workflowservice.v1.ListWorkflowExecutionsResponse;
+  const page = Response.decode(Response.encode({ executions: infos }).finish());
+  const rawDescribe = vi.fn(async (_request: unknown) => ({ workflowExecutionInfo: providerInfo() }));
+  const rawList = vi.fn(async () => page);
+  const rawTerminate = vi.fn(async () => ({}));
+  const rawDelete = vi.fn(async () => ({}));
+  const rawHistory = vi.fn(async () => ({ history: { events: [] } }));
+  const workflowClient = {
+    options: { namespace: NAMESPACE },
+    workflowService: {
+      describeWorkflowExecution: rawDescribe,
+      listWorkflowExecutions: rawList,
+      terminateWorkflowExecution: rawTerminate,
+      deleteWorkflowExecution: rawDelete,
+      getWorkflowExecutionHistory: rawHistory,
+    },
+    withDeadline,
+  };
+  return { page, rawDescribe, rawList, rawTerminate, rawDelete, workflowClient,
+    adapter: createTemporalCleanupClient(workflowClient as unknown as WorkflowClient) };
 }
 
 beforeEach(() => {
@@ -1128,6 +1167,7 @@ describe("stateless Temporal cleanup protocol v3", () => {
       namespace: NAMESPACE,
       execution: { workflowId: WORKFLOW_ID, runId: RUN_A },
     });
+    expect(rawDescribe).toHaveBeenCalledTimes(1);
     expect(rawList).toHaveBeenCalledWith({
       namespace: NAMESPACE,
       query: "exact query",
@@ -1147,6 +1187,132 @@ describe("stateless Temporal cleanup protocol v3", () => {
       waitNewEvent: false,
       skipArchival: false,
     });
+  });
+
+  it.each(["applicationWorkflow", "applicationWorkflowV2"] as const)(
+    "hydrates omitted protobuf visibility roots for %s from the exact run inside the existing deadline",
+    async (workflowType) => {
+      const workflowId = workflowType === "applicationWorkflow" ? LEGACY_WORKFLOW_ID : WORKFLOW_ID;
+      const visible = providerInfo({ execution: { workflowId, runId: RUN_B }, firstRunId: undefined,
+        type: { name: workflowType } });
+      const fixture = providerAdapter([visible]);
+      expect(fixture.page.executions[0]?.firstRunId).toBe("");
+      expect(Object.hasOwn(fixture.page.executions[0]!, "firstRunId")).toBe(false);
+      const deadlineContext = new AsyncLocalStorage<number>();
+      fixture.workflowClient.withDeadline = vi.fn(async (deadline: number | Date, operation: () => Promise<unknown>) =>
+        deadlineContext.run(Number(deadline), operation));
+      fixture.rawDescribe.mockImplementationOnce(async (request) => {
+        expect(deadlineContext.getStore()).toBe(1_500);
+        expect(request).toEqual({ namespace: NAMESPACE, execution: { workflowId, runId: RUN_B } });
+        return { workflowExecutionInfo: providerInfo({ execution: { workflowId, runId: RUN_B },
+          type: { name: workflowType }, firstRunId: RUN_A, status: 2,
+          startTime: { seconds: 2, nanos: 0 }, memo: { fields: {} } }) };
+      });
+      const page = await fixture.adapter.withDeadline(1_500,
+        () => fixture.adapter.listPage("exact query", new Uint8Array(), 100));
+      const hydrated = page.executions[0]!;
+      expect(hydrated.firstExecutionRunId).toBe(RUN_A);
+      expect(hydrated.runId).toBe(RUN_B);
+      expect(hydrated.memoFields).toBe(fixture.page.executions[0]?.memo?.fields);
+      expect(hydrated.status).toBe(fixture.page.executions[0]?.status);
+      expect(hydrated.startTime).toBe(fixture.page.executions[0]?.startTime);
+      expect(fixture.rawDescribe).toHaveBeenCalledTimes(1);
+      expect(fixture.rawTerminate).not.toHaveBeenCalled();
+      expect(fixture.rawDelete).not.toHaveBeenCalled();
+    },
+  );
+
+  it("never overwrites a present foreign visibility root or reads Describe to repair it", async () => {
+    const fixture = providerAdapter([providerInfo({ firstRunId: RUN_C })]);
+    const page = await fixture.adapter.listPage("exact query", new Uint8Array(), 100);
+    expect(page.executions[0]?.firstExecutionRunId).toBe(RUN_C);
+    expect(fixture.rawDescribe).not.toHaveBeenCalled();
+    const result = await service({ client: fixture.adapter }).executeCleanup(v2Request());
+    expect(result.status).toBe(409);
+    expect(result.body).toMatchObject({ outcome: "identity_conflict" });
+    expect(fixture.rawDescribe).toHaveBeenCalledTimes(1); // Only the service's latest lookup.
+    expect(fixture.rawTerminate).not.toHaveBeenCalled();
+    expect(fixture.rawDelete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "foreign workflow", info: providerInfo({ execution: { workflowId: `${WORKFLOW_ID}-foreign`, runId: RUN_A } }) },
+    { label: "foreign run", info: providerInfo({ execution: { workflowId: WORKFLOW_ID, runId: RUN_B } }) },
+    { label: "foreign type", info: providerInfo({ type: { name: "applicationWorkflow" } }) },
+    { label: "absent root", info: providerInfo({ firstRunId: undefined }) },
+    { label: "empty root", info: providerInfo({ firstRunId: "" }) },
+    { label: "invalid root", info: providerInfo({ firstRunId: "short" }) },
+  ])("rejects visibility hydration from a Describe with $label", async ({ info }) => {
+    const fixture = providerAdapter([providerInfo({ firstRunId: undefined })]);
+    fixture.rawDescribe.mockResolvedValueOnce({ workflowExecutionInfo: info });
+    await expect(fixture.adapter.listPage("exact query", new Uint8Array(), 100)).rejects.toThrow();
+    expect(fixture.rawDescribe).toHaveBeenCalledWith({ namespace: NAMESPACE,
+      execution: { workflowId: WORKFLOW_ID, runId: RUN_A } });
+    expect(fixture.rawTerminate).not.toHaveBeenCalled();
+    expect(fixture.rawDelete).not.toHaveBeenCalled();
+  });
+
+  it("treats a stale visibility run's missing Describe as unavailable, never absence or mutation", async () => {
+    const fixture = providerAdapter([providerInfo({ firstRunId: undefined,
+      execution: { workflowId: WORKFLOW_ID, runId: RUN_B } })]);
+    fixture.rawDescribe.mockResolvedValueOnce({ workflowExecutionInfo: providerInfo() })
+      .mockRejectedValueOnce(notFound(RUN_B));
+    const result = await service({ client: fixture.adapter }).executeCleanup(v2Request());
+    expect(result.status).toBe(202);
+    expect(result.body).toMatchObject({ outcome: "pending", reason: "temporal_unavailable" });
+    expect(fixture.rawDescribe).toHaveBeenNthCalledWith(2, { namespace: NAMESPACE,
+      execution: { workflowId: WORKFLOW_ID, runId: RUN_B } });
+    expect(fixture.rawTerminate).not.toHaveBeenCalled();
+    expect(fixture.rawDelete).not.toHaveBeenCalled();
+  });
+
+  it("bounds visibility size and validates every omitted-root row before any hydration RPC", async () => {
+    const oversized = providerAdapter(Array.from({ length: WORKFLOW_CLEANUP_PAGE_SIZE + 1 },
+      () => providerInfo({ firstRunId: undefined })));
+    await expect(oversized.adapter.listPage("query", new Uint8Array(), 100)).rejects.toThrow();
+    expect(oversized.rawDescribe).not.toHaveBeenCalled();
+    const malformed = providerAdapter([providerInfo({ firstRunId: undefined }),
+      providerInfo({ firstRunId: undefined, execution: { workflowId: "invalid", runId: RUN_A } })]);
+    await expect(malformed.adapter.listPage("query", new Uint8Array(), 100)).rejects.toThrow();
+    expect(malformed.rawDescribe).not.toHaveBeenCalled();
+  });
+
+  it("hydrates at most eight exact runs concurrently and preserves page order", async () => {
+    const runIds = Array.from({ length: 9 }, (_, index) => `temporal-run-${String(index).padStart(32, "0")}`);
+    const fixture = providerAdapter(runIds.map((runId) => providerInfo({ firstRunId: undefined,
+      execution: { workflowId: WORKFLOW_ID, runId } })));
+    let releaseBatch!: () => void;
+    const batchGate = new Promise<void>((resolve) => { releaseBatch = resolve; });
+    let firstBatchReady!: () => void;
+    const eightStarted = new Promise<void>((resolve) => { firstBatchReady = resolve; });
+    let active = 0;
+    let maximum = 0;
+    fixture.rawDescribe.mockImplementation(async (request) => {
+      const { execution: requested } = request as { execution: { workflowId: string; runId: string } };
+      active += 1;
+      maximum = Math.max(maximum, active);
+      if (fixture.rawDescribe.mock.calls.length === 8) firstBatchReady();
+      if (requested.runId !== runIds[8]) await batchGate;
+      active -= 1;
+      return { workflowExecutionInfo: providerInfo({ execution: requested, firstRunId: RUN_A }) };
+    });
+    const pending = fixture.adapter.listPage("query", new Uint8Array(), 100);
+    await eightStarted;
+    expect(fixture.rawDescribe).toHaveBeenCalledTimes(8);
+    releaseBatch();
+    const page = await pending;
+    expect(maximum).toBe(8);
+    expect(page.executions.map((row) => row.runId)).toEqual(runIds);
+    expect(page.executions.every((row) => row.firstExecutionRunId === RUN_A)).toBe(true);
+  });
+
+  it("does not schedule another hydration batch after an exact-run lookup fails", async () => {
+    const fixture = providerAdapter(Array.from({ length: 9 }, () => providerInfo({ firstRunId: undefined })));
+    fixture.rawDescribe.mockRejectedValueOnce(new Error("private Describe outage"));
+    await expect(fixture.adapter.listPage("query", new Uint8Array(), 100)).rejects.toThrow();
+    expect(fixture.rawDescribe).toHaveBeenCalledTimes(8);
+    expect(fixture.rawTerminate).not.toHaveBeenCalled();
+    expect(fixture.rawDelete).not.toHaveBeenCalled();
   });
 
   it("contains no cleanup logger, process cache, or high-level payload-decoding handle", () => {
