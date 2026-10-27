@@ -791,7 +791,6 @@ pub(crate) fn record_source_verifier_boot_startup(
                 &request.worker_id,
                 &request.session_token,
             )?;
-            require_source_verifier_boot_head_sqlite(&tx, request)?;
             let now = managed_cloud_db_now_sqlite(&tx)?;
             let existing = tx
                 .query_row(
@@ -842,6 +841,10 @@ pub(crate) fn record_source_verifier_boot_startup(
                     replayed: true,
                 });
             }
+            // Stored responses are immutable read-only results, not fresh execution
+            // authority. A replacement boot must fence new work, not erase an
+            // authenticated exact retry of a previously committed result.
+            require_source_verifier_boot_head_sqlite(&tx, request)?;
             let probe_result = probe_source_verifier_boot_sqlite(&mut tx, &instance, request, now)?;
             let probe_result = probe_result.as_str();
             let (canonical_response_base64url, response_sha256, authority_sha256) =
@@ -908,7 +911,6 @@ pub(crate) fn record_source_verifier_boot_startup(
                 &request.worker_id,
                 &request.session_token,
             )?;
-            require_source_verifier_boot_head_postgres(&mut tx, request)?;
             let now = managed_cloud_db_now_postgres(&mut tx)?;
             let existing = tx.query_opt(
                 "SELECT request_sha256, boot_generation, degraded_heartbeat_sequence,
@@ -937,6 +939,7 @@ pub(crate) fn record_source_verifier_boot_startup(
                 tx.commit()?;
                 return Ok(startup);
             }
+            require_source_verifier_boot_head_postgres(&mut tx, request)?;
             let probe_result =
                 probe_source_verifier_boot_postgres(&mut tx, &instance, request, now)?;
             let probe_result = probe_result.as_str();
@@ -1000,8 +1003,24 @@ pub(crate) fn record_source_verifier_boot_startup(
 mod source_verifier_boot_tests {
     use super::*;
 
+    fn snapshot(pool: &DbPool, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let connection = pool.get().expect("snapshot connection");
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
+            .expect("snapshot prepared fixture table");
+        let rows = statement
+            .query_map([], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|column| row.get(column))
+                    .collect()
+            })
+            .expect("snapshot rows");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("snapshot values")
+    }
+
     #[test]
-    fn source_verifier_boot_migration_replay_preserves_ready_authority_and_manifest_bytes() {
+    fn source_verifier_boot_migration_failure_and_replay_preserve_ready_authority_and_manifest_bytes() {
         let fixture = original_source_verifier_startup_test_fixture();
         let registration = register_source_verifier_boot(
             &fixture.pool,
@@ -1026,24 +1045,10 @@ mod source_verifier_boot_tests {
         );
         let ready = record_source_verifier_boot_startup(&fixture.pool, &request)
             .expect("establish ready authority before migration replay");
-        fn snapshot(pool: &DbPool, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
-            let connection = pool.get().expect("snapshot connection");
-            let mut statement = connection
-                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2"))
-                .expect("snapshot prepared fixture table");
-            let rows = statement
-                .query_map([], |row| {
-                    (0..row.as_ref().column_count())
-                        .map(|column| row.get(column))
-                        .collect()
-                })
-                .expect("snapshot rows");
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .expect("snapshot values")
-        }
         let tables = [
             "jobs_managed_cloud_manifests",
             "jobs_managed_cloud_manifest_components",
+            "jobs_managed_cloud_source_verifier_boot_generation_heads",
             "jobs_managed_cloud_source_verifier_boot_registrations",
             "jobs_managed_cloud_source_verifier_boot_startup_authorities",
             "jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
@@ -1053,6 +1058,36 @@ mod source_verifier_boot_tests {
             .iter()
             .map(|table| snapshot(&fixture.pool, table))
             .collect();
+        let schema_before = snapshot(&fixture.pool, "sqlite_master");
+        for (migration, version) in [
+            (crate::db::SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY, "063"),
+            (crate::db::SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE, "064"),
+            (crate::db::SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS, "065"),
+        ] {
+            assert_eq!(migration.matches("COMMIT;").count(), 1);
+            let interrupted = migration.replacen(
+                "COMMIT;",
+                "SELECT * FROM phase628_forced_missing_relation; COMMIT;",
+                1,
+            );
+            let mut connection = fixture.pool.get().expect("failure injection connection");
+            crate::db::execute_sqlite_source_verifier_boot_migration(
+                &mut connection,
+                &interrupted,
+                version,
+            )
+            .expect_err("real migration must propagate the injected pre-commit failure");
+            assert!(connection.is_autocommit());
+            let enabled: bool = connection
+                .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                .expect("foreign-key mode after failed real migration");
+            assert!(enabled);
+            drop(connection);
+            assert_eq!(schema_before, snapshot(&fixture.pool, "sqlite_master"));
+            for (index, table) in tables.iter().enumerate() {
+                assert_eq!(before[index], snapshot(&fixture.pool, table), "failure changed {table}");
+            }
+        }
         for _ in 0..2 {
             crate::db::run_migrations(&fixture.pool).expect("replay full SQLite migration chain");
             for (index, table) in tables.iter().enumerate() {
@@ -1481,6 +1516,81 @@ mod source_verifier_boot_tests {
             Some(registration.boot_generation),
             "duplicate ready reporting must be a no-op"
         );
+    }
+
+    #[test]
+    fn startup_retry_after_replacement_boot_is_read_only_and_keeps_old_work_fenced() {
+        let fixture = original_source_verifier_startup_test_fixture();
+        let first = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-retry-old-00000001",
+                "boot-retry-old-000001",
+            ),
+        )
+        .expect("register first tested boot");
+        publish_boot_degraded(
+            &fixture.pool,
+            &fixture.request,
+            &first.boot_id,
+            first.boot_generation,
+        );
+        let request = db_startup(
+            &fixture.request,
+            "startup-retry-old-000001",
+            &first.boot_id,
+            first.boot_generation,
+        );
+        let committed = record_source_verifier_boot_startup(&fixture.pool, &request)
+            .expect("commit first boot readiness");
+        let old_binding = boot_binding(&fixture.pool, &request);
+        let replacement = register_source_verifier_boot(
+            &fixture.pool,
+            &db_registration(
+                &fixture.request,
+                "reg-retry-new-00000001",
+                "boot-retry-new-000001",
+            ),
+        )
+        .expect("register replacement boot");
+        assert_eq!(replacement.boot_generation, first.boot_generation + 1);
+        assert!(lease_original_source_verification(&fixture.pool, &old_binding).is_err());
+
+        let tables = [
+            "jobs_managed_cloud_source_verifier_boot_generation_heads",
+            "jobs_managed_cloud_source_verifier_boot_registrations",
+            "jobs_managed_cloud_source_verifier_boot_startup_authorities",
+            "jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+            "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+        ];
+        let before: Vec<_> = tables
+            .iter()
+            .map(|table| snapshot(&fixture.pool, table))
+            .collect();
+        let replay = record_source_verifier_boot_startup(&fixture.pool, &request)
+            .expect("an authenticated exact retry must survive a replacement boot");
+        assert!(replay.replayed);
+        assert_eq!(committed.canonical_response_base64url, replay.canonical_response_base64url);
+        assert_eq!(committed.response_sha256, replay.response_sha256);
+        assert_eq!(committed.startup_at_ms, replay.startup_at_ms);
+
+        let mut changed = request.clone();
+        changed.degraded_heartbeat_sequence += 1;
+        assert!(record_source_verifier_boot_startup(&fixture.pool, &changed)
+            .expect_err("a changed payload must not replay")
+            .to_string()
+            .contains("request id conflicts"));
+        let mut fresh = request.clone();
+        fresh.startup_request_id = "startup-retry-stale-000001".to_string();
+        assert!(record_source_verifier_boot_startup(&fixture.pool, &fresh).is_err());
+        let mut unauthenticated = request.clone();
+        unauthenticated.session_token = "invalid-runtime-session".to_string();
+        assert!(record_source_verifier_boot_startup(&fixture.pool, &unauthenticated).is_err());
+        assert!(lease_original_source_verification(&fixture.pool, &old_binding).is_err());
+        for (index, table) in tables.iter().enumerate() {
+            assert_eq!(before[index], snapshot(&fixture.pool, table), "retry changed {table}");
+        }
     }
 
     /// Required case: same startup token with a changed payload conflicts.

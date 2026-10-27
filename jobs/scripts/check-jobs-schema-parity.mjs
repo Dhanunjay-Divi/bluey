@@ -1225,6 +1225,582 @@ function extractPostgresTrigger(sql, triggerName) {
   );
 }
 
+function extractLastPostgresTrigger(sql, triggerName) {
+  const matches = [
+    ...sql.matchAll(
+      new RegExp(`CREATE\\s+TRIGGER\\s+${triggerName}\\b[\\s\\S]*?;`, "gi"),
+    ),
+  ];
+  return matches.length === 0 ? null : normalizeSql(matches.at(-1)[0]);
+}
+
+function extractLastSqliteTrigger(sql, triggerName) {
+  const matches = [
+    ...sql.matchAll(
+      new RegExp(
+        `CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${triggerName}\\b[\\s\\S]*?\\bEND\\s*;`,
+        "gi",
+      ),
+    ),
+  ];
+  return matches.length === 0 ? null : normalizeSql(matches.at(-1)[0]);
+}
+
+function extractLastPostgresFunctionBlock(sql, functionName) {
+  const matches = [
+    ...sql.matchAll(
+      new RegExp(
+        `CREATE\\s+OR\\s+REPLACE\\s+FUNCTION\\s+${functionName}\\s*\\([^)]*\\)` +
+          `\\s*RETURNS\\s+trigger(?:\\s+LANGUAGE\\s+plpgsql)?\\s+AS\\s+` +
+          `(\\$(?:[A-Za-z_][A-Za-z0-9_]*)?\\$)[\\s\\S]*?\\1` +
+          `(?:\\s+LANGUAGE\\s+plpgsql)?\\s*;`,
+        "gi",
+      ),
+    ),
+  ];
+  return matches.length === 0 ? null : normalizeSql(matches.at(-1)[0]);
+}
+
+function requirePhase628Fragments(
+  issues,
+  dialect,
+  objectName,
+  objectSource,
+  requirements,
+) {
+  if (!objectSource) {
+    issues.push(`${dialect} Phase 628 object ${objectName} must exist`);
+    return;
+  }
+  for (const [invariant, fragment] of requirements) {
+    if (!objectSource.includes(normalizeSql(fragment))) {
+      issues.push(
+        `${dialect} Phase 628 invariant ${invariant} is missing from ${objectName}`,
+      );
+    }
+  }
+}
+
+function requirePhase628FragmentCount(
+  issues,
+  dialect,
+  objectName,
+  objectSource,
+  invariant,
+  fragment,
+  expectedCount,
+) {
+  if (!objectSource) return;
+  const normalizedFragment = normalizeSql(fragment);
+  const count = objectSource.split(normalizedFragment).length - 1;
+  if (count !== expectedCount) {
+    issues.push(
+      `${dialect} Phase 628 invariant ${invariant} is missing from ${objectName}: ` +
+        `expected ${expectedCount}, found ${count}`,
+    );
+  }
+}
+
+const PHASE_628_ATTEMPT_IDENTITY_REQUIREMENTS = [
+  ["attempt identity attempt id", "attempt.attempt_id=NEW.attempt_id"],
+  [
+    "attempt identity runtime instance",
+    "attempt.runtime_instance_id=NEW.runtime_instance_id",
+  ],
+  [
+    "attempt identity runtime epoch",
+    "attempt.runtime_instance_epoch=NEW.runtime_instance_epoch",
+  ],
+  ["attempt identity worker", "attempt.worker_id=registration.worker_id"],
+  ["attempt identity boot id", "registration.boot_id=NEW.boot_id"],
+  [
+    "attempt identity registration runtime",
+    "registration.runtime_instance_id=NEW.runtime_instance_id",
+  ],
+  [
+    "attempt identity registration epoch",
+    "registration.instance_epoch=NEW.runtime_instance_epoch",
+  ],
+  [
+    "attempt identity boot generation",
+    "registration.boot_generation=NEW.boot_generation",
+  ],
+  [
+    "attempt binding current generation",
+    "head.current_boot_generation=NEW.boot_generation",
+  ],
+  [
+    "attempt binding ready generation",
+    "head.ready_boot_generation=NEW.boot_generation",
+  ],
+];
+
+const PHASE_628_STARTUP_REQUIREMENTS = [
+  ["startup heartbeat runtime", "heartbeat.runtime_instance_id=NEW.runtime_instance_id"],
+  ["startup heartbeat epoch", "heartbeat.instance_epoch=NEW.instance_epoch"],
+  [
+    "startup heartbeat sequence",
+    "heartbeat.heartbeat_sequence=NEW.degraded_heartbeat_sequence",
+  ],
+  ["startup requires degraded", "heartbeat.health_state='degraded'"],
+  ["startup rejects probe-failed substitute", "heartbeat.reason_code='startup'"],
+  ["startup boot id", "binding.boot_id=NEW.boot_id"],
+  ["startup boot generation", "binding.boot_generation=NEW.boot_generation"],
+  [
+    "startup current generation",
+    "head.current_boot_generation=NEW.boot_generation",
+  ],
+];
+
+const PHASE_628_V1_READINESS_REQUIREMENTS = [
+  [
+    "v1 readiness excludes boot manifests",
+    "NOT EXISTS (SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols boot " +
+      "WHERE boot.manifest_sha256 = NEW.manifest_sha256 " +
+      "AND boot.protocol_id = 'source_verifier_boot' " +
+      "AND boot.protocol_version = 1 AND boot.ordinal = 11)",
+  ],
+  [
+    "v1 readiness keeps startup protocol binding",
+    "FROM jobs_managed_cloud_manifest_source_verifier_startup_protocols protocol " +
+      "WHERE protocol.manifest_sha256 = NEW.manifest_sha256 " +
+      "AND protocol.protocol_id = 'source_verifier_startup' " +
+      "AND protocol.protocol_version = 1 AND protocol.ordinal = 10",
+  ],
+  [
+    "v1 readiness keeps historical authority",
+    "FROM jobs_managed_cloud_original_source_verifier_startup_authorities startup",
+  ],
+  [
+    "v1 readiness keeps degraded predecessor",
+    "startup.degraded_heartbeat_sequence = OLD.heartbeat_sequence",
+  ],
+  [
+    "v1 readiness keeps ready successor",
+    "startup.ready_heartbeat_sequence = NEW.heartbeat_sequence",
+  ],
+];
+
+function phase628SqliteRequirements(issues, sql) {
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_managed_source_verifier_boot_head_monotonic",
+    extractSqliteTrigger(
+      sql,
+      "trg_jobs_managed_source_verifier_boot_head_monotonic",
+    ),
+    [
+      [
+        "ready generation non-regression",
+        "OLD.ready_boot_generation IS NOT NULL AND " +
+          "(NEW.ready_boot_generation IS NULL OR " +
+          "NEW.ready_boot_generation < OLD.ready_boot_generation)",
+      ],
+      [
+        "ready generation non-regression rejection",
+        "SELECT RAISE(ABORT, 'source-verifier boot generation head is monotonic')",
+      ],
+    ],
+  );
+  const attemptTable = extractTable(
+    sql,
+    "jobs_original_source_verification_attempt_boot_bindings",
+  );
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "jobs_original_source_verification_attempt_boot_bindings",
+    attemptTable ? normalizeSql(attemptTable.join(", ")) : null,
+    [
+      [
+        "attempt binding parent cascade",
+        "FOREIGN KEY(attempt_id) REFERENCES jobs_original_source_verification_attempts(attempt_id) ON DELETE CASCADE",
+      ],
+      [
+        "attempt binding boot restrict",
+        "FOREIGN KEY(boot_id) REFERENCES " +
+          "jobs_managed_cloud_source_verifier_boot_registrations(boot_id) ON DELETE RESTRICT",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_osv_attempt_boot_binding_immutable",
+    extractSqliteTrigger(sql, "trg_jobs_osv_attempt_boot_binding_immutable"),
+    [
+      [
+        "attempt binding update immutability",
+        "BEFORE UPDATE ON jobs_original_source_verification_attempt_boot_bindings",
+      ],
+      [
+        "attempt binding update rejection",
+        "SELECT RAISE(ABORT, 'source-verifier attempt boot binding is immutable')",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_osv_attempt_boot_binding_delete",
+    extractSqliteTrigger(sql, "trg_jobs_osv_attempt_boot_binding_delete"),
+    [
+      [
+        "attempt binding direct delete rejection",
+        "BEFORE DELETE ON jobs_original_source_verification_attempt_boot_bindings",
+      ],
+      [
+        "attempt binding parent-aware delete",
+        "WHERE attempt.attempt_id=OLD.attempt_id",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_osv_attempt_boot_binding_current",
+    extractSqliteTrigger(sql, "trg_jobs_osv_attempt_boot_binding_current"),
+    PHASE_628_ATTEMPT_IDENTITY_REQUIREMENTS,
+  );
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_osv_boot_binding_current",
+    extractSqliteTrigger(sql, "trg_jobs_osv_boot_binding_current"),
+    [
+      ["heartbeat binding boot id", "r.boot_id=NEW.boot_id"],
+      [
+        "heartbeat binding runtime instance",
+        "r.runtime_instance_id=NEW.runtime_instance_id",
+      ],
+      ["heartbeat binding epoch", "r.instance_epoch=NEW.instance_epoch"],
+      [
+        "heartbeat binding boot generation",
+        "r.boot_generation=NEW.boot_generation",
+      ],
+      [
+        "heartbeat binding current generation",
+        "h.current_boot_generation=NEW.boot_generation",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_osv_boot_binding_immutable",
+    extractSqliteTrigger(sql, "trg_jobs_osv_boot_binding_immutable"),
+    [
+      [
+        "heartbeat binding update immutability",
+        "BEFORE UPDATE ON jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+      ],
+      [
+        "heartbeat binding update rejection",
+        "SELECT RAISE(ABORT,'source-verifier heartbeat boot binding is immutable')",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_osv_boot_binding_permanent",
+    extractSqliteTrigger(sql, "trg_jobs_osv_boot_binding_permanent"),
+    [
+      [
+        "heartbeat binding delete immutability",
+        "BEFORE DELETE ON jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+      ],
+      [
+        "heartbeat binding delete rejection",
+        "SELECT RAISE(ABORT,'source-verifier heartbeat boot binding is permanent')",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_osv_boot_startup_requires_degraded",
+    extractSqliteTrigger(sql, "trg_jobs_osv_boot_startup_requires_degraded"),
+    PHASE_628_STARTUP_REQUIREMENTS,
+  );
+  for (const triggerName of [
+    "trg_jobs_osv_boot_heartbeat_transition",
+    "trg_jobs_osv_boot_heartbeat_transition_update",
+  ]) {
+    requirePhase628Fragments(
+      issues,
+      "SQLite",
+      triggerName,
+      extractSqliteTrigger(sql, triggerName),
+      [
+        [
+          "ready heartbeat startup sequence",
+          "s.ready_heartbeat_sequence<=NEW.heartbeat_sequence",
+        ],
+        [
+          "ready heartbeat generation",
+          "h.ready_boot_generation=b.boot_generation",
+        ],
+      ],
+    );
+  }
+  requirePhase628Fragments(
+    issues,
+    "SQLite",
+    "trg_jobs_managed_cloud_original_source_verifier_runtime_heartbeats_fenced_update",
+    extractLastSqliteTrigger(
+      sql,
+      "trg_jobs_managed_cloud_original_source_verifier_runtime_heartbeats_fenced_update",
+    ),
+    PHASE_628_V1_READINESS_REQUIREMENTS,
+  );
+}
+
+function phase628PostgresRequirements(issues, sql) {
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "jobs_managed_source_verifier_boot_head_monotonic",
+    extractLastPostgresFunctionBlock(
+      sql,
+      "jobs_managed_source_verifier_boot_head_monotonic",
+    ),
+    [
+      [
+        "ready generation non-regression",
+        "OLD.ready_boot_generation IS NOT NULL AND " +
+          "(NEW.ready_boot_generation IS NULL OR " +
+          "NEW.ready_boot_generation < OLD.ready_boot_generation)",
+      ],
+      [
+        "ready generation non-regression rejection",
+        "RAISE EXCEPTION 'source-verifier boot generation head is monotonic'",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "trg_jobs_managed_source_verifier_boot_head_monotonic",
+    extractPostgresTrigger(
+      sql,
+      "trg_jobs_managed_source_verifier_boot_head_monotonic",
+    ),
+    [
+      [
+        "ready generation trigger operation",
+        "BEFORE UPDATE ON jobs_managed_cloud_source_verifier_boot_generation_heads",
+      ],
+      [
+        "ready generation trigger function",
+        "EXECUTE FUNCTION jobs_managed_source_verifier_boot_head_monotonic()",
+      ],
+    ],
+  );
+  const attemptTable = extractTable(
+    sql,
+    "jobs_original_source_verification_attempt_boot_bindings",
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "jobs_original_source_verification_attempt_boot_bindings",
+    attemptTable ? normalizeSql(attemptTable.join(", ")) : null,
+    [
+      [
+        "attempt binding parent cascade",
+        "FOREIGN KEY(attempt_id) REFERENCES jobs_original_source_verification_attempts(attempt_id) ON DELETE CASCADE",
+      ],
+      [
+        "attempt binding boot restrict",
+        "FOREIGN KEY(boot_id) REFERENCES " +
+          "jobs_managed_cloud_source_verifier_boot_registrations(boot_id) ON DELETE RESTRICT",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "jobs_osv_attempt_boot_binding_guard",
+    extractLastPostgresFunctionBlock(sql, "jobs_osv_attempt_boot_binding_guard"),
+    [
+      ["attempt binding delete branch", "IF TG_OP = 'DELETE'"],
+      [
+        "attempt binding parent-aware delete",
+        "WHERE attempt.attempt_id=OLD.attempt_id",
+      ],
+      ["attempt binding update immutability", "IF TG_OP <> 'INSERT'"],
+      [
+        "attempt binding update rejection",
+        "IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION " +
+          "'source-verifier attempt boot binding is immutable'",
+      ],
+      ...PHASE_628_ATTEMPT_IDENTITY_REQUIREMENTS,
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "trg_jobs_osv_attempt_boot_binding_guard",
+    extractPostgresTrigger(sql, "trg_jobs_osv_attempt_boot_binding_guard"),
+    [
+      [
+        "attempt binding trigger operations",
+        "BEFORE INSERT OR UPDATE OR DELETE ON jobs_original_source_verification_attempt_boot_bindings",
+      ],
+      [
+        "attempt binding trigger function",
+        "EXECUTE FUNCTION jobs_osv_attempt_boot_binding_guard()",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "jobs_osv_boot_binding_guard",
+    extractLastPostgresFunctionBlock(sql, "jobs_osv_boot_binding_guard"),
+    [
+      ["heartbeat binding immutability", "IF TG_OP <> 'INSERT'"],
+      [
+        "heartbeat binding immutability rejection",
+        "IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION " +
+          "'source-verifier heartbeat boot binding is immutable'",
+      ],
+      ["heartbeat binding boot id", "r.boot_id=NEW.boot_id"],
+      [
+        "heartbeat binding runtime instance",
+        "r.runtime_instance_id=NEW.runtime_instance_id",
+      ],
+      ["heartbeat binding epoch", "r.instance_epoch=NEW.instance_epoch"],
+      [
+        "heartbeat binding boot generation",
+        "r.boot_generation=NEW.boot_generation",
+      ],
+      [
+        "heartbeat binding current generation",
+        "h.current_boot_generation=NEW.boot_generation",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "trg_jobs_osv_boot_binding_insert",
+    extractPostgresTrigger(sql, "trg_jobs_osv_boot_binding_insert"),
+    [
+      [
+        "heartbeat binding trigger operations",
+        "BEFORE INSERT OR UPDATE OR DELETE ON " +
+          "jobs_managed_cloud_source_verifier_heartbeat_boot_bindings",
+      ],
+      [
+        "heartbeat binding trigger function",
+        "EXECUTE FUNCTION jobs_osv_boot_binding_guard()",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "jobs_osv_boot_startup_requires_degraded",
+    extractLastPostgresFunctionBlock(
+      sql,
+      "jobs_osv_boot_startup_requires_degraded",
+    ),
+    PHASE_628_STARTUP_REQUIREMENTS,
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "trg_jobs_osv_boot_startup_requires_degraded",
+    extractPostgresTrigger(sql, "trg_jobs_osv_boot_startup_requires_degraded"),
+    [
+      [
+        "startup trigger operation",
+        "BEFORE INSERT ON jobs_managed_cloud_source_verifier_boot_startup_authorities",
+      ],
+      [
+        "startup trigger function",
+        "EXECUTE FUNCTION jobs_osv_boot_startup_requires_degraded()",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "jobs_osv_boot_heartbeat_guard",
+    extractLastPostgresFunctionBlock(sql, "jobs_osv_boot_heartbeat_guard"),
+    [
+      [
+        "heartbeat requires current generation",
+        "h.current_boot_generation=b.boot_generation",
+      ],
+      [
+        "ready heartbeat startup sequence",
+        "s.ready_heartbeat_sequence<=NEW.heartbeat_sequence",
+      ],
+      [
+        "ready heartbeat generation",
+        "h.ready_boot_generation=b.boot_generation",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "trg_jobs_osv_boot_heartbeat",
+    extractPostgresTrigger(sql, "trg_jobs_osv_boot_heartbeat"),
+    [
+      [
+        "heartbeat authority trigger operations",
+        "BEFORE INSERT OR UPDATE ON " +
+          "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+      ],
+      [
+        "heartbeat authority trigger function",
+        "EXECUTE FUNCTION jobs_osv_boot_heartbeat_guard()",
+      ],
+    ],
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "bluey_jobs_guard_osv_heartbeat_sequence",
+    extractLastPostgresFunctionBlock(sql, "bluey_jobs_guard_osv_heartbeat_sequence"),
+    PHASE_628_V1_READINESS_REQUIREMENTS,
+  );
+  requirePhase628FragmentCount(
+    issues,
+    "Postgres",
+    "bluey_jobs_guard_osv_heartbeat_sequence",
+    extractLastPostgresFunctionBlock(sql, "bluey_jobs_guard_osv_heartbeat_sequence"),
+    "v1 readiness excludes boot manifests exactly twice",
+    PHASE_628_V1_READINESS_REQUIREMENTS[0][1],
+    2,
+  );
+  requirePhase628Fragments(
+    issues,
+    "Postgres",
+    "trg_jobs_managed_cloud_original_source_verifier_runtime_heartbeats_sequence",
+    extractLastPostgresTrigger(
+      sql,
+      "trg_jobs_managed_cloud_original_source_verifier_runtime_heartbeats_sequence",
+    ),
+    [
+      [
+        "v1 readiness trigger operations",
+        "BEFORE INSERT OR UPDATE ON " +
+          "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+      ],
+      [
+        "v1 readiness trigger function",
+        "EXECUTE FUNCTION bluey_jobs_guard_osv_heartbeat_sequence()",
+      ],
+    ],
+  );
+}
+
 function requireOperationalHoldFragments(
   issues,
   dialect,
@@ -3183,6 +3759,8 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
   phase613PostgresRequirements(issues, postgresSource);
   phase614BSqliteRequirements(issues, sqliteSource);
   phase614BPostgresRequirements(issues, postgresSource);
+  phase628SqliteRequirements(issues, sqliteSource);
+  phase628PostgresRequirements(issues, postgresSource);
 
   return issues;
 }

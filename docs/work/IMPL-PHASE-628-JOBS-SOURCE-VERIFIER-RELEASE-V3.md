@@ -1,6 +1,6 @@
 # IMPL — Phase 628 Jobs Source-Verifier Release V3
 
-Updated: 2026-10-26. Jobs-only local candidate; independent review unapproved.
+Updated: 2026-10-27. Jobs-only local candidate; canonical release REVIEW unapproved.
 Continuation starts at `529f49d6687372caee94e6e01e6a8b64f0698c5b`, preserving
 the original uncommitted Phase 628 changes and earlier Kiro commits.
 
@@ -46,7 +46,91 @@ the original uncommitted Phase 628 changes and earlier Kiro commits.
 | Fixture repairs | Real preference mutation, additive ATS corruption, exact general-channel query budget, migration prerequisites, repaired membership count and fresh authenticated positive-fixture liveness; see FIX-790 |
 | Documentation | Round, FIX-789, operations and changelog updated; independent REVIEW not self-approved |
 
-## Observed verification ledger
+## October 27 independent-review continuation
+
+The October 26 implementation/handoff commits remain local historical evidence.
+Independent actual-diff review found two protocol/migration P2s, a contradictory
+active operations runbook, and missing SQL/retry mutation coverage. Corrections
+remain within Phase 628 (FIX-791 through FIX-794); no new roadmap batch or
+external authority is introduced.
+
+- Authenticated exact committed startup replay now precedes the current boot-head
+  fence, while fresh publication and all operational work remain fenced.
+- All transaction-owning SQLite boot scripts 063-065 use guarded rollback and
+  prior-FK-mode restoration; committed script bytes are unchanged.
+- Real populated failure injection covers each boot migration before its sole
+  COMMIT; response replay after replacement snapshots authority tables and rejects
+  stale new work, changed payloads and invalid session proof.
+- The current runbook names one boot startup procedure. Retry tests verify each
+  delivery's fresh nonce and recomputed valid HMAC over identical request bytes.
+- SQL mutation guards now cover paired authority predicates, not only table shape.
+
+Observed after correction: targeted automation runtime/auth tests PASS 15/15;
+release-contract tests PASS 32/32; Rust boot/auth filter PASS 24/24 in 27.31 s,
+including both new backend regressions; broader SQLite migration filter PASS
+23/23 in 24.49 s. These filters overlap and are not 47 distinct tests.
+Rust formatting and diff checks PASS.
+Independent protocol static re-review found no remaining source blocker.
+Strict all-target Clippy PASS (both test-support features, warnings denied).
+The full all-target server command PASS, exit 0: 1,697 library + 1 binary unit +
+134 integration tests = 1,832 passed / 0 failed. Library time 2,722.01 s;
+HTTP integration 113/113 in 545.73 s. Both test-support features were enabled.
+The exact launcher-owned root
+`/private/tmp/bluey-test-runs-phase628-reviewed-20261027/run.1793079552.48662.4743250230`
+was verified absent after exit, and its parent directory was empty. Both changed
+Rust source SHA-256 values matched the pre-run values after cleanup.
+Independent client/guard re-review ACCEPT with no scoped source blockers; its
+own reruns passed parity (113/91), CI self-test and targeted client 11/11.
+Staged privacy PASS (2,800 tracked paths / 2,524 text files). Final local
+packaging also requires restaging and the privacy/diff preflight. Launcher
+self-test PASS, including its
+intentional active-process cleanup-refusal cases. The independent protocol
+reviewer independently reran the two critical filters only after the parent
+harness exited and cleaned up: boot 24/24 in 26.09 s; SQLite migration 23/23 in
+24.41 s (overlapping filters). Its harness exited 0, preserved both source hashes
+and removed the exact owned root:
+`/private/tmp/bluey-test-runs-phase628-independent-postfix-20261027/run.1793083219.99359.7835160200`.
+No concurrent heavy Cargo run was started. Both dated independent reports now
+accept their reviewed source scopes; neither approves external/runtime release.
+The 36 changed code/configuration files in the frozen continuation snapshot
+remained byte-identical through final verification. The local correction commit
+is identified in HANDOFF and `git log`; it must not be pushed by implication.
+
+Parent-observed automation typecheck PASS and corrected retry/auth tests PASS
+15/15. Schema parity PASS 113 tables / 91 indexes. A parent simplification of
+the PostgreSQL function extractor initially failed parity because the real
+scripts use both `$$ LANGUAGE plpgsql;` and `$fn$;` endings. It was corrected to
+match the actual same dollar delimiter and optional language position; parity
+then passed. Final CI self-test and independent re-review passed on
+that corrected extractor. This guard-parser iteration did not change SQL or
+the frozen Rust source under the full server harness.
+
+### Local sample-data portal preview (not backend acceptance)
+
+Built the unchanged portal with Vite into an isolated launcher-owned temporary
+directory (2,301 modules, 5.31 s); the existing 502.51 kB minified chunk warning
+remains. A temporary loopback-only static server at port 5187 serves the fixture
+with no API/auth proxy, CSP `connect-src 'none'` and `form-action 'none'`, and
+HTTP 405 for every write method. HEAD `/jobs/?preview=1` returned 200 with those
+headers; POST `/api/jobs/workspace` returned 405. No feature flag or product
+source changed to expose this preview.
+
+Browser observations confirmed Overview -> Matches -> job details ->
+Applications -> Overview, retaining `preview=1` and visible PREVIEW labeling.
+The sample job showed its review-only uncertified automation boundary. The
+browser tab was retained as a user-facing deliverable. Displayed account,
+balance, connections, source health, applications and interviews are fixture
+values, not live or verified customer activity. No real resume, account,
+application, message, OAuth or provider operation was exercised.
+
+Preview root:
+`/private/tmp/bluey-test-runs-phase628-preview-20261027/run.1793080112.57557.614714310`.
+It is intentionally active for the user's local test with a two-hour timeout;
+its owned cleanup must be checked at shutdown, not falsely reported complete
+while serving. This preview does not satisfy functional end-to-end or release
+gates and is not a substitute for functional backend/runtime acceptance.
+
+## October 26 observed verification ledger (prior committed candidate)
 
 All Rust build/test commands run through `scripts/run-bluey-tests.sh` with
 isolated Cargo target, SQLite/data/config/runtime/log/temp roots. Development
@@ -181,9 +265,12 @@ approval. The canonical independent REVIEW remains unapproved.
 
 ## Completion state
 
-Local implementation/available verification complete; staged privacy passed.
-See HANDOFF for the local commit ledger. This is not a release
-approval: PostgreSQL runtime, Linux Docker/native, hosted exact-tip CI and full
-independent review remain pending. No push, PR, merge, rebase, deploy, image
+The October 27 corrections passed parent-owned full server/Clippy, independent
+critical backend execution, and focused client/release/schema gates. Local
+correction packaging does not authorize a new roadmap or integration batch.
+See HANDOFF for the local commit ledger.
+This is not a release approval: PostgreSQL runtime, Linux Docker/native, hosted
+exact-tip CI and protected publication/rollout gates remain pending. No push,
+PR, merge, rebase, deploy, image
 publication, provider access, application or message. The meeting checkout,
 desktop overlay and all production flags/accounts remain untouched.

@@ -3086,6 +3086,123 @@ function assertPhase614BDriftRejected({
   );
 }
 
+function assertPhase628DriftRejected({
+  dialect,
+  invariant,
+  migrationFile,
+  original,
+  replacement,
+  sqlite,
+  postgres,
+}) {
+  const migrationPath = path.join(
+    repoRoot,
+    migrationFile ??
+      (dialect === "SQLite"
+        ? "infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql"
+        : "infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql"),
+  );
+  const migration = fs.readFileSync(migrationPath, "utf8");
+  const mutatedMigration = replaceFirstForGuardTest(
+    migration,
+    original,
+    replacement,
+    invariant,
+  );
+  const source = dialect === "SQLite" ? sqlite : postgres;
+  assert(
+    source.includes(migration),
+    `${dialect} guard fixture must contain the Phase 628 migration`,
+  );
+  const mutated = source.replace(migration, () => mutatedMigration);
+  const issues =
+    dialect === "SQLite"
+      ? compareJobsSchemas(mutated, postgres)
+      : compareJobsSchemas(sqlite, mutated);
+  assert(
+    issues.some((issue) =>
+      issue.includes(`${dialect} Phase 628 invariant ${invariant}`),
+    ),
+    `${dialect} ${invariant} drift must fail the Phase 628 semantic guard; ` +
+      `issues=${JSON.stringify(issues)}`,
+  );
+}
+
+function assertPhase628OperationsV3Contract(operationsSource) {
+  const heading =
+    "## Managed discovery and source-verifier release-v3 authority";
+  const nextHeading = "### Managed-cloud artifact publication and read-back";
+  const start = operationsSource.indexOf(heading);
+  const end = operationsSource.indexOf(nextHeading, start + heading.length);
+  assert(start >= 0 && end > start, "active release-v3 operations section must exist");
+  const activeV3 = operationsSource.slice(start, end).replace(/\s+/g, " ");
+  for (const [invariant, fragment] of [
+    [
+      "current migration heads",
+      "source-verifier boot authority is SQLite head `065` and PostgreSQL head `043`",
+    ],
+    [
+      "boot registration endpoint",
+      "/source-verifier-boot-registration",
+    ],
+    ["boot startup endpoint", "/source-verifier-boot-startup"],
+    [
+      "fresh retry authentication",
+      "worker-auth nonce and HMAC are fresh for each delivery",
+    ],
+    [
+      "no speculative probe-failed recovery",
+      "do not send a speculative `degraded/probe_failed` heartbeat",
+    ],
+  ]) {
+    assert(
+      activeV3.includes(fragment),
+      `active release-v3 operations must preserve ${invariant}`,
+    );
+  }
+  assert(
+    !activeV3.includes("/original-source-verifier-startup"),
+    "active release-v3 operations must not restore the legacy startup endpoint",
+  );
+}
+
+function testPhase628OperationsContractGuard() {
+  const operations = fs.readFileSync(
+    path.join(repoRoot, "jobs/OPERATIONS.md"),
+    "utf8",
+  );
+  assertPhase628OperationsV3Contract(operations);
+  for (const [invariant, original, replacement] of [
+    [
+      "obsolete migration heads",
+      "source-verifier boot authority is SQLite head `065` and PostgreSQL head `043`",
+      "source-verifier boot authority is SQLite head `062` and PostgreSQL head `040`",
+    ],
+    [
+      "legacy startup endpoint",
+      "/source-verifier-boot-startup",
+      "/original-source-verifier-startup",
+    ],
+    [
+      "speculative probe-failed recovery",
+      "do not\nsend a speculative `degraded/probe_failed` heartbeat",
+      "send a speculative `degraded/probe_failed` heartbeat",
+    ],
+  ]) {
+    const mutated = replaceFirstForGuardTest(
+      operations,
+      original,
+      replacement,
+      invariant,
+    );
+    assert.throws(
+      () => assertPhase628OperationsV3Contract(mutated),
+      /active release-v3 operations/,
+      `${invariant} must fail the active release-v3 documentation guard`,
+    );
+  }
+}
+
 function assertSourceVerifierStartupMigrationRegistration(migrationRunner) {
   assert.deepEqual(
     checkPhase628MigrationRegistration(migrationRunner),
@@ -3192,6 +3309,243 @@ function testSchemaParity() {
     ),
     "boot heartbeat binding foreign-key drift must fail schema parity",
   );
+
+  for (const mutation of [
+    {
+      dialect: "SQLite",
+      invariant: "ready generation non-regression",
+      migrationFile:
+        "infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql",
+      original:
+        "OR NEW.ready_boot_generation < OLD.ready_boot_generation))",
+      replacement:
+        "OR NEW.ready_boot_generation > OLD.ready_boot_generation))",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "ready generation non-regression rejection",
+      migrationFile:
+        "infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql",
+      original:
+        "SELECT RAISE(ABORT, 'source-verifier boot generation head is monotonic');",
+      replacement: "SELECT 1;",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "heartbeat binding current generation",
+      original: "AND h.current_boot_generation=NEW.boot_generation)",
+      replacement: "AND h.current_boot_generation<=NEW.boot_generation)",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt binding ready generation",
+      original: "AND head.ready_boot_generation=NEW.boot_generation",
+      replacement: "AND head.ready_boot_generation<=NEW.boot_generation",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "startup requires degraded",
+      original: "heartbeat.health_state='degraded'",
+      replacement: "heartbeat.health_state='ready'",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "startup rejects probe-failed substitute",
+      original: "heartbeat.reason_code='startup'",
+      replacement: "heartbeat.reason_code='probe_failed'",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt identity runtime instance",
+      original: "attempt.runtime_instance_id=NEW.runtime_instance_id",
+      replacement: "attempt.runtime_instance_id<>NEW.runtime_instance_id",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt identity runtime epoch",
+      original: "attempt.runtime_instance_epoch=NEW.runtime_instance_epoch",
+      replacement: "attempt.runtime_instance_epoch<>NEW.runtime_instance_epoch",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt identity worker",
+      original: "attempt.worker_id=registration.worker_id",
+      replacement: "attempt.worker_id<>registration.worker_id",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt identity boot id",
+      original: "registration.boot_id=NEW.boot_id",
+      replacement: "registration.boot_id<>NEW.boot_id",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt identity boot generation",
+      original: "registration.boot_generation=NEW.boot_generation",
+      replacement: "registration.boot_generation<=NEW.boot_generation",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt binding update rejection",
+      original:
+        "SELECT RAISE(ABORT, 'source-verifier attempt boot binding is immutable');",
+      replacement: "SELECT 1;",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt binding parent-aware delete",
+      original: "WHERE attempt.attempt_id=OLD.attempt_id",
+      replacement: "WHERE attempt.attempt_id=NEW.attempt_id",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "attempt binding parent cascade",
+      original:
+        "FOREIGN KEY(attempt_id) REFERENCES jobs_original_source_verification_attempts(attempt_id)\n" +
+        "    ON DELETE CASCADE",
+      replacement:
+        "FOREIGN KEY(attempt_id) REFERENCES jobs_original_source_verification_attempts(attempt_id)\n" +
+        "    ON DELETE RESTRICT",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "heartbeat binding update rejection",
+      original:
+        "SELECT RAISE(ABORT,'source-verifier heartbeat boot binding is immutable');",
+      replacement: "SELECT 1;",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "heartbeat binding delete rejection",
+      original:
+        "SELECT RAISE(ABORT,'source-verifier heartbeat boot binding is permanent');",
+      replacement: "SELECT 1;",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "v1 readiness excludes boot manifests",
+      original:
+        "AND NOT EXISTS (\n" +
+        "    SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols boot",
+      replacement:
+        "AND EXISTS (\n" +
+        "    SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols boot",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "ready generation non-regression",
+      migrationFile:
+        "infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql",
+      original:
+        "OR NEW.ready_boot_generation < OLD.ready_boot_generation)) THEN",
+      replacement:
+        "OR NEW.ready_boot_generation > OLD.ready_boot_generation)) THEN",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "ready generation non-regression rejection",
+      migrationFile:
+        "infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql",
+      original:
+        "RAISE EXCEPTION 'source-verifier boot generation head is monotonic';",
+      replacement: "NULL;",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "heartbeat binding current generation",
+      original: "AND h.current_boot_generation=NEW.boot_generation)",
+      replacement: "AND h.current_boot_generation<=NEW.boot_generation)",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt binding ready generation",
+      original: "AND head.ready_boot_generation=NEW.boot_generation",
+      replacement: "AND head.ready_boot_generation<=NEW.boot_generation",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "startup requires degraded",
+      original: "heartbeat.health_state='degraded'",
+      replacement: "heartbeat.health_state='ready'",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "startup rejects probe-failed substitute",
+      original: "heartbeat.reason_code='startup'",
+      replacement: "heartbeat.reason_code='probe_failed'",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt identity runtime instance",
+      original: "attempt.runtime_instance_id=NEW.runtime_instance_id",
+      replacement: "attempt.runtime_instance_id<>NEW.runtime_instance_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt identity runtime epoch",
+      original: "attempt.runtime_instance_epoch=NEW.runtime_instance_epoch",
+      replacement: "attempt.runtime_instance_epoch<>NEW.runtime_instance_epoch",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt identity worker",
+      original: "attempt.worker_id=registration.worker_id",
+      replacement: "attempt.worker_id<>registration.worker_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt identity boot id",
+      original: "registration.boot_id=NEW.boot_id",
+      replacement: "registration.boot_id<>NEW.boot_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt identity boot generation",
+      original: "registration.boot_generation=NEW.boot_generation",
+      replacement: "registration.boot_generation<=NEW.boot_generation",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt binding update rejection",
+      original:
+        "IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'source-verifier attempt boot binding is immutable'",
+      replacement:
+        "IF TG_OP <> 'INSERT' THEN NULL",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt binding parent-aware delete",
+      original: "WHERE attempt.attempt_id=OLD.attempt_id",
+      replacement: "WHERE attempt.attempt_id=NEW.attempt_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "attempt binding parent cascade",
+      original:
+        "FOREIGN KEY(attempt_id) REFERENCES jobs_original_source_verification_attempts(attempt_id) ON DELETE CASCADE",
+      replacement:
+        "FOREIGN KEY(attempt_id) REFERENCES jobs_original_source_verification_attempts(attempt_id) ON DELETE RESTRICT",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "heartbeat binding immutability rejection",
+      original:
+        "IF TG_OP <> 'INSERT' THEN RAISE EXCEPTION 'source-verifier heartbeat boot binding is immutable'",
+      replacement: "IF TG_OP <> 'INSERT' THEN NULL",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "v1 readiness excludes boot manifests exactly twice",
+      original:
+        "IF TG_OP = 'UPDATE' AND NOT EXISTS (\n" +
+        "    SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols boot",
+      replacement:
+        "IF TG_OP = 'UPDATE' AND EXISTS (\n" +
+        "    SELECT 1 FROM jobs_managed_cloud_manifest_source_verifier_boot_protocols boot",
+    },
+  ]) {
+    assertPhase628DriftRejected({ ...mutation, sqlite, postgres });
+  }
 
   for (const mutation of [
     {
@@ -4191,6 +4545,7 @@ testIsolatedTestDiskAuthorityGuard();
 testIntegrationTestSupportContainmentGuard();
 testPublicBetaAdminMutationAuditBoundary();
 checkBusinessMessagingSimulatorContainment();
+testPhase628OperationsContractGuard();
 testSchemaParity();
 testLicenseInventory();
 testProvenance();

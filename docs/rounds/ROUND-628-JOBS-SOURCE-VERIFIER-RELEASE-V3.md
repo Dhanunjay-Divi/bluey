@@ -3,10 +3,14 @@
 > Codex preflight: load `bluey-ops`. Current Jobs code and local handoff are authority.
 > The meeting checkout and desktop overlay are outside this batch.
 
-Updated: 2026-10-26. Branch: `feat/phase-628-jobs-source-verifier-release-v3`.
+Updated: 2026-10-27. Branch: `feat/phase-628-jobs-source-verifier-release-v3`.
 Original batch base: `fc7e535143a262689da8e99ce7638aee42f40407`.
 Continuation base: `529f49d6687372caee94e6e01e6a8b64f0698c5b`.
-Status: local available gates verified; independent review and external release gates remain required.
+Status: independent-review corrections verified locally; full server gate PASS
+(1,832 tests), strict Clippy PASS, separate independent critical backend reruns
+PASS (24 boot / 23 migration, overlapping filters). Both scoped independent
+source reviews accept. External release gates remain required; October 26
+results are separately labeled historical evidence.
 
 ## Objective and boundary
 
@@ -47,7 +51,9 @@ The process creates one boot ID and stable registration/startup request IDs.
 Only the server assigns the next monotonic generation. A new process receives
 a new identity/generation; no client-proposed generation is accepted at
 registration. Exact-token/exact-payload retries replay stored canonical bytes
-and stored time. Changed payloads conflict.
+and stored time, including after another boot advances the current generation.
+Runtime/session and active release checks still precede replay; only new
+publication requires the current boot head. Changed payloads conflict.
 
 Endpoints:
 
@@ -102,6 +108,9 @@ The probe leaves no assignment, lease, event or provisional readiness mutation.
 - New SQLite 065 / PostgreSQL 043: exact per-heartbeat boot binding and
   prospective legacy-trigger replacement. Legacy sequence/time/readiness
   predicates remain active for non-boot manifests.
+- SQLite 063-065 execute through a guarded transaction boundary that rolls back
+  unfinished migrations and restores the prior foreign-key mode on failure or
+  success. Committed SQL script bytes are unchanged.
 - The successor also admits ten capabilities for the exact full discovery +
   source-verification feature shape. SQLite copies every existing manifest
   field while rebuilding the CHECK; PostgreSQL replaces only that constraint.

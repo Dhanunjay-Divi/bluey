@@ -1564,8 +1564,10 @@ separate release gates.
 The candidate workflow now emits release-v3. V1 and v2 audiences, migration
 heads, feature matrices, canonical fixture bytes, and runtime behavior remain
 accepted without reinterpretation. Release-v3 alone enables direct discovery,
-global discovery, and original-source verification together, binds SQLite head
-`062` and PostgreSQL head `040`, and measures `jobs-workflows` for exactly:
+global discovery, and original-source verification together. Its current
+source-verifier boot authority is SQLite head `065` and PostgreSQL head `043`;
+`062`/`040` remain historical startup-authority migrations and are not the v3
+readiness procedure. It measures `jobs-workflows` for exactly:
 
 ```text
 discovery_worker
@@ -1575,30 +1577,38 @@ workflow_gateway
 workflow_worker
 ```
 
-The verifier may not announce v3 readiness through the generic heartbeat API.
-It must claim its one-time grant, publish sequence `N` as `degraded/startup`,
-then call exactly:
+The verifier may not announce v3 readiness through a generic ready heartbeat.
+It must claim its one-time grant, register its stable process boot ID, publish
+the registered generation at sequence `N` as `degraded/startup`, then call:
 
 ```text
-POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/original-source-verifier-startup
+POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-registration
+POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-startup
 ```
 
-That request uses the managed-runtime HMAC, exact origin, body digest, nonce,
-clock, worker, path, and runtime-session proof. The server runs the real bounded
-lease-decision path inside a rollback-only savepoint. An idle queue is healthy;
-a leaseable queue proves the same claim path without retaining an assignment,
-attempt, event, lease, or provider subject. The server then atomically records
-immutable startup authority and changes `N degraded/startup` to `N+1 ready`.
-Only after receiving that canonical response may the worker start and recurring
-heartbeats begin at `N+2`.
+Both requests use the managed-runtime HMAC, exact origin, body digest, fresh
+nonce, clock, worker, path, and claimed runtime-session proof. Registration
+assigns the strictly monotonic generation. An exact retry retains the same boot
+ID, request ID, session-bound canonical body, and response bytes/time; only the
+worker-auth nonce and HMAC are fresh for each delivery. A changed canonical
+payload conflicts.
 
-An exact startup replay returns the original bytes and database time. A changed
-request or a second request for the same instance epoch conflicts. On startup
-failure, the process attempts one `N+1 degraded/probe_failed` heartbeat, starts
-no worker, and exits. A v3 instance that later degrades must use a fresh grant
-and epoch before becoming ready again. Historical v2 instances retain their
+New startup publication accepts only the current boot's exact `degraded/startup`
+predecessor. An authenticated exact committed response retry remains read-only
+after a replacement boot registers; it does not permit stale execution. The
+server runs the real bounded lease-decision path in a
+rollback-only savepoint, then atomically commits immutable startup authority and
+`N degraded/startup` to `N+1 ready`. An idle queue is healthy; a leaseable queue
+proves the same claim path without retaining an assignment, attempt, event,
+lease, or provider subject. Only after receiving the canonical response may the
+worker start and recurring boot-scoped heartbeats begin at `N+2`.
+
+Startup replay is a server-side idempotency detail; do not order recovery around
+client replay. On an ambiguous or failed startup, start no worker and do not
+send a speculative `degraded/probe_failed` heartbeat. A new process registers a
+new generation and proves readiness again. Historical v2 instances retain their
 reviewed direct-ready and ready-to-ready behavior because they do not carry the
-v3 startup protocol row.
+v3 boot protocol row.
 
 Release-v3 reuses builder policy v2, exact-tip test evidence v2, portal readback
 v2, and the reviewed publication, promotion, and rollback generations. It does

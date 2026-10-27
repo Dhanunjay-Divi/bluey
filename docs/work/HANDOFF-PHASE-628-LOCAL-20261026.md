@@ -1,7 +1,40 @@
 # Jobs-only Phase 628 local continuation — handoff
 
-Updated 2026-10-26. Local implementation, available code gates and staged
-privacy checks completed. This is a Jobs-only candidate, not release approval.
+Updated 2026-10-27. Jobs-only source candidate, not release approval.
+
+## Latest continuation — October 27
+
+Independent actual-diff review found and corrected two backend P2s plus active
+runbook and mutation-test gaps (FIX-791 through FIX-794). The correction base is
+`4ef949732ee50e0d8691e5eb809462e97eae0199`; 16 scoped paths comprise the correction, including
+four FIX records and two separately authored independent review reports. The
+inherited canonical REVIEW remains untracked, unedited and unapproved.
+
+- Exact authenticated committed startup replay survives boot replacement without
+  allowing stale execution. New publication still requires the current boot.
+- SQLite 063-065 failures roll back unfinished transactions and restore prior
+  foreign-key mode. Committed 063/064 script bytes are unchanged.
+- The v3 runbook, raw-body/fresh-HMAC retry test, 33 SQL mutations and three
+  operations-document mutations now agree with the current contract.
+- Full server gate PASS: 1,697 library + 1 binary unit + 134 integration = 1,832,
+  zero failures. Strict all-target Clippy PASS. Parent-focused boot 24/24 and
+  SQLite migration 23/23 PASS (overlapping filters, not 47 distinct cases).
+- Automation typecheck, runtime/auth 15/15, release contracts 32/32, parity
+  113 tables/91 indexes and CI guard self-test PASS. Client/release independent
+  re-review ACCEPT; protocol static findings resolved. Separate independent
+  critical backend execution PASS: boot 24/24 and migration 23/23, exit 0,
+  unchanged source hashes and exact owned root absent.
+- Parent Rust scratch root was verified absent after exit 0; launcher self-test
+  and staged privacy (2,800 paths / 2,524 text files) PASS. The final local commit
+  preflight includes documentation restaging and privacy/diff recheck.
+- A two-hour loopback-only fixture preview is open at
+  `http://127.0.0.1:5187/jobs/?preview=1`; it has no API/auth proxy, blocks
+  connections and write methods, and shows sample—not live—account/job data.
+  Its active root and cleanup obligation are recorded in IMPL.
+
+Read the current IMPL continuation ledger and dated independent review reports
+for actual evidence and remaining holds. No push, external integration or new
+roadmap phase follows automatically from this local handoff.
 
 ## Authority and scope
 
@@ -9,9 +42,11 @@ privacy checks completed. This is a Jobs-only candidate, not release approval.
 - Branch: `feat/phase-628-jobs-source-verifier-release-v3`
 - Continuation base: `529f49d6687372caee94e6e01e6a8b64f0698c5b`
 - Original Phase 628 base: `fc7e535143a262689da8e99ce7638aee42f40407`
-- Implementation commit: `9b2e2e08a18908f063d11bd1a9361f0276ec5f53`
-- Documentation successor: `docs(jobs): record Phase 628 verified local handoff`.
-  Read `git log -2` for both exact local commit IDs; neither was pushed.
+- October 26 implementation: `9b2e2e08a18908f063d11bd1a9361f0276ec5f53`.
+- October 26 documentation: `4ef949732ee50e0d8691e5eb809462e97eae0199`.
+  Neither was pushed. The October 27 local successor is
+  `fix(jobs): close independent boot readiness findings`; resolve its exact ID
+  with `git log -1 --format=oneline --grep='close independent boot readiness findings'`.
 - Read `bluey-ops`, this checkout's AGENTS.md, Round 628, IMPL and FIX-789/790.
   Current code/local handoff are authority. SSD archives are historical fallback
   only when a specific missing fact requires them; none was needed here.
@@ -31,7 +66,7 @@ or claim the whole Jobs product is production-ready.
    ready N+1 inside a savepoint, executes the actual lease path, rolls everything
    back, then atomically commits the real probe result, ready head, heartbeat,
    audit and immutable response. Failed/unknown probes cannot fabricate idle.
-3. Startup requires exactly degraded/startup. Generic heartbeat replay checks
+3. New startup publication requires exactly degraded/startup. Generic heartbeat replay checks
    current boot before returning; old or late failures cannot lower readiness.
 4. Every v3 verifier work request retains its process boot identity. Fresh
    readiness, boot head, heartbeat sequence binding and attempt boot identity
@@ -46,7 +81,7 @@ or claim the whole Jobs product is production-ready.
 7. V1/v2 canonical fixtures/order remain separate. V3 has nine runtime roles,
    portal, fourteen ordered protocols and bounded identical-body retries.
 
-## Evidence ledger
+## October 26 committed-candidate evidence ledger (historical)
 
 See IMPL for full commands, failed attempts and final results. Current observed
 evidence includes five Jobs typechecks, 2,018 passing Jobs TypeScript tests plus
@@ -98,8 +133,10 @@ owned temporary tree, used the normal addon loader, and removed that tree.
   used. Early-return PostgreSQL tests are not runtime proof.
 - Exact Linux Docker image/native smoke: local Docker CLI exists but its
   configured local daemon socket is absent. No remote context was selected.
-- Full independent review of the entire batch remains required. The canonical
-  REVIEW is still unapproved; scoped AI review is not a substitute.
+- The dated independent reports now cover the entire assigned Rust/SQL and
+  client/release diff and its corrections. Their scope is AI source review and
+  selected local reruns, not human or release approval. The canonical REVIEW
+  remains unapproved while external/runtime release evidence is missing.
 - Hosted exact-tip CI, registry publication/read-back, signing, canaries and
   release approval remain separate gates and require authorization.
 - Boot/heartbeat authority retention and fleet-scale database growth require
@@ -114,7 +151,7 @@ email, calendar event or competitor/private-session operation. No meeting,
 desktop, host or overlay file was intentionally edited. Local verification
 does not enable autonomous customer actions.
 
-## Final source/cleanup manifest
+## October 26 source/cleanup manifest (historical)
 
 The successful final Rust root was verified absent after exit 0:
 `/private/tmp/bluey-test-runs-501/run.1793045008.18045.29205301450`.

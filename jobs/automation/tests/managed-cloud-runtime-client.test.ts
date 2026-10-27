@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -292,12 +292,18 @@ describe("managed-cloud runtime API client", () => {
 
   it("retries boot registration and startup with byte-identical bodies after response loss", async () => {
     const bodies: Record<string, unknown>[] = [];
+    const deliveries: Array<{ path: string; body: string; headers: Headers }> = [];
     let registrationAttempts = 0;
     let startupAttempts = 0;
     const client = new ManagedCloudRuntimeApiClient(STARTUP_CONFIG, {
-      fetch: async (_url, init) => {
+      fetch: async (url, init) => {
         const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
         bodies.push(body);
+        deliveries.push({
+          path: new URL(String(url)).pathname,
+          body: String(init?.body),
+          headers: new Headers(init?.headers),
+        });
         if ("registrationRequestId" in body) {
           registrationAttempts += 1;
           if (registrationAttempts === 1) throw new Error("response lost");
@@ -341,6 +347,42 @@ describe("managed-cloud runtime API client", () => {
     expect(startupAttempts).toBe(2);
     expect(JSON.stringify(bodies[0])).toBe(JSON.stringify(bodies[1]));
     expect(JSON.stringify(bodies[2])).toBe(JSON.stringify(bodies[3]));
+    expect(deliveries).toHaveLength(4);
+    expect(deliveries[0]?.body).toBe(deliveries[1]?.body);
+    expect(deliveries[2]?.body).toBe(deliveries[3]?.body);
+    const nonces = deliveries.map((delivery) =>
+      delivery.headers.get("x-bluey-jobs-worker-nonce"),
+    );
+    const signatures = deliveries.map((delivery) =>
+      delivery.headers.get("x-bluey-jobs-worker-signature"),
+    );
+    expect(new Set(nonces).size).toBe(4);
+    expect(new Set(signatures).size).toBe(4);
+    for (const [index, delivery] of deliveries.entries()) {
+      const headers = delivery.headers;
+      const body = delivery.body;
+      expect(nonces[index]).toMatch(/^[a-f0-9]{32}$/);
+      expect(signatures[index]).toMatch(/^[a-f0-9]{64}$/);
+      const contentSha256 = createHash("sha256").update(body).digest("hex");
+      expect(headers.get("x-bluey-jobs-worker-content-sha256")).toBe(contentSha256);
+      const canonical = [
+        "bluey-jobs-worker-v2",
+        headers.get("x-bluey-jobs-worker-timestamp"),
+        headers.get("x-bluey-jobs-worker-nonce"),
+        STARTUP_CONFIG.workerId,
+        "bluey-jobs-api",
+        "managed-cloud-runtime",
+        STARTUP_CONFIG.apiOrigin,
+        "POST",
+        delivery.path,
+        contentSha256,
+      ].join("\n");
+      expect(headers.get("x-bluey-jobs-worker-signature")).toBe(
+        createHmac("sha256", STARTUP_CONFIG.signingKey)
+          .update(canonical)
+          .digest("hex"),
+      );
+    }
     expect(bodies[0]).toMatchObject({
       sessionToken: STARTUP_CONFIG.sessionToken,
       bootId: expect.stringMatching(/^boot-/),

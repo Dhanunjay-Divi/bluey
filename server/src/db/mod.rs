@@ -2711,8 +2711,17 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         .with_context(|| format!("migration {} failed", signed_job_integrity_index + 1))?;
     for (offset, sql) in following_migrations.iter().enumerate() {
         let migration_number = signed_job_integrity_index + offset + 2;
+        let boot_migration_number = match *sql {
+            SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY => Some("063"),
+            SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE => Some("064"),
+            SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS => Some("065"),
+            _ => None,
+        };
         if *sql == SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY {
             execute_sqlite_original_source_verifier_startup_migration(&mut conn, sql)
+                .with_context(|| format!("migration {migration_number} failed"))?;
+        } else if let Some(version) = boot_migration_number {
+            execute_sqlite_source_verifier_boot_migration(&mut conn, sql, version)
                 .with_context(|| format!("migration {migration_number} failed"))?;
         } else {
             conn.execute_batch(sql)
@@ -2723,6 +2732,78 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         backend = pool.backend_name(),
         count = MIGRATIONS.len(),
         "migrations applied"
+    );
+    Ok(())
+}
+
+fn execute_sqlite_source_verifier_boot_migration(
+    conn: &mut rusqlite::Connection,
+    migration: &str,
+    version: &str,
+) -> Result<()> {
+    // Migrations 063-065 own transactions and temporarily disable foreign keys.
+    // Do not return that state to the pool if any statement fails:
+    // r2d2_sqlite does not discard broken connections.
+    anyhow::ensure!(
+        conn.is_autocommit(),
+        "SQLite migration {version} requires an autocommit connection"
+    );
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let execution = conn.execute_batch(migration).and_then(|()| {
+        if conn.is_autocommit() {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::InvalidParameterName(format!(
+                "SQLite migration {version} left an uncommitted transaction"
+            )))
+        }
+    });
+    let rollback = (|| -> Result<()> {
+        if !conn.is_autocommit() {
+            conn.execute_batch("ROLLBACK")?;
+        }
+        anyhow::ensure!(
+            conn.is_autocommit(),
+            "SQLite migration {version} rollback failed"
+        );
+        Ok(())
+    })();
+    let restore = (|| -> Result<()> {
+        conn.pragma_update(None, "foreign_keys", foreign_keys_enabled)?;
+        let restored: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        anyhow::ensure!(
+            restored == foreign_keys_enabled,
+            "SQLite foreign-key enforcement was not restored after migration {version}"
+        );
+        Ok(())
+    })();
+    if let Err(error) = execution {
+        let rollback_status = rollback
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        let restore_status = restore
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        return Err(anyhow::Error::new(error).context(format!(
+            "SQLite migration {version} failed; rollback={rollback_status}; \
+             foreign_key_restore={restore_status}"
+        )));
+    }
+    rollback.with_context(|| format!("finish SQLite migration {version} transaction cleanup"))?;
+    restore.with_context(|| {
+        format!("restore SQLite foreign-key enforcement after migration {version}")
+    })?;
+    let foreign_key_violation = conn
+        .prepare("PRAGMA foreign_key_check")?
+        .query([])?
+        .next()?
+        .is_some();
+    anyhow::ensure!(
+        !foreign_key_violation,
+        "SQLite migration {version} produced a foreign-key violation"
     );
     Ok(())
 }
@@ -3455,11 +3536,99 @@ mod sqlite_migration_replay_tests {
     use super::{
         ensure_column, ensure_sqlite_original_source_verification_hold_capability,
         execute_sqlite_original_source_verifier_startup_migration,
-        execute_sqlite_signed_job_integrity_migration, open_pool, run_migrations,
+        execute_sqlite_signed_job_integrity_migration,
+        execute_sqlite_source_verifier_boot_migration, open_pool, run_migrations,
         SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
         SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY, SQLITE_JOBS_OPERATIONAL_HOLDS,
         SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
     };
+
+    #[test]
+    fn source_verifier_boot_bindings_migration_failure_restores_connection_state() {
+        for foreign_keys_before in [false, true] {
+            for failure in ["SELECT * FROM phase628_missing_relation;", ""] {
+                let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+                conn.pragma_update(None, "foreign_keys", foreign_keys_before)
+                    .unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE phase628_parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE phase628_child(
+                       parent_id INTEGER NOT NULL REFERENCES phase628_parent(id)
+                     );",
+                )
+                .unwrap();
+                // Empty suffix deliberately omits COMMIT: successful statement
+                // execution is not successful migration completion.
+                let migration = format!(
+                    "PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;
+                     CREATE TABLE phase628_interrupted(id INTEGER PRIMARY KEY);
+                     {failure}"
+                );
+                let error =
+                    execute_sqlite_source_verifier_boot_migration(&mut conn, &migration, "065")
+                        .expect_err("partial boot migration must fail");
+                assert!(error.to_string().contains("SQLite migration 065 failed"));
+                assert!(conn.is_autocommit());
+                let foreign_keys_after: bool = conn
+                    .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                    .unwrap();
+                assert_eq!(foreign_keys_before, foreign_keys_after);
+                let partial_table: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                          WHERE name='phase628_interrupted')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(!partial_table);
+                if foreign_keys_before {
+                    assert!(conn
+                        .execute("INSERT INTO phase628_child(parent_id) VALUES(999)", [])
+                        .is_err());
+                }
+                conn.execute("INSERT INTO phase628_parent(id) VALUES(1)", [])
+                    .expect("connection remains usable after failure");
+            }
+        }
+    }
+
+    #[test]
+    fn source_verifier_boot_bindings_migration_success_restores_prior_foreign_key_mode() {
+        for foreign_keys_before in [false, true] {
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "foreign_keys", foreign_keys_before)
+                .unwrap();
+            execute_sqlite_source_verifier_boot_migration(
+                &mut conn,
+                "PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;
+                 CREATE TABLE phase628_committed(id INTEGER PRIMARY KEY);
+                 COMMIT; PRAGMA foreign_keys=ON;",
+                "065",
+            )
+            .expect("complete boot migration");
+            assert!(conn.is_autocommit());
+            let foreign_keys_after: bool = conn
+                .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                .unwrap();
+            assert_eq!(foreign_keys_before, foreign_keys_after);
+            conn.execute("INSERT INTO phase628_committed(id) VALUES(1)", [])
+                .expect("completed migration schema must persist");
+        }
+    }
+
+    #[test]
+    fn source_verifier_boot_bindings_migration_refuses_an_existing_transaction() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("BEGIN; CREATE TABLE phase628_caller(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        execute_sqlite_source_verifier_boot_migration(&mut conn, "SELECT 1;", "065")
+            .expect_err("the executor must not own another caller's transaction");
+        assert!(!conn.is_autocommit());
+        conn.execute("INSERT INTO phase628_caller(id) VALUES(1)", [])
+            .expect("caller's transaction must not be rolled back");
+        conn.execute_batch("ROLLBACK;").unwrap();
+    }
 
     #[test]
     fn signed_job_integrity_migration_failure_restores_transaction_and_foreign_keys() {

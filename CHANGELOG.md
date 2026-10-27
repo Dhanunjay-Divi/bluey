@@ -12,6 +12,10 @@ under `docs/release/`.
   Operational verifier requests and immutable attempt bindings now carry the
   exact boot generation; replacement boots cannot inherit old readiness or
   attempts, and failed-probe heartbeats cannot be promoted by startup.
+- Jobs: preserve authenticated exact startup-response replay after boot replacement
+  without granting stale execution authority; restore transaction/foreign-key state
+  after failed SQLite boot migrations 063-065. Correct the v3 runbook and add
+  fresh retry-authentication and paired SQL authority mutation coverage.
 
 ### Added
 
