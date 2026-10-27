@@ -33,7 +33,7 @@ boundary, not a claim of live service, scale, employer or provider success.
 | Profile, preferences and Career Tracks | Implemented; Phase 631 actual browser/API/private PG full six-step manual onboarding, exact policy/Track reload, account isolation and disabled-state 5/5 | Resume object import, live auth/OAuth and nonempty packet/execution journey remain separate |
 | Discovery and source verification | Implemented source/normalization/verification authority and local tests | Measured licensed/authorized source coverage, freshness/closure reconciliation and scheduled canaries; never infer 50,000 sources |
 | Grounded resume/cover letter/answers | Implemented generation/immutable packet constraints and local tests | Real private object-storage/model canary and layout/readback evidence; no fabricated facts |
-| Apply and receipts | Implemented approval, provider certification and runner/reconciliation authority | One stitched owned fixture journey plus provider-specific ATS canaries; unknown submission is never retried blindly |
+| Apply and receipts | Implemented authority; Phase 632 actual browser/API/PG signed-test-job prepare, factual kit/reload and exact blocked-approval/no-debit proof | Positive source-asset/Track approval and fixture runner/receipt journey plus provider-specific canaries; unknown submission is never retried blindly |
 | Durable orchestration | Phase 630 actual Temporal 10/10, persistent restart, Update/replay and exact cleanup | Hosted TLS, actual fleet capacity, final source-qualified Linux artifacts and rollback rehearsal |
 | Tracker and recruiter inbox | Implemented application/outcome/mailbox source paths | Stitched actual UI/API/PG tracking and isolated Gmail/Outlook correlation/draft/send canaries under explicit scope |
 | Monthly Jobs billing | Implemented plan/allowance/metering source | Subscription lifecycle and failure/re-credit qualification; do not confuse desktop prepaid billing |
@@ -83,7 +83,16 @@ exited cleanly, PG stopped and both runtime parents were empty. The report
 boundaries passed 6/6 and are wired into normal Jobs tests. No new employer,
 runner, provider, mailbox, artifact, deployment or production claim follows.
 
-Next local slice: a bounded feature-gated signed synthetic posting bridge into
-the same owned PG, followed by actual packet prepare/review and approval denial
-while the source-resume/Track prerequisites remain absent. It is planned, not
-implemented or proven; see IMPL-631's cross-process feasibility constraints.
+Phase 632 passed the frozen actual browser/API/PG journey 7/7: signed test job,
+ordinary Settings identity choice, actual Matches-button factual preparation,
+immutable kit/reload and exact unreviewed-Track approval denial with no attempt,
+workflow command or debit. Four helper guard tests, narrow strict Clippy and
+seven report-boundary tests passed. All three child PIDs exited cleanly and were
+absent; PG stopped; all four run parents were empty. Earlier diagnostic and
+source-race attempts remain failed, not blended into this accepted run.
+
+Next local boundary: source-resume upload/object readback and canonical Track
+review needed for positive approval. Reuse existing storage/provider guards;
+do not create a production fixture or weaken TLS/endpoint/identity/certification
+constraints. Hosted/provider/source/runner/receipt and broader parity work remain
+unfinished, not implied by local signed-fixture success.

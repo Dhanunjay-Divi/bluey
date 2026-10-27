@@ -20,6 +20,11 @@ path = "src/main.rs"
 name = "bluey-jobs-api"
 path = "src/bin/bluey-jobs-api.rs"
 
+[[example]]
+name = "jobs-nonprod-browser-fixture"
+path = "examples/jobs-nonprod-browser-fixture.rs"
+required-features = ["integration-test-support"]
+
 [[test]]
 name = "integration_e2e"
 path = "tests/integration_e2e.rs"

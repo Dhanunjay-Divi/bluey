@@ -5,6 +5,9 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs: qualify actual Matches-to-application-kit preparation and exact
+  unreviewed-Track approval denial using a private debug-only signed fixture;
+  prove no attempt, workflow command or billing debit is created on denial.
 - Jobs: extend isolated browser/API/PostgreSQL qualification through six-step
   onboarding, exact saved search policy, tenant isolation and disabled-effect
   views; reject incomplete or ambiguous runtime reports in the normal test gate.

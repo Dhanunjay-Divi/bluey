@@ -4,8 +4,10 @@ import { assertBrowserApiReport, BROWSER_API_CASES } from "./nonprod-browser-api
 
 function report() {
   return {
-    version: 2, tests: 5, passed: 5, cases: [...BROWSER_API_CASES], failed: [],
+    version: 3, tests: BROWSER_API_CASES.length, passed: BROWSER_API_CASES.length,
+    cases: [...BROWSER_API_CASES], failed: [],
     binaries: [{ pid: 12345, code: 0, signal: null }, { pid: 12346, code: 0, signal: null }],
+    fixture: { pid: 12347, code: 0, signal: null },
     requests: { jobs: 25, account: 3 },
   };
 }
@@ -13,7 +15,7 @@ function report() {
 test("all named browser cases and both absent owned APIs are required", () => {
   const seen = [];
   assertBrowserApiReport(report(), (pid) => { seen.push(pid); return false; });
-  assert.deepEqual(seen, [12345, 12346]);
+  assert.deepEqual(seen, [12345, 12346, 12347]);
   assert.throws(() => assertBrowserApiReport(report(), () => true), /still exists/);
   assert.throws(() => assertBrowserApiReport(report(), () => { throw new Error("ambiguous"); }),
     /ambiguous/);
@@ -21,7 +23,7 @@ test("all named browser cases and both absent owned APIs are required", () => {
 
 test("partial, duplicated, reordered or fabricated case reports cannot qualify", () => {
   for (const change of [
-    { version: 1 }, { tests: 1, passed: 1 }, { passed: 4 }, { passed: "5" },
+    { version: 1 }, { version: 2 }, { tests: 5, passed: 5 }, { passed: 6 }, { passed: "7" },
     { cases: [] }, { cases: BROWSER_API_CASES.slice(0, -1) },
     { cases: [...BROWSER_API_CASES].reverse() },
     { cases: BROWSER_API_CASES.map(() => "profile_reload") },
@@ -54,4 +56,13 @@ test("request evidence must be complete bounded integer counters", () => {
     { jobs: Infinity, account: 1 }, { jobs: 100_001, account: 1 },
     { jobs: 1, account: 1, extra: 1 }, null, [],
   ]) assert.throws(() => assertBrowserApiReport({ ...report(), requests }, () => false));
+});
+
+test("signed fixture bridge must also exit cleanly with a distinct absent PID", () => {
+  for (const fixture of [
+    null, {}, report().binaries[0], { pid: 12347, code: 1, signal: null },
+    { pid: 12347, code: null, signal: "SIGKILL" },
+    { pid: 12347, code: 0, signal: null, extra: true },
+  ]) assert.throws(() => assertBrowserApiReport({ ...report(), fixture }, () => false));
+  assert.throws(() => assertBrowserApiReport(report(), (pid) => pid === 12347), /still exists/);
 });

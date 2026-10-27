@@ -7,6 +7,8 @@ export const BROWSER_API_CASES = Object.freeze([
   "preference_track_reload",
   "auth_isolation",
   "effect_availability",
+  "packet_review",
+  "approval_fenced",
 ]);
 
 function exactRecord(value, fields) {
@@ -25,19 +27,19 @@ function processExists(pid) {
 }
 
 export function assertBrowserApiReport(report, pidExists = processExists) {
-  exactRecord(report, ["version", "tests", "passed", "cases", "failed", "binaries", "requests"]);
-  assert.equal(report.version, 2, "unexpected browser report version");
+  exactRecord(report, ["version", "tests", "passed", "cases", "failed", "binaries", "fixture", "requests"]);
+  assert.equal(report.version, 3, "unexpected browser report version");
   assert.equal(report.tests, BROWSER_API_CASES.length, "incomplete browser case declaration");
   assert.equal(report.passed, BROWSER_API_CASES.length, "incomplete browser case execution");
   assert.deepEqual(report.cases, BROWSER_API_CASES, "missing or reordered browser cases");
   assert.deepEqual(report.failed, [], "browser failures cannot pass");
   assert(Array.isArray(report.binaries) && report.binaries.length === 2, "two API exits required");
   const seen = new Set();
-  for (const binary of report.binaries) {
+  for (const binary of [...report.binaries, report.fixture]) {
     exactRecord(binary, ["pid", "code", "signal"]);
     assert(Number.isSafeInteger(binary.pid) && binary.pid > 1 && binary.pid <= 2_147_483_647,
       "invalid owned API PID");
-    assert(!seen.has(binary.pid), "duplicate API process evidence");
+    assert(!seen.has(binary.pid), "duplicate owned process evidence");
     seen.add(binary.pid);
     assert.equal(binary.code, 0, "nonclean API exit cannot pass");
     assert.equal(binary.signal, null, "signal termination cannot pass");

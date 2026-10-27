@@ -52,8 +52,11 @@ for (const path of [
   "scripts/run-nonprod-browser-api-tests.mjs",
   "scripts/nonprod-browser-api-report.mjs",
 ]) snapshot(join(jobs, path));
+for (const path of ["Cargo.toml", "src/lib.rs", "examples/jobs-nonprod-browser-fixture.rs"]) {
+  snapshot(resolve(jobs, "../server", path));
+}
 const artifacts = [];
-for (const name of ["bluey-jobs-api", "bluey-server"]) {
+for (const name of ["bluey-jobs-api", "bluey-server", "examples/jobs-nonprod-browser-fixture"]) {
   const binary = join(process.env.CARGO_TARGET_DIR, "debug", name);
   const info = lstatSync(binary);
   assert(info.isFile() && !info.isSymbolicLink() && info.uid === process.getuid());
@@ -79,6 +82,8 @@ const childEnv = { ...env,
   BLUEY_TEST_POSTGRES_URL: process.env.BLUEY_TEST_POSTGRES_URL,
   BLUEY_POSTGRES_BIN: "/opt/homebrew/opt/postgresql@17/bin",
   BLUEY_PORTAL_DIST: dist,
+  BLUEY_NONPROD_PACKET_FIXTURE_BIN: join(process.env.CARGO_TARGET_DIR,
+    "debug/examples/jobs-nonprod-browser-fixture"),
 };
 const child = spawn(process.execPath, [join(jobs, "portal/nonprod/browser-api.integration.mjs")], {
   env: childEnv, stdio: "inherit",
