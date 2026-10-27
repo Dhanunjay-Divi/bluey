@@ -3,7 +3,7 @@
 Date: 2026-10-27 (America/New_York)
 Base: `57635b29`
 Reviewer role: independent source and procedure review
-Verdict: 🟡 static harness accepted; Linux runtime qualification pending
+Verdict: 🟢 bounded local Linux/ARM64 qualification accepted
 
 ## Scope reviewed
 
@@ -180,22 +180,55 @@ Parent-reported evidence below was not independently reproduced and is not a Lin
 The manual recovery is not evidence that automatic cleanup passed and does not weaken the frozen
 cleanup rules.
 
-## Pending executable gates
+## Final parent-reported executable evidence
 
-- Commit the reviewed harness/test/package/plan bytes so the image's source commit names the exact
-  clean admitted HEAD, then rerun source review if those bytes change.
-- Run the normal Jobs regression suite, configured Chromium guard and five workspace typechecks on
-  the committed source.
-- Under the shared machine lock and canonical launcher, supply an explicit private child `HOME`,
-  execute the actual isolated VM/image/smoke harness and require exact result parsing, clean
-  VM/container termination, absent owned PIDs/socket/state and canonical-root cleanup.
-- Treat unsupported CLI/config/legacy-builder behavior or ambiguous cleanup as a recorded failure;
-  do not switch profiles, install tools, broaden resources or weaken isolation.
+The following final runtime evidence was supplied by the parent and was not independently rerun by
+this reviewer:
+
+- Corrected-source commit `d9a5b0db398386c2701b98ecb006cc3e0f46c96b`, canonical session
+  74829, exited zero. The committed context contained 111 files and 2,508,373 bytes. The private
+  native-aarch64 VZ VM passed live/generated configuration checks for four CPUs, 6 GiB RAM, 8 GiB
+  root and 16 GiB data, with the reviewed isolation and no host filesystem mounts.
+- Explicit `legacy-explicit` construction produced local Linux/ARM64 image
+  `sha256:ef2ae6e9c1976a490d08081579c2570373f1d39e8190772581778f98506b96f3`.
+  The measurement read from that exact image had SHA-256
+  `b69ad2395160ade4337a5e2708be2bdb2dad9522f7d90c93f8df5d64727c1dd6` and matched the
+  admitted source/build/component/role plus the three CI-only zero authority hashes.
+- The unchanged native-addon smoke passed 1/1. Exact finished-container inspection passed the
+  reviewed nonroot, no-network/no-ports/no-host-binds, read-only-root, dropped-capability,
+  no-new-privileges, bounded-resource and bounded-tmpfs assertions. The runner server was not
+  started.
+- Automatic cleanup observed the exact VM stopped, PID 2988 absent, final inventories empty,
+  private Docker socket absent and state root
+  `/private/tmp/bluey-jobs-linux-p634-IfYImk` absent. Parent process checks also found PIDs 2986,
+  3019 and 3183 absent. The four unrelated profiles remained stopped and the global Docker context
+  remained `default`.
+- Host free space changed from 41,385,975,808 to 41,337,602,048 bytes, a whole-host sample delta of
+  48,373,760 bytes. Because all owned VM, socket and state paths were absent, this is recorded as a
+  non-attributed observation, not proof of zero leakage or a capacity result.
+- Fresh unchanged-source session 80351 exited zero: report/Temporal 8, object 7, Linux harness 17,
+  automation 804, Browser 219, runner 308, workflows 321 and portal 387, for 2,071 passes, zero
+  skips. The privately configured Chromium guard executed, and all five workspace typechecks
+  passed. Launcher self-test session 17598 also exited zero, including intentional negative cleanup
+  cases. All five Phase 634 launcher parents were empty afterward.
+
+## Unverified gates and limits
+
+- No fresh full Rust suite or all-target Clippy run was performed for Phase 634. This phase changed
+  the nonproduction Node harness/test/package wiring, not product Rust.
+- The local image was not retained, signed, published, promoted or rebuilt through CI/BuildKit.
+  The result is native Linux/ARM64 only and says nothing about amd64 parity.
+- No runner HTTP server, PostgreSQL lease lifecycle, browser/employer action, receipt, provider,
+  hosted storage, production identity or external production flag was exercised.
+- The run is not a capacity, latency, durability, cost or SLO benchmark and is not production or
+  release approval.
 
 ## Current verdict and limits
 
-🟡 **STATIC HARNESS ACCEPTED; LINUX RUNTIME QUALIFICATION PENDING** — no remaining P0–P3
-finding in the reviewed frozen source. This is not Linux runtime evidence and does not approve a
-production runner, amd64 image, BuildKit/CI equivalence, release artifact, registry publication,
-signing, deployment, capacity/latency, live API/PostgreSQL lease, browser/employer action, receipt,
-provider behavior or production readiness.
+🟢 **BOUNDED LOCAL LINUX/ARM64 QUALIFICATION ACCEPTED** — no remaining P0–P3 finding in the
+reviewed frozen source and supplied final evidence. Acceptance is limited to the exact local
+nonproduction VZ/Colima, explicit-legacy Linux/ARM64 image construction, embedded measurement,
+native-addon smoke and automatic cleanup procedure above. It does not approve a production runner,
+amd64 or CI/BuildKit parity, final release artifact, registry publication, signing, deployment,
+capacity/latency, live API/PostgreSQL lease, browser/employer action, receipt, provider behavior or
+production readiness.

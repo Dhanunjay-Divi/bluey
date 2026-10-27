@@ -2,7 +2,7 @@
 
 Preflight: `bluey-ops`; task-owned recovery also used `codex-storage-archive`.
 Current source/local handoffs are authority; no SSD was used.
-Status: diagnosed, corrective qualification pending.
+Status: fixed; corrected actual local Linux qualification passed.
 
 ## Issue
 
@@ -20,7 +20,7 @@ with cleanup failure. Lima's useful cause was stdout, so stderr-only logging
 would not correct diagnosis. This is a qualification-harness defect, not a
 production host, Dockerfile, candidate or employer-application defect.
 
-## Fix Summary (pending qualification)
+## Fix Summary
 
 - Shorter private `/l` with unchanged profile randomness; preflight byte budgets
   for the known longest SSH/Docker sockets before any startup.
@@ -62,11 +62,13 @@ This specific evidence-backed recovery did not weaken automatic cleanup rules.
 Run focused pure units and independent review, commit corrected admitted inputs,
 then run the actual private-HOME/shared-lock/canonical Linux procedure anew.
 Require VM/resource/image/native and cleanup gates, not a shorter string alone.
-Current focused pure units17/17 and independent static review pass; actual
-corrected resource execution remains pending.
+Focused pure units17/17 and independent static review passed. Actual corrected
+session74829/source `d9a5b0db` exited0: VM/resource checks, exact-image native
+smoke1/1 and automatic stopped/PID/socket/inventory/state cleanup passed. Fresh
+full Jobs session80351 passed2,071 cases, zero skipped and all five typechecks.
 
 ## Known Limitations
 
-Actual Linux qualification remains failed/pending until that run passes. CI/
+This is only local Linux/ARM64 explicit-legacy construction/native probing. CI/
 BuildKit, amd64, signed release, cloud/API lease, receipt, capacity and latency
-remain unproven.
+remain unproven. The initial attempt remains failed.

@@ -2,7 +2,8 @@
 
 Date: 2026-10-27. Preflight: `bluey-ops`, current local handoff and
 `performance-analysis` reproducible-baseline discipline. Base: `57635b29`.
-Status: source/pure gates and static review passed; actual Linux/container run pending.
+Status: bounded local batch complete; actual ARM64 image/addon, Jobs gates,
+privacy and independent review passed. Not release or production approval.
 
 ## Acceptance and boundaries
 

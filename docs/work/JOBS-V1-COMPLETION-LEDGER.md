@@ -43,7 +43,7 @@ boundary, not a claim of live service, scale, employer or provider success.
 | MCP / Agent Connect | Successor; command-center UI is not a deployed MCP service | Scoped and revocable tools, protocol/authorization tests, read-first end-to-end client proof before separately gated writes |
 | Chrome extension | Full product parity not established | Original scoped extension, permission review, account linkage, supported-site fill/readback and install/update tests |
 | Mobile | Responsive portal exists; native parity not established | Narrow-screen core/intervention tests; native clients and store/install proof are separate unfinished work |
-| Operations/privacy/performance | Local tests, privacy guards and isolated workspace cleanup | Production metrics/redacted traces, alerts, retention, load/cost measurements, deletion/restore and kill-switch drills |
+| Operations/privacy/performance | Local tests/privacy/isolated cleanup; Phase634 private Linux/ARM64 image/native probe with inspected read-only/no-network container | Real runner/API/receipt, signed artifacts/attestation, production metrics/alerts, load/cost, deletion/restore and kill-switch drills |
 
 The competitive reference is Tsenta's publicly documented find/prepare/apply/track
 loop and web, messaging, MCP, extension and mobile access. These are competitor
@@ -109,6 +109,19 @@ Next local boundary: stitch a matching runner control-plane lifecycle, then
 controlled browser/receipt evidence. This local-certified queue cannot authorize
 a cloud session: cloud requires separately matching runtime/volume/ATS authority.
 Employer loopback remains prohibited; the TXT-only object protocol fixture is
-not receipt storage or hosted R2/TLS/durability proof. Docker/Colima are currently
-stopped; unrelated Pinky context was untouched. Hosted/provider/source/runner/
-receipt and broader parity work remain unfinished.
+not receipt storage or hosted R2/TLS/durability proof. The private construction VM
+was stopped/deleted; unrelated Pinky context was untouched. Hosted/provider/
+source/runner/receipt and broader parity work remain unfinished.
+
+Phase634 corrected-source session74829 passed local Linux/ARM64 construction
+and exact native-addon probe1/1 using a new private4CPU/6GiB/8+16GiB VZ VM.
+Image/embedded measurement bound source `d9a5b0db`; the exact native container
+was inspected for no network, read-only root, no binds/ports/caps and bounded
+resources. All owned VM/PID/socket/root state was removed. Builder was explicit
+legacy, not CI/BuildKit or amd64/release proof; CI-only zero authority hashes
+cannot grant production trust. Initial105-byte Unix-path failure, bounded
+diagnosis and exact recreatable-cache recovery remain documented failure history.
+Fresh full Jobs gates passed2,071 tests, zero skipped and five typechecks. A
+docs-only closeout does not relabel the earlier image as a final-tip artifact.
+API lease/runner/browser/receipt stitching, hosted providers/sources/model/
+billing/OAuth/capacity and broader features remain unfinished.
