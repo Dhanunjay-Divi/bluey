@@ -5,6 +5,9 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs: add an explicit resource-bounded, private-state Linux runner construction
+  harness with native-addon smoke and pre-delete stopped-VM/process checks;
+  pure boundary tests run normally without starting a VM or enabling execution.
 - Jobs: qualify signed source-resume upload/readback/replay and source-bound
   factual re-preparation through one included, review-approved private queue
   packet; verify unchanged balance, no double metering and zero dispatch.
