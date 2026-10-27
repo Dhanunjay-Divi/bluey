@@ -20,8 +20,9 @@
     "node": ">=22.13.0"
   },
   "overrides": {
-    "dompurify": "3.4.14",
-    "fast-uri": "3.1.5",
-    "postcss": "8.5.26"
+    "dompurify": "3.4.17",
+    "fast-uri": "3.1.9",
+    "postcss": "8.5.26",
+    "source-map-js": "1.2.2"
   }
 }

@@ -9,6 +9,7 @@ import {
   downloadJobhiveArtifact,
   JobhiveArtifactError,
   streamVerifiedJobhiveCsv,
+  type JobhiveCandidateRow,
   type VerifiedJobhiveArtifact,
 } from "../src/jobhive-artifact.js";
 import type { JobhiveArtifact } from "../src/jobhive-manifest.js";
@@ -222,5 +223,101 @@ describe("Jobhive artifact ingestion", () => {
     verified.sha256 = createHash("sha256").update(valid).digest("hex");
     await expect(streamVerifiedJobhiveCsv({ verified, onBatch: () => undefined }))
       .rejects.toMatchObject({ code: "row_count_mismatch" });
+  });
+
+  it.each(["future_extension", "__proto__"])(
+    "preserves required-column parsing with a unique %s extra header without prototype mutation",
+    async (extraHeader) => {
+      const prototypeBefore = Object.getOwnPropertyDescriptors(Object.prototype);
+      const pollutionMarker = "__blueyJobsCsvPrototypePollution__";
+      expect(Reflect.get({}, pollutionMarker)).toBeUndefined();
+      const values = [
+        "https://jobs.lever.co/acme/1", "Software Engineer", "Acme", "lever", "1", "Austin, TX", "true",
+        "120000", "160000", "USD", "year", "$120k-$160k", "full_time", "Engineering", "Platform",
+        "Build systems", "2026-07-20T00:00:00Z", "REQ-1", "https://jobs.lever.co/acme/1/apply", "Full-time",
+        "{\"source\":\"lever\"}", "US", JSON.stringify({ [pollutionMarker]: true }),
+      ];
+      const content = `${csvRow([...headers, extraHeader])}\n${csvRow(values)}\n`;
+      const stagingDirectory = await temporaryDirectory();
+      const filePath = path.join(stagingDirectory, "unique-extra-header.csv");
+      await writeFile(filePath, content);
+      const verified: VerifiedJobhiveArtifact = {
+        artifact: artifactFor(content, { rows: 1 }),
+        sourceFamily: "lever",
+        path: filePath,
+        bytes: Buffer.byteLength(content),
+        sha256: createHash("sha256").update(content).digest("hex"),
+      };
+      const candidates: JobhiveCandidateRow[] = [];
+
+      const result = await streamVerifiedJobhiveCsv({
+        verified,
+        onBatch: (batch) => { candidates.push(...batch); },
+      });
+
+      expect(result).toEqual({ rows: 1, batches: 1 });
+      expect(candidates).toEqual([{
+        url: "https://jobs.lever.co/acme/1", title: "Software Engineer", company: "Acme",
+        atsType: "lever", atsId: "1", location: "Austin, TX", isRemote: true,
+        salaryMin: 120000, salaryMax: 160000, salaryCurrency: "USD", salaryPeriod: "year",
+        salarySummary: "$120k-$160k", employmentType: "full_time", department: "Engineering",
+        team: "Platform", description: "Build systems", postedAt: "2026-07-20T00:00:00Z",
+        requisitionId: "REQ-1", applyUrl: "https://jobs.lever.co/acme/1/apply", commitment: "Full-time",
+        raw: "{\"source\":\"lever\"}", countryIso: "US",
+      }]);
+      expect(Object.hasOwn(candidates[0]!, extraHeader)).toBe(false);
+      expect(Object.getPrototypeOf(candidates[0]!)).toBe(Object.prototype);
+      expect(Object.getOwnPropertyDescriptors(Object.prototype)).toEqual(prototypeBefore);
+      expect(Reflect.get({}, pollutionMarker)).toBeUndefined();
+      expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+    },
+  );
+
+  it.each([
+    {
+      label: "duplicate prototype headers",
+      maliciousHeaders: [...headers, "__proto__", "__proto__"],
+      message: "Jobhive CSV contains duplicate columns",
+    },
+    {
+      label: "whitespace-normalized duplicate prototype headers",
+      maliciousHeaders: [...headers, "__proto__", " __proto__ "],
+      message: "Jobhive CSV contains duplicate columns",
+    },
+    {
+      label: "duplicate constructor headers",
+      maliciousHeaders: [...headers, "constructor", "constructor"],
+      message: "Jobhive CSV contains duplicate columns",
+    },
+    {
+      label: "a prototype header replacing a required column",
+      maliciousHeaders: headers.map((header) => header === "raw" ? "__proto__" : header),
+      message: "Jobhive CSV is missing raw",
+    },
+  ])("rejects $label before emitting rows or mutating Object.prototype", async ({ maliciousHeaders, message }) => {
+    const prototypeBefore = Object.getOwnPropertyDescriptors(Object.prototype);
+    const pollutionMarker = "__blueyJobsCsvPrototypePollution__";
+    expect(Reflect.get({}, pollutionMarker)).toBeUndefined();
+    const maliciousValues = maliciousHeaders.map(() => JSON.stringify({ [pollutionMarker]: true }));
+    const content = `${csvRow(maliciousHeaders)}\n${csvRow(maliciousValues)}\n`;
+    const stagingDirectory = await temporaryDirectory();
+    const filePath = path.join(stagingDirectory, "malicious-headers.csv");
+    await writeFile(filePath, content);
+    const verified: VerifiedJobhiveArtifact = {
+      artifact: artifactFor(content, { rows: 1 }),
+      sourceFamily: "lever",
+      path: filePath,
+      bytes: Buffer.byteLength(content),
+      sha256: createHash("sha256").update(content).digest("hex"),
+    };
+    const onBatch = vi.fn();
+
+    await expect(streamVerifiedJobhiveCsv({ verified, onBatch }))
+      .rejects.toMatchObject({ code: "invalid_artifact", message });
+
+    expect(onBatch).not.toHaveBeenCalled();
+    expect(Object.getOwnPropertyDescriptors(Object.prototype)).toEqual(prototypeBefore);
+    expect(Reflect.get({}, pollutionMarker)).toBeUndefined();
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
   });
 });

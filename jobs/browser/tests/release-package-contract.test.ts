@@ -103,7 +103,7 @@ describe("Bluey Browser release package contract", () => {
     await expect(readBrowserSourceContract()).resolves.toEqual({
       appId: BLUEY_BROWSER_APP_ID,
       appVersion: "0.1.0",
-      electronVersion: "43.1.0",
+      electronVersion: "43.8.3",
       playwrightVersion: "1.61.1",
       chromiumRevision: "1228",
     });
