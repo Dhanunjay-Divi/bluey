@@ -4,7 +4,7 @@
  * to a developer database, browser profile, or external endpoint.
  */
 import assert from "node:assert/strict";
-import { createHmac, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { lstat, mkdir, readFile, realpath, stat, writeFile, chmod } from "node:fs/promises";
@@ -12,16 +12,18 @@ import { extname, join, normalize, relative, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { chromium } from "playwright";
+import { startNonprodObjectStore } from "../../scripts/nonprod-object-store.mjs";
 
 const LIMIT_MS = 180_000;
 const OPERATION_MS = 10_000;
 const children = [];
-const EXPECTED_CASES = ["profile_reload", "onboarding_complete", "preference_track_reload", "auth_isolation", "effect_availability", "packet_review", "approval_fenced"];
-const result = { version: 3, cases: [], tests: EXPECTED_CASES.length, passed: 0, failed: [], binaries: [], fixture: null, requests: { jobs: 0, account: 0 } };
+const EXPECTED_CASES = ["profile_reload", "onboarding_complete", "preference_track_reload", "auth_isolation", "effect_availability", "packet_review", "approval_fenced", "source_resume_readback", "review_first_queue"];
+const result = { version: 4, cases: [], tests: EXPECTED_CASES.length, passed: 0, failed: [], binaries: [], fixture: null, object_store: null, requests: { jobs: 0, account: 0 } };
 let outputRoot;
 let liveBrowser;
 let liveProxy;
 let stage = "preflight";
+let objectStore;
 
 function fail(code) { throw new Error(code); }
 function passCase(name) {
@@ -215,7 +217,7 @@ async function postgresIdentity(psql, database, home, root) {
 }
 async function packetLedgerSnapshot(psql, database, home, accountId) {
   if (!/^ui_fixture_[0-9a-f-]{36}$/.test(accountId)) fail("fixture_account_id");
-  const query = "SELECT json_build_object('attempts',(SELECT count(*) FROM jobs_attempt_reservations WHERE account_id=:'fixture_account'),'metering',(SELECT count(*) FROM jobs_packet_metering WHERE account_id=:'fixture_account'),'commands',(SELECT count(*) FROM jobs_workflow_commands WHERE account_id=:'fixture_account'),'balance_events',(SELECT count(*) FROM balance_ledger_entries WHERE account_id=:'fixture_account'),'balance_cents',(SELECT balance_cents FROM accounts WHERE id=:'fixture_account'),'used_packets',coalesce((SELECT used_packets FROM jobs_entitlements WHERE account_id=:'fixture_account'),0))::text";
+  const query = "SELECT json_build_object('attempts',(SELECT count(*) FROM jobs_attempt_reservations WHERE account_id=:'fixture_account'),'metering',(SELECT count(*) FROM jobs_packet_metering WHERE account_id=:'fixture_account'),'included_metering',(SELECT count(*) FROM jobs_packet_metering WHERE account_id=:'fixture_account' AND included=1),'metered_amount_cents',coalesce((SELECT sum(amount_cents) FROM jobs_packet_metering WHERE account_id=:'fixture_account'),0),'commands',(SELECT count(*) FROM jobs_workflow_commands WHERE account_id=:'fixture_account'),'balance_events',(SELECT count(*) FROM balance_ledger_entries WHERE account_id=:'fixture_account'),'balance_cents',(SELECT balance_cents FROM accounts WHERE id=:'fixture_account'),'used_packets',coalesce((SELECT used_packets FROM jobs_entitlements WHERE account_id=:'fixture_account'),0))::text";
   const command = spawn(psql, ["-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-v", `fixture_account=${accountId}`], { env: pgEnv(database, home), stdio: ["pipe", "pipe", "ignore"] });
   let stdout = ""; command.stdout.on("data", (chunk) => { stdout += chunk; if (stdout.length > 4096) command.kill("SIGTERM"); });
   const completion = once(command, "close"); command.stdin.end(`${query};\n`);
@@ -287,6 +289,7 @@ async function main() {
   const email = `ui-fixture-${randomUUID()}@example.test`;
   const isolatedAccountId = `ui_isolated_${randomUUID()}`;
   const isolatedEmail = `ui-isolated-${randomUUID()}@example.test`;
+  objectStore = await startNonprodObjectStore({ accountId });
   const common = {
     PATH: process.env.PATH, HOME: childHome, TMPDIR: childTmp, TMP: childTmp, TEMP: childTmp,
     SQLITE_TMPDIR: childTmp, LANG: "C", TZ: "UTC",
@@ -304,7 +307,7 @@ async function main() {
     BLUEY_JOBS_GLOBAL_ARCHIVE_ENABLED: "0", BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED: "0",
     BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED: "0", BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED: "0",
     BLUEY_JOBS_COMMUNICATION_OAUTH_WRITE_ENABLED: "0",
-    BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED: "0", RUST_LOG: "warn",
+    BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED: "0", ...objectStore.env, RUST_LOG: "warn",
   };
   stage = "start_jobs_api";
   child(jobsBinary, [], { ...common, BLUEY_JOBS_API_HOST: "127.0.0.1", BLUEY_JOBS_API_PORT: String(jobsPort) }, "bluey-jobs-api");
@@ -453,7 +456,7 @@ async function main() {
     assert.equal(boundWorkspace.profile.source_resume_name, "", "track_binding_no_source_resume"); assert.equal(boundWorkspace.tracks[0].policy.authority.review_state, "needs_review", "track_binding_policy_needs_review");
     stage = "packet_fixture";
     const fixtureRequest = join(root, "browser-packet-fixture-request.json");
-    await writeFile(fixtureRequest, `${JSON.stringify({ version: 1, account_id: accountId, track_id: boundWorkspace.tracks[0].id })}\n`, { flag: "wx", mode: 0o600 });
+    await writeFile(fixtureRequest, `${JSON.stringify({ version: 1, account_id: accountId, track_id: boundWorkspace.tracks[0].id, queue_entitlement: true })}\n`, { flag: "wx", mode: 0o600 });
     const fixtureProcess = child(fixtureBinary, [], { PATH: process.env.PATH, HOME: childHome, TMPDIR: childTmp, TMP: childTmp, TEMP: childTmp, SQLITE_TMPDIR: childTmp, BLUEY_TEST_RUN_ROOT: root, BLUEY_TEST_POSTGRES_URL: required("BLUEY_TEST_POSTGRES_URL"), BLUEY_JOBS_DATA_KEY: dataKey }, "packet-fixture", true);
     const fixtureOutcome = await withTimeout(children.find(({ processHandle }) => processHandle === fixtureProcess).completion, "packet_fixture");
     result.fixture = { pid: fixtureProcess.pid, code: fixtureOutcome.code, signal: fixtureOutcome.signal };
@@ -505,7 +508,7 @@ async function main() {
     const beforeApproval = structuredClone({ applications: packetWorkspace.applications, browser_sessions: packetWorkspace.browser_sessions, auto_submit_authorizations: packetWorkspace.auto_submit_authorizations });
     stage = "packet_ledger";
     const ledgerBefore = await packetLedgerSnapshot(psql, database, childHome, accountId);
-    assert.deepEqual({ attempts: ledgerBefore.attempts, metering: ledgerBefore.metering, commands: ledgerBefore.commands, balance_events: ledgerBefore.balance_events, used_packets: ledgerBefore.used_packets }, { attempts: 0, metering: 0, commands: 0, balance_events: 0, used_packets: 0 }, "ledger_zero_before_approval");
+    assert.deepEqual({ attempts: ledgerBefore.attempts, metering: ledgerBefore.metering, included_metering: ledgerBefore.included_metering, metered_amount_cents: ledgerBefore.metered_amount_cents, commands: ledgerBefore.commands, balance_events: ledgerBefore.balance_events, used_packets: ledgerBefore.used_packets }, { attempts: 0, metering: 0, included_metering: 0, metered_amount_cents: 0, commands: 0, balance_events: 0, used_packets: 0 }, "ledger_zero_before_approval");
     assert.equal(packetWorkspace.applications[0].receipt.approved_execution, undefined, "no_approved_execution_before");
     assert.equal(packetWorkspace.profile.source_resume_name, "", "approval_missing_source_resume");
     const packetPosting = packetWorkspace.matches.find((posting) => posting.id === fixtureResult.job_id);
@@ -526,6 +529,69 @@ async function main() {
     assert.equal(afterApproval.applications[0].receipt.approved_execution, undefined, "no_approved_execution_after");
     assert.equal(pageErrors, 0, "packet_page_errors"); assert.equal(serverErrors, 0, "packet_server_errors");
     passCase("approval_fenced");
+    stage = "source_resume_upload";
+    const manualProfileBeforeSource = structuredClone(afterApproval.profile); const preferencesBeforeSource = structuredClone(afterApproval.preferences);
+    const sourceBytes = Buffer.from("Synthetic Candidate\nSoftware Engineer\nNew York, NY\nSynthetic Systems\nSoftware Engineer, 2022-01\nBuilt synthetic test systems\nSkills: TypeScript\n", "utf8");
+    const sourceRequest = { request_id: randomUUID(), file_name: "synthetic-source.txt", media_type: "text/plain", bytes_base64: sourceBytes.toString("base64") };
+    const uploaded = await postJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-source`, token, sourceRequest);
+    assert.equal(uploaded.status, 200, "source_upload_status"); assert.equal(uploaded.body.asset.file_type, "txt", "source_text_only"); assert.equal(uploaded.body.asset.template_status, "text_only", "source_template_text_only"); assert.equal(uploaded.body.asset.size_bytes, sourceBytes.length, "source_bytes"); assert.equal(uploaded.body.asset.sha256, createHash("sha256").update(sourceBytes).digest("hex"), "source_hash");
+    const sourceMetadata = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-source`, token);
+    assert.equal(sourceMetadata.id, uploaded.body.asset.id, "source_metadata_id"); assert.equal(sourceMetadata.sha256, uploaded.body.asset.sha256, "source_metadata_hash"); assert.equal(sourceMetadata.size_bytes, sourceBytes.length, "source_metadata_size");
+    const replay = await postJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-source`, token, sourceRequest);
+    assert.equal(replay.status, 200, "source_replay_status"); assert.equal(replay.body.asset.id, uploaded.body.asset.id, "source_replay_asset");
+    const sourceWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token); assert.equal(sourceWorkspace.profile.full_name, "Synthetic Candidate", "source_preserves_manual_name"); assert.equal(sourceWorkspace.profile.source_resume_asset_id, uploaded.body.asset.id, "source_profile_pointer"); assert.equal(sourceWorkspace.profile.source_resume_sha256, uploaded.body.asset.sha256, "source_profile_hash");
+    assert.equal(sourceWorkspace.profile.source_resume_name, "synthetic-source.txt", "source_profile_name"); assert.equal(sourceWorkspace.profile.source_resume_media_type, "text/plain", "source_profile_media_type"); assert.equal(sourceWorkspace.profile.source_resume_template_status, "text_only", "source_profile_template_status"); const manualProfileAfterSource = structuredClone(sourceWorkspace.profile); for (const key of ["source_resume_asset_id", "source_resume_name", "source_resume_sha256", "source_resume_media_type", "source_resume_template_status", "updated_at_ms"]) { delete manualProfileBeforeSource[key]; delete manualProfileAfterSource[key]; } assert.deepEqual(manualProfileAfterSource, manualProfileBeforeSource, "source_preserves_manual_profile"); assert.deepEqual(sourceWorkspace.preferences, preferencesBeforeSource, "source_preserves_preferences");
+    await objectStore.assertStoredBytes(sourceBytes); result.object_store = objectStore.counters(); assert.equal(result.object_store.put, 1, "source_single_put"); passCase("source_resume_readback");
+    stage = "source_policy_review";
+    await page.goto(`http://127.0.0.1:${portalPort}/jobs/settings`, { waitUntil: "networkidle" }); await page.locator(".track-settings-main").first().click();
+    await page.getByRole("heading", { name: "Edit Career Track" }).waitFor({ timeout: OPERATION_MS }); await page.getByRole("button", { name: "Save track" }).click(); await page.getByRole("status").getByText("Career Track updated.", { exact: true }).waitFor({ timeout: OPERATION_MS });
+    const sourceBoundWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token);
+    const sourceAuthority = sourceBoundWorkspace.tracks[0].policy.authority;
+    assert.equal(sourceAuthority.review_state, "approved", "source_policy_approved"); assert.equal(sourceAuthority.source_resume_asset_id, uploaded.body.asset.id, "source_policy_asset_binding"); assert.equal(sourceAuthority.source_resume_sha256, uploaded.body.asset.sha256, "source_policy_hash_binding");
+    stage = "review_first_reprepare";
+    await page.goto(`http://127.0.0.1:${portalPort}/jobs/matches`, { waitUntil: "networkidle" }); await page.locator(".job-row").filter({ hasText: "Synthetic Qualification Employer" }).click({ timeout: OPERATION_MS });
+    const [reprepareResponse] = await Promise.all([page.waitForResponse((response) => new URL(response.url()).pathname === "/api/jobs/applications" && response.request().method() === "POST", { timeout: OPERATION_MS }), page.getByRole("button", { name: "Prepare application", exact: true }).click()]);
+    const reprepareText = await reprepareResponse.text();
+    assert.ok(Buffer.byteLength(reprepareText) <= 1024 * 1024, "reprepare_body_limit");
+    const reprepare = { status: reprepareResponse.status(), body: JSON.parse(reprepareText) };
+    stage = "review_first_packet_binding";
+    assert.deepEqual(JSON.parse(reprepareResponse.request().postData()), { job_id: fixtureResult.job_id, mode: "factual", submission_mode: "review_first" }, "reprepare_browser_authority");
+    assert.equal(reprepare.status, 200, "reprepare_status"); assert.equal(reprepare.body.application.id, prepared.body.application.id, "same_application_reprepared"); assert.equal(reprepare.body.application.state, "awaiting_review", "reprepare_awaiting_review"); assert.notEqual(reprepare.body.resume_version.id, prepared.body.resume_version.id, "fresh_resume_version"); assert.equal(reprepare.body.resume_version.mode, "factual", "fresh_factual_mode"); assert.equal(reprepare.body.resume_version.content.provenance.generated_for_job_id, fixtureResult.job_id, "fresh_generated_job_binding"); assert.equal(reprepare.body.resume_version.content.provenance.career_track_policy_authority.source_resume_asset_id, uploaded.body.asset.id, "fresh_resume_source_binding"); assert.equal(reprepare.body.resume_version.content.provenance.career_track_policy_authority.source_resume_sha256, uploaded.body.asset.sha256, "fresh_resume_hash_binding"); assert.equal(reprepare.body.application.receipt.approved_execution, undefined, "fresh_not_approved");
+    assert.equal(reprepare.body.resume_version.content.provenance.mode, "factual", "fresh_factual_provenance");
+    const oldResume = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-versions/${encodeURIComponent(prepared.body.resume_version.id)}`, token); assert.deepEqual(oldResume, prepared.body.resume_version, "old_resume_immutable_after_source_change");
+    const freshResume = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-versions/${encodeURIComponent(reprepare.body.resume_version.id)}`, token); assert.deepEqual(freshResume, reprepare.body.resume_version, "fresh_resume_immutable_reload");
+    assert.deepEqual(freshResume.content.employment, prepared.body.resume_version.content.employment, "fresh_resume_preserves_employment");
+    assert.deepEqual(freshResume.content.skills, prepared.body.resume_version.content.skills, "fresh_resume_preserves_skills");
+    stage = "review_first_queue_eligibility";
+    const queueBefore = await packetLedgerSnapshot(psql, database, childHome, accountId); const queueWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token); const queuePosting = queueWorkspace.matches.find((posting) => posting.id === fixtureResult.job_id);
+    assert.equal(queueWorkspace.applications.length, 1, "reprepare_no_duplicate_application");
+    assert.equal(queueWorkspace.applications[0].id, reprepare.body.application.id, "reprepare_workspace_application");
+    assert.equal(queueWorkspace.applications[0].job_id, fixtureResult.job_id, "reprepare_workspace_job");
+    assert.equal(queueWorkspace.entitlement.plan, "pro", "guarded_fixture_plan");
+    assert.equal(queueWorkspace.entitlement.used_packets, 0, "no_packet_consumed_before_approval");
+    assert.ok(queuePosting, "queue_posting_present");
+    assert.deepEqual(queuePosting.eligibility.hard_failures, [], "queue_no_hard_failures");
+    for (const check of ["career_track_policy_current", "role_family_aligned", "location_allowed", "employment_type_allowed", "engagement_type_allowed", "job_recently_verified", "discovery_source_healthy", "ats_certified"]) {
+      assert.ok(queuePosting.eligibility.passed_checks.includes(check), `queue_gate_${check}`);
+    }
+    assert.equal(queuePosting.eligibility.ats_certification.status, "active", "queue_ats_active");
+    assert.equal(queuePosting.eligibility.can_queue_local, true, "queue_local_allowed"); assert.equal(queuePosting.eligibility.can_queue_cloud, false, "queue_cloud_disabled");
+    stage = "review_first_queue_approval";
+    const queued = await postJson(`http://127.0.0.1:${jobsPort}/api/jobs/applications/${encodeURIComponent(reprepare.body.application.id)}/approve`, token, {}); assert.equal(queued.status, 200, "queue_approval_status"); assert.equal(queued.body.application.state, "queued", "queue_state");
+    assert.equal(queued.body.metering.newly_metered, true, "queue_metered_once");
+    assert.equal(queued.body.metering.included, true, "queue_included_packet");
+    assert.equal(queued.body.metering.amount_cents, 0, "queue_no_overage_charge");
+    assert.equal(queued.body.metering.used_packets, queueBefore.used_packets + 1, "queue_metered_usage");
+    const queuedWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token); assert.equal(queuedWorkspace.applications[0].state, "queued", "queued_workspace_state"); const approvalEvidence = queuedWorkspace.applications[0].receipt.approved_execution; assert.equal(approvalEvidence.schema_version, 2, "queued_approval_schema"); assert.equal(approvalEvidence.admission.kind, "review_approval", "queued_approval_kind"); assert.match(approvalEvidence.checksum, /^[a-f0-9]{64}$/, "queued_approval_checksum"); assert.equal(approvalEvidence.packet.applicationId, reprepare.body.application.id, "queued_approval_application_binding"); assert.equal(approvalEvidence.packet.jobId, fixtureResult.job_id, "queued_approval_job_binding"); assert.equal(approvalEvidence.packet.applicationIdentityId, verifiedIdentity.id, "queued_approval_identity_binding"); assert.equal(approvalEvidence.packet.resumeVersionId, reprepare.body.resume_version.id, "queued_approval_resume_binding"); assert.deepEqual(approvalEvidence.packet.resumeContent, freshResume.content, "queued_approval_resume_content"); assert.equal(approvalEvidence.packet.resumeContent.provenance.career_track_policy_authority.source_resume_asset_id, uploaded.body.asset.id, "queued_approval_source_binding"); assert.equal(approvalEvidence.packet.resumeContent.provenance.career_track_policy_authority.source_resume_sha256, uploaded.body.asset.sha256, "queued_approval_source_hash_binding"); assert.deepEqual(queuedWorkspace.auto_submit_authorizations, [], "queued_no_auto_submit_authority"); assert.equal(queuedWorkspace.applications[0].submitted_at_ms, null, "queued_not_submitted"); assert.deepEqual(queuedWorkspace.browser_sessions, [], "queued_no_browser_session"); assert.deepEqual(queuedWorkspace.interventions, [], "queued_no_intervention");
+    const queueAfter = await packetLedgerSnapshot(psql, database, childHome, accountId); assert.equal(queueAfter.attempts, queueBefore.attempts + 1, "queue_attempt"); assert.equal(queueAfter.metering, queueBefore.metering + 1, "queue_metering"); assert.equal(queueAfter.used_packets, queueBefore.used_packets + 1, "queue_used_packet"); assert.equal(queueAfter.balance_events, queueBefore.balance_events, "queue_no_balance_event"); assert.equal(queueAfter.commands, queueBefore.commands, "queue_no_dispatch");
+    assert.equal(queuedWorkspace.applications.length, 1, "queue_no_duplicate_application");
+    assert.equal(queuedWorkspace.applications[0].id, reprepare.body.application.id, "queue_workspace_application");
+    assert.equal(queuedWorkspace.applications[0].job_id, fixtureResult.job_id, "queue_workspace_job");
+    assert.equal(queuedWorkspace.entitlement.used_packets, queueAfter.used_packets, "queue_workspace_usage");
+    assert.equal(queueAfter.included_metering, queueBefore.included_metering + 1, "queue_included_ledger");
+    assert.equal(queueAfter.metered_amount_cents, 0, "queue_ledger_zero_charge");
+    assert.equal(queueAfter.balance_cents, queueBefore.balance_cents, "queue_ledger_balance_unchanged");
+    const repeatApprove = await postJson(`http://127.0.0.1:${jobsPort}/api/jobs/applications/${encodeURIComponent(reprepare.body.application.id)}/approve`, token, {}); assert.equal(repeatApprove.status, 409, "queue_repeat_conflict"); assert.deepEqual(await packetLedgerSnapshot(psql, database, childHome, accountId), queueAfter, "queue_repeat_no_double_debit"); assert.equal(pageErrors, 0, "final_page_errors"); assert.equal(serverErrors, 0, "final_server_errors"); passCase("review_first_queue");
     await context.close();
   } finally { await browser.close(); liveBrowser = undefined; await new Promise((resolveClose) => proxy.close(resolveClose)); liveProxy = undefined; }
   stage = "cleanup"; await stopChildren();
@@ -539,19 +605,23 @@ try {
   await Promise.race([main(), new Promise((_, reject) => { totalTimer = setTimeout(() => reject(new Error("timeout_total")), LIMIT_MS); })]);
 } catch (error) {
   const brokenStage = stage;
-  const candidate = error instanceof Error ? error.message : "unknown_failure";
+  const assertionLabel = error?.code === "ERR_ASSERTION" && typeof error.message === "string"
+    ? error.message.split("\n", 1)[0] : "";
+  const candidate = /^[a-z0-9_]{1,120}$/.test(assertionLabel)
+    ? assertionLabel : error instanceof Error ? error.message : "unknown_failure";
   const code = /^[a-z0-9_:-]{1,120}$/i.test(candidate) ? candidate : "generic_failure";
   result.failed.push(code);
   if (liveBrowser) await liveBrowser.close().catch(() => {});
   if (liveProxy) await new Promise((resolveClose) => liveProxy.close(resolveClose));
   try { stage = "cleanup"; await stopChildren(); } catch { result.failed.push("cleanup_failure"); }
-  process.stdout.write(`${JSON.stringify({ version: 3, passed: 0, stage: brokenStage, failure: code })}\n`);
+  process.stdout.write(`${JSON.stringify({ version: 4, passed: 0, stage: brokenStage, failure: code })}\n`);
 } finally {
   clearTimeout(totalTimer);
+  if (objectStore) { result.object_store = objectStore.counters(); await objectStore.close(); objectStore = undefined; }
   if (result.failed.length === 0 && result.passed === result.tests && outputRoot) {
     const output = join(outputRoot, "browser-api-result.json");
     await writeFile(output, `${JSON.stringify(result)}\n`, { flag: "wx", mode: 0o600 }); await chmod(output, 0o600);
-    process.stdout.write(`${JSON.stringify({ version: 3, passed: result.passed, tests: result.tests })}\n`);
+    process.stdout.write(`${JSON.stringify({ version: 4, passed: result.passed, tests: result.tests })}\n`);
   }
 }
 if (result.failed.length) process.exitCode = 1;

@@ -51,8 +51,9 @@ for (const path of [
   "portal/nonprod/browser-api.integration.mjs",
   "scripts/run-nonprod-browser-api-tests.mjs",
   "scripts/nonprod-browser-api-report.mjs",
+  "scripts/nonprod-object-store.mjs",
 ]) snapshot(join(jobs, path));
-for (const path of ["Cargo.toml", "src/lib.rs", "examples/jobs-nonprod-browser-fixture.rs"]) {
+for (const path of ["Cargo.toml", "src/lib.rs", "src/db/jobs/production_positive_authority_fixture.rs", "examples/jobs-nonprod-browser-fixture.rs"]) {
   snapshot(resolve(jobs, "../server", path));
 }
 const artifacts = [];

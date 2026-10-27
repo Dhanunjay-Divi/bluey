@@ -25,6 +25,23 @@ pub(crate) struct ProductionPositiveAuthorityFixture {
     pub(crate) surface: AtsObservedSurface,
 }
 
+fn discovery_fixture_categories(value: &str) -> (String, String) {
+    // Stored postings join the two canonical discovery fields. Split only an
+    // exact canonical pair; malformed/mixed input must still fail validation.
+    if let Some((employment, engagement)) = value.split_once(' ') {
+        if !employment.is_empty()
+            && !engagement.is_empty()
+            && employment.trim() == employment
+            && engagement.trim() == engagement
+            && is_canonical_discovered_employment_type(employment)
+            && is_canonical_discovered_engagement_type(engagement)
+        {
+            return (employment.to_string(), engagement.to_string());
+        }
+    }
+    (value.to_string(), String::new())
+}
+
 pub(crate) fn save_production_positive_verified_import(
     pool: &DbPool,
     account_id: &str,
@@ -111,20 +128,24 @@ pub(crate) fn save_production_positive_verified_import_with_runtime(
                 .iter()
                 .any(|authority| authority.source_id == lease.source.id)
         })
-        .map(|candidate| DiscoveredJobInput {
-            external_id: candidate.external_id,
-            canonical_url: candidate.canonical_url,
-            title: candidate.title,
-            company: candidate.company,
-            source_catalog_id: String::new(),
-            requires_original_revalidation: false,
-            location: candidate.location,
-            workplace: candidate.workplace,
-            description: candidate.description,
-            compensation: candidate.compensation,
-            employment_type: candidate.employment_type,
-            engagement_type: String::new(),
-            posted_at_ms: candidate.posted_at_ms,
+        .map(|candidate| {
+            let (employment_type, engagement_type) =
+                discovery_fixture_categories(&candidate.employment_type);
+            DiscoveredJobInput {
+                external_id: candidate.external_id,
+                canonical_url: candidate.canonical_url,
+                title: candidate.title,
+                company: candidate.company,
+                source_catalog_id: String::new(),
+                requires_original_revalidation: false,
+                location: candidate.location,
+                workplace: candidate.workplace,
+                description: candidate.description,
+                compensation: candidate.compensation,
+                employment_type,
+                engagement_type,
+                posted_at_ms: candidate.posted_at_ms,
+            }
         })
         .collect::<Vec<_>>();
     assert!(source_snapshot
@@ -373,6 +394,49 @@ pub(crate) fn install_production_positive_job_authorities_from_verified_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_fixture_splits_only_exact_canonical_category_pairs() {
+        for employment in [
+            "full_time",
+            "part_time",
+            "contract",
+            "temporary",
+            "internship",
+            "apprenticeship",
+            "seasonal",
+            "per_diem",
+        ] {
+            for engagement in ["w2", "c2c", "1099", "direct_hire"] {
+                assert_eq!(
+                    discovery_fixture_categories(&format!("{employment} {engagement}")),
+                    (employment.to_string(), engagement.to_string())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_fixture_preserves_plain_and_malformed_input_for_validation() {
+        for value in [
+            "",
+            "full_time",
+            "contract",
+            "full_time w2 c2c",
+            "full_time  w2",
+            " full_time w2",
+            "full_time w2 ",
+            "full_time unknown",
+            "unknown w2",
+            "W2",
+            "not full_time w2",
+        ] {
+            assert_eq!(
+                discovery_fixture_categories(value),
+                (value.to_string(), String::new())
+            );
+        }
+    }
 
     fn pool() -> DbPool {
         let path = std::env::temp_dir().join(format!(

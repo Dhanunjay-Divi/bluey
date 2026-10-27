@@ -9,6 +9,8 @@ export const BROWSER_API_CASES = Object.freeze([
   "effect_availability",
   "packet_review",
   "approval_fenced",
+  "source_resume_readback",
+  "review_first_queue",
 ]);
 
 function exactRecord(value, fields) {
@@ -27,8 +29,8 @@ function processExists(pid) {
 }
 
 export function assertBrowserApiReport(report, pidExists = processExists) {
-  exactRecord(report, ["version", "tests", "passed", "cases", "failed", "binaries", "fixture", "requests"]);
-  assert.equal(report.version, 3, "unexpected browser report version");
+  exactRecord(report, ["version", "tests", "passed", "cases", "failed", "binaries", "fixture", "requests", "object_store"]);
+  assert.equal(report.version, 4, "unexpected browser report version");
   assert.equal(report.tests, BROWSER_API_CASES.length, "incomplete browser case declaration");
   assert.equal(report.passed, BROWSER_API_CASES.length, "incomplete browser case execution");
   assert.deepEqual(report.cases, BROWSER_API_CASES, "missing or reordered browser cases");
@@ -50,4 +52,10 @@ export function assertBrowserApiReport(report, pidExists = processExists) {
     assert(Number.isSafeInteger(count) && count > 0 && count <= 100_000,
       "invalid API request count");
   }
+  exactRecord(report.object_store, ["put", "get", "denied", "objects"]);
+  assert.equal(report.object_store.put, 1, "source replay must not create another PUT");
+  assert(Number.isSafeInteger(report.object_store.get) && report.object_store.get >= 2
+    && report.object_store.get <= 100, "source upload and replay both require readback");
+  assert.equal(report.object_store.denied, 0, "normal source journey must have no storage rejection");
+  assert.equal(report.object_store.objects, 1, "one canonical source object required");
 }

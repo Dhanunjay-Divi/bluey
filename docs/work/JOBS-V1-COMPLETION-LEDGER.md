@@ -30,13 +30,13 @@ boundary, not a claim of live service, scale, employer or provider success.
 
 | Capability | Current evidence | Remaining completion condition |
 |---|---|---|
-| Profile, preferences and Career Tracks | Implemented; Phase 631 actual browser/API/private PG full six-step manual onboarding, exact policy/Track reload, account isolation and disabled-state 5/5 | Resume object import, live auth/OAuth and nonempty packet/execution journey remain separate |
+| Profile, preferences and Career Tracks | Implemented; Phase 633 actual browser/API/private PG retains full onboarding/isolation and adds source upload/readback/replay plus canonical Track review | Hosted object import, live auth/OAuth and actual execution remain separate |
 | Discovery and source verification | Implemented source/normalization/verification authority and local tests | Measured licensed/authorized source coverage, freshness/closure reconciliation and scheduled canaries; never infer 50,000 sources |
 | Grounded resume/cover letter/answers | Implemented generation/immutable packet constraints and local tests | Real private object-storage/model canary and layout/readback evidence; no fabricated facts |
-| Apply and receipts | Implemented authority; Phase 632 actual browser/API/PG signed-test-job prepare, factual kit/reload and exact blocked-approval/no-debit proof | Positive source-asset/Track approval and fixture runner/receipt journey plus provider-specific canaries; unknown submission is never retried blindly |
+| Apply and receipts | Implemented authority; Phase 633 actual browser/API/PG signed-test-job factual kit, source-bound reprepare, negative approval and positive private local queue proof | Matching fixture runner/receipt journey plus provider-specific canaries; unknown submission is never retried blindly |
 | Durable orchestration | Phase 630 actual Temporal 10/10, persistent restart, Update/replay and exact cleanup | Hosted TLS, actual fleet capacity, final source-qualified Linux artifacts and rollback rehearsal |
 | Tracker and recruiter inbox | Implemented application/outcome/mailbox source paths | Stitched actual UI/API/PG tracking and isolated Gmail/Outlook correlation/draft/send canaries under explicit scope |
-| Monthly Jobs billing | Implemented plan/allowance/metering source | Subscription lifecycle and failure/re-credit qualification; do not confuse desktop prepaid billing |
+| Monthly Jobs billing | Implemented; Phase 633 one included private queue allowance, unchanged balance and repeat-approval/no-double-debit proof | Real subscription lifecycle, paid overage/failure/re-credit qualification; do not confuse desktop prepaid billing |
 | W-2/C2C/1099/direct-hire targeting | Implemented taxonomy and preference controls | End-to-end policy persistence/matching proof; contract filters do not establish recruiter chat/outreach |
 | C2C recruiter workflows | Successor under existing Phase 620B–F product plan | Separate recipient authority, opt-out/abuse controls, immutable plan and effect evidence |
 | WhatsApp/Apple business messaging | Phase 620A1 no-egress simulator only | Durable connection/consent/STOP authority, official provider adapters, sandbox and canary; no customer integration claim |
@@ -91,8 +91,24 @@ seven report-boundary tests passed. All three child PIDs exited cleanly and were
 absent; PG stopped; all four run parents were empty. Earlier diagnostic and
 source-race attempts remain failed, not blended into this accepted run.
 
-Next local boundary: source-resume upload/object readback and canonical Track
-review needed for positive approval. Reuse existing storage/provider guards;
-do not create a production fixture or weaken TLS/endpoint/identity/certification
-constraints. Hosted/provider/source/runner/receipt and broader parity work remain
-unfinished, not implied by local signed-fixture success.
+Phase 633 frozen Run3 passed the actual browser/API/PG journey 9/9 with one
+source PUT/two GETs/no storage denial, ordinary source-bound Track review,
+same-job factual reprepare and one included review-approved internal queue packet.
+Old/new resumes stayed immutable, manual facts/preferences unchanged, balance
+unchanged and repeated approval created no second reservation/debit. No session,
+workflow dispatch or employer submission occurred. Helper5/5, fixture module3/3,
+existing category unit1/1 and narrow strict Clippy passed. Source hashes unchanged;
+all three child PIDs absent, PG stopped, exact root removed and parent empty.
+The two failed diagnostic attempts remain failed. Fresh Jobs regressions passed
+2,053 cases with one configured-browser skip, all five workspace typechecks;
+that Chromium guard was then separately installed/run in an owned root and
+passed 1/1 (2,054 cases actually exercised across the two runs). It uses synthetic
+intercepted employer pages, not a real submission or stitched runner receipt.
+
+Next local boundary: stitch a matching runner control-plane lifecycle, then
+controlled browser/receipt evidence. This local-certified queue cannot authorize
+a cloud session: cloud requires separately matching runtime/volume/ATS authority.
+Employer loopback remains prohibited; the TXT-only object protocol fixture is
+not receipt storage or hosted R2/TLS/durability proof. Docker/Colima are currently
+stopped; unrelated Pinky context was untouched. Hosted/provider/source/runner/
+receipt and broader parity work remain unfinished.

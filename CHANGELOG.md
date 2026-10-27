@@ -5,6 +5,9 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs: qualify signed source-resume upload/readback/replay and source-bound
+  factual re-preparation through one included, review-approved private queue
+  packet; verify unchanged balance, no double metering and zero dispatch.
 - Jobs: qualify actual Matches-to-application-kit preparation and exact
   unreviewed-Track approval denial using a private debug-only signed fixture;
   prove no attempt, workflow command or billing debit is created on denial.

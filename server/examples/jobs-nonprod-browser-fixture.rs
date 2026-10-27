@@ -28,6 +28,8 @@ mod unix {
         version: u8,
         account_id: String,
         track_id: String,
+        #[serde(default)]
+        queue_entitlement: bool,
     }
 
     #[derive(Serialize)]
@@ -358,6 +360,22 @@ mod unix {
             track.application_identity_id.is_some(),
             "track_identity_required",
         )?;
+        if request.queue_entitlement {
+            // Private fixture account only, after physical database and ownership
+            // checks. Exercise the normal plan function, never payment providers
+            // or hand-written execution/eligibility authority rows.
+            root.revalidate()?;
+            validate_database(&mut client, &root, port)?;
+            let entitlement = jobs::set_entitlement_plan(&pool, &account.id, "pro")
+                .map_err(|_| "fixture_queue_entitlement")?;
+            require(
+                entitlement.plan == "pro"
+                    && entitlement.local_browser
+                    && !entitlement.cloud_browser
+                    && entitlement.used_packets == 0,
+                "fixture_queue_entitlement",
+            )?;
+        }
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let now = chrono::Utc::now().timestamp_millis();
         let mut posting = jobs::JobPosting {
@@ -372,7 +390,9 @@ mod unix {
         canonical_url: format!("https://boards.greenhouse.io/blueynonprod/jobs/phase632-{suffix}"),
         description: "Full-time W2 employment. Hybrid work in New York, NY. Visa sponsorship available. Build reliable software systems with Rust and TypeScript.".into(),
         compensation: "$170k-$200k".into(),
-        employment_type: "full_time".into(),
+        // Match discovery's typed employment + engagement representation.
+        // Prose mentioning W2 is deliberately not positive engagement authority.
+        employment_type: "full_time w2".into(),
         track_id: track.id,
         match_score: 99,
         matched_reasons: Vec::new(),
@@ -406,6 +426,19 @@ mod unix {
         let eligibility = jobs::evaluate_job_eligibility(&pool, &account.id, &posting, false, None)
             .map_err(|_| "eligibility_read")?;
         require(eligibility.can_prepare, "signed_posting_not_preparable")?;
+        if request.queue_entitlement {
+            require(
+                ["employment_type_allowed", "engagement_type_allowed"]
+                    .iter()
+                    .all(|check| {
+                        eligibility
+                            .passed_checks
+                            .iter()
+                            .any(|value| value == *check)
+                    }),
+                "signed_posting_typed_categories_required",
+            )?;
+        }
         root.revalidate()?;
         let response = serde_json::to_vec(&Response {
             version: 1,
@@ -487,8 +520,34 @@ mod unix {
             assert!(validate_request(&Request {
                 version: 1,
                 account_id: "../a".into(),
-                track_id: "t".into()
+                track_id: "t".into(),
+                queue_entitlement: false,
             })
+            .is_err());
+        }
+
+        #[test]
+        fn queue_entitlement_is_explicit_boolean_and_defaults_off() {
+            let legacy = r#"{"version":1,"account_id":"a","track_id":"t"}"#;
+            assert!(
+                !serde_json::from_str::<Request>(legacy)
+                    .unwrap()
+                    .queue_entitlement
+            );
+            let granting =
+                r#"{"version":1,"account_id":"a","track_id":"t","queue_entitlement":true}"#;
+            assert!(
+                serde_json::from_str::<Request>(granting)
+                    .unwrap()
+                    .queue_entitlement
+            );
+            assert!(serde_json::from_str::<Request>(
+                r#"{"version":1,"account_id":"a","track_id":"t","queue_entitlement":"true"}"#
+            )
+            .is_err());
+            assert!(serde_json::from_str::<Request>(
+                r#"{"version":1,"account_id":"a","track_id":"t","plan":"cloud"}"#
+            )
             .is_err());
         }
 

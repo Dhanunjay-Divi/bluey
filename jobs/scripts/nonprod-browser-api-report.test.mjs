@@ -4,11 +4,12 @@ import { assertBrowserApiReport, BROWSER_API_CASES } from "./nonprod-browser-api
 
 function report() {
   return {
-    version: 3, tests: BROWSER_API_CASES.length, passed: BROWSER_API_CASES.length,
+    version: 4, tests: BROWSER_API_CASES.length, passed: BROWSER_API_CASES.length,
     cases: [...BROWSER_API_CASES], failed: [],
     binaries: [{ pid: 12345, code: 0, signal: null }, { pid: 12346, code: 0, signal: null }],
     fixture: { pid: 12347, code: 0, signal: null },
     requests: { jobs: 25, account: 3 },
+    object_store: { put: 1, get: 2, denied: 0, objects: 1 },
   };
 }
 
@@ -23,7 +24,7 @@ test("all named browser cases and both absent owned APIs are required", () => {
 
 test("partial, duplicated, reordered or fabricated case reports cannot qualify", () => {
   for (const change of [
-    { version: 1 }, { version: 2 }, { tests: 5, passed: 5 }, { passed: 6 }, { passed: "7" },
+    { version: 1 }, { version: 2 }, { version: 3 }, { tests: 7, passed: 7 }, { passed: 8 }, { passed: "9" },
     { cases: [] }, { cases: BROWSER_API_CASES.slice(0, -1) },
     { cases: [...BROWSER_API_CASES].reverse() },
     { cases: BROWSER_API_CASES.map(() => "profile_reload") },
@@ -65,4 +66,13 @@ test("signed fixture bridge must also exit cleanly with a distinct absent PID", 
     { pid: 12347, code: 0, signal: null, extra: true },
   ]) assert.throws(() => assertBrowserApiReport({ ...report(), fixture }, () => false));
   assert.throws(() => assertBrowserApiReport(report(), (pid) => pid === 12347), /still exists/);
+});
+
+test("source object must have one PUT, repeated exact readback and zero normal rejections", () => {
+  for (const object_store of [null, {}, { put: 2, get: 2, denied: 0, objects: 1 },
+    { put: 1, get: 1, denied: 0, objects: 1 }, { put: 1, get: 2, denied: 1, objects: 1 },
+    { put: 1, get: 2, denied: 0, objects: 0 }, { put: 1, get: 2, denied: 0, objects: 2 },
+    { put: 1, get: "2", denied: 0, objects: 1 }, { put: 1, get: 101, denied: 0, objects: 1 },
+    { put: 1, get: 2, denied: 0, objects: 1, extra: true },
+  ]) assert.throws(() => assertBrowserApiReport({ ...report(), object_store }, () => false));
 });
