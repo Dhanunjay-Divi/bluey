@@ -38,6 +38,24 @@ state-root removal.
 Locations: `jobs/scripts/run-nonprod-linux-runner-tests.mjs:70-108,410-455` and focused tests at
 `jobs/scripts/run-nonprod-linux-runner-tests.test.mjs:75-128`.
 
+## Resolved P1 Lima stopped-inventory protocol finding
+
+Official Lima 2.2.1 source reviewed by the parent shows that the integer host-agent and driver PID
+fields retain `omitempty` in `Instance.MarshalJSON`; a genuinely stopped VZ instance can therefore
+omit both zero-valued fields. Treating every omission as an unknown inventory would retain a
+proven-stopped owned VM indefinitely, while treating arbitrary missing fields as zero would weaken
+the deletion fence.
+
+The frozen adapter normalizes an omitted PID to zero only for the exact reviewed protocol tuple:
+Lima `2.2.1`, VZ, `aarch64`, canonical `Running` or `Stopped` status and no reported errors. A
+running row still requires a positive host-agent PID. Explicit null/string values, missing live
+host PID, unknown versions, VM types, architectures, statuses or errors fail closed. The cleanup
+path still requires the exact stopped Colima and Lima inventories and absence of every PID captured
+before deletion; this adapter does not turn absent or partial inventory into deletion authority.
+
+Locations: `jobs/scripts/run-nonprod-linux-runner-tests.mjs:119-166` and the focused positive and
+negative protocol cases at `jobs/scripts/run-nonprod-linux-runner-tests.test.mjs:172-198`.
+
 ## Resolved P1 socket-budget and failure-evidence finding
 
 The first actual attempt used a private Lima path whose reserved SSH socket was 105 bytes. Darwin's
@@ -119,7 +137,7 @@ root; the canonical launcher alone does not supply that isolation.
 ## Reviewer-observed checks
 
 - `node --check` passed for the harness and focused test file.
-- `node --test jobs/scripts/run-nonprod-linux-runner-tests.test.mjs` passed 16/16 with zero failures,
+- `node --test jobs/scripts/run-nonprod-linux-runner-tests.test.mjs` passed 17/17 with zero failures,
   skips or cancellations.
 - `git diff --check 57635b29 -- jobs/package.json
   jobs/scripts/run-nonprod-linux-runner-tests.mjs

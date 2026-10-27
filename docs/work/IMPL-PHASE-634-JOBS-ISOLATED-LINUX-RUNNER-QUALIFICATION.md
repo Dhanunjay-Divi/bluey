@@ -118,3 +118,15 @@ causes, both bounded private output streams, and unknown-entry retention. Raw
 output is never emitted in the public report. Proven cleanup removes only known
 large state children before retaining at most1MiB diagnostics/owner marker;
 uncertainty preserves the entire state. Actual Linux qualification is pending.
+
+Before another VM attempt, a primary-source check found an additional protocol
+detail: Lima2.2.1's `Instance.MarshalJSON` preserves `omitempty` for zero-valued
+host/driver PIDs. Requiring literal serialized0 fields would reject normal
+stopped inventory. A narrow adapter now interprets those documented omissions
+only for canonical2.2.1/VZ/aarch64 Running-or-Stopped/no-error rows. Running still
+requires a positive host-agent PID; unknown/malformed omission is not zero and
+retains state. Full prior-PID absence remains mandatory before destructive
+deletion. Parent/reviewer each passed17/17 current pure units, syntax and diff
+checks; this is a reviewed protocol adapter, not relaxed shutdown authority.
+
+The source is [the exact Lima2.2.1 instance contract](https://github.com/lima-vm/lima/blob/v2.2.1/pkg/limatype/lima_instance.go).

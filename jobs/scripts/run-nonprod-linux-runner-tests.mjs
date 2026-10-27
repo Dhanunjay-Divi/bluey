@@ -116,10 +116,30 @@ export function assertEmptyInventories(colima, lima) {
   check(Array.isArray(colima) && Array.isArray(lima) && colima.length === 0 && lima.length === 0,
     "private_vm_inventory_not_empty");
 }
+function limaPidFields(row) {
+  let host = Object.hasOwn(row, "hostAgentPID") ? row.hostAgentPID : row.HostAgentPID;
+  let driver = Object.hasOwn(row, "driverPID") ? row.driverPID : row.DriverPID;
+  const documentedProtocol = row.limaVersion === "2.2.1" && row.vmType === "vz" && row.arch === "aarch64"
+    && ["Running", "Stopped"].includes(row.status);
+  const noErrors = row.errors === undefined || (Array.isArray(row.errors) && row.errors.length === 0);
+  if (documentedProtocol) {
+    check(noErrors && (row.status !== "Running" || (Number.isInteger(host) && host > 1)),
+      "lima_known_protocol_live_host_pid_required");
+  }
+  if (host === undefined || driver === undefined) {
+    // Lima2.2.1 Instance.MarshalJSON preserves json:"...,omitempty" on these
+    // integer fields. Missing means zero ONLY for this exact reviewed protocol:
+    // https://github.com/lima-vm/lima/blob/v2.2.1/pkg/limatype/lima_instance.go
+    check(documentedProtocol && noErrors, "lima_pid_omission_protocol_unsupported");
+    if (host === undefined) host = 0;
+    if (driver === undefined) driver = 0;
+  }
+  return [host, driver];
+}
 export function ownedLimaPids(row, profile, { allowStopped = false } = {}) {
   assertProfile(profile);
   check((row?.name ?? row?.Name) === `colima-${profile}`, "foreign_lima_instance");
-  const fields = [row.hostAgentPID ?? row.HostAgentPID, row.driverPID ?? row.DriverPID];
+  const fields = limaPidFields(row);
   const errors = row.errors ?? row.Errors;
   const knownStopped = allowStopped && ["Stopped", "stopped"].includes(row.status ?? row.Status)
     && fields.every((pid) => pid === 0) && (errors === undefined || (Array.isArray(errors) && errors.length === 0));

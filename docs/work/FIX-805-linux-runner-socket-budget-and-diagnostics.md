@@ -28,6 +28,8 @@ production host, Dockerfile, candidate or employer-application defect.
   stderr, with only closed metadata in public reports.
 - Preserve active/uncertain VM state. After full shutdown/deletion proof, retain
   only bounded diagnostics/owner marker, not large caches, snapshots or disks.
+- Interpret zero-PID omission only under the reviewed Lima2.2.1/VZ/aarch64
+  serialization contract; recorded process absence before deletion stays required.
 
 ## Files Modified
 
@@ -60,6 +62,8 @@ This specific evidence-backed recovery did not weaken automatic cleanup rules.
 Run focused pure units and independent review, commit corrected admitted inputs,
 then run the actual private-HOME/shared-lock/canonical Linux procedure anew.
 Require VM/resource/image/native and cleanup gates, not a shorter string alone.
+Current focused pure units17/17 and independent static review pass; actual
+corrected resource execution remains pending.
 
 ## Known Limitations
 

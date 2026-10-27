@@ -153,6 +153,29 @@ test("private inventory cleanup and PID observation reject foreign unknown or pa
   }
 });
 
+test("only reviewed Lima2.2.1 VZ aarch64 protocol normalizes documented zero PID omissions", () => {
+  const stopped = { name: `colima-${profile}`, limaVersion: "2.2.1", vmType: "vz", arch: "aarch64", status: "Stopped" };
+  assert.deepEqual(ownedLimaPids(stopped, profile, { allowStopped: true }), []);
+  assert.deepEqual(cleanupInventoryProof([{ name: profile, status: "Stopped" }], [stopped], profile,
+    { requireStopped: true }), []);
+  const running = { ...stopped, status: "Running", hostAgentPID: 12345 };
+  assert.deepEqual(ownedLimaPids(running, profile), [12345]);
+  assert.deepEqual(cleanupInventoryProof([{ name: profile, status: "Running" }], [running], profile), [12345]);
+  assert.throws(() => cleanupInventoryProof([{ name: profile, status: "Stopped" }], [running], profile,
+    { requireStopped: true }));
+  for (const changed of [{ limaVersion: "2.2.2" }, { limaVersion: "v2.2.1" }, { limaVersion: undefined },
+    { vmType: "qemu" }, { arch: "x86_64" }, { status: "Unknown" }, { errors: ["unproven"] },
+    { hostAgentPID: null }, { driverPID: "0" }]) {
+    assert.throws(() => ownedLimaPids({ ...stopped, ...changed }, profile, { allowStopped: true }));
+  }
+  for (const changed of [{ hostAgentPID: undefined }, { hostAgentPID: 0 }, { hostAgentPID: "12345" },
+    { errors: ["unproven"] }, { limaVersion: "2.1.0" }, { arch: "arm64" }, { vmType: "qemu" }]) {
+    assert.throws(() => ownedLimaPids({ ...running, ...changed }, profile));
+  }
+  // Explicit null is not the documented omitted integer and is never coerced.
+  assert.throws(() => ownedLimaPids({ ...running, driverPID: null }, profile));
+});
+
 test("generated VM configuration requires exact resources and nil rather than default HOME mounts", () => {
   const config = "cpu: 4\nmemory: 6\nrootDisk: 8\ndisk: 16\narch: aarch64\nvmType: vz\nruntime: docker\nforwardAgent: false\nsshConfig: false\nautoActivate: false\nrosetta: false\nbinfmt: false\nportForwarder: none\nmounts: null\n";
   assertVmConfiguration(config);
