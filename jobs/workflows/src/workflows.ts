@@ -9,8 +9,8 @@ import {
 import {
   assertApprovedExecutionChecksum,
   createApprovedExecutionSnapshot,
-  type SubmissionReceipt,
-} from "@bluey/jobs-automation";
+} from "@bluey/jobs-automation/approved-execution";
+import type { SubmissionReceipt } from "@bluey/jobs-automation";
 import type {
   ManagedCloudReleaseMemoAuthority,
 } from "@bluey/jobs-automation/managed-cloud-execution";

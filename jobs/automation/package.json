@@ -31,6 +31,10 @@
       "types": "./dist/worker-auth.d.ts",
       "import": "./dist/worker-auth.js"
     },
+    "./approved-execution": {
+      "types": "./dist/approved-execution.d.ts",
+      "import": "./dist/approved-execution.js"
+    },
     "./managed-cloud-runtime": {
       "types": "./dist/managed-cloud-runtime.d.ts",
       "import": "./dist/managed-cloud-runtime.js"
