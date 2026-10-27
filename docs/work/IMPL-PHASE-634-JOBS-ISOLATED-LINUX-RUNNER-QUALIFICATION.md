@@ -2,7 +2,7 @@
 
 Preflight: `bluey-ops`, current source/local handoff, Round634 and
 `performance-analysis` reproducible evidence guidance. Base: `57635b29`.
-Status: frozen harness and static review accepted; no VM started or Linux pass yet.
+Status: initial startup failed before VM creation; FIX805 correction pending.
 
 ## Starting evidence and scope
 
@@ -93,3 +93,28 @@ mount, Docker context, VM, application service or provider was used in these gat
 
 The harness and package must be committed after static review/privacy before the
 actual resource command. Static acceptance is not Linux runtime acceptance.
+
+## Initial actual attempt — failed, safely retained
+
+Harness `e5532431`; canonical session10495 exited1 at `vm_start`, before image
+construction or addon execution. Its cleanup fence retained the separate state
+rather than unlinking possibly active disks. Scoped diagnostic78399 identified
+the actual pre-instance105-byte SSH socket rejection; it was stdout, which the
+initial harness discarded. Exact-profile stop returned0/not running and private
+inventories were empty.
+
+FIX805 records root/marker/inode/uid/mode/open-file/inventory checks and exact
+private CLI deletion/recovery. Only the task's331MiB recreatable cache/snapshot/
+sparse disk state was removed; the path is absent, free space about39GiB, and
+unrelated profiles/global context remain unchanged. No automatic safety gate was
+weakened. Corrected socket preflight, shorter `/l`, separate primary/cleanup
+failures and bounded private capture of BOTH output streams remain pending
+fresh source review/runtime. No Linux pass is inferred from the diagnosis.
+
+FIX805 correction is now frozen and independently statically clear. Parent and
+reviewer each observed16/16 focused pure tests plus syntax/diff checks. New
+coverage includes103/104-byte UTF8 socket boundaries, separate primary/cleanup
+causes, both bounded private output streams, and unknown-entry retention. Raw
+output is never emitted in the public report. Proven cleanup removes only known
+large state children before retaining at most1MiB diagnostics/owner marker;
+uncertainty preserves the entire state. Actual Linux qualification is pending.

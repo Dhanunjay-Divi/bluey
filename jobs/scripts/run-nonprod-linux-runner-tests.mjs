@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, statfs, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, statfs, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,11 +14,60 @@ const CLI = Object.freeze({ colima: "/opt/homebrew/bin/colima", docker: "/opt/ho
   lima: "/opt/homebrew/bin/limactl", git: "/usr/bin/git" });
 const PRODUCT = "jobs";
 const OWNER_MARKER = ".phase634-owner.json";
+const MAX_FAILURE_OUTPUT = 64 * 1024;
+const MAX_FAILURE_COMMANDS = 8;
+const MAX_FAILURE_DIAGNOSTICS = MAX_FAILURE_COMMANDS * 2;
 const SELF = fileURLToPath(import.meta.url);
 const REPO = resolve(dirname(SELF), "../..");
 const check = (condition, code) => { if (!condition) throw new Error(code); };
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const inside = (parent, child) => child.startsWith(parent + "/");
+
+export function boundedDiagnosticTail(previous, chunk) {
+  check(Buffer.isBuffer(previous) && Buffer.isBuffer(chunk), "diagnostic_bytes_required");
+  if (chunk.length >= MAX_FAILURE_OUTPUT) return Buffer.from(chunk.subarray(-MAX_FAILURE_OUTPUT));
+  const keep = Math.min(previous.length, MAX_FAILURE_OUTPUT - chunk.length);
+  return Buffer.concat([previous.subarray(previous.length - keep), chunk]);
+}
+function closedFailure(value, fallback) {
+  return typeof value === "string" && /^[a-zA-Z0-9_]{1,80}$/.test(value) ? value : fallback;
+}
+export function failureReport({ stage, primaryFailure, cleanupFailure, interrupted, retained,
+  stateRoot, profile, cleanupProven = false, retainedDiagnosticsOnly = false,
+  diagnostics = [], diagnosticWriteFailed = false }) {
+  check(Array.isArray(diagnostics) && diagnostics.length <= MAX_FAILURE_DIAGNOSTICS,
+    "diagnostic_count_bound");
+  const files = diagnostics.map((entry) => {
+    check(/^command-failure-000[1-8]\.(?:stdout|stderr)$/.test(entry.file)
+      && Object.hasOwn(CLI, entry.tool) && Number.isInteger(entry.bytes)
+      && entry.bytes > 0 && entry.bytes <= MAX_FAILURE_OUTPUT, "diagnostic_report_shape");
+    return { file: entry.file, tool: entry.tool, stage: closedFailure(entry.stage, "unknown_stage"), bytes: entry.bytes };
+  });
+  const primary = primaryFailure ? closedFailure(primaryFailure, "closed_stage_failure") : null;
+  const cleanup = cleanupFailure ? closedFailure(cleanupFailure, "cleanup_unproven_state_retained") : null;
+  return { event: "nonprod_linux_runner_failed", stage: closedFailure(stage, "unknown_stage"),
+    code: primary || cleanup || (interrupted ? "interrupted" : "qualification_incomplete"),
+    primaryFailure: primary, cleanupFailure: cleanup, cleanupProven,
+    retainedDiagnosticsOnly: retained && cleanupProven && retainedDiagnosticsOnly,
+    diagnostics: files, diagnosticWriteFailed,
+    ...(retained ? { retainedState: stateRoot, profile } : {}) };
+}
+export function assertUnixSocketBudget({ dockerSocket, limaSshSocket }) {
+  for (const path of [dockerSocket, limaSshSocket]) {
+    // Darwin sockaddr_un.sun_path is104bytes including the terminating NUL.
+    check(typeof path === "string" && path.startsWith("/") && !path.includes("\0")
+      && Buffer.byteLength(path, "utf8") <= 103, "unix_socket_path_budget");
+  }
+}
+export function diagnosticRetentionPlan(names) {
+  check(Array.isArray(names) && names.length <= MAX_FAILURE_DIAGNOSTICS + 9
+    && new Set(names).size === names.length && names.includes(OWNER_MARKER), "diagnostic_retention_shape");
+  const removable = ["colima", "l", "lima", "cache", "context", "docker", "tmp", "image.id"];
+  const diagnostics = names.filter((name) => /^command-failure-000[1-8]\.(?:stdout|stderr)$/.test(name));
+  check(diagnostics.length <= MAX_FAILURE_DIAGNOSTICS && names.every((name) => name === OWNER_MARKER
+    || removable.includes(name) || diagnostics.includes(name)), "diagnostic_retention_unknown_entry");
+  return removable.filter((name) => names.includes(name));
+}
 
 export function assertResources({ cpus, memoryGiB, rootDiskGiB, dataDiskGiB, freeBytes }) {
   check(cpus === 4 && memoryGiB === 6 && rootDiskGiB === 8 && dataDiskGiB === 16,
@@ -44,7 +93,7 @@ export function isolatedEnvironment(stateRoot, canonicalRoot, home) {
     LANG: "C", LC_ALL: "C", TZ: "UTC", TMPDIR: join(stateRoot, "tmp"),
     TMP: join(stateRoot, "tmp"), TEMP: join(stateRoot, "tmp"),
     COLIMA_HOME: join(stateRoot, "colima"), COLIMA_CACHE_HOME: join(stateRoot, "cache"),
-    LIMA_HOME: join(stateRoot, "lima"), DOCKER_CONFIG: join(stateRoot, "docker"),
+    LIMA_HOME: join(stateRoot, "l"), DOCKER_CONFIG: join(stateRoot, "docker"),
     DOCKER_BUILDKIT: "0", DOCKER_SCAN_SUGGEST: "false",
   });
 }
@@ -237,9 +286,15 @@ export async function main() {
   let startAttempted = false;
   let stage = "preflight";
   let failure;
+  let cleanupFailure;
+  let cleanupProven = false;
+  let retainedDiagnosticsOnly = false;
   let result;
   let retained = true;
   const vmPids = new Set();
+  const diagnostics = [];
+  let failureSequence = 0;
+  let diagnosticWriteFailed = false;
   const event = (value) => console.log(JSON.stringify(value));
   const signals = ["SIGHUP", "SIGINT", "SIGTERM"];
   const stop = () => { interrupted = true; if (active && !cleaning) active.terminate(); };
@@ -255,7 +310,7 @@ export async function main() {
     check(!interrupted || cleaning, "interrupted");
     await revalidate();
     const child = spawn(CLI[tool], args, { cwd: REPO, env, stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = [], outputBytes = 0, denied = false, escalation;
+    let stdout = [], stdoutTail = Buffer.alloc(0), stderr = Buffer.alloc(0), outputBytes = 0, denied = false, escalation;
     const terminate = () => {
       if (denied) return;
       denied = true;
@@ -264,6 +319,8 @@ export async function main() {
     };
     active = { child, terminate };
     const collect = (stream, save) => stream.on("data", (chunk) => {
+      if (save) stdoutTail = boundedDiagnosticTail(stdoutTail, chunk);
+      else stderr = boundedDiagnosticTail(stderr, chunk);
       outputBytes += chunk.length;
       if (outputBytes > maximum) { if (!denied) terminate(); return; }
       if (save) stdout.push(chunk);
@@ -277,6 +334,22 @@ export async function main() {
       child.once("close", (code, signal) => resolveClose({ code, signal }));
     });
     clearTimeout(timer); clearTimeout(escalation); active = undefined;
+    if ((denied || closed.code !== 0 || closed.signal !== null) && failureSequence < MAX_FAILURE_COMMANDS) {
+      // Raw output is private-only: fixed filenames, owned inode-bound root,
+      // bounded tails, create-new0600. Never include content/argv in reports.
+      failureSequence += 1;
+      try {
+        await revalidate();
+        for (const [stream, tail] of [["stdout", stdoutTail], ["stderr", stderr]]) {
+          const file = `command-failure-${String(failureSequence).padStart(4, "0")}.${stream}`;
+          const bytes = tail.length ? tail : Buffer.from(`No ${stream} captured.\n`);
+          await writeFile(join(stateRoot, file), bytes, { flag: "wx", mode: 0o600 });
+          const observed = await privateFile(join(stateRoot, file), MAX_FAILURE_OUTPUT);
+          check(observed.equals(bytes), "failure_diagnostic_changed");
+          diagnostics.push({ file, tool, stage: cleaning ? "cleanup" : stage, bytes: bytes.length });
+        }
+      } catch { diagnosticWriteFailed = true; }
+    }
     check(!denied && (!interrupted || cleaning), "command_timeout_or_interrupted");
     if (!allowFailure) check(closed.code === 0 && closed.signal === null, `command_${tool}_failed`);
     const bytes = Buffer.concat(stdout);
@@ -296,6 +369,8 @@ export async function main() {
     }
   };
   try {
+    assertUnixSocketBudget({ dockerSocket: join(env.COLIMA_HOME, profile, "docker.sock"),
+      limaSshSocket: join(env.LIMA_HOME, `colima-${profile}`, "ssh.sock.1234567890123456") });
     for (const directory of new Set([env.COLIMA_HOME, env.COLIMA_CACHE_HOME, env.LIMA_HOME, env.DOCKER_CONFIG, env.TMPDIR])) {
       await mkdir(directory, { mode: 0o700 });
     }
@@ -434,16 +509,46 @@ export async function main() {
       assertRecordedPidsAbsent([...vmPids], pidExists);
       await assert.rejects(lstat(join(env.COLIMA_HOME, profile, "docker.sock")), { code: "ENOENT" });
       await revalidate();
-      await rm(stateRoot, { recursive: true, force: false });
-      await assert.rejects(lstat(stateRoot), { code: "ENOENT" });
-      retained = false;
-    } catch { failure = "cleanup_unproven_state_retained"; }
+      cleanupProven = true;
+      if (failure || interrupted) {
+        // Keep only bounded diagnostics+owner marker after ALL VM/disk safety
+        // proofs. Unknown cleanup never enters this destructive reduction.
+        const names = await readdir(stateRoot);
+        const plan = diagnosticRetentionPlan(names);
+        for (const name of names) {
+          if (name !== OWNER_MARKER && !plan.includes(name)) await privateFile(join(stateRoot, name), MAX_FAILURE_OUTPUT);
+        }
+        const children = new Map();
+        for (const name of plan) {
+          const path = join(stateRoot, name); const metadata = await lstat(path);
+          check(!metadata.isSymbolicLink() && metadata.uid === process.getuid()
+            && (name === "image.id" ? metadata.isFile() : metadata.isDirectory())
+            && await realpath(path) === path, "diagnostic_cleanup_child_identity");
+          children.set(name, identity(metadata));
+        }
+        for (const name of plan) {
+          await revalidate();
+          const path = join(stateRoot, name);
+          check(identity(await lstat(path)) === children.get(name), "diagnostic_cleanup_child_changed");
+          await rm(path, { recursive: name !== "image.id", force: false });
+        }
+        const remaining = await readdir(stateRoot);
+        check(diagnosticRetentionPlan(remaining).length === 0, "diagnostic_cleanup_incomplete");
+        for (const name of remaining) if (name !== OWNER_MARKER) await privateFile(join(stateRoot, name), MAX_FAILURE_OUTPUT);
+        await revalidate();
+        retainedDiagnosticsOnly = true;
+      } else {
+        await rm(stateRoot, { recursive: true, force: false });
+        await assert.rejects(lstat(stateRoot), { code: "ENOENT" });
+        retained = false;
+      }
+    } catch { cleanupFailure = "cleanup_unproven_state_retained"; }
     clearTimeout(overall);
     for (const signal of signals) process.off(signal, stop);
   }
-  if (failure || interrupted || !result || retained) {
-    event({ event: "nonprod_linux_runner_failed", stage, code: failure || "interrupted",
-      ...(retained ? { retainedState: stateRoot, profile } : {}) });
+  if (failure || cleanupFailure || interrupted || !result || retained) {
+    event(failureReport({ stage, primaryFailure: failure, cleanupFailure, interrupted, retained,
+      stateRoot, profile, cleanupProven, retainedDiagnosticsOnly, diagnostics, diagnosticWriteFailed }));
     throw new Error("nonprod_linux_runner_not_qualified");
   }
   const after = await statfs(canonicalRoot);

@@ -38,6 +38,29 @@ state-root removal.
 Locations: `jobs/scripts/run-nonprod-linux-runner-tests.mjs:70-108,410-455` and focused tests at
 `jobs/scripts/run-nonprod-linux-runner-tests.test.mjs:75-128`.
 
+## Resolved P1 socket-budget and failure-evidence finding
+
+The first actual attempt used a private Lima path whose reserved SSH socket was 105 bytes. Darwin's
+104-byte `sun_path` includes the terminating NUL, so Lima rejected startup before creating a VM.
+The initial harness discarded the useful stdout diagnostic and later cleanup failure obscured the
+primary start failure.
+
+FIX-805 shortens only the private Lima directory to `/l` and checks both the longest known Lima SSH
+socket and private Docker socket in UTF-8 bytes, requiring at most 103 bytes before startup. Failed
+commands retain bounded 64 KiB tails from both stdout and stderr in create-new mode-0600 files,
+with at most eight commands/sixteen files. Public events expose only fixed filenames, tool/stage,
+byte counts and closed failure codes; raw output and arguments are never emitted. Primary and
+cleanup failures remain separate.
+
+Large state may be reduced to the owner marker and bounded diagnostics only after the exact VM has
+been deleted, inventories are empty, captured PIDs and Docker socket are absent, and the root marker
+and inode are revalidated. Every removable child has an allowlisted name, owner/type/canonical-path
+check and captured inode. Unknown entries or any cleanup uncertainty retain the entire state root.
+
+Locations: `jobs/scripts/run-nonprod-linux-runner-tests.mjs:17-69,93-108,308-357,371-375,484-552`
+and the first four focused tests in
+`jobs/scripts/run-nonprod-linux-runner-tests.test.mjs`.
+
 ## Isolation and lifecycle review
 
 - The canonical launcher root and a separately generated VM-state root must both be canonical,
@@ -96,7 +119,7 @@ root; the canonical launcher alone does not supply that isolation.
 ## Reviewer-observed checks
 
 - `node --check` passed for the harness and focused test file.
-- `node --test jobs/scripts/run-nonprod-linux-runner-tests.test.mjs` passed 12/12 with zero failures,
+- `node --test jobs/scripts/run-nonprod-linux-runner-tests.test.mjs` passed 16/16 with zero failures,
   skips or cancellations.
 - `git diff --check 57635b29 -- jobs/package.json
   jobs/scripts/run-nonprod-linux-runner-tests.mjs
@@ -104,12 +127,12 @@ root; the canonical launcher alone does not supply that isolation.
 
 These checks do not prove any Linux, Docker, VM, image or native-addon runtime behavior.
 
-## Parent-reported committed-source regression gates
+## Prior parent-reported committed-source regression gates
 
 The following evidence was not independently reproduced by this reviewer:
 
-- Canonical session 27127 exited zero. Report/Temporal tests passed 8/8, object tests 7/7 and the
-  Linux harness pure tests 12/12. Workspace tests passed automation 804, Browser 219, runner 308,
+- Before FIX-805, canonical session 27127 exited zero. Report/Temporal tests passed 8/8, object tests
+  7/7 and the then-current Linux harness tests 12/12. Workspace tests passed automation 804, Browser 219, runner 308,
   workflows 321 and portal 387: 2,066 total passes and zero skips.
 - Configured Chromium was installed only inside the owned scratch root before the suite, so the
   existing exact-submit/beacon synthetic-route test executed rather than conditionally skipping.
@@ -119,6 +142,25 @@ The following evidence was not independently reproduced by this reviewer:
   inventory boundary; the actual installed CLI/config/runtime behavior remains a pending run gate.
 
 This is not a fresh full Rust suite, all-target Clippy, VM, image or native-addon result.
+
+## Failed actual attempt and recovery
+
+Parent-reported evidence below was not independently reproduced and is not a Linux qualification:
+
+- Harness source `e5532431`, session 10495 exited one at `vm_start`, before image construction or
+  addon smoke. The existing cleanup fence retained the separate state root rather than treating the
+  failed start as safe deletion authority.
+- Scoped diagnostic session 78399 reproduced the exact 105-byte-versus-104-byte Lima SSH socket
+  rejection. No VM instance, configuration or VM process was created; exact-profile stop reported
+  not running and both private inventories were empty.
+- Before manual recovery the parent revalidated the exact root's inode, UID, mode, marker, empty
+  inventories and absence of open files. Exact private-profile delete was followed by another
+  identity/open-file check; only the task's 331 MiB recreatable cache/context/sparse-disk state was
+  removed. The exact path is absent, free space returned to about 39 GiB, four unrelated profiles
+  remain stopped and the global Docker context remains `default`.
+
+The manual recovery is not evidence that automatic cleanup passed and does not weaken the frozen
+cleanup rules.
 
 ## Pending executable gates
 

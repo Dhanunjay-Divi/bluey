@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { admittedContextPath, assertEmptyInventories, assertPrivateRoot, assertRecordedPidsAbsent, assertResources,
   assertRuntimeMeasurement, assertSmokeInspection, assertVmConfiguration, cleanupArguments,
-  cleanupInventoryProof, CONSTRUCTION_BUILDER, isolatedEnvironment, ownedLimaPids, parseInventory, smokeArguments,
+  assertUnixSocketBudget, boundedDiagnosticTail, cleanupInventoryProof, CONSTRUCTION_BUILDER, diagnosticRetentionPlan,
+  failureReport, isolatedEnvironment, ownedLimaPids, parseInventory, smokeArguments,
   startArguments } from "./run-nonprod-linux-runner-tests.mjs";
 
 const profile = `p634-${"a".repeat(20)}`;
@@ -11,6 +12,64 @@ const root = "/private/tmp/bluey-test-runs-501/run.1234567890.456.abc";
 const home = `${root}/child-home`;
 const image = `sha256:${"b".repeat(64)}`;
 const privateInfo = { directory: true, symlink: false, uid: 501, mode: 0o700 };
+
+test("private stdout and stderr capture keeps only bounded tails without public raw content", () => {
+  let bytes = boundedDiagnosticTail(Buffer.from("first"), Buffer.from(" second"));
+  assert.equal(bytes.toString(), "first second");
+  bytes = boundedDiagnosticTail(bytes, Buffer.alloc(70 * 1024, 65));
+  assert.equal(bytes.length, 64 * 1024);
+  bytes = boundedDiagnosticTail(bytes, Buffer.from("closed diagnostic tail"));
+  assert.equal(bytes.length, 64 * 1024);
+  assert(bytes.subarray(-22).equals(Buffer.from("closed diagnostic tail")));
+  assert.throws(() => boundedDiagnosticTail("raw text", Buffer.alloc(0)));
+});
+
+test("failure reports preserve primary cause separately from cleanup and expose only diagnostic metadata", () => {
+  const report = failureReport({ stage: "vm_start", primaryFailure: "command_colima_failed",
+    cleanupFailure: "cleanup_unproven_state_retained", retained: true, stateRoot: state, profile,
+    diagnostics: [{ file: "command-failure-0001.stderr", tool: "colima", stage: "vm_start", bytes: 128,
+      stderr: "private fixture diagnostic", authorization: "private fixture credential" }] });
+  assert.equal(report.code, "command_colima_failed");
+  assert.equal(report.primaryFailure, "command_colima_failed");
+  assert.equal(report.cleanupFailure, "cleanup_unproven_state_retained");
+  assert.equal(report.retainedState, state);
+  assert.equal(JSON.stringify(report).includes("private fixture"), false);
+  assert.deepEqual(report.diagnostics, [{ file: "command-failure-0001.stderr", tool: "colima", stage: "vm_start", bytes: 128 }]);
+  const cleaned = failureReport({ stage: "image_build", primaryFailure: "command_docker_failed", cleanupProven: true });
+  assert.equal(cleaned.cleanupFailure, null); assert.equal(cleaned.cleanupProven, true);
+  assert.equal(failureReport({ stage: "vm_start", cleanupFailure: "cleanup_unproven_state_retained" }).primaryFailure, null);
+  assert.throws(() => failureReport({ diagnostics: [{ file: "../outside", tool: "colima", bytes: 1 }] }));
+  assert.throws(() => failureReport({ diagnostics: [{ file: "command-failure-0001.stderr", tool: "colima", bytes: 65537 }] }));
+  assert.equal(failureReport({ primaryFailure: "command_colima_failed", retained: true, cleanupProven: true, retainedDiagnosticsOnly: true,
+    diagnostics: [{ file: "command-failure-0001.stdout", tool: "colima", stage: "vm_start", bytes: 16 }] }).retainedDiagnosticsOnly, true);
+  assert.equal(failureReport({ primaryFailure: "command_colima_failed", retained: true, cleanupProven: true,
+    cleanupFailure: "cleanup_unproven_state_retained" }).retainedDiagnosticsOnly, false);
+});
+
+test("Unix socket preflight admits103bytes, denies104bytes and counts UTF8 rather than characters", () => {
+  const allowed = "/" + "a".repeat(102);
+  assertUnixSocketBudget({ dockerSocket: allowed, limaSshSocket: allowed });
+  for (const path of [allowed + "a", "/" + "é".repeat(52), "/socket\0", "relative"]) {
+    assert.throws(() => assertUnixSocketBudget({ dockerSocket: path, limaSshSocket: allowed }));
+    assert.throws(() => assertUnixSocketBudget({ dockerSocket: allowed, limaSshSocket: path }));
+  }
+  assertUnixSocketBudget({ dockerSocket: `${state}/colima/${profile}/docker.sock`,
+    limaSshSocket: `${state}/l/colima-${profile}/ssh.sock.1234567890123456` });
+  assert.throws(() => assertUnixSocketBudget({ dockerSocket: allowed,
+    limaSshSocket: `${state}/lima/colima-${profile}/ssh.sock.1234567890123456` }));
+});
+
+test("proven-cleanup retention removes only explicit owned large children and rejects unknown entries", () => {
+  const marker = ".phase634-owner.json";
+  const names = [marker, "colima", "l", "cache", "context", "docker", "tmp", "image.id",
+    "command-failure-0001.stdout", "command-failure-0001.stderr"];
+  assert.deepEqual(diagnosticRetentionPlan(names), ["colima", "l", "cache", "context", "docker", "tmp", "image.id"]);
+  assert.deepEqual(diagnosticRetentionPlan([marker, "command-failure-0001.stdout"]), []);
+  for (const bad of [[...names, "unknown"], names.filter((name) => name !== marker),
+    [...names, "../outside"], [...names, "colima"], [...names, "command-failure-9999.stdout"]]) {
+    assert.throws(() => diagnosticRetentionPlan(bad));
+  }
+});
 
 test("root admission rejects owner paths, aliases, permissions and canonical-root VM state", () => {
   assertPrivateRoot(state, state, privateInfo, 501, "state");
@@ -39,7 +98,7 @@ test("environment is a closed private allowlist and builder mode is explicitly l
   const env = isolatedEnvironment(state, root, home);
   assert.equal(env.HOME, home);
   assert.equal(env.COLIMA_HOME, `${state}/colima`);
-  assert.equal(env.LIMA_HOME, `${state}/lima`);
+  assert.equal(env.LIMA_HOME, `${state}/l`);
   assert.equal(env.DOCKER_CONFIG, `${state}/docker`);
   assert.equal(env.COLIMA_CACHE_HOME, `${state}/cache`);
   assert.equal(env.DOCKER_BUILDKIT, "0");
