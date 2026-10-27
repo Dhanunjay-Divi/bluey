@@ -4,6 +4,19 @@ All notable Bluey changes are documented here. Historical release detail lives
 under `docs/release/`.
 
 ## [Unreleased]
+
+- Jobs: fix PostgreSQL boot-ready heartbeat sequence inference with explicit
+  BIGINT bindings. Add disposable PostgreSQL 17/pgvector validation and real
+  configured migration, concurrent startup, legacy readiness, boot lease/replay
+  and immutable-attempt cascade regressions; no production flags are enabled.
+- Jobs: refresh audited workspace dependencies and the isolated Jobs Browser's
+  Electron within existing major lines, plus the documented CSV parser update.
+  Preserve unknown-extra-column compatibility and test malicious CSV headers;
+  desktop host/overlay code and dependencies are unchanged.
+- Jobs: classify the exact PostgreSQL boot-trigger denial as HTTP 409 without
+  masking other storage errors. Retain capacity for pre-authorization uncertain
+  outcomes while preserving row-lock-before-clock ordering and fail-closed
+  missing-capacity handling after an irreversible marker.
 - Jobs: complete session-authenticated source-verifier boot generation readiness.
   Registration/startup retries preserve exact payloads and canonical responses;
   the server owns the rollback-only lease probe and atomically commits readiness.
