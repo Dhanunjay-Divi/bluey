@@ -13320,7 +13320,9 @@ pub fn validate_consume_reserve_ats_application_certification_from_context_sqlit
     }
     let attempt = tx
         .query_row(
-            "SELECT company_key, period_key, runner, status, reserved_at_ms, updated_at_ms
+            "SELECT id, application_id, company_key, period_key, runner, status,
+                    reserved_at_ms, updated_at_ms, canonical_employer_id,
+                    canonical_employer_domain, employer_attestation_sha256
                FROM jobs_attempt_reservations
               WHERE id = ?1 AND account_id = ?2 AND application_id = ?3",
             params![
@@ -13328,26 +13330,29 @@ pub fn validate_consume_reserve_ats_application_certification_from_context_sqlit
                 request.account_id,
                 request.application_id,
             ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            },
+            attempt_reservation_from_sqlite_row,
         )
         .optional()
         .map_err(ats_certification_storage)?
         .ok_or(AtsCertificationAuthorityError::NotFound)?;
-    if !matches!(attempt.3.as_str(), "reserved" | "running") || attempt.2 != runtime.runtime_kind {
+    if !matches!(attempt.status.as_str(), "reserved" | "running")
+        || attempt.runner != runtime.runtime_kind
+    {
         return Err(AtsCertificationAuthorityError::ScopeMismatch);
     }
+    // Keep the established metering hash contract unchanged. This separate
+    // check also fences pre-migration/in-flight bindings before consumption.
+    require_existing_attempt_employer_binding(&application, &attempt)
+        .map_err(|_| AtsCertificationAuthorityError::ScopeMismatch)?;
     let (metering_reservation_sha256, phase_b_request_id, canary_reservation_id) =
         ats_phase_b_server_ids(
-            &record, &attempt.0, &attempt.1, &attempt.2, &attempt.3, attempt.4, attempt.5,
+            &record,
+            &attempt.company_key,
+            &attempt.period_key,
+            &attempt.runner,
+            &attempt.status,
+            attempt.reserved_at_ms,
+            attempt.updated_at_ms,
         )?;
     let raw_request = AtsCertificationPhaseBRequest {
         binding_id: record.authority.binding_id.clone(),
@@ -13483,7 +13488,9 @@ pub(crate) fn validate_consume_reserve_ats_application_certification_from_contex
     }
     let row = tx
         .query_opt(
-            "SELECT company_key, period_key, runner, status, reserved_at_ms, updated_at_ms
+            "SELECT id, application_id, company_key, period_key, runner, status,
+                    reserved_at_ms, updated_at_ms, canonical_employer_id,
+                    canonical_employer_domain, employer_attestation_sha256
                FROM jobs_attempt_reservations
               WHERE id = $1 AND account_id = $2 AND application_id = $3 FOR UPDATE",
             &[
@@ -13494,20 +13501,23 @@ pub(crate) fn validate_consume_reserve_ats_application_certification_from_contex
         )
         .map_err(ats_certification_storage)?
         .ok_or(AtsCertificationAuthorityError::NotFound)?;
-    let attempt = (
-        row.get::<_, String>(0),
-        row.get::<_, String>(1),
-        row.get::<_, String>(2),
-        row.get::<_, String>(3),
-        row.get::<_, i64>(4),
-        row.get::<_, i64>(5),
-    );
-    if !matches!(attempt.3.as_str(), "reserved" | "running") || attempt.2 != runtime.runtime_kind {
+    let attempt = attempt_reservation_from_postgres_row(row);
+    if !matches!(attempt.status.as_str(), "reserved" | "running")
+        || attempt.runner != runtime.runtime_kind
+    {
         return Err(AtsCertificationAuthorityError::ScopeMismatch);
     }
+    require_existing_attempt_employer_binding(&application, &attempt)
+        .map_err(|_| AtsCertificationAuthorityError::ScopeMismatch)?;
     let (metering_reservation_sha256, phase_b_request_id, canary_reservation_id) =
         ats_phase_b_server_ids(
-            &record, &attempt.0, &attempt.1, &attempt.2, &attempt.3, attempt.4, attempt.5,
+            &record,
+            &attempt.company_key,
+            &attempt.period_key,
+            &attempt.runner,
+            &attempt.status,
+            attempt.reserved_at_ms,
+            attempt.updated_at_ms,
         )?;
     let raw_request = AtsCertificationPhaseBRequest {
         binding_id: record.authority.binding_id.clone(),
@@ -13540,6 +13550,40 @@ pub(crate) fn validate_consume_reserve_ats_application_certification_from_contex
     )
 }
 
+fn ats_phase_b_known_aborted_serialization(error: &AtsCertificationAuthorityError) -> bool {
+    match error {
+        AtsCertificationAuthorityError::Storage(source) => {
+            source
+                .downcast_ref::<postgres::Error>()
+                .and_then(postgres::Error::code)
+                == Some(&postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
+        }
+        _ => false,
+    }
+}
+
+fn retry_ats_phase_b_local_transaction(
+    mut operation: impl FnMut() -> Result<AtsCertificationPhaseBResult, AtsCertificationAuthorityError>,
+) -> Result<AtsCertificationPhaseBResult, AtsCertificationAuthorityError> {
+    // This boundary owns the WHOLE local database transaction. Only PostgreSQL
+    // 40001 proves it aborted. Never retry an ambiguous commit, employer action,
+    // generic Storage error or a caller-owned transaction from this helper.
+    let mut attempts_remaining = 3;
+    loop {
+        let result = operation();
+        attempts_remaining -= 1;
+        if attempts_remaining > 0
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(ats_phase_b_known_aborted_serialization)
+        {
+            continue;
+        }
+        return result;
+    }
+}
+
 pub fn validate_consume_reserve_ats_application_certification(
     pool: &DbPool,
     request: &AtsCertificationPhaseBRequest,
@@ -13559,18 +13603,22 @@ pub fn validate_consume_reserve_ats_application_certification(
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg().map_err(ats_certification_storage)?;
-            let mut tx = conn
-                .build_transaction()
-                .isolation_level(postgres::IsolationLevel::Serializable)
-                .start()
-                .map_err(ats_certification_storage)?;
-            lock_postgres_ats_certification(&mut tx)?;
-            let outcome =
-                validate_consume_reserve_ats_application_certification_postgres_tx_after_prelock(
-                    &mut tx, request, now_ms,
-                )?;
-            tx.commit().map_err(ats_certification_storage)?;
-            outcome.into_result()
+            retry_ats_phase_b_local_transaction(|| {
+                // A failed attempt drops/rolls back before this closure returns.
+                // The next attempt gets a new snapshot and reacquires the lock.
+                let mut tx = conn
+                    .build_transaction()
+                    .isolation_level(postgres::IsolationLevel::Serializable)
+                    .start()
+                    .map_err(ats_certification_storage)?;
+                lock_postgres_ats_certification(&mut tx)?;
+                let outcome =
+                    validate_consume_reserve_ats_application_certification_postgres_tx_after_prelock(
+                        &mut tx, request, now_ms,
+                    )?;
+                tx.commit().map_err(ats_certification_storage)?;
+                outcome.into_result()
+            })
         }
     })
 }
@@ -14733,6 +14781,79 @@ pub(super) mod ats_certification_authority_tests {
     const TEST_NOW_MS: i64 = 2_000_000_000_000;
 
     #[test]
+    fn phase_b_local_transaction_never_retries_untyped_or_domain_errors() {
+        for kind in ["untyped", "domain", "ambiguous"] {
+            let mut attempts = 0;
+            let error = retry_ats_phase_b_local_transaction(|| {
+                attempts += 1;
+                Err(match kind {
+                    "untyped" => {
+                        ats_certification_storage(anyhow::anyhow!("40001 serialization failure"))
+                    }
+                    "ambiguous" => {
+                        ats_certification_storage(anyhow::anyhow!("connection lost during commit"))
+                    }
+                    _ => AtsCertificationAuthorityError::CapacityUnavailable,
+                })
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert!(!ats_phase_b_known_aborted_serialization(&error));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_phase_b_local_transaction_retries_only_typed_40001_and_is_bounded() {
+        let Some(pool) = postgres_test_pool_or_skip(
+            "postgres_phase_b_local_transaction_retries_only_typed_40001_and_is_bounded",
+        ) else {
+            return;
+        };
+        let mut connection = pool.get_pg().unwrap();
+        let mut attempts = 0;
+        let exhausted = retry_ats_phase_b_local_transaction(|| {
+            attempts += 1;
+            let mut tx = connection.transaction().map_err(ats_certification_storage)?;
+            // Actual driver error from a definitely aborted private transaction.
+            tx.batch_execute("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001', MESSAGE='synthetic serialization abort'; END $$")
+                .map_err(ats_certification_storage)?;
+            unreachable!("the synthetic transaction must abort")
+        }).unwrap_err();
+        assert_eq!(attempts, 3);
+        assert!(ats_phase_b_known_aborted_serialization(&exhausted));
+        let mut attempts = 0;
+        let other_storage = retry_ats_phase_b_local_transaction(|| {
+            attempts += 1;
+            let mut tx = connection.transaction().map_err(ats_certification_storage)?;
+            tx.batch_execute("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='23505', MESSAGE='synthetic unique violation'; END $$")
+                .map_err(ats_certification_storage)?;
+            unreachable!("the synthetic transaction must abort")
+        }).unwrap_err();
+        assert_eq!(attempts, 1);
+        assert!(matches!(
+            other_storage,
+            AtsCertificationAuthorityError::Storage(_)
+        ));
+        assert!(!ats_phase_b_known_aborted_serialization(&other_storage));
+        let mut attempts = 0;
+        let reread = retry_ats_phase_b_local_transaction(|| {
+            attempts += 1;
+            if attempts == 1 {
+                let mut tx = connection.transaction().map_err(ats_certification_storage)?;
+                tx.batch_execute("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001', MESSAGE='synthetic serialization abort'; END $$")
+                    .map_err(ats_certification_storage)?;
+            }
+            Err(AtsCertificationAuthorityError::CapacityUnavailable)
+        }).unwrap_err();
+        assert_eq!(attempts, 2);
+        assert!(matches!(
+            reread,
+            AtsCertificationAuthorityError::CapacityUnavailable
+        ));
+    }
+
+    #[test]
     fn fix_728_ats_after_prelock_phase_helpers_never_reacquire_ats() {
         let source = include_str!("ats_certification_authority.rs");
         for (legacy_start, after_prelock_start, end) in [
@@ -15307,8 +15428,9 @@ pub(super) mod ats_certification_authority_tests {
         conn.execute(
             "INSERT INTO jobs_attempt_reservations (
                 id, account_id, application_id, company_key, period_key, runner, status,
-                reserved_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, '2033-05-18', 'local', ?5, ?6, ?6)",
+                reserved_at_ms, updated_at_ms, canonical_employer_id,
+                canonical_employer_domain, employer_attestation_sha256
+             ) VALUES (?1, ?2, ?3, ?4, '2033-05-18', 'local', ?5, ?6, ?6, ?7, ?8, ?9)",
             params![
                 request.application_attempt_id,
                 request.account_id,
@@ -15316,6 +15438,12 @@ pub(super) mod ats_certification_authority_tests {
                 format!("company-{}", request.binding_id),
                 status,
                 TEST_NOW_MS,
+                format!("synthetic-capacity-{}", request.binding_id),
+                format!(
+                    "capacity-{}.example",
+                    &ats_certification_sha256(request.binding_id.as_bytes())[..24]
+                ),
+                "a".repeat(64),
             ],
         )
         .unwrap();
@@ -15942,47 +16070,47 @@ pub(super) mod ats_certification_authority_tests {
         );
         let (policy_sha256, policy_expires_at_ms) =
             match load_current_ats_certification_trust_policy(pool, now_ms) {
-            Ok((policy_sha256, current_policy)) => {
-                let expected_policy = test_trust_policy(&authority, 1, None);
-                if current_policy.delegated_trust != expected_policy.delegated_trust
-                    || current_policy.certification_requirements
-                        != expected_policy.certification_requirements
-                {
-                    return Err(AtsCertificationAuthorityError::InvalidTrustPolicy);
+                Ok((policy_sha256, current_policy)) => {
+                    let expected_policy = test_trust_policy(&authority, 1, None);
+                    if current_policy.delegated_trust != expected_policy.delegated_trust
+                        || current_policy.certification_requirements
+                            != expected_policy.certification_requirements
+                    {
+                        return Err(AtsCertificationAuthorityError::InvalidTrustPolicy);
+                    }
+                    (policy_sha256, current_policy.expires_at_ms)
                 }
-                (policy_sha256, current_policy.expires_at_ms)
-            }
-            Err(AtsCertificationAuthorityError::TrustPolicyNotInitialized) => {
-                let policy_issued_at_ms = now_ms.saturating_sub(4_000);
-                let policy_valid_from_ms = now_ms.saturating_sub(3_000);
-                let policy_expires_at_ms = now_ms
-                    .checked_add(2_000_000)
-                    .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
-                let mut policy = test_trust_policy(&authority, 1, None);
-                policy.policy_id = format!("ats-fixture-policy-{fixture_id}");
-                policy.issued_at_ms = policy_issued_at_ms;
-                policy.valid_from_ms = policy_valid_from_ms;
-                policy.expires_at_ms = policy_expires_at_ms;
-                let policy_envelope = envelope(
-                    &policy,
-                    "root",
-                    ATS_CERTIFICATION_TRUST_POLICY_AUDIENCE,
-                    policy.issued_at_ms,
-                    &authority,
-                    &format!("authorize-fixture-policy-{fixture_id}"),
-                );
-                let policy_sha256 = envelope_sha256(&policy_envelope);
-                import_ats_certification_trust_policy_with_root_at(
-                    pool,
-                    &policy_envelope,
-                    &authority.root_anchor,
-                    "fixture-root-operator",
-                    now_ms,
-                )?;
-                (policy_sha256, policy_expires_at_ms)
-            }
-            Err(error) => return Err(error),
-        };
+                Err(AtsCertificationAuthorityError::TrustPolicyNotInitialized) => {
+                    let policy_issued_at_ms = now_ms.saturating_sub(4_000);
+                    let policy_valid_from_ms = now_ms.saturating_sub(3_000);
+                    let policy_expires_at_ms = now_ms
+                        .checked_add(2_000_000)
+                        .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+                    let mut policy = test_trust_policy(&authority, 1, None);
+                    policy.policy_id = format!("ats-fixture-policy-{fixture_id}");
+                    policy.issued_at_ms = policy_issued_at_ms;
+                    policy.valid_from_ms = policy_valid_from_ms;
+                    policy.expires_at_ms = policy_expires_at_ms;
+                    let policy_envelope = envelope(
+                        &policy,
+                        "root",
+                        ATS_CERTIFICATION_TRUST_POLICY_AUDIENCE,
+                        policy.issued_at_ms,
+                        &authority,
+                        &format!("authorize-fixture-policy-{fixture_id}"),
+                    );
+                    let policy_sha256 = envelope_sha256(&policy_envelope);
+                    import_ats_certification_trust_policy_with_root_at(
+                        pool,
+                        &policy_envelope,
+                        &authority.root_anchor,
+                        "fixture-root-operator",
+                        now_ms,
+                    )?;
+                    (policy_sha256, policy_expires_at_ms)
+                }
+                Err(error) => return Err(error),
+            };
 
         let evidence_expires_at_ms = now_ms
             .checked_add(1_000_000)
@@ -16187,9 +16315,7 @@ pub(super) mod ats_certification_authority_tests {
             now_ms,
         )?;
         let activation_sha256 = envelope_sha256(&activation_envelope);
-        let expected_head_revision = current_head
-            .as_ref()
-            .map_or(0, |head| head.head_revision);
+        let expected_head_revision = current_head.as_ref().map_or(0, |head| head.head_revision);
         let expected_transition_sha256 = current_head
             .as_ref()
             .map(|head| head.transition_sha256.as_str());
@@ -20268,6 +20394,23 @@ pub(super) mod ats_certification_authority_tests {
         let packet_checksum = approved_submission_checksum(3, &packet, &job, Some(&admission))
             .expect("hash frozen certified packet");
         let posting = test_posting();
+        // This unit isolates ATS context consumption. Current signed source
+        // verification is exercised by the production-positive PG fixtures.
+        let job_integrity = JobIntegrityReceiptV1 {
+            subject_sha256: "c".repeat(64),
+            source_material_sha256: "a".repeat(64),
+            attestation_sha256: "c".repeat(64),
+            attestation_generation: 1,
+            head_revision: 1,
+            head_transition_sha256: "c".repeat(64),
+            policy_sha256: "c".repeat(64),
+            employer_identity_authorization_sha256: "c".repeat(64),
+            job_risk_authorization_sha256: "c".repeat(64),
+            canonical_employer_id: "synthetic-cloud-employer".to_string(),
+            canonical_employer_domain: "acme.example".to_string(),
+            risk_policy_sha256: "c".repeat(64),
+            expires_at_ms: TEST_NOW_MS + 10_000,
+        };
         let application = JobApplication {
             id: application_id.to_string(),
             job_id: posting.id.clone(),
@@ -20278,6 +20421,7 @@ pub(super) mod ats_certification_authority_tests {
             answers: Vec::new(),
             cover_letter: String::new(),
             receipt: json!({
+                "job_integrity": job_integrity.clone(),
                 "approved_execution": {
                     "schema_version": 3,
                     "approved_at_ms": TEST_NOW_MS - 10,
@@ -20385,9 +20529,18 @@ pub(super) mod ats_certification_authority_tests {
         conn.execute(
             "INSERT INTO jobs_attempt_reservations (
                 id, account_id, application_id, company_key, period_key, runner, status,
-                reserved_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, 'acme', '2033-05-18', 'cloud', 'running', ?4, ?4)",
-            params![attempt_id, account_id, application_id, TEST_NOW_MS - 10],
+                reserved_at_ms, updated_at_ms, canonical_employer_id,
+                canonical_employer_domain, employer_attestation_sha256
+             ) VALUES (?1, ?2, ?3, 'acme', '2033-05-18', 'cloud', 'running', ?4, ?4, ?5, ?6, ?7)",
+            params![
+                attempt_id,
+                account_id,
+                application_id,
+                TEST_NOW_MS - 10,
+                job_integrity.canonical_employer_id,
+                job_integrity.canonical_employer_domain,
+                job_integrity.attestation_sha256
+            ],
         )
         .unwrap();
         drop(conn);
@@ -21292,6 +21445,14 @@ pub(super) mod ats_certification_authority_tests {
                 request
             })
             .collect::<Vec<_>>();
+        let mut blocker_connection = fixture.pool.get_pg().unwrap();
+        let blocker_pid: i32 = blocker_connection
+            .query_one("SELECT pg_backend_pid()", &[])
+            .unwrap()
+            .get(0);
+        let mut blocker = blocker_connection.transaction().unwrap();
+        lock_postgres_ats_certification(&mut blocker).unwrap();
+        let mut observer = fixture.pool.get_pg().unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let contenders = phase_b_requests
             .iter()
@@ -21310,10 +21471,42 @@ pub(super) mod ats_certification_authority_tests {
             })
             .collect::<Vec<_>>();
         barrier.wait();
+        // Force BOTH serializable snapshots to precede the winner's commit.
+        // A start barrier alone can accidentally run contenders serially and
+        // never exercise the known-aborted retry. Observe actual advisory waits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut both_waiting = false;
+        while std::time::Instant::now() < deadline {
+            let waiting: i64 = observer
+                .query_one(
+                    "SELECT COUNT(DISTINCT waiting.pid)
+                   FROM pg_locks waiting JOIN pg_locks held
+                     ON held.locktype='advisory' AND waiting.locktype=held.locktype
+                    AND waiting.database IS NOT DISTINCT FROM held.database
+                    AND waiting.classid=held.classid AND waiting.objid=held.objid
+                    AND waiting.objsubid=held.objsubid
+                  WHERE held.pid=$1 AND held.granted AND NOT waiting.granted",
+                    &[&blocker_pid],
+                )
+                .unwrap()
+                .get(0);
+            if waiting == 2 {
+                both_waiting = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        blocker
+            .commit()
+            .expect("release the private ATS interleaving lock");
         let outcomes = contenders
             .into_iter()
             .map(|contender| contender.join().expect("canary contender did not panic"))
             .collect::<Vec<_>>();
+        assert!(
+            both_waiting,
+            "both Phase B transactions must actually wait before either can commit"
+        );
         assert_eq!(
             outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
             1,

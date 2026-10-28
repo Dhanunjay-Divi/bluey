@@ -10404,6 +10404,26 @@ fn validation_or_internal(error: anyhow::Error, validation_message: &str) -> Api
 }
 
 pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
+    if let Some(admission) = error.downcast_ref::<jobs::ApplicationAttemptAdmissionError>() {
+        let copy = match admission {
+            jobs::ApplicationAttemptAdmissionError::Blocked { reason_code }
+                if reason_code == "company_application_exists" =>
+                Some("An application is already in progress or submitted for this company. Another Career Track or application email does not create a second candidate."),
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code }
+                if reason_code == "legacy_company_identity_review_required" =>
+                Some("Existing application history needs employer identity review before another application can start."),
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code }
+                if reason_code == "canonical_employer_mapping_conflict" =>
+                Some("The employer identity conflicts with existing application history. Review it before applying."),
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code }
+                if reason_code == "attempt_employer_identity_review_required" =>
+                Some("This application's employer evidence is incomplete or changed. Review the application history before starting execution."),
+            _ => None,
+        };
+        if let Some(copy) = copy {
+            return (StatusCode::CONFLICT, copy.to_string());
+        }
+    }
     if matches!(
         error.downcast_ref::<jobs::OperationalHoldError>(),
         Some(jobs::OperationalHoldError::Held(_))
@@ -10424,6 +10444,13 @@ pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("daily application limit")
         || message.contains("active application attempt")
         || message.contains("application attempt")
+        || message
+            .contains("Bluey already has an in-progress or submitted application for this company")
+        || message.contains("Review the employer identity of existing application history")
+        || message
+            .contains("Verify this job's employer identity against existing application history")
+        || message.contains("Review conflicting employer identity records")
+        || message.contains("current application employer binding does not permit packet commit")
         || message.contains("already been resolved")
         || message.contains("no longer waiting for an answer")
         || message.contains("awaiting reconciliation")
@@ -10565,6 +10592,57 @@ pub(super) fn internal(error: anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use crate::db::jobs::CareerTrackPolicy;
+
+    #[test]
+    fn employer_admission_conflicts_have_actionable_non_private_copy() {
+        let errors = [
+            jobs::ApplicationAttemptAdmissionError::Blocked {
+                reason_code: "company_application_exists".to_string(),
+            },
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: "legacy_company_identity_review_required".to_string(),
+            },
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: "canonical_employer_mapping_conflict".to_string(),
+            },
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: "attempt_employer_identity_review_required".to_string(),
+            },
+        ];
+        for error in errors {
+            let reason = match &error {
+                jobs::ApplicationAttemptAdmissionError::Blocked { reason_code }
+                | jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code } => {
+                    reason_code
+                }
+            }
+            .clone();
+            let response = domain_error(error.into());
+            assert_eq!(response.0, StatusCode::CONFLICT);
+            assert!(!response.1.contains(&reason));
+            assert!(!response.1.contains("@"));
+            assert!(response.1.contains("application") || response.1.contains("employer"));
+        }
+    }
+
+    #[test]
+    fn employer_eligibility_conflicts_are_not_reported_as_server_failures() {
+        for message in [
+            "Bluey already has an in-progress or submitted application for this company",
+            "Review the employer identity of existing application history",
+            "Verify this job's employer identity against existing application history",
+            "Review conflicting employer identity records",
+            "current application employer binding does not permit packet commit",
+        ] {
+            assert_eq!(
+                domain_error(anyhow::anyhow!(message)).0,
+                StatusCode::CONFLICT
+            );
+        }
+        let unexpected = domain_error(anyhow::anyhow!("malformed internal employer binding"));
+        assert_eq!(unexpected.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!unexpected.1.contains("malformed"));
+    }
 
     #[test]
     fn matches_page_cursor_failures_are_one_generic_bad_request() {

@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import {
+  checkAttemptEmployerMigrationRegistration,
   checkPhase613MigrationRegistration,
   checkPhase614MigrationRegistration,
   checkPhase614BMigrationRegistration,
@@ -2794,6 +2795,23 @@ function testPublicBetaAdminMutationAuditBoundary() {
 
 function jobsParitySchema(integerType) {
   return `
+    CREATE TABLE IF NOT EXISTS jobs_attempt_reservations (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+      application_id TEXT NOT NULL REFERENCES jobs_applications(id) ON DELETE CASCADE,
+      company_key TEXT NOT NULL,
+      period_key TEXT NOT NULL,
+      runner TEXT NOT NULL DEFAULT 'unassigned',
+      status TEXT NOT NULL DEFAULT 'reserved',
+      reserved_at_ms ${integerType} NOT NULL,
+      updated_at_ms ${integerType} NOT NULL,
+      UNIQUE(account_id, application_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_attempt_reservations_period
+      ON jobs_attempt_reservations(account_id, period_key, status, reserved_at_ms);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_attempt_reservations_active_company
+      ON jobs_attempt_reservations(account_id, company_key)
+      WHERE status IN ('reserved', 'running', 'side_effect_unknown', 'submitted');
     CREATE TABLE IF NOT EXISTS account_deletion_intents (
       account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
       requested_at_ms ${integerType} NOT NULL CHECK(requested_at_ms >= 0),
@@ -3214,6 +3232,9 @@ function assertSourceVerifierStartupMigrationRegistration(migrationRunner) {
 function testSchemaParity() {
   const sqlite = [
     jobsParitySchema("INTEGER"),
+    fs.readFileSync(path.join(repoRoot, "server/src/db/mod.rs"), "utf8")
+      .match(/fn ensure_sqlite_attempt_employer_identity_columns\([^]*?\n}/)?.[0] ?? "",
+    fs.readFileSync(path.join(repoRoot, "infra/sqlite/server-runtime/066_jobs_attempt_employer_identity.sql"), "utf8"),
     fs.readFileSync(
       path.join(
         repoRoot,
@@ -3252,6 +3273,7 @@ function testSchemaParity() {
   ].join("\n");
   const postgres = [
     jobsParitySchema("BIGINT"),
+    fs.readFileSync(path.join(repoRoot, "infra/postgres/server-runtime/044_jobs_attempt_employer_identity.sql"), "utf8"),
     fs.readFileSync(
       path.join(
         repoRoot,
@@ -3289,6 +3311,36 @@ function testSchemaParity() {
     ),
   ].join("\n");
   assert.deepEqual(compareJobsSchemas(sqlite, postgres), []);
+  for (const [dialect, original, replacement] of [
+    ["SQLite", 'ensure_column(conn, "jobs_attempt_reservations", column, "TEXT")', 'ensure_column(conn, "jobs_attempt_reservations", column, "INTEGER")'],
+    ["Postgres", "ADD COLUMN IF NOT EXISTS canonical_employer_id TEXT,", "ADD COLUMN IF NOT EXISTS canonical_employer_id TEXT NOT NULL,"],
+    ["SQLite", "NEW.canonical_employer_id IS NOT OLD.canonical_employer_id", "NEW.canonical_employer_id IS OLD.canonical_employer_id"],
+    ["Postgres", "NEW.canonical_employer_domain IS DISTINCT FROM OLD.canonical_employer_domain", "NEW.canonical_employer_domain IS NOT DISTINCT FROM OLD.canonical_employer_domain"],
+    ["SQLite", "OLD.status = 'released' AND NEW.status = 'reserved'", "OLD.status = 'submitted' AND NEW.status = 'reserved'"],
+    ["Postgres", "NEW.status NOT IN ('released', 'side_effect_unknown', 'submitted')", "NEW.status NOT IN ('released', 'side_effect_unknown', 'submitted', 'running')"],
+    ["SQLite", "NEW.employer_attestation_sha256 NOT GLOB '*[^0-9a-f]*'", "1 = 1"],
+    ["SQLite", "instr(NEW.canonical_employer_domain, '.') > 0", "1 = 1"],
+    ["SQLite", "length(CAST(NEW.canonical_employer_domain AS BLOB)) = length(NEW.canonical_employer_domain)", "1 = 1"],
+    ["Postgres", "length(employer_domain) BETWEEN 1 AND 253", "length(employer_domain) BETWEEN 1 AND 999"],
+    ["SQLite", "OLD.status = 'submitted' AND NEW.status IS NOT 'submitted'", "0 = 1"],
+    ["Postgres", "OLD.status = 'submitted' AND NEW.status IS DISTINCT FROM 'submitted'", "FALSE"],
+    ["SQLite", "NEW.status NOT IN ('side_effect_unknown', 'submitted', 'released')", "NEW.status NOT IN ('side_effect_unknown', 'submitted', 'released', 'failed')"],
+    ["Postgres", "NEW.status NOT IN ('side_effect_unknown', 'submitted', 'released')", "NEW.status NOT IN ('side_effect_unknown', 'submitted', 'released', 'running')"],
+  ]) {
+    const source = dialect === "SQLite" ? sqlite : postgres;
+    assert(source.includes(original), `Phase 636 mutation precondition: ${original}`);
+    const mutated = source.replaceAll(original, replacement);
+    assert((dialect === "SQLite" ? compareJobsSchemas(mutated, postgres) : compareJobsSchemas(sqlite, mutated))
+      .some((issue) => issue.includes(`${dialect} Phase 636`)), `Phase 636 ${dialect} guard drift must fail`);
+  }
+  for (const column of ["canonical_employer_id", "canonical_employer_domain"]) {
+    const mutated = postgres.replace(
+      `ON jobs_attempt_reservations(account_id, ${column})`,
+      "ON jobs_attempt_reservations(account_id, company_key)",
+    );
+    assert(compareJobsSchemas(sqlite, mutated).some((issue) => issue.includes("jobs_attempt_reservations")),
+      `Phase 636 unique ${column} drift must fail`);
+  }
   const bootColumnDrift = sqlite.replace(
     "boot_generation                 INTEGER NOT NULL",
     "boot_generation_drift           INTEGER NOT NULL",
@@ -3939,6 +3991,14 @@ function testSchemaParity() {
     path.join(repoRoot, "server/src/db/mod.rs"),
     "utf8",
   );
+  assert.deepEqual(checkAttemptEmployerMigrationRegistration(migrationRunner), []);
+  for (const filename of ["066_jobs_attempt_employer_identity.sql", "044_jobs_attempt_employer_identity.sql"]) {
+    assert(checkAttemptEmployerMigrationRegistration(migrationRunner.replaceAll(filename, "removed.sql")).length > 0,
+      `Phase 636 ${filename} removal must fail registration`);
+  }
+  assert(checkAttemptEmployerMigrationRegistration(migrationRunner.replace(
+    "    ensure_sqlite_attempt_employer_identity_columns(&conn)?;", "",
+  )).length > 0, "Phase 636 missing column ensure must fail registration");
   assertSourceVerifierStartupMigrationRegistration(migrationRunner);
   for (const [index, migrationName] of [
     "062_jobs_original_source_verifier_startup_authority.sql",

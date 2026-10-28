@@ -614,6 +614,15 @@ pub fn prepare_application_draft(
     prepare_application_inner(pool, account_id, job_id, mode, submission_mode)
 }
 
+fn require_application_repreparation_state(state: &str) -> Result<()> {
+    if matches!(state, "submitted" | "side_effect_unknown") {
+        return Err(attempt_review_required(
+            "legacy_company_identity_review_required",
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_application_inner(
     pool: &DbPool,
     account_id: &str,
@@ -634,6 +643,17 @@ fn prepare_application_inner(
         .as_ref()
         .map(|(application, _)| application.clone());
     let expected_application = existing.as_ref().map(|(_, revision)| revision.clone());
+    if let Some(application) = &existing_application {
+        require_application_repreparation_state(&application.state)?;
+        if application.submitted_at_ms.is_some() {
+            return Err(attempt_review_required(
+                "legacy_company_identity_review_required",
+            ));
+        }
+    }
+    // Preparation is new work, not outcome recording. Include the current job
+    // in historical review so reprepare cannot erase a legacy terminal outcome.
+    require_complete_terminal_attempt_history(pool, account_id, "")?;
     let eligibility = evaluate_job_eligibility_with_composed_projection(
         pool,
         account_id,
@@ -1190,6 +1210,9 @@ fn commit_prepared_application(
     expected_facts: &[CareerFact],
 ) -> Result<(JobApplication, ResumeVersion)> {
     validate_application_state(&application.state)?;
+    if let Some(previous) = expected {
+        require_application_repreparation_state(&previous.state)?;
+    }
     let content_json = to_json(&content, "resume content")?;
     let diff_json = to_json(&diff, "resume diff")?;
     let claim_ids = claim_evidence
@@ -1353,7 +1376,9 @@ fn commit_prepared_application(
             let preferences = enforce_job_preference_safety(preferences);
             let mut reservation_stmt = tx.prepare(
                 "SELECT id, application_id, company_key, period_key, runner, status,
-                        reserved_at_ms, updated_at_ms
+                        reserved_at_ms, updated_at_ms,
+                        canonical_employer_id, canonical_employer_domain,
+                        employer_attestation_sha256
                    FROM jobs_attempt_reservations WHERE account_id = ?1",
             )?;
             let reservations = reservation_stmt
@@ -1367,6 +1392,9 @@ fn commit_prepared_application(
                         status: row.get(5)?,
                         reserved_at_ms: row.get(6)?,
                         updated_at_ms: row.get(7)?,
+                        canonical_employer_id: row.get(8)?,
+                        canonical_employer_domain: row.get(9)?,
+                        employer_attestation_sha256: row.get(10)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1892,7 +1920,9 @@ fn commit_prepared_application(
             let reservations = tx
                 .query(
                     "SELECT id, application_id, company_key, period_key, runner, status,
-                            reserved_at_ms, updated_at_ms
+                            reserved_at_ms, updated_at_ms,
+                            canonical_employer_id, canonical_employer_domain,
+                            employer_attestation_sha256
                        FROM jobs_attempt_reservations
                       WHERE account_id = $1 FOR SHARE",
                     &[&account_id],
@@ -1907,6 +1937,9 @@ fn commit_prepared_application(
                     status: row.get(5),
                     reserved_at_ms: row.get(6),
                     updated_at_ms: row.get(7),
+                    canonical_employer_id: row.get(8),
+                    canonical_employer_domain: row.get(9),
+                    employer_attestation_sha256: row.get(10),
                 })
                 .collect::<Vec<_>>();
             let authorities = tx
@@ -2823,26 +2856,51 @@ mod queue_admission_tests {
             .split_once("\nfn packet_commit_current_job_sqlite(")
             .expect("bounded PostgreSQL packet reservations")
             .0;
-        for (label, loader) in [
-            ("SQLite", sqlite_reservations),
-            ("PostgreSQL", postgres_reservations),
+        for (label, loader, parameter) in [
+            ("SQLite", sqlite_reservations, '?'),
+            ("PostgreSQL", postgres_reservations, '$'),
         ] {
+            let compact = loader.split_whitespace().collect::<Vec<_>>().join(" ");
             for required in [
-                "company_key",
-                "period_key",
-                "application_id<>",
+                "SELECT id,application_id,company_key,period_key,runner,status,",
+                concat!(
+                    "reserved_at_ms,updated_at_ms, canonical_employer_id, ",
+                    "canonical_employer_domain, employer_attestation_sha256"
+                ),
                 "status IN ('reserved','running','side_effect_unknown','submitted')",
-                "LIMIT 1",
-                "daily_limit",
+                "OR canonical_employer_id IS NULL OR canonical_employer_domain IS NULL",
+                "daily_limit = preferences.daily_limit.clamp(1, 50)",
             ] {
                 assert!(
-                    loader.contains(required),
+                    compact.contains(required),
                     "{label} omits bounded {required}"
                 );
             }
+            for required in [
+                format!("WHERE account_id={parameter}1 AND (application_id={parameter}3 OR ("),
+                format!("company_key={parameter}2 OR canonical_employer_id={parameter}4"),
+                format!("OR canonical_employer_domain={parameter}5"),
+                format!("OR employer_attestation_sha256 IS NULL OR {parameter}4 IS NULL"),
+                format!("ORDER BY (application_id={parameter}3) DESC,application_id LIMIT 2"),
+                format!("period_key={parameter}2 AND application_id<>{parameter}3"),
+                format!("ORDER BY reserved_at_ms DESC,id LIMIT {parameter}4"),
+            ] {
+                assert!(
+                    compact.contains(&required),
+                    "{label} omits bounded {required}"
+                );
+            }
+            assert_eq!(
+                compact
+                    .matches("status IN ('reserved','running','side_effect_unknown','submitted')")
+                    .count(),
+                2,
+                "{label} must bound both employer and daily-budget history to active states"
+            );
             assert!(!loader.contains("WHERE account_id=?1 ORDER BY reserved_at_ms DESC"));
             assert!(!loader.contains("WHERE account_id=$1 ORDER BY reserved_at_ms DESC"));
         }
+        assert!(postgres_reservations.contains("LIMIT 2 FOR SHARE"));
         assert!(postgres_reservations.contains("LIMIT $4 FOR SHARE"));
     }
 
@@ -5112,6 +5170,9 @@ fn validate_packet_commit_current_job(
     {
         anyhow::bail!("current job integrity does not permit packet commit")
     }
+    if !own_attempt_employer_allows_current_authority(application, reservations)? {
+        anyhow::bail!("current application employer binding does not permit packet commit")
+    }
 
     let track = track
         .ok_or_else(|| anyhow::anyhow!("current Career Track does not permit packet commit"))?;
@@ -5332,6 +5393,9 @@ fn packet_commit_attempt_reservation_from_sqlite_row(
         status: row.get(5)?,
         reserved_at_ms: row.get(6)?,
         updated_at_ms: row.get(7)?,
+        canonical_employer_id: row.get(8)?,
+        canonical_employer_domain: row.get(9)?,
+        employer_attestation_sha256: row.get(10)?,
     })
 }
 
@@ -5345,6 +5409,9 @@ fn packet_commit_attempt_reservation_from_postgres_row(row: postgres::Row) -> At
         status: row.get(5),
         reserved_at_ms: row.get(6),
         updated_at_ms: row.get(7),
+        canonical_employer_id: row.get(8),
+        canonical_employer_domain: row.get(9),
+        employer_attestation_sha256: row.get(10),
     }
 }
 
@@ -5353,31 +5420,52 @@ fn packet_commit_relevant_attempt_reservations_sqlite(
     account_id: &str,
     application_id: &str,
     posting: &JobPosting,
+    composed: &ComposedJobIntegrityProjection,
     preferences: &JobPreferences,
     eligibility_at_ms: i64,
 ) -> Result<Vec<AttemptReservation>> {
     let company_key = normalize_company_key(&posting.company);
+    let employer = composed
+        .job_integrity
+        .authority
+        .as_ref()
+        .filter(|_| composed.job_integrity.status == JobIntegrityResolutionStatus::Verified);
+    let employer_id = employer.map(|value| value.canonical_employer_id.as_str());
+    let employer_domain = employer.map(|value| value.canonical_employer_domain.as_str());
     let period_key = attempt_period_key(eligibility_at_ms, preferences.time_zone_offset_minutes);
     let daily_limit = preferences.daily_limit.clamp(1, 50);
     let mut relevant = BTreeMap::new();
-    if let Some(reservation) = tx
-        .query_row(
-            "SELECT id,application_id,company_key,period_key,runner,status,
-                    reserved_at_ms,updated_at_ms
+    let mut company_statement = tx.prepare(
+        "SELECT id,application_id,company_key,period_key,runner,status,
+                    reserved_at_ms,updated_at_ms,
+                    canonical_employer_id, canonical_employer_domain,
+                    employer_attestation_sha256
                FROM jobs_attempt_reservations
-              WHERE account_id=?1 AND company_key=?2 AND application_id<>?3
-                AND status IN ('reserved','running','side_effect_unknown','submitted')
-              LIMIT 1",
-            params![account_id, company_key, application_id],
-            packet_commit_attempt_reservation_from_sqlite_row,
-        )
-        .optional()?
-    {
+              WHERE account_id=?1 AND (application_id=?3 OR (
+                status IN ('reserved','running','side_effect_unknown','submitted') AND (
+                  company_key=?2 OR canonical_employer_id=?4 OR canonical_employer_domain=?5
+                  OR canonical_employer_id IS NULL OR canonical_employer_domain IS NULL
+                  OR employer_attestation_sha256 IS NULL OR ?4 IS NULL)))
+              ORDER BY (application_id=?3) DESC,application_id LIMIT 2",
+    )?;
+    for reservation in company_statement.query_map(
+        params![
+            account_id,
+            company_key,
+            application_id,
+            employer_id,
+            employer_domain
+        ],
+        packet_commit_attempt_reservation_from_sqlite_row,
+    )? {
+        let reservation = reservation?;
         relevant.insert(reservation.id.clone(), reservation);
     }
     let mut statement = tx.prepare(
         "SELECT id,application_id,company_key,period_key,runner,status,
-                reserved_at_ms,updated_at_ms
+                reserved_at_ms,updated_at_ms,
+                canonical_employer_id, canonical_employer_domain,
+                employer_attestation_sha256
            FROM jobs_attempt_reservations
           WHERE account_id=?1 AND period_key=?2 AND application_id<>?3
             AND status IN ('reserved','running','side_effect_unknown','submitted')
@@ -5398,28 +5486,49 @@ fn packet_commit_relevant_attempt_reservations_postgres(
     account_id: &str,
     application_id: &str,
     posting: &JobPosting,
+    composed: &ComposedJobIntegrityProjection,
     preferences: &JobPreferences,
     eligibility_at_ms: i64,
 ) -> Result<Vec<AttemptReservation>> {
     let company_key = normalize_company_key(&posting.company);
+    let employer = composed
+        .job_integrity
+        .authority
+        .as_ref()
+        .filter(|_| composed.job_integrity.status == JobIntegrityResolutionStatus::Verified);
+    let employer_id = employer.map(|value| value.canonical_employer_id.as_str());
+    let employer_domain = employer.map(|value| value.canonical_employer_domain.as_str());
     let period_key = attempt_period_key(eligibility_at_ms, preferences.time_zone_offset_minutes);
     let daily_limit = preferences.daily_limit.clamp(1, 50);
     let mut relevant = BTreeMap::new();
-    if let Some(row) = tx.query_opt(
+    for row in tx.query(
         "SELECT id,application_id,company_key,period_key,runner,status,
-                reserved_at_ms,updated_at_ms
+                reserved_at_ms,updated_at_ms,
+                canonical_employer_id, canonical_employer_domain,
+                employer_attestation_sha256
            FROM jobs_attempt_reservations
-          WHERE account_id=$1 AND company_key=$2 AND application_id<>$3
-            AND status IN ('reserved','running','side_effect_unknown','submitted')
-          LIMIT 1 FOR SHARE",
-        &[&account_id, &company_key, &application_id],
+          WHERE account_id=$1 AND (application_id=$3 OR (
+            status IN ('reserved','running','side_effect_unknown','submitted') AND (
+              company_key=$2 OR canonical_employer_id=$4 OR canonical_employer_domain=$5
+              OR canonical_employer_id IS NULL OR canonical_employer_domain IS NULL
+              OR employer_attestation_sha256 IS NULL OR $4 IS NULL)))
+          ORDER BY (application_id=$3) DESC,application_id LIMIT 2 FOR SHARE",
+        &[
+            &account_id,
+            &company_key,
+            &application_id,
+            &employer_id,
+            &employer_domain,
+        ],
     )? {
         let reservation = packet_commit_attempt_reservation_from_postgres_row(row);
         relevant.insert(reservation.id.clone(), reservation);
     }
     for row in tx.query(
         "SELECT id,application_id,company_key,period_key,runner,status,
-                reserved_at_ms,updated_at_ms
+                reserved_at_ms,updated_at_ms,
+                canonical_employer_id, canonical_employer_domain,
+                employer_attestation_sha256
            FROM jobs_attempt_reservations
           WHERE account_id=$1 AND period_key=$2 AND application_id<>$3
             AND status IN ('reserved','running','side_effect_unknown','submitted')
@@ -5609,10 +5718,16 @@ pub fn commit_packet(
                 account_id,
                 &current.application.id,
                 &current.posting,
+                &current.composed,
                 &current.preferences,
                 current.eligibility_at_ms,
             )?;
             validate_packet_commit_current_job(&current, &reservations)?;
+            require_complete_terminal_attempt_history_sqlite(
+                &tx,
+                account_id,
+                &current.application.id,
+            )?;
             let effect_at_ms = current.eligibility_at_ms;
             let application = current.application;
             let metering_key = format!("jobs-packet:{}", application.job_id);
@@ -5782,10 +5897,16 @@ pub fn commit_packet(
                 account_id,
                 &current.application.id,
                 &current.posting,
+                &current.composed,
                 &current.preferences,
                 current.eligibility_at_ms,
             )?;
             validate_packet_commit_current_job(&current, &reservations)?;
+            require_complete_terminal_attempt_history_postgres(
+                &mut tx,
+                account_id,
+                &current.application.id,
+            )?;
             let effect_at_ms = current.eligibility_at_ms;
             let application = current.application;
             let metering_key = format!("jobs-packet:{}", application.job_id);

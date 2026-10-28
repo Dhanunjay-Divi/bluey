@@ -5,6 +5,13 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs: bind application reservations to signed canonical employer identity in
+  both databases, retaining the display-name guard across aliases, Tracks and
+  application emails. Preserve terminal history, require review for unresolved
+  legacy bindings and recheck exact evidence before packet/execution effects.
+- Jobs: retry only typed PostgreSQL serialization failures in the standalone
+  ATS capacity transaction, with bounded whole-transaction retries and no
+  replay of domain failures or employer/provider effects.
 - Jobs: add an explicit resource-bounded, private-state Linux runner construction
   harness with native-addon smoke and pre-delete stopped-VM/process checks;
   pure boundary tests run normally without starting a VM or enabling execution.

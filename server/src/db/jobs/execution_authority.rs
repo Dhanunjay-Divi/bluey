@@ -82,6 +82,7 @@ fn resolve_current_execution_authority_sqlite_after_prelock_at_ms(
         db_time_ms >= 0,
         "current execution database time is invalid"
     );
+    require_complete_terminal_attempt_history_sqlite(tx, account_id, &application.id)?;
     let Some(profile) = tx
         .query_row(
             "SELECT profile_json FROM jobs_profiles WHERE account_id = ?1",
@@ -223,7 +224,9 @@ fn resolve_current_execution_authority_sqlite_after_prelock_at_ms(
         .unwrap_or_default();
     let mut reservation_stmt = tx.prepare(
         "SELECT id, application_id, company_key, period_key, runner, status,
-                reserved_at_ms, updated_at_ms
+                reserved_at_ms, updated_at_ms,
+                canonical_employer_id, canonical_employer_domain,
+                employer_attestation_sha256
            FROM jobs_attempt_reservations WHERE account_id = ?1",
     )?;
     let reservations = reservation_stmt
@@ -237,6 +240,9 @@ fn resolve_current_execution_authority_sqlite_after_prelock_at_ms(
                 status: row.get(5)?,
                 reserved_at_ms: row.get(6)?,
                 updated_at_ms: row.get(7)?,
+                canonical_employer_id: row.get(8)?,
+                canonical_employer_domain: row.get(9)?,
+                employer_attestation_sha256: row.get(10)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -390,6 +396,7 @@ fn resolve_current_execution_authority_postgres_after_prelock_at_ms(
         db_time_ms >= 0,
         "current execution database time is invalid"
     );
+    require_complete_terminal_attempt_history_postgres(tx, account_id, &application.id)?;
     let Some(profile_row) = tx.query_opt(
         "SELECT profile_json FROM jobs_profiles WHERE account_id = $1",
         &[&account_id],
@@ -504,7 +511,9 @@ fn resolve_current_execution_authority_postgres_after_prelock_at_ms(
     let reservations = tx
         .query(
             "SELECT id, application_id, company_key, period_key, runner, status,
-                    reserved_at_ms, updated_at_ms
+                    reserved_at_ms, updated_at_ms,
+                    canonical_employer_id, canonical_employer_domain,
+                    employer_attestation_sha256
                FROM jobs_attempt_reservations WHERE account_id = $1",
             &[&account_id],
         )?
@@ -518,6 +527,9 @@ fn resolve_current_execution_authority_postgres_after_prelock_at_ms(
             status: row.get(5),
             reserved_at_ms: row.get(6),
             updated_at_ms: row.get(7),
+            canonical_employer_id: row.get(8),
+            canonical_employer_domain: row.get(9),
+            employer_attestation_sha256: row.get(10),
         })
         .collect::<Vec<_>>();
     let authorities = tx
@@ -593,7 +605,8 @@ fn current_execution_authority_matches(
         .receipt
         .pointer("/approved_execution/job/canonicalUrl")
         .and_then(Value::as_str);
-    if frozen_track.as_deref() != Some(track.id.as_str())
+    if !own_attempt_employer_allows_current_authority(application, reservations)?
+        || frozen_track.as_deref() != Some(track.id.as_str())
         || posting.track_id != track.id
         || !track.active
         || track.application_identity_id.as_deref() != Some(identity.id.as_str())
@@ -682,9 +695,9 @@ fn current_ats_certification_matches_frozen_admission(
     else {
         return false;
     };
-    let Ok(frozen) = serde_json::from_value::<AtsFrozenCertificationAdmissionProjection>(
-        frozen_value.clone(),
-    ) else {
+    let Ok(frozen) =
+        serde_json::from_value::<AtsFrozenCertificationAdmissionProjection>(frozen_value.clone())
+    else {
         return false;
     };
     let Some(binding) = current

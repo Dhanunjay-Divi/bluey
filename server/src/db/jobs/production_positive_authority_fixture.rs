@@ -209,9 +209,32 @@ pub(crate) fn install_production_positive_job_authorities_for_runner(
     suffix: &str,
     runner_kind: &str,
 ) -> ProductionPositiveAuthorityFixture {
+    install_production_positive_job_authorities_for_runner_for_employer(
+        pool,
+        account_id,
+        posting,
+        managed,
+        canonical_employer_domain,
+        suffix,
+        runner_kind,
+        "employer-acme",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_production_positive_job_authorities_for_runner_for_employer(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    managed: &managed_cloud_release_authority_tests::OriginalSourceVerifierRuntimeTestFixture,
+    canonical_employer_domain: &str,
+    suffix: &str,
+    runner_kind: &str,
+    canonical_employer_id: &str,
+) -> ProductionPositiveAuthorityFixture {
     let (runtime_target, surface) =
         production_positive_runtime_surface(account_id, suffix, runner_kind);
-    install_production_positive_job_authorities_with_runtime_surface(
+    install_production_positive_job_authorities_with_runtime_surface_for_employer(
         pool,
         account_id,
         posting,
@@ -220,6 +243,7 @@ pub(crate) fn install_production_positive_job_authorities_for_runner(
         suffix,
         runtime_target,
         surface,
+        canonical_employer_id,
     )
 }
 
@@ -239,6 +263,7 @@ pub(crate) fn install_production_positive_verified_source_job_authorities(
         canonical_employer_domain,
         runtime_target,
         surface,
+        "employer-acme",
     )
 }
 
@@ -311,6 +336,31 @@ pub(crate) fn install_production_positive_job_authorities_with_runtime_surface(
     runtime_target: AtsCertificationRuntimeTarget,
     surface: AtsObservedSurface,
 ) -> ProductionPositiveAuthorityFixture {
+    install_production_positive_job_authorities_with_runtime_surface_for_employer(
+        pool,
+        account_id,
+        posting,
+        managed,
+        canonical_employer_domain,
+        suffix,
+        runtime_target,
+        surface,
+        "employer-acme",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_production_positive_job_authorities_with_runtime_surface_for_employer(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    managed: &managed_cloud_release_authority_tests::OriginalSourceVerifierRuntimeTestFixture,
+    canonical_employer_domain: &str,
+    suffix: &str,
+    runtime_target: AtsCertificationRuntimeTarget,
+    surface: AtsObservedSurface,
+    canonical_employer_id: &str,
+) -> ProductionPositiveAuthorityFixture {
     original_source_verification_tests::complete_public_original_source_positive_fixture(
         pool, posting, managed, suffix,
     );
@@ -321,6 +371,7 @@ pub(crate) fn install_production_positive_job_authorities_with_runtime_surface(
         canonical_employer_domain,
         runtime_target,
         surface,
+        canonical_employer_id,
     )
 }
 
@@ -331,6 +382,7 @@ pub(crate) fn install_production_positive_job_authorities_from_verified_source(
     canonical_employer_domain: &str,
     runtime_target: AtsCertificationRuntimeTarget,
     surface: AtsObservedSurface,
+    canonical_employer_id: &str,
 ) -> ProductionPositiveAuthorityFixture {
     let source = resolve_original_source_verification_projection(pool, account_id, posting)
         .expect("resolve production-positive original-source authority");
@@ -366,6 +418,7 @@ pub(crate) fn install_production_positive_job_authorities_from_verified_source(
         pool,
         &expected,
         canonical_employer_domain,
+        canonical_employer_id,
     );
     let composed = resolve_composed_job_integrity_projection(pool, account_id, posting)
         .expect("resolve production-positive composed job authority");

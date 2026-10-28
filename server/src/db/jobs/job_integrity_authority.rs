@@ -5303,17 +5303,11 @@ pub(crate) mod job_integrity_authority_tests {
         pool: &DbPool,
         expected_source: &JobIntegrityExpectedSource,
         canonical_employer_domain: &str,
+        canonical_employer_id: &str,
     ) -> JobIntegrityCurrentAuthority {
         let fixture = shared_fixture_with_pool(pool);
         let suffix = &expected_source.subject_sha256[..24];
-        let mut attestation = attestation(
-            &fixture,
-            suffix,
-            '1',
-            "verified",
-            "clear",
-            Vec::new(),
-        );
+        let mut attestation = attestation(&fixture, suffix, '1', "verified", "clear", Vec::new());
         attestation.subject_sha256 = expected_source.subject_sha256.clone();
         attestation.source_material_sha256 = expected_source.source_material_sha256.clone();
         attestation.canonical_job_id = expected_source.canonical_job_id.clone();
@@ -5328,6 +5322,7 @@ pub(crate) mod job_integrity_authority_tests {
         attestation.source.application_domain = expected_source.application_domain.clone();
         attestation.source.ats_tenant_binding_sha256 =
             expected_source.ats_tenant_binding_sha256.clone();
+        attestation.employer.canonical_employer_id = canonical_employer_id.to_string();
         attestation.employer.canonical_employer_domain = canonical_employer_domain.to_string();
         assert!(expected_source.source_expires_at_ms > attestation.not_before_ms);
         attestation.expires_at_ms = attestation

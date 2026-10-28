@@ -1210,6 +1210,15 @@ fn stage_attempt_reservation_sqlite_tx(
     posting: &JobPosting,
     now_ms: i64,
 ) -> Result<()> {
+    // The caller already resolved exact current signed/frozen execution authority.
+    let employer_binding = frozen_attempt_employer_binding(application)?;
+    require_attempt_employer_admission_sqlite(
+        tx,
+        &input.account_id,
+        application,
+        posting,
+        &employer_binding,
+    )?;
     if let Some((runner, status)) = tx
         .query_row(
             "SELECT runner, status FROM jobs_attempt_reservations
@@ -1254,25 +1263,19 @@ fn stage_attempt_reservation_sqlite_tx(
         anyhow::bail!("today's application attempt limit has been reached")
     }
     let company_key = normalize_company_key(&posting.company);
-    let company_in_use: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM jobs_attempt_reservations
-          WHERE account_id = ?1 AND company_key = ?2 AND application_id <> ?3
-            AND status IN ('reserved', 'running', 'side_effect_unknown', 'submitted')",
-        params![input.account_id, company_key, input.application_id],
-        |row| row.get(0),
-    )?;
-    if company_in_use > 0 {
-        anyhow::bail!("an in-progress or submitted application already exists for this company")
-    }
     tx.execute(
         "INSERT INTO jobs_attempt_reservations (
             id, account_id, application_id, company_key, period_key, runner, status,
-            reserved_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 'cloud', 'reserved', ?6, ?6)
+            reserved_at_ms, updated_at_ms, canonical_employer_id,
+            canonical_employer_domain, employer_attestation_sha256
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'cloud', 'reserved', ?6, ?6, ?7, ?8, ?9)
          ON CONFLICT(account_id, application_id) DO UPDATE SET
             company_key = excluded.company_key, period_key = excluded.period_key,
             runner = 'cloud', status = 'reserved',
-            reserved_at_ms = excluded.reserved_at_ms, updated_at_ms = excluded.updated_at_ms",
+            reserved_at_ms = excluded.reserved_at_ms, updated_at_ms = excluded.updated_at_ms,
+            canonical_employer_id = excluded.canonical_employer_id,
+            canonical_employer_domain = excluded.canonical_employer_domain,
+            employer_attestation_sha256 = excluded.employer_attestation_sha256",
         params![
             format!("attempt-{}", application.id),
             input.account_id,
@@ -1280,6 +1283,9 @@ fn stage_attempt_reservation_sqlite_tx(
             company_key,
             period_key,
             now_ms,
+            employer_binding.canonical_employer_id,
+            employer_binding.canonical_employer_domain,
+            employer_binding.employer_attestation_sha256,
         ],
     )?;
     Ok(())
@@ -1292,6 +1298,14 @@ fn stage_attempt_reservation_postgres_tx(
     posting: &JobPosting,
     now_ms: i64,
 ) -> Result<()> {
+    let employer_binding = frozen_attempt_employer_binding(application)?;
+    require_attempt_employer_admission_postgres(
+        tx,
+        &input.account_id,
+        application,
+        posting,
+        &employer_binding,
+    )?;
     if let Some(row) = tx.query_opt(
         "SELECT runner, status FROM jobs_attempt_reservations
           WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
@@ -1336,27 +1350,20 @@ fn stage_attempt_reservation_postgres_tx(
         anyhow::bail!("today's application attempt limit has been reached")
     }
     let company_key = normalize_company_key(&posting.company);
-    let company_in_use: i64 = tx
-        .query_one(
-            "SELECT COUNT(*) FROM jobs_attempt_reservations
-              WHERE account_id = $1 AND company_key = $2 AND application_id <> $3
-                AND status IN ('reserved', 'running', 'side_effect_unknown', 'submitted')",
-            &[&input.account_id, &company_key, &input.application_id],
-        )?
-        .get(0);
-    if company_in_use > 0 {
-        anyhow::bail!("an in-progress or submitted application already exists for this company")
-    }
     tx.execute(
         "INSERT INTO jobs_attempt_reservations (
             id, account_id, application_id, company_key, period_key, runner, status,
-            reserved_at_ms, updated_at_ms
-         ) VALUES ($1, $2, $3, $4, $5, 'cloud', 'reserved', $6, $6)
+            reserved_at_ms, updated_at_ms, canonical_employer_id,
+            canonical_employer_domain, employer_attestation_sha256
+         ) VALUES ($1, $2, $3, $4, $5, 'cloud', 'reserved', $6, $6, $7, $8, $9)
          ON CONFLICT(account_id, application_id) DO UPDATE SET
             company_key = EXCLUDED.company_key, period_key = EXCLUDED.period_key,
             runner = 'cloud', status = 'reserved',
             reserved_at_ms = EXCLUDED.reserved_at_ms,
-            updated_at_ms = EXCLUDED.updated_at_ms",
+            updated_at_ms = EXCLUDED.updated_at_ms,
+            canonical_employer_id = EXCLUDED.canonical_employer_id,
+            canonical_employer_domain = EXCLUDED.canonical_employer_domain,
+            employer_attestation_sha256 = EXCLUDED.employer_attestation_sha256",
         &[
             &format!("attempt-{}", application.id),
             &input.account_id,
@@ -1364,6 +1371,9 @@ fn stage_attempt_reservation_postgres_tx(
             &company_key,
             &period_key,
             &now_ms,
+            &employer_binding.canonical_employer_id,
+            &employer_binding.canonical_employer_domain,
+            &employer_binding.employer_attestation_sha256,
         ],
     )?;
     Ok(())

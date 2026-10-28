@@ -699,7 +699,9 @@ fn load_posting_representation_inputs_sqlite(
     let reservations = {
         let mut statement = tx.prepare(
             "SELECT id,application_id,company_key,period_key,runner,status,
-                    reserved_at_ms,updated_at_ms
+                    reserved_at_ms,updated_at_ms,
+                    canonical_employer_id, canonical_employer_domain,
+                    employer_attestation_sha256
                FROM jobs_attempt_reservations
               WHERE account_id=?1 ORDER BY reserved_at_ms DESC",
         )?;
@@ -714,6 +716,9 @@ fn load_posting_representation_inputs_sqlite(
                     status: row.get(5)?,
                     reserved_at_ms: row.get(6)?,
                     updated_at_ms: row.get(7)?,
+                    canonical_employer_id: row.get(8)?,
+                    canonical_employer_domain: row.get(9)?,
+                    employer_attestation_sha256: row.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -807,7 +812,9 @@ fn load_posting_representation_inputs_postgres(
     let reservations = tx
         .query(
             "SELECT id,application_id,company_key,period_key,runner,status,
-                    reserved_at_ms,updated_at_ms
+                    reserved_at_ms,updated_at_ms,
+                    canonical_employer_id, canonical_employer_domain,
+                    employer_attestation_sha256
                FROM jobs_attempt_reservations
               WHERE account_id=$1 ORDER BY reserved_at_ms DESC",
             &[&account_id],
@@ -822,6 +829,9 @@ fn load_posting_representation_inputs_postgres(
             status: row.get(5),
             reserved_at_ms: row.get(6),
             updated_at_ms: row.get(7),
+            canonical_employer_id: row.get(8),
+            canonical_employer_domain: row.get(9),
+            employer_attestation_sha256: row.get(10),
         })
         .collect();
 
@@ -889,7 +899,9 @@ fn posting_representation_mutable_inputs_sha256_postgres(
                         reservation.status AS value_5,
                         reservation.reserved_at_ms::text AS value_6,
                         reservation.updated_at_ms::text AS value_7,
-                        ''::text AS value_8
+                        json_build_array(reservation.canonical_employer_id,
+                                         reservation.canonical_employer_domain,
+                                         reservation.employer_attestation_sha256)::text AS value_8
                    FROM jobs_attempt_reservations reservation
                   WHERE reservation.account_id=$1
                ) mutable_input
@@ -3524,9 +3536,11 @@ mod workspace_representation_tests {
             pool.get_pg()?.execute(
                 "INSERT INTO jobs_attempt_reservations (
                     id,account_id,application_id,company_key,period_key,runner,status,
-                    reserved_at_ms,updated_at_ms
-                 ) VALUES ($1,$2,$3,'acme','test-period','local','reserved',1,1)",
-                &[&reservation_id, &account_id, &phantom_application_id],
+                    reserved_at_ms,updated_at_ms,canonical_employer_id,
+                    canonical_employer_domain,employer_attestation_sha256
+                 ) VALUES ($1,$2,$3,'acme','test-period','local','reserved',1,1,
+                           'workspace-fixture-employer','workspace-fixture.example',$4)",
+                &[&reservation_id, &account_id, &phantom_application_id, &"a".repeat(64)],
             )?;
             let mut aba_connection = pool.get_pg()?;
             let mut aba_tx = aba_connection.transaction()?;

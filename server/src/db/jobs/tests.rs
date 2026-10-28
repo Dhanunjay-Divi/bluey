@@ -2,9 +2,11 @@
 mod tests {
     use super::production_positive_authority_fixture::{
         install_production_positive_job_authorities,
-        install_production_positive_job_authorities_for_runner,
+        install_production_positive_job_authorities_for_runner_for_employer,
         install_production_positive_job_authorities_with_runtime_surface,
+        install_production_positive_job_authorities_with_runtime_surface_for_employer,
         save_production_positive_verified_import,
+        save_production_positive_verified_import_with_runtime,
     };
     use super::*;
     use crate::db;
@@ -2315,7 +2317,8 @@ mod tests {
             &profile,
             &preferences,
         );
-        let authority_fixture = install_production_positive_job_authorities_for_runner(
+        // Each suffix models a distinct employer, not a new alias for one signed employer ID.
+        let authority_fixture = install_production_positive_job_authorities_for_runner_for_employer(
             pool,
             "acct-jobs",
             &posting,
@@ -2323,6 +2326,7 @@ mod tests {
             &format!("{greenhouse_tenant}.example"),
             suffix,
             "cloud",
+            &format!("employer-{greenhouse_tenant}"),
         );
         let (application, _) =
             prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
@@ -12913,6 +12917,7 @@ mod tests {
             &sde_application,
             &sde_job,
             &saved_preferences,
+            true, // This legacy name-only fixture has no signed authority.
         );
         update_attempt_reservation_status(&pool, "acct-jobs", &sde_application.id, "submitted")
             .unwrap();
@@ -13064,7 +13069,9 @@ mod tests {
                 .unwrap();
         let first = commit_packet(&pool, "acct-jobs", &application.id).unwrap();
         let mut changed_preferences = get_preferences(&pool, "acct-jobs").unwrap();
-        changed_preferences.excluded_companies.push("Acme".to_string());
+        changed_preferences
+            .excluded_companies
+            .push("Acme".to_string());
         save_preferences(&pool, "acct-jobs", &changed_preferences).unwrap();
         let mut unavailable = posting.clone();
         unavailable.availability_status = "expired".to_string();
@@ -13175,16 +13182,72 @@ mod tests {
             &JobPreferences::default(),
         )
         .expect("save packet effect posting");
-        let (application, _) = prepare_application(
-            &pool,
-            "acct-jobs",
-            &posting.id,
-            "factual",
-            "review_first",
-        )
-        .expect("prepare packet effect application");
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .expect("prepare packet effect application");
         force_packet_overage_effect_fixture(&pool);
         (pool, profile, posting, application)
+    }
+
+    #[test]
+    fn canonical_employer_terminal_history_cannot_be_erased_by_same_job_preparation() {
+        for terminal in ["submitted", "side_effect_unknown"] {
+            let (pool, _, posting, application) = prepared_packet_effect_fixture(terminal);
+            // A nonterminal packet can still be prepared again normally.
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+            let current = get_application(&pool, "acct-jobs", &application.id)
+                .unwrap()
+                .unwrap();
+            let mut historical = current.clone();
+            historical.state = terminal.to_string();
+            historical.receipt["retained_terminal_evidence"] = json!({"immutable": true});
+            if terminal == "submitted" {
+                historical.submitted_at_ms = Some(now_ms());
+            }
+            pool.get()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs_applications SET state=?2,application_json=?3,submitted_at_ms=?4
+                  WHERE account_id='acct-jobs' AND id=?1",
+                    params![
+                        application.id,
+                        terminal,
+                        serde_json::to_string(&historical).unwrap(),
+                        historical.submitted_at_ms
+                    ],
+                )
+                .unwrap();
+            let resumes =
+                serde_json::to_value(list_resume_versions(&pool, "acct-jobs").unwrap()).unwrap();
+            let attempts = list_attempt_reservations(&pool, "acct-jobs").unwrap();
+            let before =
+                serde_json::to_value(get_application(&pool, "acct-jobs", &application.id).unwrap())
+                    .unwrap();
+            let effects = packet_overage_effect_snapshot(&pool, &posting.id);
+            let error =
+                prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                    .unwrap_err();
+            assert!(
+                matches!(error.downcast_ref::<ApplicationAttemptAdmissionError>(),
+                Some(ApplicationAttemptAdmissionError::ReviewRequired { reason_code })
+                    if reason_code == "legacy_company_identity_review_required")
+            );
+            assert_eq!(
+                serde_json::to_value(get_application(&pool, "acct-jobs", &application.id).unwrap())
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(list_resume_versions(&pool, "acct-jobs").unwrap()).unwrap(),
+                resumes
+            );
+            assert_eq!(
+                list_attempt_reservations(&pool, "acct-jobs").unwrap(),
+                attempts
+            );
+            assert_eq!(packet_overage_effect_snapshot(&pool, &posting.id), effects);
+        }
     }
 
     #[test]
@@ -13240,7 +13303,8 @@ mod tests {
         let before = packet_overage_effect_snapshot(&pool, &posting.id);
         let mut preferences = get_preferences(&pool, "acct-jobs").unwrap();
         preferences.excluded_companies.push(posting.company.clone());
-        let updated = pool.get()
+        let updated = pool
+            .get()
             .unwrap()
             .execute(
                 "UPDATE jobs_preferences SET preferences_json=?2
@@ -13251,7 +13315,10 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(updated, 1, "the current preference authority must actually change");
+        assert_eq!(
+            updated, 1,
+            "the current preference authority must actually change"
+        );
 
         let error = commit_packet(&pool, "acct-jobs", &application.id)
             .expect_err("current company exclusion must reject packet metering");
@@ -14944,22 +15011,42 @@ mod tests {
         application: &JobApplication,
         posting: &JobPosting,
         preferences: &JobPreferences,
+        allow_unsigned_name_only: bool,
     ) {
         let at_ms = now_ms();
         let period_key = attempt_period_key(at_ms, preferences.time_zone_offset_minutes);
+        // A signed fixture must retain its exact frozen binding. The older
+        // name-guard-only fixture has no signed receipt and uses explicit
+        // synthetic metadata, never execution authority.
+        let binding = if !allow_unsigned_name_only {
+            frozen_attempt_employer_binding(application).expect("signed quota fixture binding")
+        } else {
+            assert!(application_job_integrity_receipt(application)
+                .unwrap()
+                .is_none());
+            AttemptEmployerBinding {
+                canonical_employer_id: "synthetic-nameguard-only".to_string(),
+                canonical_employer_domain: "nameguard.example".to_string(),
+                employer_attestation_sha256: "a".repeat(64),
+            }
+        };
         pool.get()
             .unwrap()
             .execute(
                 "INSERT INTO jobs_attempt_reservations (
                     id, account_id, application_id, company_key, period_key, runner, status,
-                    reserved_at_ms, updated_at_ms
-                 ) VALUES (?1, 'acct-jobs', ?2, ?3, ?4, 'local', 'reserved', ?5, ?5)",
+                    reserved_at_ms, updated_at_ms, canonical_employer_id,
+                    canonical_employer_domain, employer_attestation_sha256
+                 ) VALUES (?1, 'acct-jobs', ?2, ?3, ?4, 'local', 'reserved', ?5, ?5, ?6, ?7, ?8)",
                 params![
                     format!("quota-reservation-{}", application.id),
                     application.id,
                     normalize_company_key(&posting.company),
                     period_key,
                     at_ms,
+                    binding.canonical_employer_id,
+                    binding.canonical_employer_domain,
+                    binding.employer_attestation_sha256,
                 ],
             )
             .unwrap();
@@ -14968,36 +15055,70 @@ mod tests {
     #[test]
     fn eligibility_enforces_company_and_daily_limits_from_active_reservations() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
-        let preferences = JobPreferences::default();
-        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
-
-        let first = upsert_posting(
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
+        // One synthetic multi-employer board isolates the application quota
+        // from the separate source-enrollment cap. Each exact job is still
+        // independently signed with its intended employer identity/domain.
+        let signed_posting = |id: &str, company: &str, title: &str| {
+            let mut posting = test_posting(
+                &format!("https://boards.greenhouse.io/quota-fixture/jobs/{id}"),
+                now_ms(),
+                now_ms(),
+            );
+            posting.company = company.to_string();
+            posting.title = title.to_string();
+            posting.source = "greenhouse_import".to_string();
+            posting.employment_type = "full_time w2".to_string();
+            posting.external_id = id.to_string();
+            posting.track_id = "track-default".to_string();
+            posting.canonical_key = canonical_job_key(&posting);
+            posting.discovery_evidence = JobDiscoveryEvidence::default();
+            posting
+        };
+        let (first, managed) = save_production_positive_verified_import(
             &pool,
             "acct-jobs",
-            &test_posting(
-                "https://boards.greenhouse.io/acme/jobs/one",
-                now_ms(),
-                now_ms(),
-            ),
+            &signed_posting("quota-one", "Acme", "Software Engineer"),
             &profile,
             &preferences,
-        )
-        .unwrap();
+        );
+        let authority = install_production_positive_job_authorities(
+            &pool,
+            "acct-jobs",
+            &first,
+            &managed,
+            "quota-acme.example",
+            "quota-one",
+        );
         let (application, _) =
             prepare_application(&pool, "acct-jobs", &first.id, "factual", "review_first").unwrap();
         assert_eq!(application.state, "awaiting_review");
-        seed_active_reservation_for_quota_eligibility(&pool, &application, &first, &preferences);
-
-        let mut second = test_posting(
-            "https://boards.greenhouse.io/acme/jobs/two",
-            now_ms(),
-            now_ms(),
+        seed_active_reservation_for_quota_eligibility(
+            &pool,
+            &application,
+            &first,
+            &preferences,
+            false,
         );
-        second.title = "Backend Engineer".to_string();
-        let second = verified_test_posting(second, now_ms());
-        let second = upsert_posting(&pool, "acct-jobs", &second, &profile, &preferences).unwrap();
+
+        let second = save_production_positive_verified_import_with_runtime(
+            &pool,
+            "acct-jobs",
+            &signed_posting("quota-two", "Acme", "Backend Engineer"),
+            &profile,
+            &preferences,
+        );
+        install_production_positive_job_authorities_with_runtime_surface(
+            &pool,
+            "acct-jobs",
+            &second,
+            &managed,
+            "quota-acme.example",
+            "quota-two",
+            authority.runtime_target.clone(),
+            authority.surface.clone(),
+        );
         assert!(
             prepare_application(&pool, "acct-jobs", &second.id, "factual", "review_first")
                 .unwrap_err()
@@ -15006,16 +15127,30 @@ mod tests {
         );
 
         for index in 2..=10 {
-            let mut posting = test_posting(
-                &format!("https://boards.greenhouse.io/company-{index}/jobs/{index}"),
-                now_ms(),
-                now_ms(),
+            let domain = format!("quota-company-{index}");
+            let id = format!("quota-{index}");
+            let posting = save_production_positive_verified_import_with_runtime(
+                &pool,
+                "acct-jobs",
+                &signed_posting(
+                    &id,
+                    &format!("Company {index}"),
+                    &format!("Platform Engineer {index}"),
+                ),
+                &profile,
+                &preferences,
             );
-            posting.company = format!("Company {index}");
-            posting.title = format!("Platform Engineer {index}");
-            let posting = verified_test_posting(posting, now_ms());
-            let posting =
-                upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+            install_production_positive_job_authorities_with_runtime_surface_for_employer(
+                &pool,
+                "acct-jobs",
+                &posting,
+                &managed,
+                &format!("{domain}.example"),
+                &id,
+                authority.runtime_target.clone(),
+                authority.surface.clone(),
+                &format!("employer-{domain}"),
+            );
             let (application, _) =
                 prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                     .unwrap();
@@ -15024,19 +15159,28 @@ mod tests {
                 &application,
                 &posting,
                 &preferences,
+                false,
             );
         }
 
-        let mut final_posting = test_posting(
-            "https://boards.greenhouse.io/globex/jobs/final",
-            now_ms(),
-            now_ms(),
+        let final_posting = save_production_positive_verified_import_with_runtime(
+            &pool,
+            "acct-jobs",
+            &signed_posting("quota-final", "Globex", "Platform Engineer"),
+            &profile,
+            &preferences,
         );
-        final_posting.company = "Globex".to_string();
-        final_posting.title = "Platform Engineer".to_string();
-        let final_posting = verified_test_posting(final_posting, now_ms());
-        let final_posting =
-            upsert_posting(&pool, "acct-jobs", &final_posting, &profile, &preferences).unwrap();
+        install_production_positive_job_authorities_with_runtime_surface_for_employer(
+            &pool,
+            "acct-jobs",
+            &final_posting,
+            &managed,
+            "quota-globex.example",
+            "quota-final",
+            authority.runtime_target.clone(),
+            authority.surface.clone(),
+            "employer-quota-globex",
+        );
         assert!(prepare_application(
             &pool,
             "acct-jobs",
@@ -20961,9 +21105,11 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
-            .unwrap()
-            .is_none());
+        assert!(
+            claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(local_claim_state(&pool, &application.id, &run_id), queued);
         assert!(matches!(
             claim_local_run_with_browser_release(
@@ -21052,16 +21198,14 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(!local_run_submit_authorized(
-            &pool,
-            &run_id,
-            &ticket_hash,
-            &proof,
-            &capacity,
-        )
-        .unwrap());
+        assert!(
+            !local_run_submit_authorized(&pool, &run_id, &ticket_hash, &proof, &capacity,).unwrap()
+        );
         assert_eq!(local_claim_state(&pool, &application.id, &run_id), claimed);
-        assert_eq!(submission_capacity_count(&pool, &application.id, &run_id), 0);
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
         assert!(get_application(&pool, "acct-jobs", &application.id)
             .unwrap()
             .unwrap()
@@ -21116,7 +21260,10 @@ mod tests {
         .unwrap()
         .expect("public-beta closure must not strand exact click-started replay");
         assert_eq!(replay, started);
-        assert_eq!(submission_capacity_count(&pool, &application.id, &run_id), 1);
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            1
+        );
     }
 
     #[test]

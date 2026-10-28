@@ -2933,18 +2933,19 @@ type ManagedExecutionEffectBoundary = fn(
 ) -> ExecutionLeaseResult<AuthorizedExecutionLeaseRecord>;
 
 #[cfg(test)]
-type IrreversibleSubmitWorkerBoundary = fn(
-    &DbPool,
-    &str,
-    &str,
-    &str,
-    &str,
-    i64,
-    &FinalSubmitProof,
-    &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
-    Option<&ManagedCloudExecutionLeaseClaimInput>,
-    &str,
-) -> ExecutionLeaseResult<AuthorizedIrreversibleExecutionLeaseRecord>;
+type IrreversibleSubmitWorkerBoundary =
+    fn(
+        &DbPool,
+        &str,
+        &str,
+        &str,
+        &str,
+        i64,
+        &FinalSubmitProof,
+        &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+        Option<&ManagedCloudExecutionLeaseClaimInput>,
+        &str,
+    ) -> ExecutionLeaseResult<AuthorizedIrreversibleExecutionLeaseRecord>;
 
 #[cfg(test)]
 #[test]
@@ -3605,8 +3606,7 @@ fn start_irreversible_submission_inner(
                 return Err(ExecutionLeaseError::Conflict);
             }
             if lease.phase == "click_started" {
-                let (input, authenticated_worker_id) =
-                    managed_cloud_context.unwrap_or((None, ""));
+                let (input, authenticated_worker_id) = managed_cloud_context.unwrap_or((None, ""));
                 let managed_cloud = load_managed_cloud_irreversible_effect_receipt_sqlite_tx(
                     &tx,
                     account_id,
@@ -3651,10 +3651,7 @@ fn start_irreversible_submission_inner(
             )? {
                 return Err(ExecutionLeaseError::Conflict);
             }
-            if managed_cloud_context
-                .and_then(|(input, _)| input)
-                .is_none()
-            {
+            if managed_cloud_context.and_then(|(input, _)| input).is_none() {
                 require_unmanaged_cloud_execution_sqlite_tx(
                     &tx,
                     account_id,
@@ -3817,8 +3814,7 @@ fn start_irreversible_submission_inner(
             {
                 lock_postgres_ats_certification(&mut tx)
                     .map_err(execution_lease_from_ats_certification_error)?;
-                let (input, authenticated_worker_id) =
-                    managed_cloud_context.unwrap_or((None, ""));
+                let (input, authenticated_worker_id) = managed_cloud_context.unwrap_or((None, ""));
                 let managed_cloud = load_managed_cloud_irreversible_effect_receipt_postgres_tx(
                     &mut tx,
                     account_id,
@@ -3894,10 +3890,7 @@ fn start_irreversible_submission_inner(
                 return Err(ExecutionLeaseError::Conflict);
             }
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
-            if managed_cloud_context
-                .and_then(|(input, _)| input)
-                .is_none()
-            {
+            if managed_cloud_context.and_then(|(input, _)| input).is_none() {
                 require_unmanaged_cloud_execution_postgres_tx(
                     &mut tx,
                     account_id,
@@ -4141,8 +4134,7 @@ fn start_irreversible_submission_inner(
                 now,
             )?;
             crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(
-                &mut tx,
-                &capacity,
+                &mut tx, &capacity,
             )?;
             if tx.execute(
                 "UPDATE jobs_execution_leases
@@ -5071,7 +5063,9 @@ pub fn reconcile_execution_lease_checkpoint(
             let attempt = tx
                 .query_row(
                     "SELECT id, application_id, company_key, period_key, runner, status,
-                            reserved_at_ms, updated_at_ms
+                            reserved_at_ms, updated_at_ms,
+                            canonical_employer_id, canonical_employer_domain,
+                            employer_attestation_sha256
                        FROM jobs_attempt_reservations
                       WHERE account_id = ?1 AND application_id = ?2",
                     params![account_id, application_id],
@@ -5085,6 +5079,9 @@ pub fn reconcile_execution_lease_checkpoint(
                             status: row.get(5)?,
                             reserved_at_ms: row.get(6)?,
                             updated_at_ms: row.get(7)?,
+                            canonical_employer_id: row.get(8)?,
+                            canonical_employer_domain: row.get(9)?,
+                            employer_attestation_sha256: row.get(10)?,
                         })
                     },
                 )
@@ -5264,7 +5261,9 @@ pub fn reconcile_execution_lease_checkpoint(
             let attempt = tx
                 .query_opt(
                     "SELECT id, application_id, company_key, period_key, runner, status,
-                            reserved_at_ms, updated_at_ms
+                            reserved_at_ms, updated_at_ms,
+                            canonical_employer_id, canonical_employer_domain,
+                            employer_attestation_sha256
                        FROM jobs_attempt_reservations
                       WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
                     &[&account_id, &application_id],
@@ -5278,6 +5277,9 @@ pub fn reconcile_execution_lease_checkpoint(
                     status: row.get(5),
                     reserved_at_ms: row.get(6),
                     updated_at_ms: row.get(7),
+                    canonical_employer_id: row.get(8),
+                    canonical_employer_domain: row.get(9),
+                    employer_attestation_sha256: row.get(10),
                 });
             let lease = tx
                 .query_opt(

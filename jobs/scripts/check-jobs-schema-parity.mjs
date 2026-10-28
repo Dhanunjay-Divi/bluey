@@ -62,6 +62,7 @@ const SEMANTIC_PARITY_TABLES = new Set([
 
 export const JOBS_PARITY_TABLES = [
   "account_deletion_intents",
+  "jobs_attempt_reservations",
   "jobs_browser_account_channel_assignments",
   "jobs_browser_release_activations",
   "jobs_browser_release_artifact_runtime_components",
@@ -142,6 +143,15 @@ export const JOBS_PARITY_TABLES = [
 ];
 
 const REQUIRED_INDEX_SIGNATURES = new Map([
+  [
+    "jobs_attempt_reservations",
+    [
+      "idx_jobs_attempt_reservations_period on jobs_attempt_reservations (account_id, period_key, status, reserved_at_ms)",
+      "unique idx_jobs_attempt_reservations_active_company on jobs_attempt_reservations (account_id, company_key) where status in ('reserved', 'running', 'side_effect_unknown', 'submitted')",
+      "unique idx_jobs_attempt_reservations_active_employer_id on jobs_attempt_reservations (account_id, canonical_employer_id) where canonical_employer_id is not null and status in ('reserved', 'running', 'side_effect_unknown', 'submitted')",
+      "unique idx_jobs_attempt_reservations_active_employer_domain on jobs_attempt_reservations (account_id, canonical_employer_domain) where canonical_employer_domain is not null and status in ('reserved', 'running', 'side_effect_unknown', 'submitted')",
+    ].sort(),
+  ],
   [
     "jobs_managed_cloud_source_verifier_boot_registrations",
     [
@@ -3654,6 +3664,97 @@ function phase613PostgresRequirements(issues, sql) {
   }
 }
 
+function attemptEmployerRequirements(issues, sqliteSource, postgresSource) {
+  const columns = ["canonical_employer_id", "canonical_employer_domain", "employer_attestation_sha256"];
+  const require = (dialect, object, body, fragments) => {
+    for (const fragment of fragments) {
+      if (!body?.includes(normalizeSql(fragment))) {
+        issues.push(`${dialect} Phase 636 ${object} invariant missing: ${fragment}`);
+      }
+    }
+  };
+  // Compare the historical CREATE TABLE separately. These are the deliberate additive
+  // column paths; CREATE-only extraction cannot prove ALTER/ensure_column semantics.
+  const helper = /fn ensure_sqlite_attempt_employer_identity_columns\([^]*?\n}/.exec(sqliteSource)?.[0];
+  const compactHelper = helper?.replace(/\s+/g, "");
+  if (!compactHelper?.includes(
+    'forcolumnin["canonical_employer_id","canonical_employer_domain","employer_attestation_sha256",]'
+  ) || !compactHelper.includes('ensure_column(conn,"jobs_attempt_reservations",column,"TEXT")?;')) {
+    issues.push("SQLite Phase 636 additive nullable TEXT column helper differs");
+  }
+  for (const column of columns) {
+    const expression = new RegExp(`ADD\\s+COLUMN\\s+IF\\s+NOT\\s+EXISTS\\s+${column}\\s+TEXT\\s*[,;]`, "gi");
+    if ([...postgresSource.matchAll(expression)].length !== 1) {
+      issues.push(`Postgres Phase 636 additive nullable TEXT column differs: ${column}`);
+    }
+  }
+  const insert = extractSqliteTrigger(sqliteSource, "trg_jobs_attempt_employer_identity_insert");
+  const update = extractSqliteTrigger(sqliteSource, "trg_jobs_attempt_employer_identity_update");
+  const commonSqlite = [
+    "NEW.canonical_employer_id IS NULL AND NEW.canonical_employer_domain IS NULL AND NEW.employer_attestation_sha256 IS NULL",
+    "NEW.canonical_employer_id IS NOT NULL AND NEW.canonical_employer_domain IS NOT NULL AND NEW.employer_attestation_sha256 IS NOT NULL",
+    "length(NEW.canonical_employer_id) BETWEEN 1 AND 240",
+    "length(CAST(NEW.canonical_employer_id AS BLOB)) = length(NEW.canonical_employer_id)",
+    "NEW.canonical_employer_id NOT GLOB '*[^A-Za-z0-9_./:-]*'",
+    "length(NEW.canonical_employer_domain) BETWEEN 1 AND 253",
+    "length(CAST(NEW.canonical_employer_domain AS BLOB)) = length(NEW.canonical_employer_domain)",
+    "NEW.canonical_employer_domain NOT GLOB '*[^a-z0-9.-]*'",
+    "instr(NEW.canonical_employer_domain, '.') > 0",
+    "NEW.canonical_employer_domain NOT LIKE '%.localhost'",
+    "length(NEW.employer_attestation_sha256) = 64",
+    "length(CAST(NEW.employer_attestation_sha256 AS BLOB)) = 64",
+    "NEW.employer_attestation_sha256 NOT GLOB '*[^0-9a-f]*'",
+    "length(label) NOT BETWEEN 1 AND 63 OR substr(label, 1, 1) = '-' OR substr(label, -1) = '-'",
+    "label NOT GLOB '*[^0-9]*'",
+    "substr(label, 1, 2) = '0x' AND substr(label, 3) NOT GLOB '*[^0-9a-f]*'",
+    ") IS NOT TRUE",
+  ];
+  require("SQLite", "insert guard", insert, [
+    "BEFORE INSERT ON jobs_attempt_reservations", ...commonSqlite,
+    "NEW.status IN ('reserved', 'running', 'side_effect_unknown', 'submitted') AND NEW.canonical_employer_id IS NULL",
+  ]);
+  require("SQLite", "update guard", update, [
+    "BEFORE UPDATE ON jobs_attempt_reservations", ...commonSqlite,
+    "NEW.canonical_employer_id IS NOT OLD.canonical_employer_id OR NEW.canonical_employer_domain IS NOT OLD.canonical_employer_domain",
+    "NEW.employer_attestation_sha256 IS NOT OLD.employer_attestation_sha256",
+    "OLD.status = 'released' AND NEW.status = 'reserved' AND NEW.canonical_employer_id IS OLD.canonical_employer_id AND NEW.canonical_employer_domain IS OLD.canonical_employer_domain",
+    "NEW.status NOT IN ('released', 'side_effect_unknown', 'submitted')",
+    "OLD.status = 'submitted' AND NEW.status IS NOT 'submitted'",
+    "OLD.status = 'side_effect_unknown' AND NEW.status NOT IN ('side_effect_unknown', 'submitted', 'released')",
+  ]);
+  const validator = extractSingleSqlObject(postgresSource,
+    /CREATE\s+OR\s+REPLACE\s+FUNCTION\s+jobs_attempt_employer_binding_valid\([^]*?\$fn\$;/gi);
+  const guard = extractSingleSqlObject(postgresSource,
+    /CREATE\s+OR\s+REPLACE\s+FUNCTION\s+jobs_attempt_employer_identity_guard\([^]*?\$fn\$;/gi);
+  require("Postgres", "shape validator", validator, [
+    "employer_id IS NULL AND employer_domain IS NULL AND attestation_sha256 IS NULL",
+    "employer_id IS NOT NULL AND employer_domain IS NOT NULL AND attestation_sha256 IS NOT NULL",
+    'employer_id COLLATE "C" ~ \'^[A-Za-z0-9_./:-]{1,240}$\'',
+    "length(employer_domain) BETWEEN 1 AND 253",
+    "'^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'",
+    "employer_domain NOT LIKE '%.localhost'",
+    "'\\.([0-9]+|0x[0-9a-f]*)$'",
+    'attestation_sha256 COLLATE "C" ~ \'^[0-9a-f]{64}$\'',
+    "FALSE",
+  ]);
+  require("Postgres", "update/insert guard", guard, [
+    "IF NOT jobs_attempt_employer_binding_valid(",
+    "NEW.status IN ('reserved', 'running', 'side_effect_unknown', 'submitted')",
+    "NEW.canonical_employer_id IS DISTINCT FROM OLD.canonical_employer_id OR NEW.canonical_employer_domain IS DISTINCT FROM OLD.canonical_employer_domain",
+    "NEW.employer_attestation_sha256 IS DISTINCT FROM OLD.employer_attestation_sha256",
+    "OLD.status = 'released' AND NEW.status = 'reserved' AND NEW.canonical_employer_id IS NOT DISTINCT FROM OLD.canonical_employer_id AND NEW.canonical_employer_domain IS NOT DISTINCT FROM OLD.canonical_employer_domain",
+    "NEW.status NOT IN ('released', 'side_effect_unknown', 'submitted')",
+    "OLD.status = 'submitted' AND NEW.status IS DISTINCT FROM 'submitted'",
+    "OLD.status = 'side_effect_unknown' AND NEW.status NOT IN ('side_effect_unknown', 'submitted', 'released')",
+  ]);
+  require("Postgres", "shape CHECK", normalizeSql(postgresSource), [
+    "ADD CONSTRAINT jobs_attempt_employer_binding_shape CHECK (jobs_attempt_employer_binding_valid(canonical_employer_id, canonical_employer_domain, employer_attestation_sha256))",
+  ]);
+  require("Postgres", "trigger", extractPostgresTrigger(postgresSource, "trg_jobs_attempt_employer_identity"), [
+    "BEFORE INSERT OR UPDATE ON jobs_attempt_reservations FOR EACH ROW EXECUTE FUNCTION jobs_attempt_employer_identity_guard()",
+  ]);
+}
+
 export function compareJobsSchemas(sqliteSource, postgresSource) {
   const issues = [];
   const expectedNames = [...JOBS_PARITY_TABLES].sort();
@@ -3761,6 +3862,7 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
   phase614BPostgresRequirements(issues, postgresSource);
   phase628SqliteRequirements(issues, sqliteSource);
   phase628PostgresRequirements(issues, postgresSource);
+  attemptEmployerRequirements(issues, sqliteSource, postgresSource);
 
   return issues;
 }
@@ -3770,6 +3872,32 @@ function extractRustArrayBody(source, constantName) {
     `const\\s+${constantName}\\s*:[^=]+?=\\s*&\\[([\\s\\S]*?)\\n\\];`,
   );
   return expression.exec(source)?.[1] ?? null;
+}
+
+export function checkAttemptEmployerMigrationRegistration(source) {
+  const issues = [];
+  for (const [dialect, symbol, filename, array] of [
+    ["SQLite", "SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY", "066_jobs_attempt_employer_identity.sql", "MIGRATIONS"],
+    ["Postgres", "POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY", "044_jobs_attempt_employer_identity.sql", "POSTGRES_POST_JOBS_MIGRATIONS"],
+  ]) {
+    const declaration = new RegExp(`const\\s+${symbol}\\s*:\\s*&str\\s*=\\s*include_str!\\(\\s*"\\.\\./\\.\\./\\.\\./infra/${dialect === "SQLite" ? "sqlite" : "postgres"}/server-runtime/${filename.replaceAll(".", "\\.")}"\\s*\\)\\s*;`, "g");
+    const registrations = extractRustArrayBody(source, array) ?? "";
+    if ([...source.matchAll(declaration)].length !== 1 ||
+        (registrations.match(new RegExp(`\\b${symbol}\\b`, "g")) ?? []).length !== 1) {
+      issues.push(`${dialect} Phase 636 migration runner must register ${filename} exactly once`);
+    }
+  }
+  if (!/pub\s+const\s+JOBS_ATTEMPT_EMPLOYER_IDENTITY_MIGRATION_ID\s*:\s*&str\s*=\s*"044_jobs_attempt_employer_identity\.sql"\s*;/.test(source) ||
+      !/\(\s*JOBS_ATTEMPT_EMPLOYER_IDENTITY_MIGRATION_ID\s*,\s*POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY\s*,?\s*\)/.test(extractRustArrayBody(source, "POSTGRES_POST_JOBS_MIGRATIONS") ?? "")) {
+    issues.push("Postgres Phase 636 migration runner must bind the exact migration ID");
+  }
+  const runner = source.slice(source.indexOf("fn run_sqlite_migrations("), source.indexOf("fn execute_sqlite_source_verifier_boot_migration("));
+  const columnsAt = runner.indexOf("ensure_sqlite_attempt_employer_identity_columns(&conn)?;");
+  const migrationLoopAt = runner.indexOf("for (offset, sql) in following_migrations.iter().enumerate()");
+  if (columnsAt < 0 || migrationLoopAt < 0 || columnsAt >= migrationLoopAt) {
+    issues.push("SQLite Phase 636 columns must be ensured before replaying the additive migration");
+  }
+  return issues;
 }
 
 export function checkPhase613MigrationRegistration(runnerSource) {
@@ -4229,6 +4357,7 @@ function main() {
     sqliteOriginalSourceVerifierStartupAuthorityPath,
     sqliteSourceVerifierBootAuthorityPath,
     sqliteSourceVerifierHeartbeatBindingsPath,
+    path.join(repoRoot, "infra/sqlite/server-runtime/066_jobs_attempt_employer_identity.sql"),
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -4251,6 +4380,7 @@ function main() {
     postgresOriginalSourceVerifierStartupAuthorityPath,
     postgresSourceVerifierBootAuthorityPath,
     postgresSourceVerifierHeartbeatBindingsPath,
+    path.join(repoRoot, "infra/postgres/server-runtime/044_jobs_attempt_employer_identity.sql"),
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -4261,6 +4391,7 @@ function main() {
     ...checkPhase614BMigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
     ...checkPhase628MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
     ...checkPhase621MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
+    ...checkAttemptEmployerMigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
   );
 
   const includePath =

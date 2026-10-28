@@ -2079,6 +2079,12 @@ pub struct AttemptReservation {
     pub status: String,
     pub reserved_at_ms: i64,
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub canonical_employer_id: Option<String>,
+    #[serde(default)]
+    pub canonical_employer_domain: Option<String>,
+    #[serde(default)]
+    pub employer_attestation_sha256: Option<String>,
 }
 
 fn default_resume_mode() -> String {
@@ -2362,6 +2368,7 @@ include!("jobs/global_archive.rs");
 include!("jobs/resume_assets.rs");
 include!("jobs/auto_submit.rs");
 include!("jobs/operational_holds.rs");
+include!("jobs/attempt_employer_identity.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");

@@ -1,5 +1,8 @@
 use super::production_positive_authority_fixture::{
-    install_production_positive_job_authorities, save_production_positive_verified_import,
+    install_production_positive_job_authorities,
+    install_production_positive_job_authorities_with_runtime_surface,
+    save_production_positive_verified_import,
+    save_production_positive_verified_import_with_runtime, ProductionPositiveAuthorityFixture,
 };
 use super::*;
 use crate::db;
@@ -191,9 +194,19 @@ struct PreparedPacketCommitFixture {
     preferences: JobPreferences,
     application: JobApplication,
     posting: JobPosting,
+    managed: managed_cloud_release_authority_tests::OriginalSourceVerifierRuntimeTestFixture,
+    authorities: ProductionPositiveAuthorityFixture,
 }
 
 fn prepared_packet_commit_fixture(pool: &DbPool, label: &str) -> PreparedPacketCommitFixture {
+    prepared_packet_commit_fixture_with_employment_type(pool, label, "full_time")
+}
+
+fn prepared_packet_commit_fixture_with_employment_type(
+    pool: &DbPool,
+    label: &str,
+    employment_type: &str,
+) -> PreparedPacketCommitFixture {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let account_id = format!("acct_packet_commit_{label}_{suffix}");
     let email = format!("packet-commit-{label}-{suffix}@example.test");
@@ -277,7 +290,7 @@ fn prepared_packet_commit_fixture(pool: &DbPool, label: &str) -> PreparedPacketC
         ),
         description: "Build reliable products with Rust and TypeScript.".to_string(),
         compensation: "$170k-$200k".to_string(),
-        employment_type: "full_time".to_string(),
+        employment_type: employment_type.to_string(),
         track_id: track.id,
         match_score: 90,
         matched_reasons: Vec::new(),
@@ -298,15 +311,15 @@ fn prepared_packet_commit_fixture(pool: &DbPool, label: &str) -> PreparedPacketC
         &profile,
         &preferences,
     );
-    let posting = install_production_positive_job_authorities(
+    let authorities = install_production_positive_job_authorities(
         pool,
         &account_id,
         &posting,
         &managed,
         "acme.com",
         &format!("packet-commit-{label}-{suffix}"),
-    )
-    .posting;
+    );
+    let posting = authorities.posting.clone();
     let (application, _) =
         prepare_application(pool, &account_id, &posting.id, "factual", "review_first")
             .expect("prepare PostgreSQL packet-commit application");
@@ -316,7 +329,813 @@ fn prepared_packet_commit_fixture(pool: &DbPool, label: &str) -> PreparedPacketC
         preferences,
         application,
         posting,
+        managed,
+        authorities,
     }
+}
+
+fn approve_postgres_alias_application(
+    pool: &DbPool,
+    account_id: &str,
+    email: &str,
+    application_id: &str,
+) -> JobApplication {
+    let authority = current_application_approval_authority(pool, account_id, email, application_id)
+        .expect("resolve current alias application approval")
+        .expect("current alias application approval exists");
+    let profile = get_profile(pool, account_id, email).expect("current alias profile");
+    let preferences = get_preferences(pool, account_id).expect("current alias preferences");
+    let track = list_tracks(pool, account_id)
+        .expect("current alias Tracks")
+        .into_iter()
+        .find(|track| track.id == authority.posting.track_id)
+        .expect("current alias Track exists");
+    let mut decision = build_job_eligibility(
+        &authority.posting,
+        &profile,
+        &preferences,
+        &list_attempt_reservations(pool, account_id).expect("current alias reservations"),
+        true,
+        Some(application_id),
+        Some(&track),
+    );
+    apply_discovery_authorities(
+        &get_job_discovery_authority(pool, account_id, &authority.posting.id)
+            .expect("current alias discovery authority"),
+        &mut decision,
+    );
+    apply_ats_certification_resolution(
+        &authority.posting,
+        &mut decision,
+        &authority.ats_certification,
+    );
+    assert!(
+        decision.can_queue_local,
+        "alias fixture must be queue-eligible before approval: hard={:?}, review={:?}",
+        decision
+            .hard_failures
+            .iter()
+            .map(|reason| &reason.code)
+            .collect::<Vec<_>>(),
+        decision
+            .review_reasons
+            .iter()
+            .map(|reason| &reason.code)
+            .collect::<Vec<_>>()
+    );
+    let resume = get_resume_version(
+        pool,
+        account_id,
+        authority
+            .application
+            .resume_version_id
+            .as_deref()
+            .expect("alias application has a resume"),
+    )
+    .expect("load alias application resume")
+    .expect("alias application resume exists");
+    let identity_id = authority
+        .application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .expect("frozen alias application identity");
+    let identity_email = authority
+        .application
+        .receipt
+        .pointer("/application_identity/email")
+        .and_then(Value::as_str)
+        .expect("frozen alias application email");
+    let packet = json!({
+        "applicationId": authority.application.id,
+        "jobId": authority.posting.id,
+        "resumeVersionId": resume.id,
+        "resumeContent": resume.content,
+        "coverLetterContent": authority.application.cover_letter,
+        "answers": {},
+        "verifiedClaimIds": [],
+        "applicationIdentityId": identity_id,
+        "applicationEmail": identity_email,
+        "browserProfileId": execution_browser_profile_id(account_id, identity_id),
+    });
+    let job = json!({
+        "externalId": authority.posting.external_id,
+        "canonicalUrl": authority.posting.canonical_url,
+        "company": authority.posting.company,
+        "title": authority.posting.title,
+        "location": authority.posting.location,
+        "workplace": authority.posting.workplace,
+        "description": authority.posting.description,
+        "source": authority.posting.source,
+        "compensation": authority.posting.compensation,
+    });
+    let admission = json!({ "kind": "review_approval" });
+    let approved = json!({
+        "schema_version": 2,
+        "approved_at_ms": authority.evaluated_at_ms,
+        "checksum": approved_submission_checksum(2, &packet, &job, Some(&admission))
+            .expect("checksum approved alias application"),
+        "admission": admission,
+        "packet": packet,
+        "job": job,
+    });
+    persist_current_application_approval(pool, account_id, email, &authority, &approved)
+        .expect("persist current alias application approval")
+        .expect("approved alias application exists")
+}
+
+fn canonical_employer_alias_fixture(
+    pool: DbPool,
+) -> (
+    PreparedPacketCommitFixture,
+    JobApplication,
+    JobApplication,
+    JobPosting,
+) {
+    let fixture = prepared_packet_commit_fixture_with_employment_type(
+        &pool,
+        "canonical-employer-alias",
+        "full_time w2",
+    );
+    let alias_identity = save_application_identity(
+        &pool,
+        &fixture.account_id,
+        &ApplicationIdentity {
+            id: String::new(),
+            email: format!("alias-{}@example.test", uuid::Uuid::new_v4().simple()),
+            label: "Synthetic alias applications".to_string(),
+            verification_status: "verified".to_string(),
+            is_default: false,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .expect("save second verified alias application identity");
+    let mut alias_track = list_tracks(&pool, &fixture.account_id)
+        .expect("list alias fixture Tracks")
+        .into_iter()
+        .find(|track| track.id == fixture.posting.track_id)
+        .expect("first alias fixture Track");
+    alias_track.id.clear();
+    alias_track.name = "Second synthetic employer alias Track".to_string();
+    alias_track.application_identity_id = Some(alias_identity.id);
+    alias_track.policy = CareerTrackPolicy {
+        role_family: "software_engineering".to_string(),
+        ..CareerTrackPolicy::default()
+    };
+    alias_track.created_at_ms = 0;
+    alias_track.updated_at_ms = 0;
+    let alias_track = upsert_track(&pool, &fixture.account_id, &alias_track)
+        .expect("save second approved alias fixture Track");
+    assert_eq!(alias_track.policy.authority.review_state, "approved");
+    let mut alias_posting = fixture.posting.clone();
+    alias_posting.id.clear();
+    alias_posting.canonical_key.clear();
+    alias_posting.company = "Acme Technologies".to_string();
+    alias_posting.external_id = format!("canonical-alias-{}", uuid::Uuid::new_v4().simple());
+    alias_posting.canonical_url = format!(
+        "https://boards.greenhouse.io/acmealias/jobs/{}",
+        alias_posting.external_id
+    );
+    alias_posting.track_id = alias_track.id;
+    alias_posting.discovery_evidence = JobDiscoveryEvidence::default();
+    alias_posting.eligibility = None;
+    let alias_posting = save_production_positive_verified_import_with_runtime(
+        &pool,
+        &fixture.account_id,
+        &alias_posting,
+        &fixture.profile,
+        &fixture.preferences,
+    );
+    let alias_authorities = install_production_positive_job_authorities_with_runtime_surface(
+        &pool,
+        &fixture.account_id,
+        &alias_posting,
+        &fixture.managed,
+        "acme.com",
+        "canonical-employer-alias-b",
+        fixture.authorities.runtime_target.clone(),
+        fixture.authorities.surface.clone(),
+    );
+    let alias_posting = alias_authorities.posting;
+    assert_ne!(
+        normalize_company_key(&fixture.posting.company),
+        normalize_company_key(&alias_posting.company)
+    );
+    // Adding an application identity advances account-input authority. Review
+    // both Tracks normally and prepare fresh packets against that final state.
+    for track in list_tracks(&pool, &fixture.account_id).expect("load Tracks for alias review") {
+        let reviewed = upsert_track(&pool, &fixture.account_id, &track)
+            .expect("review alias Track against current account inputs");
+        assert_eq!(reviewed.policy.authority.review_state, "approved");
+    }
+    let (first_application, _) = prepare_application(
+        &pool,
+        &fixture.account_id,
+        &fixture.posting.id,
+        "factual",
+        "review_first",
+    )
+    .expect("reprepare first alias after final identity and Track review");
+    let (alias_application, _) = prepare_application(
+        &pool,
+        &fixture.account_id,
+        &alias_posting.id,
+        "factual",
+        "review_first",
+    )
+    .expect("prepare second alias before either reservation exists");
+    let first = approve_postgres_alias_application(
+        &pool,
+        &fixture.account_id,
+        &fixture.profile.email,
+        &first_application.id,
+    );
+    let second = approve_postgres_alias_application(
+        &pool,
+        &fixture.account_id,
+        &fixture.profile.email,
+        &alias_application.id,
+    );
+    assert_ne!(
+        first.receipt.pointer("/application_identity/id"),
+        second.receipt.pointer("/application_identity/id")
+    );
+    for application in [&first, &second] {
+        let mut connection = pool.get_pg().expect("alias execution preflight connection");
+        let mut tx = connection
+            .transaction()
+            .expect("alias execution preflight transaction");
+        lock_operational_hold_shared_postgres_tx(&mut tx).unwrap();
+        lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx).unwrap();
+        lock_postgres_ats_certification(&mut tx).unwrap();
+        lock_discovery_account_shared_postgres(&mut tx, &fixture.account_id).unwrap();
+        assert!(
+            resolve_current_execution_authority_postgres_after_prelock(
+                &mut tx,
+                &fixture.account_id,
+                application,
+                ExecutionAuthorityRunner::Local,
+            )
+            .expect("resolve complete current alias execution authority")
+            .authorized,
+            "both aliases must be execution-authorized before either reservation"
+        );
+        tx.rollback()
+            .expect("release alias execution preflight locks");
+    }
+    (fixture, first, second, alias_posting)
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_canonical_employer_alias_cannot_reserve_across_tracks_and_identities() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let (fixture, first, second, alias_posting) = canonical_employer_alias_fixture(pool.clone());
+    reserve_application_attempt(&pool, &fixture.account_id, &first.id, "local")
+        .expect("reserve first canonical employer application");
+
+    // Prove the losing job is not rejected for stale or fabricated authority.
+    let mut bindings = Vec::new();
+    for (application, posting) in [(&first, &fixture.posting), (&second, &alias_posting)] {
+        let composed =
+            resolve_composed_job_integrity_projection(&pool, &fixture.account_id, posting)
+                .expect("resolve current alias source and integrity");
+        assert_eq!(
+            composed.job_integrity.status,
+            JobIntegrityResolutionStatus::Verified
+        );
+        assert!(
+            job_integrity_resolution_matches_application(application, &composed.job_integrity)
+                .expect("compare exact frozen alias authority")
+        );
+        let authority = composed
+            .job_integrity
+            .authority
+            .expect("verified employer authority");
+        bindings.push((
+            authority.canonical_employer_id,
+            authority.canonical_employer_domain,
+        ));
+    }
+    assert_eq!(bindings[0], bindings[1]);
+    let attempts_before = list_attempt_reservations(&pool, &fixture.account_id)
+        .expect("snapshot first canonical employer reservation");
+    let effects_before =
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &alias_posting.id);
+    let application_before = get_application(&pool, &fixture.account_id, &second.id)
+        .expect("snapshot second alias application");
+
+    let result = reserve_application_attempt(&pool, &fixture.account_id, &second.id, "local");
+    assert!(
+        result.is_err(),
+        "same signed canonical employer aliases must not reserve twice"
+    );
+    let error = result.unwrap_err();
+    let duplicate = error.to_string()
+        == "an in-progress or submitted application already exists for this company"
+        || matches!(
+            error.downcast_ref::<ApplicationAttemptAdmissionError>(),
+            Some(ApplicationAttemptAdmissionError::Blocked { reason_code })
+                if matches!(reason_code.as_str(),
+                    "company_application_exists" | "canonical_employer_application_exists")
+        );
+    assert!(
+        duplicate,
+        "alias denial must be specifically employer duplication: {error}"
+    );
+    assert_eq!(
+        list_attempt_reservations(&pool, &fixture.account_id).unwrap(),
+        attempts_before
+    );
+    assert_eq!(
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &alias_posting.id),
+        effects_before
+    );
+    assert_eq!(
+        serde_json::to_value(get_application(&pool, &fixture.account_id, &second.id).unwrap())
+            .unwrap(),
+        serde_json::to_value(application_before).unwrap()
+    );
+    delete_postgres_packet_fixture(&pool, &fixture.account_id);
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_canonical_employer_concurrent_alias_admissions_have_one_winner() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let (fixture, first, second, alias_posting) = canonical_employer_alias_fixture(pool.clone());
+    let first_before = serde_json::to_value(&first).unwrap();
+    let second_before = serde_json::to_value(&second).unwrap();
+    let first_effects =
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id);
+    let second_effects =
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &alias_posting.id);
+    let barrier = Arc::new(Barrier::new(3));
+    let workers = [&first, &second].map(|application| {
+        let worker_pool = pool.clone();
+        let account_id = fixture.account_id.clone();
+        let application_id = application.id.clone();
+        let ready = barrier.clone();
+        std::thread::spawn(move || {
+            ready.wait();
+            (
+                application_id.clone(),
+                reserve_application_attempt(&worker_pool, &account_id, &application_id, "local"),
+            )
+        })
+    });
+    barrier.wait();
+    let outcomes = workers.map(|worker| worker.join().expect("join canonical employer contender"));
+    assert_eq!(
+        outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+        1
+    );
+    let (_, losing) = outcomes.iter().find(|(_, result)| result.is_err()).unwrap();
+    assert!(
+        matches!(
+            losing.as_ref().unwrap_err().downcast_ref::<ApplicationAttemptAdmissionError>(),
+            Some(ApplicationAttemptAdmissionError::Blocked { reason_code })
+                if reason_code == "company_application_exists"
+        ),
+        "the losing admission must fail at the employer duplicate fence"
+    );
+    let attempts = list_attempt_reservations(&pool, &fixture.account_id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "reserved");
+    let (winner_id, _) = outcomes.iter().find(|(_, result)| result.is_ok()).unwrap();
+    assert_eq!(&attempts[0].application_id, winner_id);
+    assert_eq!(
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id),
+        first_effects
+    );
+    assert_eq!(
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &alias_posting.id),
+        second_effects
+    );
+    for (application, before) in [(&first, first_before), (&second, second_before)] {
+        assert_eq!(
+            serde_json::to_value(
+                get_application(&pool, &fixture.account_id, &application.id).unwrap()
+            )
+            .unwrap(),
+            before
+        );
+    }
+    // Retrying either contender cannot create another slot or mutate the winner.
+    for application in [&first, &second] {
+        let replay =
+            reserve_application_attempt(&pool, &fixture.account_id, &application.id, "local");
+        assert_eq!(replay.is_ok(), &application.id == winner_id);
+        assert_eq!(
+            list_attempt_reservations(&pool, &fixture.account_id).unwrap(),
+            attempts
+        );
+    }
+    delete_postgres_packet_fixture(&pool, &fixture.account_id);
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_canonical_employer_unique_indexes_fence_simultaneous_alias_writes() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let (fixture, first, second, alias_posting) = canonical_employer_alias_fixture(pool.clone());
+    let barrier = Arc::new(Barrier::new(3));
+    let workers =
+        [(&first, &fixture.posting), (&second, &alias_posting)].map(|(application, posting)| {
+            let worker_pool = pool.clone();
+            let account_id = fixture.account_id.clone();
+            let application_id = application.id.clone();
+            let company_key = normalize_company_key(&posting.company);
+            let binding = frozen_attempt_employer_binding(application).unwrap();
+            let ready = barrier.clone();
+            std::thread::spawn(move || {
+                let mut connection = worker_pool.get_pg().unwrap();
+                ready.wait();
+                connection.execute(
+                    "INSERT INTO jobs_attempt_reservations (
+                   id,account_id,application_id,company_key,period_key,runner,status,
+                   reserved_at_ms,updated_at_ms,canonical_employer_id,
+                   canonical_employer_domain,employer_attestation_sha256
+                 ) VALUES ($1,$2,$3,$4,'2026-10-28','local','reserved',1,1,$5,$6,$7)",
+                    &[
+                        &format!("attempt-{application_id}"),
+                        &account_id,
+                        &application_id,
+                        &company_key,
+                        &binding.canonical_employer_id,
+                        &binding.canonical_employer_domain,
+                        &binding.employer_attestation_sha256,
+                    ],
+                )
+            })
+        });
+    barrier.wait();
+    let outcomes = workers.map(|worker| worker.join().expect("join database constraint contender"));
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    let error = outcomes
+        .iter()
+        .find_map(|result| result.as_ref().err())
+        .unwrap();
+    let database = error
+        .as_db_error()
+        .expect("constraint error is PostgreSQL evidence");
+    assert_eq!(
+        database.code(),
+        &postgres::error::SqlState::UNIQUE_VIOLATION
+    );
+    assert!(matches!(
+        database.constraint(),
+        Some(
+            "idx_jobs_attempt_reservations_active_employer_id"
+                | "idx_jobs_attempt_reservations_active_employer_domain"
+        )
+    ));
+    let before = list_attempt_reservations(&pool, &fixture.account_id).unwrap();
+    assert_eq!(before.len(), 1);
+    db::run_migrations(&pool).expect("replay migration with live winner unchanged");
+    assert_eq!(
+        list_attempt_reservations(&pool, &fixture.account_id).unwrap(),
+        before
+    );
+    delete_postgres_packet_fixture(&pool, &fixture.account_id);
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_canonical_employer_binding_drift_blocks_replay_packet_and_execution() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let (fixture, first, _, _) = canonical_employer_alias_fixture(pool.clone());
+    let binding = frozen_attempt_employer_binding(&first).unwrap();
+    let invalid_sha = if binding.employer_attestation_sha256 == "f".repeat(64) {
+        "e".repeat(64)
+    } else {
+        "f".repeat(64)
+    };
+    // Fault injection at the storage boundary: well-shaped metadata is not
+    // trusted simply because it passes a database CHECK.
+    pool.get_pg()
+        .unwrap()
+        .execute(
+            "INSERT INTO jobs_attempt_reservations (
+           id,account_id,application_id,company_key,period_key,runner,status,
+           reserved_at_ms,updated_at_ms,canonical_employer_id,
+           canonical_employer_domain,employer_attestation_sha256
+         ) VALUES ($1,$2,$3,$4,'2026-10-28','local','reserved',1,1,$5,$6,$7)",
+            &[
+                &format!("attempt-{}", first.id),
+                &fixture.account_id,
+                &first.id,
+                &normalize_company_key(&fixture.posting.company),
+                &binding.canonical_employer_id,
+                &binding.canonical_employer_domain,
+                &invalid_sha,
+            ],
+        )
+        .unwrap();
+    let attempts = list_attempt_reservations(&pool, &fixture.account_id).unwrap();
+    let effects = postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id);
+    let application =
+        serde_json::to_value(get_application(&pool, &fixture.account_id, &first.id).unwrap())
+            .unwrap();
+    let error =
+        reserve_application_attempt(&pool, &fixture.account_id, &first.id, "local").unwrap_err();
+    assert!(
+        matches!(error.downcast_ref::<ApplicationAttemptAdmissionError>(),
+        Some(ApplicationAttemptAdmissionError::ReviewRequired { reason_code })
+            if reason_code == "attempt_employer_identity_review_required")
+    );
+    let packet_error = commit_packet(&pool, &fixture.account_id, &first.id).unwrap_err();
+    assert!(packet_error
+        .to_string()
+        .contains("current application employer binding does not permit packet commit"));
+    let mut connection = pool.get_pg().unwrap();
+    let mut tx = connection.transaction().unwrap();
+    lock_operational_hold_shared_postgres_tx(&mut tx).unwrap();
+    lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx).unwrap();
+    lock_postgres_ats_certification(&mut tx).unwrap();
+    lock_discovery_account_shared_postgres(&mut tx, &fixture.account_id).unwrap();
+    assert!(
+        !resolve_current_execution_authority_postgres_after_prelock(
+            &mut tx,
+            &fixture.account_id,
+            &first,
+            ExecutionAuthorityRunner::Local,
+        )
+        .unwrap()
+        .authorized
+    );
+    tx.rollback().unwrap();
+    assert_eq!(
+        list_attempt_reservations(&pool, &fixture.account_id).unwrap(),
+        attempts
+    );
+    assert_eq!(
+        postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id),
+        effects
+    );
+    assert_eq!(
+        serde_json::to_value(get_application(&pool, &fixture.account_id, &first.id).unwrap())
+            .unwrap(),
+        application
+    );
+    delete_postgres_packet_fixture(&pool, &fixture.account_id);
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_canonical_employer_terminal_history_cannot_be_erased_by_same_job_preparation() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let (fixture, first, _, alias_posting) = canonical_employer_alias_fixture(pool.clone());
+    // The same nonterminal application remains repreparable before fault setup.
+    prepare_application(
+        &pool,
+        &fixture.account_id,
+        &fixture.posting.id,
+        "factual",
+        "review_first",
+    )
+    .unwrap();
+    for terminal in ["submitted", "side_effect_unknown"] {
+        for retained_slot in [false, true] {
+            let mut historical = first.clone();
+            historical.state = terminal.to_string();
+            historical.receipt["retained_terminal_evidence"] = json!({"immutable": true});
+            if terminal == "submitted" {
+                historical.submitted_at_ms = Some(now_ms());
+            }
+            pool.get_pg()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs_applications SET state=$3,application_json=$4,submitted_at_ms=$5
+                  WHERE account_id=$1 AND id=$2",
+                    &[
+                        &fixture.account_id,
+                        &first.id,
+                        &terminal,
+                        &serde_json::to_string(&historical).unwrap(),
+                        &historical.submitted_at_ms,
+                    ],
+                )
+                .unwrap();
+            if retained_slot {
+                pool.get_pg()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO jobs_attempt_reservations (
+                       id,account_id,application_id,company_key,period_key,runner,status,
+                       reserved_at_ms,updated_at_ms
+                     ) VALUES ($1,$2,$3,'legacy','2026-10-28','local','released',1,1)",
+                        &[
+                            &format!("legacy-{}", first.id),
+                            &fixture.account_id,
+                            &first.id,
+                        ],
+                    )
+                    .unwrap();
+            }
+            let resumes =
+                serde_json::to_value(list_resume_versions(&pool, &fixture.account_id).unwrap())
+                    .unwrap();
+            let attempts = list_attempt_reservations(&pool, &fixture.account_id).unwrap();
+            let before =
+                serde_json::to_value(list_applications(&pool, &fixture.account_id).unwrap())
+                    .unwrap();
+            let effects =
+                postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id);
+            for job_id in [&fixture.posting.id, &alias_posting.id] {
+                let error = prepare_application(
+                    &pool,
+                    &fixture.account_id,
+                    job_id,
+                    "factual",
+                    "review_first",
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(error.downcast_ref::<ApplicationAttemptAdmissionError>(),
+                Some(ApplicationAttemptAdmissionError::ReviewRequired { reason_code })
+                    if reason_code == "legacy_company_identity_review_required")
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(list_applications(&pool, &fixture.account_id).unwrap())
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                serde_json::to_value(list_resume_versions(&pool, &fixture.account_id).unwrap())
+                    .unwrap(),
+                resumes
+            );
+            assert_eq!(
+                list_attempt_reservations(&pool, &fixture.account_id).unwrap(),
+                attempts
+            );
+            assert_eq!(
+                postgres_packet_effect_snapshot(&pool, &fixture.account_id, &fixture.posting.id),
+                effects
+            );
+            if retained_slot {
+                pool.get_pg().unwrap().execute("DELETE FROM jobs_attempt_reservations WHERE account_id=$1 AND application_id=$2", &[&fixture.account_id, &first.id]).unwrap();
+            }
+        }
+    }
+    delete_postgres_packet_fixture(&pool, &fixture.account_id);
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_canonical_employer_schema_preserves_legacy_and_replay_guards() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let mut connection = pool.get_pg().unwrap();
+    let mut tx = connection.transaction().unwrap();
+    let schema = format!("attempt_employer_{}", uuid::Uuid::new_v4().simple());
+    // Transaction-local namespace and final rollback keep even a failed case
+    // from altering runtime tables/functions or a pooled session's search path.
+    tx.batch_execute(&format!(
+        "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema};
+         CREATE TABLE jobs_attempt_reservations (
+           id TEXT PRIMARY KEY, account_id TEXT NOT NULL, application_id TEXT NOT NULL,
+           company_key TEXT NOT NULL, period_key TEXT NOT NULL, runner TEXT NOT NULL,
+           status TEXT NOT NULL, reserved_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL);
+         INSERT INTO jobs_attempt_reservations VALUES
+           ('old-submitted','owner','old-submitted','old-a','day','local','submitted',1,1),
+           ('old-unknown','owner','old-unknown','old-b','day','local','side_effect_unknown',2,2),
+           ('old-reserved','owner','old-reserved','old-c','day','local','reserved',3,3);"
+    ))
+    .unwrap();
+    let migration = include_str!(
+        "../../../../infra/postgres/server-runtime/044_jobs_attempt_employer_identity.sql"
+    );
+    let body = migration
+        .split_once("\nBEGIN;\n")
+        .unwrap()
+        .1
+        .trim_end()
+        .strip_suffix("COMMIT;")
+        .unwrap();
+    assert!(!body.contains("BEGIN;") && !body.contains("COMMIT;"));
+    tx.batch_execute(body)
+        .expect("apply actual additive migration body to legacy schema");
+    tx.batch_execute(body)
+        .expect("replay actual additive migration body");
+    let rows = tx
+        .query(
+            "SELECT id,status,reserved_at_ms,updated_at_ms,canonical_employer_id,
+                canonical_employer_domain,employer_attestation_sha256
+           FROM jobs_attempt_reservations ORDER BY id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in &rows {
+        assert_eq!(row.get::<_, i64>(2), row.get::<_, i64>(3));
+        for column in 4..7 {
+            assert_eq!(row.get::<_, Option<String>>(column), None);
+        }
+    }
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>(),
+        vec![
+            ("old-reserved".into(), "reserved".into()),
+            ("old-submitted".into(), "submitted".into()),
+            ("old-unknown".into(), "side_effect_unknown".into()),
+        ]
+    );
+    for (id, denied) in [
+        ("old-submitted", "released"),
+        ("old-submitted", "reserved"),
+        ("old-unknown", "failed"),
+        ("old-unknown", "reserved"),
+        ("old-reserved", "running"),
+    ] {
+        tx.batch_execute("SAVEPOINT denied_transition").unwrap();
+        let error = tx
+            .execute(
+                "UPDATE jobs_attempt_reservations SET status=$2 WHERE id=$1",
+                &[&id, &denied],
+            )
+            .unwrap_err();
+        assert!(error.as_db_error().is_some());
+        tx.batch_execute("ROLLBACK TO denied_transition; RELEASE denied_transition")
+            .unwrap();
+    }
+    for allowed in ["side_effect_unknown", "submitted", "released"] {
+        tx.batch_execute("SAVEPOINT allowed_transition").unwrap();
+        assert_eq!(
+            tx.execute(
+                "UPDATE jobs_attempt_reservations SET status=$1 WHERE id='old-unknown'",
+                &[&allowed]
+            )
+            .unwrap(),
+            1
+        );
+        tx.batch_execute("ROLLBACK TO allowed_transition; RELEASE allowed_transition")
+            .unwrap();
+    }
+    tx.batch_execute("SAVEPOINT new_unbound").unwrap();
+    let error = tx
+        .execute(
+            "INSERT INTO jobs_attempt_reservations (id,account_id,application_id,company_key,
+           period_key,runner,status,reserved_at_ms,updated_at_ms)
+         VALUES ('new','owner','new','new','day','local','reserved',4,4)",
+            &[],
+        )
+        .unwrap_err();
+    assert!(error
+        .as_db_error()
+        .unwrap()
+        .message()
+        .contains("active attempt requires employer identity binding"));
+    tx.batch_execute("ROLLBACK TO new_unbound; RELEASE new_unbound")
+        .unwrap();
+    tx.execute(
+        "INSERT INTO jobs_attempt_reservations VALUES
+          ('bound','owner','bound','bound','day','local','reserved',5,5,'employer-bound','bound.example',$1)",
+        &[&"a".repeat(64)],
+    ).unwrap();
+    for (column, value) in [
+        ("canonical_employer_id", "other".to_string()),
+        ("canonical_employer_domain", "other.example".to_string()),
+        ("employer_attestation_sha256", "b".repeat(64)),
+    ] {
+        tx.batch_execute("SAVEPOINT binding_drift").unwrap();
+        assert!(tx
+            .execute(
+                &format!("UPDATE jobs_attempt_reservations SET {column}=$1 WHERE id='bound'"),
+                &[&value]
+            )
+            .is_err());
+        tx.batch_execute("ROLLBACK TO binding_drift; RELEASE binding_drift")
+            .unwrap();
+    }
+    tx.execute(
+        "UPDATE jobs_attempt_reservations SET status='released' WHERE id='bound'",
+        &[],
+    )
+    .unwrap();
+    tx.execute("UPDATE jobs_attempt_reservations SET status='reserved',employer_attestation_sha256=$1 WHERE id='bound'", &[&"b".repeat(64)]).unwrap();
+    let before: String = tx.query_one("SELECT row_to_json(attempt)::text FROM jobs_attempt_reservations attempt WHERE id='bound'", &[]).unwrap().get(0);
+    tx.batch_execute(body).unwrap();
+    let after: String = tx.query_one("SELECT row_to_json(attempt)::text FROM jobs_attempt_reservations attempt WHERE id='bound'", &[]).unwrap().get(0);
+    assert_eq!(before, after);
+    tx.rollback()
+        .expect("remove only this transaction's synthetic schema and records");
 }
 
 fn force_postgres_packet_overage(pool: &DbPool, account_id: &str, suffix: &str) {
@@ -647,13 +1466,16 @@ fn postgres_packet_commit_locks_entitlement_before_rechecking_attempt_reservatio
         fixture.preferences.time_zone_offset_minutes,
     );
     let reservation_id = format!("attempt-packet-reservation-race-{suffix}");
+    let employer_binding = frozen_attempt_employer_binding(&fixture.application)
+        .expect("signed employer binding for the same-company interleaving fixture");
     assert_eq!(
         entitlement_owner
             .execute(
                 "INSERT INTO jobs_attempt_reservations (
                     id,account_id,application_id,company_key,period_key,runner,status,
-                    reserved_at_ms,updated_at_ms
-                 ) VALUES ($1,$2,$3,$4,$5,'local','reserved',$6,$6)",
+                    reserved_at_ms,updated_at_ms,canonical_employer_id,
+                    canonical_employer_domain,employer_attestation_sha256
+                 ) VALUES ($1,$2,$3,$4,$5,'local','reserved',$6,$6,$7,$8,$9)",
                 &[
                     &reservation_id,
                     &fixture.account_id,
@@ -661,6 +1483,9 @@ fn postgres_packet_commit_locks_entitlement_before_rechecking_attempt_reservatio
                     &company_key,
                     &period_key,
                     &reservation_at_ms,
+                    &employer_binding.canonical_employer_id,
+                    &employer_binding.canonical_employer_domain,
+                    &employer_binding.employer_attestation_sha256,
                 ],
             )
             .expect("E owner inserts current-period same-company R without Account timeout"),

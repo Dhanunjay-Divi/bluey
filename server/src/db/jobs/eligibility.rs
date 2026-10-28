@@ -403,11 +403,7 @@ fn enforce_application_finalization_eligibility_at_ms(
         track,
         eligibility_at_ms,
     );
-    apply_discovery_authorities_at_ms(
-        authorities.discovery,
-        &mut decision,
-        eligibility_at_ms,
-    );
+    apply_discovery_authorities_at_ms(authorities.discovery, &mut decision, eligibility_at_ms);
     if let Some(resolution) = authorities.ats {
         apply_ats_certification_resolution(posting, &mut decision, resolution);
     }
@@ -1349,10 +1345,17 @@ fn build_job_eligibility_at_ms(
     }
 
     let active_company_key = normalize_company_key(&posting.company);
+    let employer_identity = posting_canonical_employer_identity(posting);
     let has_active_company_application = reservations.iter().any(|reservation| {
         existing_application_id.is_none_or(|existing_id| reservation.application_id != existing_id)
             && active_attempt_status(&reservation.status)
-            && reservation.company_key == active_company_key
+            && (reservation.company_key == active_company_key
+                || employer_identity.is_some_and(|(id, domain)| {
+                    attempt_reservation_employer_binding(reservation).is_some_and(|binding| {
+                        binding.canonical_employer_id == id
+                            && binding.canonical_employer_domain == domain
+                    })
+                }))
     });
     if has_active_company_application {
         push_reason(
@@ -1362,6 +1365,45 @@ fn build_job_eligibility_at_ms(
         );
     } else {
         passed_checks.push("company_application_clear".to_string());
+    }
+    if reservations.iter().any(|reservation| {
+        active_attempt_status(&reservation.status)
+            && attempt_reservation_employer_binding(reservation).is_none()
+    }) {
+        push_reason(
+            &mut hard_failures,
+            "legacy_company_identity_review_required",
+            "Review the employer identity of existing application history before starting another application.",
+        );
+    }
+    let other_active_exists = reservations.iter().any(|reservation| {
+        active_attempt_status(&reservation.status)
+            && existing_application_id.is_none_or(|id| reservation.application_id != id)
+    });
+    if other_active_exists && employer_identity.is_none() {
+        push_reason(
+            &mut hard_failures,
+            "canonical_employer_identity_review_required",
+            "Verify this job's employer identity against existing application history before applying.",
+        );
+    }
+    if employer_identity.is_some_and(|(id, domain)| {
+        reservations.iter().any(|reservation| {
+            active_attempt_status(&reservation.status)
+                && existing_application_id.is_none_or(|own| reservation.application_id != own)
+                && attempt_reservation_employer_binding(reservation).is_some_and(|binding| {
+                    (binding.canonical_employer_id == id
+                        || binding.canonical_employer_domain == domain)
+                        && !(binding.canonical_employer_id == id
+                            && binding.canonical_employer_domain == domain)
+                })
+        })
+    }) {
+        push_reason(
+            &mut hard_failures,
+            "canonical_employer_mapping_conflict",
+            "Review conflicting employer identity records before starting another application.",
+        );
     }
 
     let period_key = attempt_period_key(now, preferences.time_zone_offset_minutes);
@@ -2333,7 +2375,9 @@ pub fn list_attempt_reservations(
             let conn = pool.get()?;
             let mut stmt = conn.prepare(
                 "SELECT id, application_id, company_key, period_key, runner, status,
-                        reserved_at_ms, updated_at_ms
+                        reserved_at_ms, updated_at_ms,
+                        canonical_employer_id, canonical_employer_domain,
+                        employer_attestation_sha256
                    FROM jobs_attempt_reservations
                   WHERE account_id = ?1 ORDER BY reserved_at_ms DESC",
             )?;
@@ -2348,6 +2392,9 @@ pub fn list_attempt_reservations(
                         status: row.get(5)?,
                         reserved_at_ms: row.get(6)?,
                         updated_at_ms: row.get(7)?,
+                        canonical_employer_id: row.get(8)?,
+                        canonical_employer_domain: row.get(9)?,
+                        employer_attestation_sha256: row.get(10)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2357,7 +2404,9 @@ pub fn list_attempt_reservations(
             .get_pg()?
             .query(
                 "SELECT id, application_id, company_key, period_key, runner, status,
-                        reserved_at_ms, updated_at_ms
+                        reserved_at_ms, updated_at_ms,
+                        canonical_employer_id, canonical_employer_domain,
+                        employer_attestation_sha256
                    FROM jobs_attempt_reservations
                   WHERE account_id = $1 ORDER BY reserved_at_ms DESC",
                 &[&account_id],
@@ -2372,6 +2421,9 @@ pub fn list_attempt_reservations(
                 status: row.get(5),
                 reserved_at_ms: row.get(6),
                 updated_at_ms: row.get(7),
+                canonical_employer_id: row.get(8),
+                canonical_employer_domain: row.get(9),
+                employer_attestation_sha256: row.get(10),
             })
             .collect()),
     })
@@ -2402,6 +2454,14 @@ pub fn reserve_application_attempt(
                 account_id,
                 &application,
                 &posting,
+            )?;
+            let employer_binding = frozen_attempt_employer_binding(&application)?;
+            require_attempt_employer_admission_sqlite(
+                &tx,
+                account_id,
+                &application,
+                &posting,
+                &employer_binding,
             )?;
             let entitlements = tx
                 .query_row(
@@ -2437,7 +2497,9 @@ pub fn reserve_application_attempt(
             if let Some(existing) = tx
                 .query_row(
                     "SELECT id, application_id, company_key, period_key, runner, status,
-                            reserved_at_ms, updated_at_ms
+                            reserved_at_ms, updated_at_ms,
+                            canonical_employer_id, canonical_employer_domain,
+                            employer_attestation_sha256
                        FROM jobs_attempt_reservations
                       WHERE account_id = ?1 AND application_id = ?2",
                     params![account_id, application_id],
@@ -2451,6 +2513,9 @@ pub fn reserve_application_attempt(
                             status: row.get(5)?,
                             reserved_at_ms: row.get(6)?,
                             updated_at_ms: row.get(7)?,
+                            canonical_employer_id: row.get(8)?,
+                            canonical_employer_domain: row.get(9)?,
+                            employer_attestation_sha256: row.get(10)?,
                         })
                     },
                 )
@@ -2491,28 +2556,22 @@ pub fn reserve_application_attempt(
             if used >= daily_limit {
                 anyhow::bail!("today's application attempt limit has been reached")
             }
-            let company_in_use: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM jobs_attempt_reservations
-                  WHERE account_id = ?1 AND company_key = ?2 AND application_id <> ?3
-                    AND status IN ('reserved', 'running', 'side_effect_unknown', 'submitted')",
-                params![account_id, company_key, application_id],
-                |row| row.get(0),
-            )?;
-            if company_in_use > 0 {
-                anyhow::bail!(
-                    "an in-progress or submitted application already exists for this company"
-                )
-            }
             tx.execute(
                 "INSERT INTO jobs_attempt_reservations (
                     id, account_id, application_id, company_key, period_key, runner, status,
-                    reserved_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'reserved', ?7, ?7)
+                    reserved_at_ms, updated_at_ms, canonical_employer_id,
+                    canonical_employer_domain, employer_attestation_sha256
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'reserved', ?7, ?7, ?8, ?9, ?10)
                  ON CONFLICT(account_id, application_id) DO UPDATE SET
                     company_key = excluded.company_key, period_key = excluded.period_key,
                     runner = excluded.runner, status = 'reserved', reserved_at_ms = excluded.reserved_at_ms,
-                    updated_at_ms = excluded.updated_at_ms",
-                params![id, account_id, application_id, company_key, period_key, runner, now],
+                    updated_at_ms = excluded.updated_at_ms,
+                    canonical_employer_id = excluded.canonical_employer_id,
+                    canonical_employer_domain = excluded.canonical_employer_domain,
+                    employer_attestation_sha256 = excluded.employer_attestation_sha256",
+                params![id, account_id, application_id, company_key, period_key, runner, now,
+                    employer_binding.canonical_employer_id, employer_binding.canonical_employer_domain,
+                    employer_binding.employer_attestation_sha256],
             )?;
             tx.commit()?;
             Ok(AttemptReservation {
@@ -2524,6 +2583,9 @@ pub fn reserve_application_attempt(
                 status: "reserved".to_string(),
                 reserved_at_ms: now,
                 updated_at_ms: now,
+                canonical_employer_id: Some(employer_binding.canonical_employer_id),
+                canonical_employer_domain: Some(employer_binding.canonical_employer_domain),
+                employer_attestation_sha256: Some(employer_binding.employer_attestation_sha256),
             })
         }
         DbPool::Postgres(_) => {
@@ -2559,7 +2621,9 @@ pub fn reserve_application_attempt(
             let existing = tx
                 .query_opt(
                     "SELECT id, application_id, company_key, period_key, runner, status,
-                        reserved_at_ms, updated_at_ms
+                        reserved_at_ms, updated_at_ms,
+                        canonical_employer_id, canonical_employer_domain,
+                        employer_attestation_sha256
                    FROM jobs_attempt_reservations
                   WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
                     &[&account_id, &application_id],
@@ -2573,12 +2637,23 @@ pub fn reserve_application_attempt(
                     status: row.get(5),
                     reserved_at_ms: row.get(6),
                     updated_at_ms: row.get(7),
+                    canonical_employer_id: row.get(8),
+                    canonical_employer_domain: row.get(9),
+                    employer_attestation_sha256: row.get(10),
                 });
             let employer_domain = ensure_original_source_application_authority_postgres_tx(
                 &mut tx,
                 account_id,
                 &application,
                 &posting,
+            )?;
+            let employer_binding = frozen_attempt_employer_binding(&application)?;
+            require_attempt_employer_admission_postgres(
+                &mut tx,
+                account_id,
+                &application,
+                &posting,
+                &employer_binding,
             )?;
             require_requested_attempt_runner_postgres_tx_after_prelock(
                 &mut tx,
@@ -2644,29 +2719,22 @@ pub fn reserve_application_attempt(
             if used >= daily_limit {
                 anyhow::bail!("today's application attempt limit has been reached")
             }
-            let company_in_use: i64 = tx
-                .query_one(
-                    "SELECT COUNT(*) FROM jobs_attempt_reservations
-                      WHERE account_id = $1 AND company_key = $2 AND application_id <> $3
-                        AND status IN ('reserved', 'running', 'side_effect_unknown', 'submitted')",
-                    &[&account_id, &company_key, &application_id],
-                )?
-                .get(0);
-            if company_in_use > 0 {
-                anyhow::bail!(
-                    "an in-progress or submitted application already exists for this company"
-                )
-            }
             tx.execute(
                 "INSERT INTO jobs_attempt_reservations (
                     id, account_id, application_id, company_key, period_key, runner, status,
-                    reserved_at_ms, updated_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, 'reserved', $7, $7)
+                    reserved_at_ms, updated_at_ms, canonical_employer_id,
+                    canonical_employer_domain, employer_attestation_sha256
+                 ) VALUES ($1, $2, $3, $4, $5, $6, 'reserved', $7, $7, $8, $9, $10)
                  ON CONFLICT(account_id, application_id) DO UPDATE SET
                     company_key = EXCLUDED.company_key, period_key = EXCLUDED.period_key,
                     runner = EXCLUDED.runner, status = 'reserved', reserved_at_ms = EXCLUDED.reserved_at_ms,
-                    updated_at_ms = EXCLUDED.updated_at_ms",
-                &[&id, &account_id, &application_id, &company_key, &period_key, &runner, &now],
+                    updated_at_ms = EXCLUDED.updated_at_ms,
+                    canonical_employer_id = EXCLUDED.canonical_employer_id,
+                    canonical_employer_domain = EXCLUDED.canonical_employer_domain,
+                    employer_attestation_sha256 = EXCLUDED.employer_attestation_sha256",
+                &[&id, &account_id, &application_id, &company_key, &period_key, &runner, &now,
+                    &employer_binding.canonical_employer_id, &employer_binding.canonical_employer_domain,
+                    &employer_binding.employer_attestation_sha256],
             )?;
             tx.commit()?;
             Ok(AttemptReservation {
@@ -2678,6 +2746,9 @@ pub fn reserve_application_attempt(
                 status: "reserved".to_string(),
                 reserved_at_ms: now,
                 updated_at_ms: now,
+                canonical_employer_id: Some(employer_binding.canonical_employer_id),
+                canonical_employer_domain: Some(employer_binding.canonical_employer_domain),
+                employer_attestation_sha256: Some(employer_binding.employer_attestation_sha256),
             })
         }
     })
@@ -2706,7 +2777,9 @@ pub fn update_attempt_reservation_status(
             let existing = tx
                 .query_row(
                     "SELECT id, application_id, company_key, period_key, runner, status,
-                            reserved_at_ms, updated_at_ms
+                            reserved_at_ms, updated_at_ms,
+                            canonical_employer_id, canonical_employer_domain,
+                            employer_attestation_sha256
                        FROM jobs_attempt_reservations
                       WHERE account_id = ?1 AND application_id = ?2",
                     params![account_id, application_id],
@@ -2720,6 +2793,9 @@ pub fn update_attempt_reservation_status(
                             status: row.get(5)?,
                             reserved_at_ms: row.get(6)?,
                             updated_at_ms: row.get(7)?,
+                            canonical_employer_id: row.get(8)?,
+                            canonical_employer_domain: row.get(9)?,
+                            employer_attestation_sha256: row.get(10)?,
                         })
                     },
                 )
@@ -2728,6 +2804,7 @@ pub fn update_attempt_reservation_status(
                 tx.commit()?;
                 return Ok(false);
             };
+            require_attempt_reservation_transition(&existing.status, status)?;
             if requires_running_capability {
                 require_attempt_account_hold_clear_sqlite_tx(&tx, account_id)?;
                 if status == "running" && existing.runner == "unassigned" {
@@ -2746,6 +2823,7 @@ pub fn update_attempt_reservation_status(
                     &application,
                     &posting,
                 )?;
+                require_existing_attempt_employer_binding(&application, &existing)?;
                 let entitlements = tx
                     .query_row(
                         "SELECT local_browser, cloud_browser FROM jobs_entitlements
@@ -2822,7 +2900,9 @@ pub fn update_attempt_reservation_status(
             };
             let existing = tx.query_opt(
                 "SELECT id, application_id, company_key, period_key, runner, status,
-                        reserved_at_ms, updated_at_ms
+                        reserved_at_ms, updated_at_ms,
+                        canonical_employer_id, canonical_employer_domain,
+                        employer_attestation_sha256
                    FROM jobs_attempt_reservations
                   WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
                 &[&account_id, &application_id],
@@ -2836,10 +2916,14 @@ pub fn update_attempt_reservation_status(
                 status: row.get(5),
                 reserved_at_ms: row.get(6),
                 updated_at_ms: row.get(7),
+                canonical_employer_id: row.get(8),
+                canonical_employer_domain: row.get(9),
+                employer_attestation_sha256: row.get(10),
             }) else {
                 tx.commit()?;
                 return Ok(false);
             };
+            require_attempt_reservation_transition(&existing.status, status)?;
             if requires_running_capability {
                 if status == "running" && existing.runner == "unassigned" {
                     return Err(attempt_review_required("exact_runner_assignment_required"));
@@ -2859,6 +2943,7 @@ pub fn update_attempt_reservation_status(
                     application,
                     posting,
                 )?;
+                require_existing_attempt_employer_binding(application, &existing)?;
                 require_requested_attempt_runner_postgres_tx_after_prelock(
                     &mut tx,
                     account_id,

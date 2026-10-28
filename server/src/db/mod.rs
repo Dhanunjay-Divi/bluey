@@ -392,6 +392,8 @@ const SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE: &str = includ
 const SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS: &str = include_str!(
     "../../../infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql"
 );
+const SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/066_jobs_attempt_employer_identity.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1757,6 +1759,8 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
     // 0065 - bind prospective boot-protocol heartbeats to registered generations.
     SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS,
+    // 0066 - immutable canonical employer bindings for application attempts.
+    SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1781,6 +1785,7 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
+    ensure_sqlite_attempt_employer_identity_columns(&conn)?;
     // SQLite replays the bundled schema on every startup. Phase611 cleanup
     // columns therefore use the idempotent column helper rather than an
     // unconditional ALTER TABLE in the replayed SQL file.
@@ -3087,6 +3092,10 @@ pub const JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID: &str =
 const POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS: &str = include_str!(
     "../../../infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql"
 );
+pub const JOBS_ATTEMPT_EMPLOYER_IDENTITY_MIGRATION_ID: &str =
+    "044_jobs_attempt_employer_identity.sql";
+const POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/044_jobs_attempt_employer_identity.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -3244,6 +3253,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
         JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID,
         POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS,
     ),
+    (
+        JOBS_ATTEMPT_EMPLOYER_IDENTITY_MIGRATION_ID,
+        POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY,
+    ),
 ];
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
@@ -3340,6 +3353,19 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
         migrations = POSTGRES_MIGRATIONS.len() + POSTGRES_POST_JOBS_MIGRATIONS.len(),
         "migrations applied"
     );
+    Ok(())
+}
+
+fn ensure_sqlite_attempt_employer_identity_columns(conn: &rusqlite::Connection) -> Result<()> {
+    // SQLite replays every schema file. Install additive nullable columns before 066's
+    // indexes/guards; no legacy row is guessed, updated, or removed by this migration.
+    for column in [
+        "canonical_employer_id",
+        "canonical_employer_domain",
+        "employer_attestation_sha256",
+    ] {
+        ensure_column(conn, "jobs_attempt_reservations", column, "TEXT")?;
+    }
     Ok(())
 }
 
@@ -3534,7 +3560,8 @@ mod blocking_boundary_tests {
 #[cfg(test)]
 mod sqlite_migration_replay_tests {
     use super::{
-        ensure_column, ensure_sqlite_original_source_verification_hold_capability,
+        ensure_column, ensure_sqlite_attempt_employer_identity_columns,
+        ensure_sqlite_original_source_verification_hold_capability,
         execute_sqlite_original_source_verifier_startup_migration,
         execute_sqlite_signed_job_integrity_migration,
         execute_sqlite_source_verifier_boot_migration, open_pool, run_migrations,
@@ -3542,6 +3569,548 @@ mod sqlite_migration_replay_tests {
         SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY, SQLITE_JOBS_OPERATIONAL_HOLDS,
         SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
     };
+
+    fn attempt_employer_legacy_schema() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        initialize_attempt_employer_legacy_schema(&conn);
+        conn
+    }
+
+    fn initialize_attempt_employer_legacy_schema(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "CREATE TABLE jobs_attempt_reservations (
+               id TEXT PRIMARY KEY, account_id TEXT NOT NULL, application_id TEXT NOT NULL,
+               company_key TEXT NOT NULL, status TEXT NOT NULL,
+               UNIQUE(account_id, application_id)
+             );
+             CREATE UNIQUE INDEX idx_jobs_attempt_reservations_active_company
+               ON jobs_attempt_reservations(account_id, company_key)
+               WHERE status IN ('reserved', 'running', 'side_effect_unknown', 'submitted');",
+        )
+        .unwrap();
+    }
+
+    fn migrate_attempt_employers(conn: &rusqlite::Connection) {
+        ensure_sqlite_attempt_employer_identity_columns(conn).unwrap();
+        conn.execute_batch(super::SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY)
+            .unwrap();
+    }
+
+    fn insert_bound_attempt(
+        conn: &rusqlite::Connection,
+        id: &str,
+        employer_id: &str,
+        domain: &str,
+        sha256: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO jobs_attempt_reservations (
+               id,account_id,application_id,company_key,status,
+               canonical_employer_id,canonical_employer_domain,employer_attestation_sha256
+             ) VALUES (?1,'account',?1,?1,'reserved',?2,?3,?4)",
+            rusqlite::params![id, employer_id, domain, sha256],
+        )
+    }
+
+    #[test]
+    fn attempt_employer_migration_preserves_legacy_rows_and_reconciliation_on_replay() {
+        let conn = attempt_employer_legacy_schema();
+        for status in [
+            "reserved",
+            "running",
+            "side_effect_unknown",
+            "submitted",
+            "released",
+        ] {
+            conn.execute(
+                "INSERT INTO jobs_attempt_reservations VALUES (?1,'account',?1,?1,?1)",
+                [status],
+            )
+            .unwrap();
+        }
+        migrate_attempt_employers(&conn);
+        migrate_attempt_employers(&conn);
+        type LegacyEmployerRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<LegacyEmployerRow> = conn
+            .prepare(
+                "SELECT id,status,canonical_employer_id,canonical_employer_domain,
+                        employer_attestation_sha256 FROM jobs_attempt_reservations ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        for (id, status, employer_id, domain, attestation) in rows {
+            assert_eq!(id, status);
+            assert_eq!((employer_id, domain, attestation), (None, None, None));
+        }
+        for terminal in ["side_effect_unknown", "submitted", "released"] {
+            conn.execute_batch("SAVEPOINT terminal_recording").unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE jobs_attempt_reservations SET status=?1 WHERE id='running'",
+                    [terminal],
+                )
+                .unwrap(),
+                1
+            );
+            conn.execute_batch("ROLLBACK TO terminal_recording; RELEASE terminal_recording")
+                .unwrap();
+        }
+        for status in ["reserved", "running"] {
+            assert!(conn
+                .execute(
+                    "UPDATE jobs_attempt_reservations SET status=?1 WHERE id='running'",
+                    [status],
+                )
+                .is_err());
+        }
+        for status in [
+            "released",
+            "reserved",
+            "running",
+            "side_effect_unknown",
+            "failed",
+        ] {
+            assert!(conn
+                .execute(
+                    "UPDATE jobs_attempt_reservations SET status=?1 WHERE id='submitted'",
+                    [status],
+                )
+                .is_err());
+        }
+        assert_eq!(conn.execute(
+            "UPDATE jobs_attempt_reservations SET company_key='submitted-metadata' WHERE id='submitted'",
+            [],
+        ).unwrap(), 1);
+        for status in ["reserved", "running", "side_effect_unknown", "submitted"] {
+            assert!(conn
+                .execute(
+                    "INSERT INTO jobs_attempt_reservations (
+                       id,account_id,application_id,company_key,status
+                     ) VALUES ('new','account','new','new',?1)",
+                    [status],
+                )
+                .is_err());
+        }
+        // Explicit complete binding is possible; this migration performs no such backfill.
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET canonical_employer_id='employer-legacy',
+               canonical_employer_domain='legacy.example',employer_attestation_sha256=?1
+               WHERE id='running'",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        migrate_attempt_employers(&conn);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM jobs_attempt_reservations",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn attempt_employer_sqlite_concurrent_alias_inserts_have_one_unique_constraint_loser() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-attempt-employer-race-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let setup = rusqlite::Connection::open(&path).unwrap();
+        initialize_attempt_employer_legacy_schema(&setup);
+        migrate_attempt_employers(&setup);
+        drop(setup);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [("alias-a", 'a'), ("alias-b", 'b')]
+            .into_iter()
+            .map(|(id, sha_byte)| {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let sha = sha_byte.to_string().repeat(64);
+                    let result =
+                        insert_bound_attempt(&conn, id, "employer-acme", "acme.example", &sha);
+                    (id, sha, result)
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM jobs_attempt_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: Vec<String> = conn
+            .query_row(
+                "SELECT id,account_id,application_id,company_key,status,canonical_employer_id,
+                    canonical_employer_domain,employer_attestation_sha256
+               FROM jobs_attempt_reservations",
+                [],
+                |row| (0..8).map(|index| row.get(index)).collect(),
+            )
+            .unwrap();
+        migrate_attempt_employers(&conn);
+        let replayed: Vec<String> = conn
+            .query_row(
+                "SELECT id,account_id,application_id,company_key,status,canonical_employer_id,
+                    canonical_employer_domain,employer_attestation_sha256
+               FROM jobs_attempt_reservations",
+                [],
+                |row| (0..8).map(|index| row.get(index)).collect(),
+            )
+            .unwrap();
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
+        let results: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, _, result)| result.is_ok())
+            .collect();
+        let losers: Vec<_> = results
+            .iter()
+            .filter(|(_, _, result)| result.is_err())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(losers.len(), 1);
+        assert_eq!(winners[0].2.as_ref().unwrap(), &1);
+        match losers[0].2.as_ref().unwrap_err() {
+            rusqlite::Error::SqliteFailure(error, message) => {
+                assert_eq!(error.code, rusqlite::ErrorCode::ConstraintViolation);
+                assert_eq!(error.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE);
+                assert!(message.as_ref().is_some_and(
+                    |message| message.contains("jobs_attempt_reservations.canonical_employer_")
+                ));
+            }
+            error => panic!("expected the canonical employer unique constraint, got {error:?}"),
+        }
+        assert_eq!(row_count, 1);
+        let (winner_id, winner_sha, _) = winners[0];
+        assert_eq!(
+            stored,
+            vec![
+                winner_id.to_string(),
+                "account".to_string(),
+                winner_id.to_string(),
+                winner_id.to_string(),
+                "reserved".to_string(),
+                "employer-acme".to_string(),
+                "acme.example".to_string(),
+                winner_sha.clone(),
+            ]
+        );
+        assert_eq!(replayed, stored);
+    }
+
+    #[test]
+    fn attempt_employer_irreversible_states_preserve_bound_and_legacy_slots() {
+        let conn = attempt_employer_legacy_schema();
+        for (id, status) in [
+            ("legacy-unknown", "side_effect_unknown"),
+            ("legacy-submitted", "submitted"),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs_attempt_reservations VALUES (?1,'account',?1,?1,?2)",
+                rusqlite::params![id, status],
+            )
+            .unwrap();
+        }
+        migrate_attempt_employers(&conn);
+        for (id, domain, state) in [
+            ("bound-unknown", "unknown.example", "side_effect_unknown"),
+            ("bound-submitted", "submitted.example", "submitted"),
+        ] {
+            insert_bound_attempt(&conn, id, id, domain, &"a".repeat(64)).unwrap();
+            conn.execute(
+                "UPDATE jobs_attempt_reservations SET status=?2 WHERE id=?1",
+                rusqlite::params![id, state],
+            )
+            .unwrap();
+        }
+        migrate_attempt_employers(&conn);
+        for id in ["legacy-unknown", "bound-unknown"] {
+            for denied in ["reserved", "running", "failed"] {
+                let error = conn
+                    .execute(
+                        "UPDATE jobs_attempt_reservations SET status=?2 WHERE id=?1",
+                        rusqlite::params![id, denied],
+                    )
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("unknown attempt requires reconciliation before reentry"));
+            }
+            for allowed in ["side_effect_unknown", "submitted", "released"] {
+                conn.execute_batch("SAVEPOINT unknown_reconciliation")
+                    .unwrap();
+                assert_eq!(
+                    conn.execute(
+                        "UPDATE jobs_attempt_reservations SET status=?2 WHERE id=?1",
+                        rusqlite::params![id, allowed],
+                    )
+                    .unwrap(),
+                    1
+                );
+                conn.execute_batch(
+                    "ROLLBACK TO unknown_reconciliation; RELEASE unknown_reconciliation",
+                )
+                .unwrap();
+            }
+            let state: String = conn
+                .query_row(
+                    "SELECT status FROM jobs_attempt_reservations WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "side_effect_unknown");
+        }
+        for id in ["legacy-submitted", "bound-submitted"] {
+            for denied in [
+                "released",
+                "reserved",
+                "running",
+                "failed",
+                "side_effect_unknown",
+            ] {
+                let error = conn
+                    .execute(
+                        "UPDATE jobs_attempt_reservations SET status=?2 WHERE id=?1",
+                        rusqlite::params![id, denied],
+                    )
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("submitted attempt status is irreversible"));
+            }
+            assert_eq!(
+                conn.execute(
+                    "UPDATE jobs_attempt_reservations SET company_key=company_key||'-metadata'
+                       WHERE id=?1",
+                    [id],
+                )
+                .unwrap(),
+                1
+            );
+        }
+        // The database permits the reconciled release transition, not its business authorization.
+        // Once the caller has authorized release, the existing same-employer renewal is preserved.
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET status='released' WHERE id='bound-unknown'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET status='reserved',employer_attestation_sha256=?1
+               WHERE id='bound-unknown'",
+            ["b".repeat(64)],
+        )
+        .unwrap();
+        let binding: (String, String, String) = conn
+            .query_row(
+                "SELECT canonical_employer_id,canonical_employer_domain,employer_attestation_sha256
+               FROM jobs_attempt_reservations WHERE id='bound-unknown'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            binding,
+            (
+                "bound-unknown".to_string(),
+                "unknown.example".to_string(),
+                "b".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn attempt_employer_binding_is_complete_immutable_and_active_unique() {
+        let conn = attempt_employer_legacy_schema();
+        migrate_attempt_employers(&conn);
+        insert_bound_attempt(
+            &conn,
+            "first",
+            "employer-acme",
+            "acme.example",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        assert!(insert_bound_attempt(
+            &conn,
+            "id-alias",
+            "employer-acme",
+            "different.example",
+            &"b".repeat(64)
+        )
+        .is_err());
+        assert!(insert_bound_attempt(
+            &conn,
+            "domain-alias",
+            "different-id",
+            "acme.example",
+            &"b".repeat(64)
+        )
+        .is_err());
+        insert_bound_attempt(&conn, "other", "other-id", "other.example", &"b".repeat(64)).unwrap();
+        conn.execute(
+            "INSERT INTO jobs_attempt_reservations (
+               id,account_id,application_id,company_key,status,
+               canonical_employer_id,canonical_employer_domain,employer_attestation_sha256
+             ) VALUES ('other-account','another-account','other-account','first','reserved',
+                       'employer-acme','acme.example',?1)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs_attempt_reservations (
+               id,account_id,application_id,company_key,status,
+               canonical_employer_id,canonical_employer_domain,employer_attestation_sha256
+             ) VALUES ('display-alias','account','display-alias','first','reserved',
+                       'third-employer','third.example',?1)",
+                ["a".repeat(64)],
+            )
+            .is_err());
+        for assignment in [
+            "canonical_employer_id='replacement'",
+            "canonical_employer_domain='replacement.example'",
+            "canonical_employer_id=NULL,canonical_employer_domain=NULL,employer_attestation_sha256=NULL",
+            "employer_attestation_sha256='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
+        ] {
+            assert!(conn
+                .execute(&format!("UPDATE jobs_attempt_reservations SET {assignment} WHERE id='first'"), [])
+                .is_err());
+        }
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET status='released' WHERE id='first'",
+            [],
+        )
+        .unwrap();
+        assert!(conn.execute(
+            "UPDATE jobs_attempt_reservations SET employer_attestation_sha256=?1 WHERE id='first'",
+            ["b".repeat(64)],
+        ).is_err());
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET status='reserved',employer_attestation_sha256=?1
+               WHERE id='first'",
+            ["b".repeat(64)],
+        )
+        .unwrap();
+        migrate_attempt_employers(&conn);
+        let attestation: String = conn.query_row(
+            "SELECT employer_attestation_sha256 FROM jobs_attempt_reservations WHERE id='first'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(attestation, "b".repeat(64));
+    }
+
+    #[test]
+    fn attempt_employer_binding_rejects_invalid_tokens_domains_and_partial_shapes() {
+        let conn = attempt_employer_legacy_schema();
+        migrate_attempt_employers(&conn);
+        for domain in [
+            "",
+            "localhost",
+            "a.localhost",
+            "intranet",
+            "Acme.example",
+            "a..example",
+            "-a.example",
+            "a-.example",
+            "a.example.",
+            "127.0.0.1",
+            "127.1",
+            "a.123",
+            "a.0x7f",
+            "a.0x",
+            "é.example",
+            "a.example\0hidden",
+        ] {
+            assert!(
+                insert_bound_attempt(&conn, "invalid", "employer", domain, &"a".repeat(64))
+                    .is_err()
+            );
+        }
+        for id in ["", "bad employer", "employer\0hidden", "é", "bad@employer"] {
+            assert!(
+                insert_bound_attempt(&conn, "invalid", id, "valid.example", &"a".repeat(64))
+                    .is_err()
+            );
+        }
+        for sha in [
+            "a".repeat(63),
+            "A".repeat(64),
+            format!("{}\0hidden", "a".repeat(64)),
+        ] {
+            assert!(
+                insert_bound_attempt(&conn, "invalid", "employer", "valid.example", &sha).is_err()
+            );
+        }
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs_attempt_reservations (
+               id,account_id,application_id,company_key,status,canonical_employer_id
+             ) VALUES ('partial','account','partial','partial','released','employer')",
+                [],
+            )
+            .is_err());
+        let valid_domain = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        insert_bound_attempt(
+            &conn,
+            "valid",
+            &"a".repeat(240),
+            &valid_domain,
+            &"a".repeat(64),
+        )
+        .unwrap();
+        assert!(insert_bound_attempt(
+            &conn,
+            "too-long",
+            &"a".repeat(241),
+            "long.example",
+            &"a".repeat(64)
+        )
+        .is_err());
+        assert!(insert_bound_attempt(
+            &conn,
+            "too-long",
+            "another",
+            &format!("{}.example", "a".repeat(64)),
+            &"a".repeat(64)
+        )
+        .is_err());
+    }
 
     #[test]
     fn source_verifier_boot_bindings_migration_failure_restores_connection_state() {
@@ -6569,6 +7138,40 @@ mod postgres_migration_tests {
         SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
         SQLITE_JOBS_WORKFLOW_COMMANDS, SQLITE_JOBS_WORKSPACE_PAGINATION,
     };
+
+    #[test]
+    fn attempt_employer_identity_migrations_are_registered_and_additive() {
+        assert!(MIGRATIONS.contains(&super::SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY));
+        let registered = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| *id == super::JOBS_ATTEMPT_EMPLOYER_IDENTITY_MIGRATION_ID)
+            .expect("employer binding migration must be registered");
+        assert_eq!(registered.0, "044_jobs_attempt_employer_identity.sql");
+        assert_eq!(registered.1, super::POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY);
+        assert!(!super::SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY.contains("ADD COLUMN"));
+        for sql in [
+            super::SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY,
+            super::POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY,
+        ] {
+            assert!(sql.contains("idx_jobs_attempt_reservations_active_employer_id"));
+            assert!(sql.contains("idx_jobs_attempt_reservations_active_employer_domain"));
+            assert!(sql.contains("'reserved', 'running', 'side_effect_unknown', 'submitted'"));
+            assert!(sql.contains("attempt employer identity is immutable"));
+            assert!(sql.contains("submitted attempt status is irreversible"));
+            assert!(sql.contains("unknown attempt requires reconciliation before reentry"));
+            assert!(
+                sql.contains("NEW.status NOT IN ('side_effect_unknown', 'submitted', 'released')")
+            );
+            assert!(sql.contains("OLD.status = 'released' AND NEW.status = 'reserved'"));
+            assert!(
+                sql.contains("NEW.status NOT IN ('released', 'side_effect_unknown', 'submitted')")
+            );
+            assert!(!sql.contains("UPDATE jobs_attempt_reservations"));
+            assert!(!sql.contains("DELETE FROM jobs_attempt_reservations"));
+            assert!(!sql.contains("DROP TABLE"));
+            assert!(!sql.contains("DROP INDEX"));
+        }
+    }
 
     #[test]
     fn heartbeat_boot_generation_fence_migrations_are_registered() {
