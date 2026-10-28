@@ -1,6 +1,6 @@
 # Bluey Jobs completion ledger
 
-Updated: 2026-10-27. Authority: current Jobs branch, source and dated local
+Updated: 2026-10-28. Authority: current Jobs branch, source and dated local
 handoffs. This is the durable product checklist, not release approval.
 Native Codex work is tracked in project-scoped Ruflo; Phase 631 task:
 `task-1793133316730-ocx7kf`. Do not create a competing board or reinterpret
@@ -68,6 +68,17 @@ Do not infer hidden infrastructure or private source systems from their UI.
 The differentiation targets are verified freshness/fit, accurate tailoring,
 trustworthy receipts/recovery, understandable controls and measured cost/latency.
 No comparative superiority, production SLO or interview outcome is proven yet.
+
+## Owner scope clarification — 2026-10-28
+
+The owner asked that work not create cybersecurity risk after a platform warning.
+Continue ordinary Jobs development and data-integrity validation only in the
+owned repository and isolated synthetic test systems. No competitor probing,
+private-session scraping, real applications/emails, deployment or safeguard
+workaround is authorized by this continuation. A platform warning does not
+establish its exact trigger; do not promise zero automated flags or change
+access/model/account controls to avoid a safeguard. This boundary preserves the
+full product goal without treating external effects as implementation authority.
 
 ## Latest observed baseline
 
@@ -142,3 +153,120 @@ it) and measured VM host-listener policy before reuse (Phase634 did not inventor
 listeners; VZ loopback management is not literal-zero networking). Neither is
 claimed fixed by Phase635. The actual runner/API/browser/receipt journey and
 the wider product/release conditions above remain unfinished; goal stays active.
+
+Phase636 is correcting the reproduced canonical-employer alias defect in both
+databases, plus irreversible-state and legacy-history reentry gaps. Preliminary
+focused31836 passed, but later source/tests require fresh qualification; current
+session78617 exited1 with7/8 actual private-PG cases passing and an ATS
+serializable-transaction concurrency failure under diagnosis. No later
+SQLite/Clippy gate ran; cleanup/source hashes were verified. Neither static
+review nor the prior focused pass is final-source acceptance. No deployment,
+employer action or product launch is implied by this local work.
+
+Follow-up97759 passed10/10 actual private-PG cases and20 focused SQLite/core/
+API cases, then failed an old quota fixture before Clippy. That fixture now
+uses ordinary signed synthetic employer publication, explicit receipt-required
+seeding and reviewed Track setup.21814 was deliberately stopped pre-test for
+the final fixture-review correction and cleaned, not counted as a pass. Current
+combined session87312 is live/pending for38 actualPG selections,24 focused
+SQLite/core/API cases, strict Clippy and full all-target Rust. Preserve the
+source freeze until actual terminal; no final-source green is claimed.
+
+Read-only GitHub chain refresh2026-10-28 is recorded in
+`AUDIT-PHASE-636-PR-CHAIN-20261028.md`:26–32 remain open drafts;26 has a cancelled
+Jobs check;32's nine reported checks succeed at66ad0fa8, not the current local
+candidate.29's differing exact head is patch-equivalent to local ancestor
+2e2a18a9, so that refresh-CAS correction is present without identical ancestry.
+No stack mutation, rerun, hosted dispatch or new CI/release approval occurred.
+
+Session87312 subsequently passed38/38 actual private-PG cases and20 focused
+core/SQLite/API cases, then failed on the shared quota test helper's hardcoded
+same employer ID across distinct domains. It was cleaned with all23 hashes
+unchanged. The test-only helper now supports explicit signed employer IDs while
+preserving existing defaults. Separate review found no actionable issue;
+current successor39121 is live/pending on a25-file frozen source manifest.
+Full Rust/Clippy, final Jobs gates/privacy/cleanup and acceptance remain pending.
+
+39121 later passed38 actualPG/core20 then failed a separate source-enrollment
+cap in the quota fixture. Its25 hashes/cleanup were verified. The fixture now
+uses one independently signed multi-employer board; ten reservation and limit
+assertions remain unchanged, with no source-cap relaxation. Current16096 runs
+the quota case first, then38PG/23otherfocused/Clippy/fullRust on frozen source;
+all outcomes remain pending. The exact controller is recorded in COMMAND636.
+
+The16096 quota-first case subsequently passed1/1 (15.59s), preserving ten
+signed employer slots and duplicate/daily-limit denials. Its private PG cluster
+is now ready for the38-case stage. Remaining current-source gates stay pending;
+no aggregate, final-source release or production acceptance is implied.
+
+16096 subsequently passed38/38 actual privatePG cases and all24 focused cases;
+PG stopped cleanly/PID file absence was checked before SQLite. Strict all-target
+Clippy is live and full Rust remains pending, as do terminal source hashes and
+cleanup. These passes do not authorize a deployment or real application.
+
+16096 strict all-target Clippy and formatting subsequently passed; its full
+all-target Rust command is live, starting with1,732 library cases. Full target
+counts, terminal hashes/cleanup and final Jobs/privacy/review remain pending.
+
+16096 then terminated exit1:1726 library tests passed and six failed in2502.74s;
+remaining all-target binaries/integration/examples did not execute. Exact reports
+confirmed an obsolete source-query LIMIT1 assertion and five shared fixture
+employer-ID/domain conflicts. All25 hashes/HEAD matched after terminal, exact
+root absent, parent empty and observed owned PIDs absent. Test-only FIX808/809
+corrections preserve product guards, defaults and lease/receipt/capacity assertions;
+independent review found no actionable issue. Successor88910 is now live on a
+new25-file freeze, with those six exact regressions first, then quota/38actualPG/
+23remainingfocused/strictClippy/fullRust. Recipe:
+`COMMAND-PHASE-636-FIXTURE-REQUALIFICATION.md`. No final-source acceptance yet.
+
+88910 then passed all six exact repaired regressions and the quota preflight
+(seven focused passes). Private PG17/pgvector is ready and its case-stage build
+is live. Remaining current-source gates and terminal cleanup/hash verification
+remain pending; the broader product/release goal is not complete.
+
+88910 subsequently passed all38 actual private-PG cases and all30 focused cases.
+PG stopped cleanly and its PID file absence was checked before SQLite. Strict
+all-target Clippy is live; full Rust, final source identity/cleanup and final
+Jobs/privacy/review remain pending. No release or external action is authorized.
+
+88910 strict all-target Clippy (warnings denied,1m50s) and formatting then passed.
+Its full all-target server command is live, starting with1732 library tests.
+Do not edit source or commit until that command is terminal and final source/
+cleanup checks are complete. No full-suite or production green is inferred.
+
+88910 subsequently exited0:1872 all-target Rust passes (1732library/1binary/
+134integration/5guarded-example),0failed/ignored, plus38 actualPG/30focused/
+strictClippy/formatting. All25 hashes/HEAD/status and independent cleanup/process
+checks passed; owned build/database storage was removed. This is native macOS
+source evidence, not Linux/release/production proof. FIX810's harmless timeout
+qualification48144 also passed with expected inner137 and all owned PIDs/root
+absent. Final Jobs session14411 is live on760 frozen scoped files for2071 tests,
+five typechecks/builds and browser/source cleanup. Final privacy/self-test/review
+and broader runner/provider/product work remain pending; goal stays active.
+
+14411's tests actually passed2071/zero skips, but its TAP-only summary parser
+failed on Node24 spec output; source760/HEAD/status/cleanup were verified before
+FIX811. Revised55179 then exited0 through all2071 tests, five typechecks/builds,
+schema/CI guards and zero private-browser process/open-file inventory. Final
+760-file identity and root/parent/process cleanup matched independently. Fresh
+launcher self-test26934 and privacy73988 (2871 paths/2595text,17owned new files)
+passed. Final closeout docs/privacy/review remain, with no live heavy process.
+Baseline PDF.js offline-font configuration and a503.99kB chunk warning require
+bounded fidelity/performance follow-up; neither is suppressed or called a latency
+benchmark. Actual cloud/runner/receipt, hosted providers and broader goal remain
+unfinished. No production flag, deployment, application or email changed.
+
+Phase636 independent AI review conditionally accepts bounded local source
+correctness, with no remaining P0–P3 employer/ATS diff finding. P2 offline-font
+and P3 unmeasured chunk warnings remain release-quality holds, not hidden passes.
+All13 task-named canonical parents were empty. Final post-record privacy and
+local checkpoint remain before the next bounded warning-remediation batch; no
+release or overall-goal completion is implied.
+
+The prospective staging check then caught one extra EOF blank line in each new
+migration and stopped before commit. FIX812 removes only those two bytes, with
+exact normalized-byte proof and fresh parity/CI guards. Full88910/55179 counts
+remain PRE-FORMAT evidence, not exact current-byte qualification. Final-source
+full gates must cover this formatting and pending warning fixes before release;
+no result was waived or relabeled. Owned new files now18; complete prospective-
+index whitespace/privacy preflight is required before future heavy freezes.
