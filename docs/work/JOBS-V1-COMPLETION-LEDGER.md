@@ -125,3 +125,20 @@ Fresh full Jobs gates passed2,071 tests, zero skipped and five typechecks. A
 docs-only closeout does not relabel the earlier image as a final-tip artifact.
 API lease/runner/browser/receipt stitching, hosted providers/sources/model/
 billing/OAuth/capacity and broader features remain unfinished.
+
+Phase635 session61600 exited0 on source `863042a0`:30 configured PostgreSQL
+cases passed in30 fresh private databases, PG stopped cleanly, then server
+formatting, strict all-target Clippy and1,845 all-target Rust tests passed
+(1,705 library,1 binary,134 integration,5 guarded-example;0 failed/ignored).
+Configured-only early returns in the SQLite stage are not extra real PG proof.
+This is installed Rust/Cargo1.95 native macOS/ARM64 evidence, not a protected
+release capsule, Linux server build, CI or production artifact. Source stayed
+frozen; exact root was removed, parent empty and observed processes absent.
+Fresh launcher self-test84754 passed. Final privacy/review is in IMPL/REVIEW635.
+
+Two explicit successors remain: canonical employer reservation uniqueness
+(current DB guard uses normalized display names, so distinct aliases can evade
+it) and measured VM host-listener policy before reuse (Phase634 did not inventory
+listeners; VZ loopback management is not literal-zero networking). Neither is
+claimed fixed by Phase635. The actual runner/API/browser/receipt journey and
+the wider product/release conditions above remain unfinished; goal stays active.
