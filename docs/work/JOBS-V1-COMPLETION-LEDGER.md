@@ -82,6 +82,25 @@ full product goal without treating external effects as implementation authority.
 
 ## Latest observed baseline
 
+Current Phase637 checkpoint: document font/bundle corrections and actual private
+built-browser PDF/real-worker, DOCX mapped-symbol, TXT, malformed and oversized
+import proof passed. Compiled Node validation/extraction retained exact bytes/SHA
+with zero font warnings/fetches. FullJobs34408 passed2085/zero skips, five
+typechecks/builds and schema/CI guards on766 frozen source inputs. Fresh paired
+written graphs93377/9615 match exact111 initial modules/static imports, keep
+symbols deferred and stay below the unchanged500000-byte JS threshold.
+
+Exact-current server qualification66480 is terminal exit0:1872 all-target passes,
+zero failed/ignored, plus actual privatePG17/pgvector38/38 and30 focused cases.
+PG stopped cleanly; strict all-target Clippy (1m50s) and formatting passed. Final
+migration bytes and all766 source hashes/HEAD/status matched. Independent root/
+parent/ownerPID/group checks passed; owned storage was removed and free disk
+returned to38GiB. Launcher self-test22258 passed. Independent bounded review and
+scratch privacy40010 passed; actual-index recheck/checkpoint remain. This is
+native macOS source proof, not Linux/cloud/release readiness.
+See HANDOFF637 and recorded commands. No production authority changes.
+The runner/API/browser/receipt journey and every wider product hold below remain.
+
 Phase 630: local `f4191d09`; 2,039 Jobs workspace tests, five typechecks/builds,
 actual Temporal 10/10 and actual browser/API/PG profile story 1/1 passed.
 See `HANDOFF-PHASE-630-LOCAL-20261027.md` for limits and reproducible commands.

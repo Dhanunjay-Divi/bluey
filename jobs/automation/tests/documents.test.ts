@@ -13,8 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { PDFDocument, StandardFonts } from "pdf-lib";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApplicationPacket, NormalizedJob } from "../src/contracts.js";
+import { pdfjsNodeDocumentOptions } from "../src/pdfjs-node-options.js";
 import {
   approvedExecutionChecksum,
   assertApprovedExecutionChecksum,
@@ -191,6 +192,31 @@ describe("application document materialization", () => {
     expect(result.packet.resumePath).toBe(result.resume.path);
     expect(result.resume.path).not.toBe(resumePath);
     expect(await extractPdfText(result.coverLetter!.path)).toContain("applications@example.com");
+  }, 20_000);
+
+  it("validates and extracts a standard-font PDF from local package assets without network access", async () => {
+    const directory = await temporaryDirectory();
+    const resumePath = join(directory, "standard-font.pdf");
+    const standardFontText = "Ada Lovelace built reliable offline PDF validation systems.";
+    await writeTextPdf(resumePath, standardFontText);
+    const warning = vi.spyOn(console, "warn");
+    const deniedFetch = vi.fn(() => Promise.reject(new Error("network access is denied")));
+    vi.stubGlobal("fetch", deniedFetch);
+
+    try {
+      const result = await materializeApplicationDocuments(packet({
+        resumePath,
+        resumeContent: undefined,
+        coverLetterContent: undefined,
+      }), directory);
+
+      expect(await extractPdfText(result.resume.path)).toContain(standardFontText);
+      expect(deniedFetch).not.toHaveBeenCalled();
+      expect(warning).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      warning.mockRestore();
+    }
   }, 20_000);
 
   it("retains the validated bytes after a same-name resume replacement", async () => {
@@ -418,7 +444,10 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 async function extractPdfText(path: string): Promise<string> {
-  const loadingTask = getDocument({ data: new Uint8Array(await readFile(path)) });
+  const loadingTask = getDocument({
+    data: new Uint8Array(await readFile(path)),
+    ...pdfjsNodeDocumentOptions(),
+  });
   try {
     const pdf = await loadingTask.promise;
     const pages: string[] = [];
@@ -435,7 +464,7 @@ async function extractPdfText(path: string): Promise<string> {
 async function writeTextPdf(path: string, value: string): Promise<void> {
   const pdf = await PDFDocument.create();
   const font = await pdf.embedFont(StandardFonts.Helvetica);
-  pdf.addPage().drawText(value, { font });
+  pdf.addPage().drawText(value, { font, size: 12, x: 48, y: 740 });
   await writeFile(path, await pdf.save());
 }
 

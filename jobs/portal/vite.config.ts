@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { portalManualChunk } from "./bundle-policy";
 
 export default defineConfig({
   base: "/jobs/",
@@ -19,6 +20,12 @@ export default defineConfig({
     outDir: "../../web/jobs",
     emptyOutDir: true,
     target: "es2022",
-    sourcemap: false
+    sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks: portalManualChunk,
+        onlyExplicitManualChunks: true
+      }
+    }
   }
 });

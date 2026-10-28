@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { PDFDocument, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 import type { ApplicationPacket } from "./contracts.js";
+import { pdfjsNodeDocumentOptions } from "./pdfjs-node-options.js";
 
 export interface MaterializedDocument {
   readonly path: string;
@@ -532,6 +533,7 @@ async function assertUsablePdf(bytes: Uint8Array, label: string): Promise<void> 
   try {
     loadingTask = getDocument({
       data: Uint8Array.from(bytes),
+      ...pdfjsNodeDocumentOptions(),
       disableFontFace: true,
       enableXfa: false,
       isImageDecoderSupported: false,

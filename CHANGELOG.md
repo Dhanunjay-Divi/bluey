@@ -5,6 +5,10 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs: resolve PDF.js standard fonts from local installed assets without network
+  fallback, and preserve the complete DOCX symbol mapping in a narrowly deferred
+  chunk. Verify synthetic built-browser imports and final source gates locally;
+  cloud-runner and production qualification remain separate.
 - Jobs: bind application reservations to signed canonical employer identity in
   both databases, retaining the display-name guard across aliases, Tracks and
   application emails. Preserve terminal history, require review for unresolved
