@@ -5,8 +5,8 @@ Branch:`feat/phase-637-jobs-document-fidelity-and-bundle`.
 Preflight:bluey-ops, current AGENTS/local handoff, security/performance/SPARC and
 native scoped team. No framework installation/hooks, owner credentials or SSD.
 Status: bounded implementation, current-source Jobs/PostgreSQL/Rust, independent
-review and scratch privacy passed. Actual-index recheck/local checkpoint pending;
-not release readiness.
+review and actual-index privacy passed; source checkpoint099f3b97 saved locally.
+Records-only continuation preserves source identity. Not release readiness.
 
 ## Problems and measured baseline
 

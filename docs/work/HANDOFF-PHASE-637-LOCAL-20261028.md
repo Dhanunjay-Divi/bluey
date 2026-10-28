@@ -1,8 +1,10 @@
-# Phase637 Jobs local handoff — locally qualified, checkpoint pending
+# Phase637 Jobs local handoff — locally qualified and checkpointed
 
 Current authority: `/Users/uno/Downloads/cue-jobs-source-verifier-release-v3-20260831`.
 Branch: `feat/phase-637-jobs-document-fidelity-and-bundle`.
-HEAD: `479377dcc8cb6928fd038a51c72ac672e5fe4abe`; Phase637 is not committed.
+Source checkpoint: `099f3b976fa961b9cc7ea067d8607501454151a0`.
+Executed base was479377dc plus the exact qualified source manifest below.
+Resolve HEAD for any later records-only continuation; no source change is implied.
 Read bluey-ops, AGENTS.md and Round/IMPL/REVIEW637 before continuing.
 Current code/local handoffs are authoritative; SSD unused.
 
@@ -33,7 +35,11 @@ later15th owned new file, so final closeout privacy must include it and any late
 record edits. Do not stage inherited untracked REVIEW628.
 Final scratch privacy40010 now passed2887 paths/2611 text, all15 owned new files
 unchanged, real index unchanged and scratch removed. Independent review accepts
-the bounded local diff. Actual-index recheck/local checkpoint remain pending.
+the bounded local diff. Actual-index gate91060 then passed cached whitespace/
+privacy2887/2611 over exactly20 owned paths, source766/manifest unchanged and
+inherited REVIEW628 excluded. Admitted treef08839240f8aa52608d3c1800330bacf3636b65a
+is the exact source checkpoint's Git tree. Only inherited REVIEW628 remained
+untracked afterward. Records-only continuation must retain that source identity.
 
 ## Proven in this phase
 
@@ -64,7 +70,8 @@ Independent AI reviewer: existing jobs_boot_final_review, REVIEW637-only
 ownership. Static issues corrected before execution: local font warning/path
 assertions, browser bounded independent close/kill/root retention, controller
 same-UID signal revalidation, sequential hashing/private Git/pinned source.
-Full server/PG gates are passed; final review/privacy/checkpoint closeout remains.
+Full server/PG, review/privacy and the source checkpoint are complete locally.
+This does not resolve the separate run/session or production holds.
 
 ## Next steps and boundaries
 
@@ -73,12 +80,14 @@ Full server/PG gates are passed; final review/privacy/checkpoint closeout remain
    cleanup checks are preserved in the stores and IMPL637.
 2. Preserve the current qualified source; no source correction is pending in this
    phase. The run/session availability defect is the next bounded successor.
-3. Actual staging must include only the20 owned paths, then repeat cached
-   whitespace/privacy after final record edits. Scratch40010 passed over15 owned
-   new files; inherited REVIEW628 stays excluded. Review is not manual QA.
-4. Local scoped commit only after the required gates/review; no remote writes.
-5. Continue the broader runner/receipt journey in HANDOFF636 after this bounded
-   phase. Native ARM64 proof does not satisfy the Linux/x86_64 OCI contract.
+3. Record-only continuation after099f3b97 must pass cached whitespace/privacy
+   and preserve source766/manifest; inherited REVIEW628 stays excluded. Review
+   is not manual QA, hosted-provider or production evidence.
+4. Begin the next bounded Jobs branch from this checkpoint/records successor.
+   First reproduce the ordinary run/session mismatch below, then fix only the
+   observed cause while preserving frozen terminal authority. No remote writes.
+5. Continue the broader runner/receipt journey in HANDOFF636. Native ARM64
+   proof does not satisfy the Linux/x86_64 OCI contract.
 
 No push, PR mutation, merge/rebase/retarget, deploy, publication/signing, paid
 resource, production flag, owner account, real application/email/calendar,

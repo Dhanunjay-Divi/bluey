@@ -233,9 +233,13 @@ only the then-pending review/privacy/checkpoint rather than the already-complete
 
 Parent-reported final scratch privacy40010 passed2887 indexed paths/2611 text files. All15 owned
 new-file hashes and the real index remained unchanged, and the exact scratch root was removed. The
-local staging/checkpoint remains pending: it must include only the20 owned Phase637 paths, repeat
-cached whitespace/privacy checks, and must not stage inherited
-`REVIEW-PHASE-628-JOBS-SOURCE-VERIFIER-RELEASE-V3.md`.
+actual cached checkpoint gate91060 then passed whitespace/privacy at the same2887/2611 counts over
+exactly20 owned Phase637 paths. It retained the766-source manifest and admitted-tree identity,
+excluded inherited `REVIEW-PHASE-628-JOBS-SOURCE-VERIFIER-RELEASE-V3.md`, and produced tree
+`f08839240f8aa52608d3c1800330bacf3636b65a`. Local core checkpoint
+`099f3b976fa961b9cc7ea067d8607501454151a0` has that exact tree; afterward only inherited REVIEW628
+was untracked. The remaining closeout is a records-only update/cached privacy pass and local docs
+commit. It does not require a source/runtime rerun while the766-source manifest remains unchanged.
 
 ## Current verdict and limits
 
@@ -243,7 +247,7 @@ cached whitespace/privacy checks, and must not stage inherited
 changes, actual built-browser import proof, paired complete-input graph, full Jobs regressions and
 current-source Rust/PostgreSQL gates passed on frozen source with the recorded cleanup and identity
 checks. No P0-P3 finding remains in the Phase637 diff. Final staged cached whitespace/privacy and
-the local checkpoint remain mechanical pre-commit gates and must include this finalized review.
+the source checkpoint passed; only the records-only cached privacy/commit closeout remains.
 
 This is not manual QA, production readiness, merge/release approval, provider or real-candidate
 proof, runner/receipt authority, or completion of the broader Jobs objective. The pre-existing P2

@@ -2,8 +2,8 @@
 
 Preflight:bluey-ops/current AGENTS and local handoff; security/performance/SPARC
 plus native scoped team. Base479377dc; branchfeat/phase-637-jobs-document-fidelity-and-bundle.
-Status: all local source gates, independent review and scratch privacy passed;
-actual-index recheck/local checkpoint pending. Not production readiness.
+Status: all local source gates, independent review and actual-index privacy
+passed; source checkpoint099f3b97 saved locally. Not production readiness.
 No release acceptance.
 
 ## Scope
@@ -162,3 +162,14 @@ real index unchanged and exact scratch root removed. After these record edits,
 the actual staged20-path candidate must pass cached whitespace/privacy again
 before its local checkpoint. No push, deployment, effect enablement, real account
 action or broader-goal completion follows.
+
+## Local source checkpoint
+
+Actual staged gate91060 passed cached whitespace/privacy2887/2611 over exactly
+20 owned paths, source766/manifest unchanged and inherited REVIEW628 excluded.
+Admitted treef08839240f8aa52608d3c1800330bacf3636b65a became local commit
+099f3b976fa961b9cc7ea067d8607501454151a0 with exactly the same Git tree.
+Only the inherited untracked review remained. Independent post-commit source/
+HEAD/root/process readback also passed; no source changed to create the commit.
+This records-only continuation must pass its own cached privacy/whitespace gate,
+without relabeling source tests as remote CI or release evidence. No push occurred.

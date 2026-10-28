@@ -96,8 +96,10 @@ PG stopped cleanly; strict all-target Clippy (1m50s) and formatting passed. Fina
 migration bytes and all766 source hashes/HEAD/status matched. Independent root/
 parent/ownerPID/group checks passed; owned storage was removed and free disk
 returned to38GiB. Launcher self-test22258 passed. Independent bounded review and
-scratch privacy40010 passed; actual-index recheck/checkpoint remain. This is
-native macOS source proof, not Linux/cloud/release readiness.
+scratch privacy40010 passed; actual-index gate91060 passed and source checkpoint
+099f3b97 is saved locally with its exact admitted tree. Records-only continuation
+preserves the source manifest. This is native macOS source proof, not Linux/
+cloud/release readiness.
 See HANDOFF637 and recorded commands. No production authority changes.
 The runner/API/browser/receipt journey and every wider product hold below remain.
 
