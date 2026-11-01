@@ -2075,6 +2075,1644 @@ fn validate_submission_object_bindings(
     Ok(())
 }
 
+/// Revalidates the durable, stored portion of a submitted receipt without
+/// reopening a live runner lease or performing object-store I/O.  This is
+/// deliberately test/integration-only until a separately owned report driver
+/// establishes that its database and account are isolated.
+///
+/// A successful result means that the frozen application authority and the
+/// database evidence/upload bindings agree. It does not claim that remote
+/// object bytes are currently readable or that an employer still shows the
+/// submission.
+#[cfg(test)]
+fn validate_stored_submitted_receipt_parts(
+    account_id: &str,
+    application: &JobApplication,
+    evidence: &[ApplicationEvidence],
+    bindings: &[crate::db::object_uploads::ApplicationObjectBinding],
+) -> Result<()> {
+    let pre_submission = validated_submitted_pre_submission_application(account_id, application)?;
+    let fingerprint = application
+        .receipt
+        .get("_bluey_server_submission_fingerprint_v1")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| anyhow::anyhow!("submitted receipt fingerprint is missing"))?;
+    // The original API fingerprint includes uploaded bytes_base64 and original
+    // keys, which are not retained in these metadata rows. Do not pretend that
+    // this format check recomputes that request-content fingerprint.
+    let prepared = prepare_submission_evidence(&application.id, fingerprint, evidence, 0)?;
+    validate_submission_evidence_resume_bindings(
+        &prepared,
+        pre_submission
+            .resume_version_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("submitted application resume is missing"))?,
+    )?;
+    validate_submission_receipt_evidence(&application.receipt, &prepared)?;
+    validate_submission_object_bindings(&application.receipt, &prepared, bindings)
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoredReceiptValidation {
+    StoredMetadataValidated,
+    Unverifiable(&'static str),
+}
+
+#[cfg(test)]
+pub(crate) fn charge_stored_receipt_read_bytes(remaining: &mut usize, bytes: usize) -> Result<()> {
+    *remaining = remaining
+        .checked_sub(bytes)
+        .ok_or_else(|| anyhow::anyhow!("provider exposure report byte cap exceeded"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) const STORED_REPORT_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Project only bounded values out of SQL. Each row reserves a conservative
+/// JSON upper bound (six bytes per UTF-8 byte plus fixed field/number overhead).
+/// An oversized row returns NULL text sentinels and its small integer charge,
+/// never its original text. Callers charge that integer before copying fields.
+/// Identifiers/expressions here are exclusively compile-time-owned SQL, not input.
+#[cfg(test)]
+pub(crate) fn bounded_report_projection(
+    postgres: bool,
+    columns: &[&str],
+    text_indexes: &[usize],
+) -> String {
+    let lengths = text_indexes
+        .iter()
+        .map(|index| {
+            let column = columns[*index];
+            if postgres {
+                format!("COALESCE(octet_length({column})::bigint, 0)")
+            } else {
+                format!("COALESCE(length(CAST({column} AS BLOB)), 0)")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let charge = format!("(1024 + 6 * ({lengths}))");
+    let mut projection = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            if text_indexes.contains(&index) {
+                format!(
+                    "CASE WHEN {charge} <= {STORED_REPORT_BYTE_LIMIT} THEN {column} ELSE NULL END"
+                )
+            } else {
+                (*column).to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    projection.push(format!("{charge} AS report_row_bytes"));
+    projection.join(", ")
+}
+
+#[cfg(test)]
+pub(crate) fn charge_report_sql_row(remaining: &mut usize, bytes: i64) -> Result<()> {
+    let bytes = usize::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("provider exposure report byte cap exceeded"))?;
+    charge_stored_receipt_read_bytes(remaining, bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn charge_report_serialization(
+    remaining: &mut usize,
+    value: &impl Serialize,
+) -> Result<()> {
+    struct BudgetWriter<'a>(&'a mut usize);
+    impl std::io::Write for BudgetWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            *self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+                std::io::Error::other("provider exposure report byte cap exceeded")
+            })?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(BudgetWriter(remaining), value)?;
+    Ok(())
+}
+
+#[cfg(test)]
+type StoredSubmissionEvidenceRow = (String, String, String, String, i64, i64, String);
+
+#[cfg(test)]
+fn stored_submission_hashes(application: &JobApplication) -> Result<Vec<String>> {
+    let fingerprint = application
+        .receipt
+        .get("_bluey_server_submission_fingerprint_v1")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| anyhow::anyhow!("invalid stored submission fingerprint"))?;
+    let mut hashes = Vec::with_capacity(70);
+    for index in 0..14 {
+        for kind in [
+            "resume",
+            "cover_letter",
+            "attachment",
+            "application_receipt",
+            "submission_confirmation",
+        ] {
+            hashes.push(private_lookup_hash(
+                "jobs-final-submission-evidence",
+                &format!("{}:{fingerprint}:{index}:{kind}", application.id),
+            )?);
+        }
+    }
+    Ok(hashes)
+}
+
+#[cfg(test)]
+fn reconstruct_stored_submission_evidence(
+    application: &JobApplication,
+    hashes: &[String],
+    rows: Vec<StoredSubmissionEvidenceRow>,
+    cutoff_ms: i64,
+) -> Result<Vec<ApplicationEvidence>> {
+    if rows.is_empty() || rows.len() > 14 {
+        anyhow::bail!("stored submission evidence count is invalid")
+    }
+    let mut ordered = BTreeMap::new();
+    let mut ids = BTreeSet::new();
+    for (id, app_id, kind, hash, occurred, created, raw) in rows {
+        let ordinal = hashes
+            .iter()
+            .position(|value| value == &hash)
+            .ok_or_else(|| anyhow::anyhow!("unexpected stored submission hash"))?
+            / 5;
+        let value: ApplicationEvidence = parse_json(raw, "stored application evidence")?;
+        if id.trim().is_empty()
+            || value.id != id
+            || !ids.insert(id)
+            || app_id != application.id
+            || value.application_id != app_id
+            || value.kind != kind
+            || occurred <= 0
+            || created <= 0
+            || occurred > cutoff_ms
+            || created > cutoff_ms
+            || value.occurred_at_ms != occurred
+            || value.created_at_ms != created
+            || ordered.insert(ordinal, (hash, value)).is_some()
+        {
+            anyhow::bail!("stored submission evidence identity is invalid")
+        }
+    }
+    if ordered.keys().copied().ne(0..ordered.len()) {
+        anyhow::bail!("stored submission evidence ordinals are not contiguous")
+    }
+    let (stored_hashes, values): (Vec<_>, Vec<_>) = ordered.into_values().unzip();
+    let fingerprint = application.receipt["_bluey_server_submission_fingerprint_v1"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing fingerprint"))?;
+    let prepared = prepare_submission_evidence(&application.id, fingerprint, &values, 0)?;
+    if prepared
+        .iter()
+        .zip(stored_hashes)
+        .any(|(item, hash)| item.provider_event_hash != hash)
+    {
+        anyhow::bail!("stored submission evidence ordinal/kind hash is invalid")
+    }
+    Ok(values)
+}
+
+#[cfg(test)]
+fn stored_report_application(
+    application_id: &str,
+    row: (String, String, Option<i64>, String, Option<String>),
+    receipt_start_ms: i64,
+    receipt_end_ms: i64,
+) -> Result<JobApplication> {
+    let (job_id, state, submitted_at_ms, raw, resume_version_id) = row;
+    // Do not use parse_application_json: it repairs mismatched payload IDs.
+    let application: JobApplication = parse_json(raw, "stored application")?;
+    if application.id != application_id
+        || application.job_id != job_id
+        || state != "submitted"
+        || application.state != state
+        || resume_version_id.as_deref().is_none_or(str::is_empty)
+        || application.resume_version_id != resume_version_id
+        || application.submitted_at_ms != submitted_at_ms
+        || submitted_at_ms
+            .is_none_or(|value| value <= 0 || value < receipt_start_ms || value >= receipt_end_ms)
+    {
+        anyhow::bail!("stored application state/window is invalid")
+    }
+    Ok(application)
+}
+
+#[cfg(test)]
+type StoredSubmissionObjectRow = (String, String, i64, String, String, String);
+
+#[cfg(test)]
+fn stored_report_object(
+    application_id: &str,
+    row: StoredSubmissionObjectRow,
+) -> Result<crate::db::object_uploads::ApplicationObjectBinding> {
+    let (upload_id, object_key, size_bytes, sha256, content_type, raw) = row;
+    let metadata: Value = parse_json(raw, "stored submission object metadata")?;
+    if upload_id.trim().is_empty()
+        || size_bytes <= 0
+        || metadata.get("jobs_application_id").and_then(Value::as_str) != Some(application_id)
+    {
+        anyhow::bail!("stored submission object binding is invalid")
+    }
+    Ok(crate::db::object_uploads::ApplicationObjectBinding {
+        upload_id,
+        object_key,
+        size_bytes,
+        sha256,
+        content_type,
+    })
+}
+
+/// Only SQL/driver/key configuration failures escape as Err. Invalid stored
+/// content has a closed, explicitly counted outcome; it is never a receipt.
+#[cfg(test)]
+pub(crate) fn validate_stored_submitted_receipt_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    receipt_start_ms: i64,
+    receipt_end_ms: i64,
+    cutoff_ms: i64,
+    remaining_bytes: &mut usize,
+) -> Result<StoredReceiptValidation> {
+    jobs_data_key()?;
+    let projection = bounded_report_projection(
+        false,
+        &[
+            "job_id",
+            "state",
+            "submitted_at_ms",
+            "application_json",
+            "resume_version_id",
+        ],
+        &[0, 1, 3, 4],
+    );
+    let raw = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT {projection} FROM jobs_applications
+            WHERE account_id = ?1 AND id = ?2"
+        ))?;
+        let mut rows = stmt.query(params![account_id, application_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(StoredReceiptValidation::Unverifiable("missing_application"));
+        };
+        charge_report_sql_row(remaining_bytes, row.get(5)?)?;
+        (
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        )
+    };
+    let application =
+        match stored_report_application(application_id, raw, receipt_start_ms, receipt_end_ms) {
+            Ok(value) => value,
+            Err(_) => return Ok(StoredReceiptValidation::Unverifiable("invalid_application")),
+        };
+    // Lookup only the finalization namespace, in its original ordinal order.
+    // Unrelated pre-submit/history evidence is intentionally untouched.
+    let hashes = match stored_submission_hashes(&application) {
+        Ok(value) => value,
+        Err(_) => return Ok(StoredReceiptValidation::Unverifiable("invalid_fingerprint")),
+    };
+    let placeholders = vec!["?"; hashes.len()].join(",");
+    let projection = bounded_report_projection(
+        false,
+        &[
+            "id",
+            "application_id",
+            "kind",
+            "provider_event_hash",
+            "occurred_at_ms",
+            "created_at_ms",
+            "evidence_json",
+        ],
+        &[0, 1, 2, 3, 6],
+    );
+    let sql = format!(
+        "SELECT {projection} FROM jobs_application_evidence
+        WHERE account_id = ? AND application_id = ? AND provider_event_hash IN ({placeholders})
+        LIMIT 15"
+    );
+    let rows = {
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(
+            std::iter::once(account_id)
+                .chain(std::iter::once(application_id))
+                .chain(hashes.iter().map(String::as_str)),
+        ))?;
+        let mut values = Vec::new();
+        while let Some(row) = rows.next()? {
+            if values.len() == 14 {
+                anyhow::bail!("stored receipt evidence row cap exceeded")
+            }
+            charge_report_sql_row(remaining_bytes, row.get(7)?)?;
+            values.push((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ));
+        }
+        values
+    };
+    let evidence =
+        match reconstruct_stored_submission_evidence(&application, &hashes, rows, cutoff_ms) {
+            Ok(value) => value,
+            Err(_) => return Ok(StoredReceiptValidation::Unverifiable("invalid_evidence")),
+        };
+    let projection = bounded_report_projection(
+        false,
+        &[
+            "id",
+            "object_key",
+            "size_bytes",
+            "sha256",
+            "content_type",
+            "metadata_json",
+        ],
+        &[0, 1, 3, 4, 5],
+    );
+    let sql = format!(
+        "SELECT {projection} FROM object_uploads
+        WHERE account_id = ?1 AND object_key = ?2 AND object_kind = 'artifact'
+          AND session_id IS NULL AND state = 'ready' LIMIT 2"
+    );
+    let mut objects = Vec::new();
+    for key in evidence.iter().map(|item| item.storage_key.as_str()) {
+        let mut stmt = tx.prepare(&sql)?;
+        let mut rows = stmt.query(params![account_id, key])?;
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            charge_report_sql_row(remaining_bytes, row.get(6)?)?;
+            objects.push((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ));
+            count += 1;
+        }
+        if count != 1 {
+            return Ok(StoredReceiptValidation::Unverifiable(
+                "missing_or_ambiguous_object",
+            ));
+        }
+    }
+    finish_stored_report_validation(account_id, &application, &evidence, objects)
+}
+
+#[cfg(test)]
+pub(crate) fn validate_stored_submitted_receipt_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    receipt_start_ms: i64,
+    receipt_end_ms: i64,
+    cutoff_ms: i64,
+    remaining_bytes: &mut usize,
+) -> Result<StoredReceiptValidation> {
+    use postgres::fallible_iterator::FallibleIterator;
+    jobs_data_key()?;
+    let projection = bounded_report_projection(
+        true,
+        &[
+            "job_id",
+            "state",
+            "submitted_at_ms",
+            "application_json",
+            "resume_version_id",
+        ],
+        &[0, 1, 3, 4],
+    );
+    let Some(row) = tx.query_opt(
+        &format!(
+            "SELECT {projection} FROM jobs_applications
+        WHERE account_id = $1 AND id = $2"
+        ),
+        &[&account_id, &application_id],
+    )?
+    else {
+        return Ok(StoredReceiptValidation::Unverifiable("missing_application"));
+    };
+    charge_report_sql_row(remaining_bytes, row.try_get(5)?)?;
+    let raw = (
+        row.try_get(0)?,
+        row.try_get(1)?,
+        row.try_get(2)?,
+        row.try_get(3)?,
+        row.try_get(4)?,
+    );
+    drop(row);
+    let application =
+        match stored_report_application(application_id, raw, receipt_start_ms, receipt_end_ms) {
+            Ok(value) => value,
+            Err(_) => return Ok(StoredReceiptValidation::Unverifiable("invalid_application")),
+        };
+    let hashes = match stored_submission_hashes(&application) {
+        Ok(value) => value,
+        Err(_) => return Ok(StoredReceiptValidation::Unverifiable("invalid_fingerprint")),
+    };
+    let projection = bounded_report_projection(
+        true,
+        &[
+            "id",
+            "application_id",
+            "kind",
+            "provider_event_hash",
+            "occurred_at_ms",
+            "created_at_ms",
+            "evidence_json",
+        ],
+        &[0, 1, 2, 3, 6],
+    );
+    let sql = format!(
+        "SELECT {projection} FROM jobs_application_evidence
+        WHERE account_id = $1 AND application_id = $2 AND provider_event_hash = ANY($3)
+        LIMIT 15"
+    );
+    let rows = {
+        let params: &[&(dyn postgres::types::ToSql + Sync)] =
+            &[&account_id, &application_id, &hashes];
+        let mut rows = tx.query_raw(&sql, params.iter().copied())?;
+        let mut values = Vec::new();
+        while let Some(row) = rows.next()? {
+            if values.len() == 14 {
+                anyhow::bail!("stored receipt evidence row cap exceeded")
+            }
+            charge_report_sql_row(remaining_bytes, row.try_get(7)?)?;
+            values.push((
+                row.try_get(0)?,
+                row.try_get(1)?,
+                row.try_get(2)?,
+                row.try_get(3)?,
+                row.try_get(4)?,
+                row.try_get(5)?,
+                row.try_get(6)?,
+            ));
+        }
+        values
+    };
+    let evidence =
+        match reconstruct_stored_submission_evidence(&application, &hashes, rows, cutoff_ms) {
+            Ok(value) => value,
+            Err(_) => return Ok(StoredReceiptValidation::Unverifiable("invalid_evidence")),
+        };
+    let projection = bounded_report_projection(
+        true,
+        &[
+            "id",
+            "object_key",
+            "size_bytes",
+            "sha256",
+            "content_type",
+            "metadata_json",
+        ],
+        &[0, 1, 3, 4, 5],
+    );
+    let sql = format!(
+        "SELECT {projection} FROM object_uploads
+        WHERE account_id = $1 AND object_key = $2 AND object_kind = 'artifact'
+          AND session_id IS NULL AND state = 'ready' LIMIT 2"
+    );
+    let mut objects = Vec::new();
+    for key in evidence.iter().map(|item| item.storage_key.as_str()) {
+        let params: &[&(dyn postgres::types::ToSql + Sync)] = &[&account_id, &key];
+        let mut rows = tx.query_raw(&sql, params.iter().copied())?;
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            charge_report_sql_row(remaining_bytes, row.try_get(6)?)?;
+            objects.push((
+                row.try_get(0)?,
+                row.try_get(1)?,
+                row.try_get(2)?,
+                row.try_get(3)?,
+                row.try_get(4)?,
+                row.try_get(5)?,
+            ));
+            count += 1;
+        }
+        if count != 1 {
+            return Ok(StoredReceiptValidation::Unverifiable(
+                "missing_or_ambiguous_object",
+            ));
+        }
+    }
+    finish_stored_report_validation(account_id, &application, &evidence, objects)
+}
+
+#[cfg(test)]
+fn finish_stored_report_validation(
+    account_id: &str,
+    application: &JobApplication,
+    evidence: &[ApplicationEvidence],
+    objects: Vec<StoredSubmissionObjectRow>,
+) -> Result<StoredReceiptValidation> {
+    let bindings = match objects
+        .into_iter()
+        .map(|row| stored_report_object(&application.id, row))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return Ok(StoredReceiptValidation::Unverifiable(
+                "invalid_object_metadata",
+            ))
+        }
+    };
+    match validate_stored_submitted_receipt_parts(account_id, application, evidence, &bindings) {
+        Ok(()) => Ok(StoredReceiptValidation::StoredMetadataValidated),
+        Err(_) => Ok(StoredReceiptValidation::Unverifiable(
+            "invalid_frozen_receipt_bindings",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod provider_exposure_receipt_tests {
+    use super::*;
+    use crate::db::jobs_provider_cost_holds::{
+        read_provider_exposure_report, ProviderExposureWindow,
+    };
+
+    fn commit_receipt(pool: &DbPool, suffix: &str) -> JobApplication {
+        let mut fixture = super::tests::final_submission_fixture(pool, suffix);
+        fixture.fingerprint = hex::encode(Sha256::digest(suffix.as_bytes()));
+        fixture.receipt["_bluey_server_submission_fingerprint_v1"] = json!(fixture.fingerprint);
+        // Stored insertion order intentionally disagrees with timestamp order.
+        // UUIDs and zero timestamps must be bound by normal finalization first.
+        fixture.evidence[0].occurred_at_ms = now_ms() - 1;
+        fixture.evidence[1].occurred_at_ms = now_ms() - 3;
+        fixture.evidence[2].occurred_at_ms = now_ms() - 2;
+        let mut history = fixture.evidence[0].clone();
+        history.id = format!("older-{suffix}");
+        history.storage_key = format!("older/{suffix}/resume.pdf");
+        history.created_at_ms = 1;
+        history.occurred_at_ms = 1;
+        save_application_evidence(pool, "acct-jobs", &history).unwrap();
+        match finalize_submission(
+            pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            "cloud",
+            fixture.receipt,
+            &fixture.fingerprint,
+            &fixture.evidence,
+            &fixture.object_uploads,
+            &fixture.session,
+            None,
+        )
+        .unwrap()
+        {
+            SubmissionFinalizeResult::Committed(application) => application,
+            SubmissionFinalizeResult::Replayed(_) => panic!("fixture must finalize once"),
+        }
+    }
+
+    fn current_window(pool: &DbPool) -> ProviderExposureWindow {
+        // Advance beyond the inclusive creation/submission millisecond without
+        // making the report accept caller-provided time-travel authority.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let end = match pool {
+            DbPool::Sqlite(_) => {
+                let mut conn = pool.get().unwrap();
+                let tx = conn.transaction().unwrap();
+                let now = original_source_db_now_sqlite(&tx).unwrap();
+                tx.rollback().unwrap();
+                now
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg().unwrap();
+                let mut tx = conn.transaction().unwrap();
+                let now =
+                    super::super::jobs_provider_cost_holds::postgres_transaction_now_ms(&mut tx)
+                        .unwrap();
+                tx.rollback().unwrap();
+                now
+            }
+        };
+        ProviderExposureWindow {
+            attempt_start_ms: end - 60_000,
+            attempt_end_ms: end,
+            receipt_start_ms: end - 60_000,
+            receipt_end_ms: end,
+            as_of_ms: 0,
+        }
+    }
+
+    fn state(pool: &DbPool) -> Vec<(String, Vec<String>)> {
+        let conn = pool.get().unwrap();
+        [
+            "accounts",
+            "jobs_provider_cost_holds",
+            "usage_events",
+            "jobs_applications",
+            "jobs_application_evidence",
+            "object_uploads",
+            "jobs_browser_sessions",
+            "jobs_execution_leases",
+        ]
+        .into_iter()
+        .map(|table| {
+            let mut stmt = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|values| format!("{values:?}"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (table.to_string(), rows)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn sqlite_exposure_receipt_uses_original_ordinals_and_preserves_all_stored_state() {
+        let pool = super::tests::test_pool();
+        let application = commit_receipt(&pool, "exposure-receipt-order");
+        // Historical metadata validation must not require a live lease.
+        pool.get().unwrap().execute(
+            "UPDATE jobs_execution_leases SET lease_expires_at_ms = 1 WHERE application_id = ?1",
+            params![application.id],
+        ).unwrap();
+        let window = current_window(&pool);
+        let before = state(&pool);
+        for _ in 0..2 {
+            let report = read_provider_exposure_report(&pool, "acct-jobs", window).unwrap();
+            assert_eq!(
+                report.stored_receipt_metadata_consistent_application_ids,
+                vec![application.id.clone()]
+            );
+            assert!(report.unverifiable_receipts.is_empty());
+            assert!(report.stored_receipt_bindings_revalidated);
+            assert_eq!(report.remote_object_bytes, "not_checked");
+            assert_eq!(report.employer_delivery, "not_checked");
+            assert!(!report.original_request_fingerprint_recomputed);
+            assert_eq!(report.completeness, "unverifiable");
+            assert_eq!(report.per_success_ratio, "unavailable");
+        }
+        assert_eq!(state(&pool), before);
+        assert_eq!(
+            list_application_evidence(&pool, "acct-jobs", Some(&application.id))
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn sqlite_exposure_receipt_tampered_sql_and_payload_identities_fail_closed() {
+        let pool = super::tests::test_pool();
+        let application = commit_receipt(&pool, "exposure-receipt-tamper");
+        let window = current_window(&pool);
+        let conn = pool.get().unwrap();
+        let (id, raw): (String, String) = conn
+            .query_row(
+                "SELECT id, evidence_json FROM jobs_application_evidence
+             WHERE application_id = ?1 AND kind = 'application_receipt'",
+                params![application.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let original: ApplicationEvidence = parse_json(raw.clone(), "test evidence").unwrap();
+        let mut wrong_id = original.clone();
+        wrong_id.id = "forged-evidence-id".into();
+        let mut wrong_time = original.clone();
+        wrong_time.created_at_ms = 0;
+        let mut wrong_application = original.clone();
+        wrong_application.application_id = "other-application".into();
+        for item in [wrong_id, wrong_time, wrong_application] {
+            conn.execute(
+                "UPDATE jobs_application_evidence SET evidence_json = ?2 WHERE id = ?1",
+                params![id, to_json(&item, "test evidence").unwrap()],
+            )
+            .unwrap();
+            let before = state(&pool);
+            let report = read_provider_exposure_report(&pool, "acct-jobs", window).unwrap();
+            assert!(report
+                .stored_receipt_metadata_consistent_application_ids
+                .is_empty());
+            assert_eq!(
+                report.unverifiable_receipts.get("invalid_evidence"),
+                Some(&1)
+            );
+            assert!(!report.stored_receipt_bindings_revalidated);
+            assert_eq!(state(&pool), before);
+        }
+        conn.execute(
+            "UPDATE jobs_application_evidence SET evidence_json = ?2, kind = 'attachment'
+            WHERE id = ?1",
+            params![id, raw],
+        )
+        .unwrap();
+        let report = read_provider_exposure_report(&pool, "acct-jobs", window).unwrap();
+        assert_eq!(
+            report.unverifiable_receipts.get("invalid_evidence"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn sqlite_exposure_receipt_missing_ordinal_and_foreign_object_metadata_are_unverifiable() {
+        let pool = super::tests::test_pool();
+        let application = commit_receipt(&pool, "exposure-receipt-missing");
+        let window = current_window(&pool);
+        let conn = pool.get().unwrap();
+        let key = application.receipt["receiptObject"]["storageKey"]
+            .as_str()
+            .unwrap();
+        let original: String = conn
+            .query_row(
+                "SELECT metadata_json FROM object_uploads
+            WHERE account_id = 'acct-jobs' AND object_key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE object_uploads SET metadata_json = ?2 WHERE object_key = ?1",
+            params![
+                key,
+                json!({"jobs_application_id": "foreign-app"}).to_string()
+            ],
+        )
+        .unwrap();
+        let report = read_provider_exposure_report(&pool, "acct-jobs", window).unwrap();
+        assert_eq!(
+            report.unverifiable_receipts.get("invalid_object_metadata"),
+            Some(&1)
+        );
+        conn.execute(
+            "UPDATE object_uploads SET metadata_json = ?2 WHERE object_key = ?1",
+            params![key, original],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM jobs_application_evidence WHERE application_id = ?1
+            AND kind = 'application_receipt'",
+            params![application.id],
+        )
+        .unwrap();
+        let report = read_provider_exposure_report(&pool, "acct-jobs", window).unwrap();
+        assert!(report
+            .stored_receipt_metadata_consistent_application_ids
+            .is_empty());
+        assert_eq!(
+            report.unverifiable_receipts.get("invalid_evidence"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn sqlite_exposure_receipt_sql_state_payload_mismatch_and_late_rows_are_distinct() {
+        let pool = super::tests::test_pool();
+        let application = commit_receipt(&pool, "exposure-receipt-window");
+        let window = current_window(&pool);
+        let mut late = window;
+        late.attempt_end_ms = application.submitted_at_ms.unwrap() - 1;
+        late.receipt_end_ms = application.submitted_at_ms.unwrap();
+        let report = read_provider_exposure_report(&pool, "acct-jobs", late).unwrap();
+        assert_eq!(report.unvalidated_late_submitted_applications, 1);
+        assert!(report
+            .stored_receipt_metadata_consistent_application_ids
+            .is_empty());
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET submitted_at_ms = submitted_at_ms - 1
+            WHERE id = ?1",
+                params![application.id],
+            )
+            .unwrap();
+        let report = read_provider_exposure_report(&pool, "acct-jobs", window).unwrap();
+        assert_eq!(
+            report.unverifiable_receipts.get("invalid_application"),
+            Some(&1)
+        );
+        let other =
+            crate::db::accounts::Account::create(&pool, "exposure-other@example.test", "hash")
+                .unwrap();
+        let report = read_provider_exposure_report(&pool, &other.id, window).unwrap();
+        assert!(report
+            .stored_receipt_metadata_consistent_application_ids
+            .is_empty());
+        assert!(report.unverifiable_receipts.is_empty());
+    }
+
+    #[test]
+    fn sqlite_exposure_receipt_database_errors_propagate_instead_of_becoming_invalid_content() {
+        let pool = super::tests::test_pool();
+        commit_receipt(&pool, "exposure-receipt-db-error");
+        let window = current_window(&pool);
+        pool.get()
+            .unwrap()
+            .execute(
+                "ALTER TABLE jobs_application_evidence
+            RENAME TO intentionally_unavailable_evidence",
+                [],
+            )
+            .unwrap();
+        assert!(read_provider_exposure_report(&pool, "acct-jobs", window).is_err());
+    }
+
+    fn financial_families(pool: &DbPool) -> Value {
+        let mut snapshot = serde_json::Map::new();
+        for table in [
+            "jobs_provider_cost_holds",
+            "usage_events",
+            "jobs_application_evidence",
+            "object_uploads",
+            "accounts",
+        ] {
+            let mut rows: Vec<Value> = match pool {
+                DbPool::Sqlite(_) => {
+                    let conn = pool.get().unwrap();
+                    let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+                    let columns = stmt
+                        .column_names()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    let rows = stmt
+                        .query_map([], |row| {
+                            let mut object = serde_json::Map::new();
+                            for (index, column) in columns.iter().enumerate() {
+                                use rusqlite::types::ValueRef;
+                                let value = match row.get_ref(index)? {
+                                    ValueRef::Null => Value::Null,
+                                    ValueRef::Integer(value) => json!(value),
+                                    ValueRef::Real(value) => json!(value),
+                                    ValueRef::Text(value) => json!(String::from_utf8_lossy(value)),
+                                    ValueRef::Blob(value) => json!(hex::encode(value)),
+                                };
+                                object.insert(column.clone(), value);
+                            }
+                            Ok(Value::Object(object))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    rows
+                }
+                DbPool::Postgres(_) => pool
+                    .get_pg()
+                    .unwrap()
+                    .query(
+                        &format!("SELECT to_jsonb(snapshot_row) FROM {table} snapshot_row"),
+                        &[],
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get(0))
+                    .collect(),
+            };
+            rows.sort_by_key(Value::to_string);
+            snapshot.insert(table.to_string(), json!(rows));
+        }
+        Value::Object(snapshot)
+    }
+
+    fn complete_snapshot(pool: &DbPool) -> Value {
+        json!({"authority": super::tests::authenticated_worker_submit_snapshot(pool),
+            "financial": financial_families(pool)})
+    }
+
+    fn seed_exposure_lifecycle(pool: &DbPool, suffix: &str) -> JobApplication {
+        use crate::db::jobs_provider_cost_holds::{
+            reserve, settle_with_usage, CostHoldReservation,
+        };
+        use crate::db::usage::UsageEvent;
+        use crate::{config::UpstreamSpendGuard, pricing::UsageProvenance};
+        // This real empty-state observation applies only to this fresh fixture.
+        // It is not passed into the report as historical completeness authority.
+        let empty = financial_families(pool);
+        for table in [
+            "jobs_provider_cost_holds",
+            "usage_events",
+            "jobs_application_evidence",
+            "object_uploads",
+        ] {
+            assert!(
+                empty[table].as_array().unwrap().is_empty(),
+                "fresh fixture: {table}"
+            );
+        }
+        for (id, projected, cost, provenance, task_type) in [
+            (
+                "accepted",
+                12,
+                3,
+                UsageProvenance::Exact,
+                "jobs_resume_tailoring_accepted",
+            ),
+            (
+                "rejected",
+                8,
+                2,
+                UsageProvenance::Estimated,
+                "jobs_resume_tailoring_rejected_truth",
+            ),
+            (
+                "unknown",
+                10,
+                0,
+                UsageProvenance::Missing,
+                "jobs_resume_tailoring_rejected_timeout",
+            ),
+            ("held", 7, 0, UsageProvenance::Missing, ""),
+        ] {
+            assert!(matches!(
+                reserve(
+                    pool,
+                    "acct-jobs",
+                    &format!("router:{id}:llm"),
+                    &format!("token:{id}"),
+                    id,
+                    "openai",
+                    "gpt-5.4-mini",
+                    projected,
+                    100_000,
+                    UpstreamSpendGuard {
+                        limit_cents: 100_000,
+                        window_hours: 24
+                    }
+                )
+                .unwrap(),
+                CostHoldReservation::Held { .. }
+            ));
+            if task_type.is_empty() {
+                continue;
+            }
+            let event = UsageEvent {
+                request_id: id.into(),
+                kind: "jobs_resume_generation_attempt".into(),
+                task_type: Some(task_type.into()),
+                lane: Some("deep".into()),
+                provider: Some("openai".into()),
+                model: Some("gpt-5.4-mini".into()),
+                input_tokens: 20,
+                output_tokens: 10,
+                latency_ms: 5,
+                cost_cents_to_bluey: cost,
+                cost_cents_to_customer: 0,
+                was_speculative: false,
+                was_fallback: false,
+            };
+            settle_with_usage(
+                pool,
+                "acct-jobs",
+                id,
+                &format!("token:{id}"),
+                cost,
+                provenance,
+                &event,
+            )
+            .unwrap();
+        }
+        let application = commit_receipt(pool, &format!("{suffix}-submitted"));
+        let failed = super::tests::final_submission_fixture(pool, &format!("{suffix}-failed"));
+        let failed = update_application(pool, "acct-jobs", &failed.application.id, "failed", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.state, "failed");
+        application
+    }
+
+    fn assert_relational_resume_binding_is_required(
+        pool: &DbPool,
+        application: &JobApplication,
+        window: ProviderExposureWindow,
+    ) {
+        let original = application.resume_version_id.clone().unwrap();
+        let other = list_resume_versions(pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|resume| resume.id != original)
+            .expect("normal failed fixture has another resume");
+        assert!(get_resume_version(pool, "acct-jobs", &other.id)
+            .unwrap()
+            .is_some());
+        for binding in [None, Some(other.id)] {
+            match pool {
+                DbPool::Sqlite(_) => {
+                    pool.get()
+                        .unwrap()
+                        .execute(
+                            "UPDATE jobs_applications SET resume_version_id = ?2
+                        WHERE account_id = 'acct-jobs' AND id = ?1",
+                            params![application.id, binding],
+                        )
+                        .unwrap();
+                }
+                DbPool::Postgres(_) => {
+                    pool.get_pg()
+                        .unwrap()
+                        .execute(
+                            "UPDATE jobs_applications SET resume_version_id = $2
+                        WHERE account_id = 'acct-jobs' AND id = $1",
+                            &[&application.id, &binding],
+                        )
+                        .unwrap();
+                }
+            }
+            let before = complete_snapshot(pool);
+            let report = read_provider_exposure_report(pool, "acct-jobs", window).unwrap();
+            assert!(report
+                .stored_receipt_metadata_consistent_application_ids
+                .is_empty());
+            assert_eq!(
+                report.unverifiable_receipts.get("invalid_application"),
+                Some(&1)
+            );
+            assert!(!report.stored_receipt_bindings_revalidated);
+            assert_eq!(complete_snapshot(pool), before);
+            let after: Option<String> = match pool {
+                DbPool::Sqlite(_) => pool
+                    .get()
+                    .unwrap()
+                    .query_row(
+                        "SELECT resume_version_id FROM jobs_applications WHERE id = ?1",
+                        params![application.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                DbPool::Postgres(_) => pool
+                    .get_pg()
+                    .unwrap()
+                    .query_one(
+                        "SELECT resume_version_id FROM jobs_applications WHERE id = $1",
+                        &[&application.id],
+                    )
+                    .unwrap()
+                    .get(0),
+            };
+            assert_eq!(after, binding, "report cannot repair relational authority");
+        }
+        match pool {
+            DbPool::Sqlite(_) => {
+                pool.get()
+                    .unwrap()
+                    .execute(
+                        "UPDATE jobs_applications SET resume_version_id = ?2
+                    WHERE id = ?1",
+                        params![application.id, original],
+                    )
+                    .unwrap();
+            }
+            DbPool::Postgres(_) => {
+                pool.get_pg()
+                    .unwrap()
+                    .execute(
+                        "UPDATE jobs_applications SET resume_version_id = $2
+                    WHERE id = $1",
+                        &[&application.id, &original],
+                    )
+                    .unwrap();
+            }
+        }
+        let report = read_provider_exposure_report(pool, "acct-jobs", window).unwrap();
+        assert_eq!(
+            report.stored_receipt_metadata_consistent_application_ids,
+            vec![application.id.clone()]
+        );
+    }
+
+    fn assert_oversize_values_are_sql_suppressed(
+        pool: &DbPool,
+        application: &JobApplication,
+        window: ProviderExposureWindow,
+    ) {
+        let postgres = matches!(pool, DbPool::Postgres(_));
+        let read_text = |sqlite: &str, pg: &str| -> String {
+            match pool {
+                DbPool::Sqlite(_) => pool
+                    .get()
+                    .unwrap()
+                    .query_row(sqlite, [], |row| row.get(0))
+                    .unwrap(),
+                DbPool::Postgres(_) => pool.get_pg().unwrap().query_one(pg, &[]).unwrap().get(0),
+            }
+        };
+        let hold = read_text(
+            "SELECT request_scope_hash FROM jobs_provider_cost_holds
+            WHERE reservation_token = 'token:accepted'",
+            "SELECT request_scope_hash
+            FROM jobs_provider_cost_holds WHERE reservation_token = 'token:accepted'",
+        );
+        let usage = read_text(
+            "SELECT id FROM usage_events WHERE request_id = 'accepted'",
+            "SELECT id FROM usage_events WHERE request_id = 'accepted'",
+        );
+        let evidence = read_text(
+            "SELECT id FROM jobs_application_evidence WHERE kind = 'application_receipt'",
+            "SELECT id FROM jobs_application_evidence WHERE kind = 'application_receipt'",
+        );
+        let object = match pool {
+            DbPool::Sqlite(_) => pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT id FROM object_uploads WHERE object_key = ?1",
+                    params![application.receipt["receiptObject"]["storageKey"]
+                        .as_str()
+                        .unwrap()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            DbPool::Postgres(_) => pool
+                .get_pg()
+                .unwrap()
+                .query_one(
+                    "SELECT id FROM object_uploads WHERE object_key = $1",
+                    &[&application.receipt["receiptObject"]["storageKey"]
+                        .as_str()
+                        .unwrap()],
+                )
+                .unwrap()
+                .get::<_, String>(0),
+        };
+        // Character count alone fits; UTF-8 bytes exceed the SQL row budget.
+        let oversized = json!({"padding": "☃".repeat(STORED_REPORT_BYTE_LIMIT / 12)}).to_string();
+        assert!(1024 + 6 * oversized.chars().count() < STORED_REPORT_BYTE_LIMIT);
+        assert!(1024 + 6 * oversized.len() > STORED_REPORT_BYTE_LIMIT);
+        let before = complete_snapshot(pool);
+        let mut stored_report_rejections = 0;
+        let mut postgres_index_rejections = 0;
+        for (table, column, key_column, key) in [
+            (
+                "jobs_provider_cost_holds",
+                "model",
+                "request_scope_hash",
+                hold.as_str(),
+            ),
+            (
+                "jobs_provider_cost_holds",
+                "provider",
+                "request_scope_hash",
+                hold.as_str(),
+            ),
+            ("usage_events", "request_id", "id", usage.as_str()),
+            (
+                "jobs_applications",
+                "application_json",
+                "id",
+                application.id.as_str(),
+            ),
+            (
+                "jobs_application_evidence",
+                "evidence_json",
+                "id",
+                evidence.as_str(),
+            ),
+            ("object_uploads", "metadata_json", "id", object.as_str()),
+        ] {
+            if postgres && table == "usage_events" && column == "request_id" {
+                let mut connection = pool.get_pg().unwrap();
+                let index_state = |connection: &mut postgres::Client| {
+                    connection.query(
+                        "SELECT relation.relname, pg_get_indexdef(relation.oid),
+                                idx.indisvalid, idx.indisready
+                           FROM pg_index idx JOIN pg_class relation ON relation.oid = idx.indexrelid
+                          WHERE idx.indrelid = 'usage_events'::regclass
+                            AND relation.relname IN ('idx_usage_events_request', 'idx_usage_events_dedupe')
+                          ORDER BY relation.relname", &[],
+                    ).unwrap().into_iter().map(|row| (
+                        row.get::<_, String>(0), row.get::<_, String>(1),
+                        row.get::<_, bool>(2), row.get::<_, bool>(3),
+                    )).collect::<Vec<_>>()
+                };
+                let indexes_before = index_state(&mut connection);
+                assert_eq!(indexes_before.len(), 2);
+                assert!(indexes_before.iter().all(|row| row.2 && row.3));
+                let error = connection
+                    .execute(
+                        "UPDATE usage_events SET request_id = $2 WHERE id = $1",
+                        &[&key, &oversized],
+                    )
+                    .unwrap_err();
+                let database_error = error
+                    .as_db_error()
+                    .expect("expected indexed-size SQL error");
+                assert_eq!(
+                    database_error.code(),
+                    &postgres::error::SqlState::PROGRAM_LIMIT_EXCEEDED
+                );
+                assert!(database_error.message().starts_with("index row requires "));
+                assert_eq!(complete_snapshot(pool), before);
+
+                // PostgreSQL rejects this indexed value before storage, so it
+                // cannot be an actual oversized stored-row report fixture.
+                // Exercise the same projection on derived TEXT only; do not
+                // bypass indexes or credit this as that impossible report path.
+                let projection = bounded_report_projection(true, &["request_id"], &[0]);
+                let row = connection.query_one(
+                    &format!("SELECT {projection} FROM (SELECT $1::text AS request_id) AS synthetic_usage"),
+                    &[&oversized],
+                ).unwrap();
+                assert!(row.get::<_, Option<String>>(0).is_none());
+                assert!(row.get::<_, i64>(1) > STORED_REPORT_BYTE_LIMIT as i64);
+                assert_eq!(index_state(&mut connection), indexes_before);
+                assert_eq!(complete_snapshot(pool), before);
+                assert_eq!(
+                    read_provider_exposure_report(pool, "acct-jobs", window)
+                        .unwrap()
+                        .stored_receipt_metadata_consistent_application_ids,
+                    vec![application.id.clone()]
+                );
+                assert_eq!(complete_snapshot(pool), before);
+                postgres_index_rejections += 1;
+                continue;
+            }
+            let original: String = match pool {
+                DbPool::Sqlite(_) => pool
+                    .get()
+                    .unwrap()
+                    .query_row(
+                        &format!("SELECT {column} FROM {table} WHERE {key_column} = ?1"),
+                        params![key],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                DbPool::Postgres(_) => pool
+                    .get_pg()
+                    .unwrap()
+                    .query_one(
+                        &format!("SELECT {column} FROM {table} WHERE {key_column} = $1"),
+                        &[&key],
+                    )
+                    .unwrap()
+                    .get(0),
+            };
+            let write = |value: &str| match pool {
+                DbPool::Sqlite(_) => {
+                    pool.get()
+                        .unwrap()
+                        .execute(
+                            &format!("UPDATE {table} SET {column} = ?2 WHERE {key_column} = ?1"),
+                            params![key, value],
+                        )
+                        .unwrap();
+                }
+                DbPool::Postgres(_) => {
+                    pool.get_pg()
+                        .unwrap()
+                        .execute(
+                            &format!("UPDATE {table} SET {column} = $2 WHERE {key_column} = $1"),
+                            &[&key, &value],
+                        )
+                        .unwrap();
+                }
+            };
+            write(&oversized);
+            let projection = bounded_report_projection(postgres, &[column], &[0]);
+            let (suppressed, charge): (Option<String>, i64) = match pool {
+                DbPool::Sqlite(_) => pool
+                    .get()
+                    .unwrap()
+                    .query_row(
+                        &format!("SELECT {projection} FROM {table} WHERE {key_column} = ?1"),
+                        params![key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap(),
+                DbPool::Postgres(_) => {
+                    let row = pool
+                        .get_pg()
+                        .unwrap()
+                        .query_one(
+                            &format!("SELECT {projection} FROM {table} WHERE {key_column} = $1"),
+                            &[&key],
+                        )
+                        .unwrap();
+                    (row.get(0), row.get(1))
+                }
+            };
+            assert!(
+                suppressed.is_none(),
+                "oversized {table}.{column} must never leave SQL"
+            );
+            assert!(charge > STORED_REPORT_BYTE_LIMIT as i64);
+            let error = read_provider_exposure_report(pool, "acct-jobs", window).unwrap_err();
+            assert!(error.to_string().contains("byte cap"));
+            write(&original);
+            assert_eq!(complete_snapshot(pool), before);
+            assert_eq!(
+                read_provider_exposure_report(pool, "acct-jobs", window)
+                    .unwrap()
+                    .stored_receipt_metadata_consistent_application_ids,
+                vec![application.id.clone()]
+            );
+            stored_report_rejections += 1;
+        }
+        assert_eq!(stored_report_rejections, if postgres { 5 } else { 6 });
+        assert_eq!(postgres_index_rejections, usize::from(postgres));
+    }
+
+    #[test]
+    fn sqlite_exposure_receipt_relational_resume_null_and_mismatch_are_unverifiable() {
+        let pool = super::tests::test_pool();
+        let application = seed_exposure_lifecycle(&pool, "exposure-relational-resume");
+        let window = current_window(&pool);
+        assert_relational_resume_binding_is_required(&pool, &application, window);
+    }
+
+    #[test]
+    fn sqlite_exposure_receipt_oversize_utf8_values_are_null_before_transport() {
+        let pool = super::tests::test_pool();
+        let application = seed_exposure_lifecycle(&pool, "exposure-sql-source-bound");
+        let window = current_window(&pool);
+        assert_oversize_values_are_sql_suppressed(&pool, &application, window);
+    }
+
+    #[test]
+    fn sqlite_exposure_report_combines_failed_work_with_stored_metadata_denominator() {
+        let pool = super::tests::test_pool();
+        let application = seed_exposure_lifecycle(&pool, "exposure-combined-sqlite");
+        let window = current_window(&pool);
+        let before = complete_snapshot(&pool);
+        let report = read_provider_exposure_report(&pool, "acct-jobs", window).unwrap();
+        assert_eq!(report.provider_exposure_cents, 28);
+        assert_eq!(report.accepted_attempt_events, 1);
+        assert_eq!(report.rejected_attempt_events, 2);
+        assert_eq!(report.failed_or_unsubmitted_applications, 1);
+        assert_eq!(
+            report.stored_receipt_metadata_consistent_application_ids,
+            vec![application.id]
+        );
+        assert_eq!(report.per_success_ratio, "unavailable");
+        assert_eq!(complete_snapshot(&pool), before);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_exposure_report_matches_sqlite_metadata_lifecycle_and_rejects_tampering() {
+        let Some(postgres_pool) = super::tests::postgres_authenticated_worker_pool_or_skip(
+            "postgres_exposure_report_matches_sqlite_metadata_lifecycle_and_rejects_tampering",
+        ) else {
+            return;
+        };
+        let sqlite_pool = super::tests::test_pool();
+        let mut summaries = Vec::new();
+        for (pool, suffix) in [
+            (&sqlite_pool, "exposure-sqlite-parity"),
+            (&postgres_pool, "exposure-postgres-parity"),
+        ] {
+            let application = seed_exposure_lifecycle(pool, suffix);
+            let window = current_window(pool);
+            let before = complete_snapshot(pool);
+            for _ in 0..2 {
+                let report = read_provider_exposure_report(pool, "acct-jobs", window).unwrap();
+                assert_eq!(report.provider_exposure_cents, 28);
+                assert_eq!(report.held_unresolved_projection_cents, 7);
+                assert_eq!(report.settled_exact_usage_priced_cents, 3);
+                assert_eq!(report.settled_estimated_conservative_cents, 8);
+                assert_eq!(report.settled_missing_conservative_cents, 10);
+                assert_eq!(report.failed_or_unsubmitted_applications, 1);
+                assert_eq!(
+                    report.stored_receipt_metadata_consistent_application_ids,
+                    vec![application.id.clone()]
+                );
+                assert!(report.unverifiable_receipts.is_empty());
+                assert_eq!(report.completeness, "unverifiable");
+                assert_eq!(report.per_success_ratio, "unavailable");
+            }
+            assert_eq!(complete_snapshot(pool), before);
+            let report = read_provider_exposure_report(pool, "acct-jobs", window).unwrap();
+            summaries.push((
+                report.provider_exposure_cents,
+                report.held_unresolved_projection_cents,
+                report.settled_exact_usage_priced_cents,
+                report.settled_estimated_conservative_cents,
+                report.settled_missing_conservative_cents,
+                report.missing_usage_linkage_holds,
+                report
+                    .stored_receipt_metadata_consistent_application_ids
+                    .len(),
+                report.failed_or_unsubmitted_applications,
+            ));
+            assert_relational_resume_binding_is_required(pool, &application, window);
+            assert_oversize_values_are_sql_suppressed(pool, &application, window);
+        }
+        assert_eq!(summaries[0], summaries[1]);
+        let window = current_window(&postgres_pool);
+        let application = list_applications(&postgres_pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|item| item.state == "submitted")
+            .unwrap();
+        let mut late = window;
+        late.attempt_end_ms = application.submitted_at_ms.unwrap() - 1;
+        late.receipt_end_ms = application.submitted_at_ms.unwrap();
+        let report = read_provider_exposure_report(&postgres_pool, "acct-jobs", late).unwrap();
+        assert_eq!(report.unvalidated_late_submitted_applications, 1);
+        assert!(report
+            .stored_receipt_metadata_consistent_application_ids
+            .is_empty());
+        assert_eq!(report.per_success_ratio, "unavailable");
+        let foreign = crate::db::accounts::Account::create(
+            &postgres_pool,
+            "exposure-pg-other@example.test",
+            "synthetic-hash",
+        )
+        .unwrap();
+        let report = read_provider_exposure_report(&postgres_pool, &foreign.id, window).unwrap();
+        assert_eq!(report.provider_exposure_cents, 0);
+        assert!(report
+            .stored_receipt_metadata_consistent_application_ids
+            .is_empty());
+        use crate::db::jobs_provider_cost_holds::{
+            reserve, settle_with_usage, CostHoldReservation,
+        };
+        let guard = crate::config::UpstreamSpendGuard {
+            limit_cents: 100_000,
+            window_hours: 24,
+        };
+        for request_id in ["pg-exact-zero", "pg-predispatch-release"] {
+            assert!(matches!(
+                reserve(
+                    &postgres_pool,
+                    "acct-jobs",
+                    request_id,
+                    request_id,
+                    request_id,
+                    "openai",
+                    "gpt-5.4-mini",
+                    4,
+                    100_000,
+                    guard
+                )
+                .unwrap(),
+                CostHoldReservation::Held { .. }
+            ));
+        }
+        let zero_event = crate::db::usage::UsageEvent {
+            request_id: "pg-exact-zero".into(),
+            kind: "jobs_resume_generation_attempt".into(),
+            task_type: Some("jobs_resume_tailoring_accepted".into()),
+            lane: Some("deep".into()),
+            provider: Some("openai".into()),
+            model: Some("gpt-5.4-mini".into()),
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: 1,
+            cost_cents_to_bluey: 0,
+            cost_cents_to_customer: 0,
+            was_speculative: false,
+            was_fallback: false,
+        };
+        settle_with_usage(
+            &postgres_pool,
+            "acct-jobs",
+            "pg-exact-zero",
+            "pg-exact-zero",
+            0,
+            crate::pricing::UsageProvenance::Exact,
+            &zero_event,
+        )
+        .unwrap();
+        let mut conn = postgres_pool.get_pg().unwrap();
+        conn.execute(
+            "UPDATE jobs_provider_cost_holds SET status = 'released'
+            WHERE reservation_token = 'pg-predispatch-release'",
+            &[],
+        )
+        .unwrap();
+        let window = current_window(&postgres_pool);
+        let report = read_provider_exposure_report(&postgres_pool, "acct-jobs", window).unwrap();
+        assert_eq!(report.provider_exposure_cents, 28);
+        assert_eq!(report.released_nonexposed_holds, 1);
+        let release_event = crate::db::usage::UsageEvent {
+            request_id: "pg-predispatch-release".into(),
+            ..zero_event.clone()
+        };
+        crate::db::usage::record(&postgres_pool, "acct-jobs", &release_event).unwrap();
+        assert!(read_provider_exposure_report(&postgres_pool, "acct-jobs", window).is_err());
+        conn.execute(
+            "DELETE FROM usage_events WHERE request_id = 'pg-predispatch-release'",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM usage_events WHERE request_id = 'rejected'",
+            &[],
+        )
+        .unwrap();
+        let report = read_provider_exposure_report(&postgres_pool, "acct-jobs", window).unwrap();
+        assert_eq!(report.missing_usage_linkage_holds, 2);
+        assert_eq!(report.settled_missing_conservative_cents, 18);
+        let restored = crate::db::usage::UsageEvent {
+            request_id: "rejected".into(),
+            task_type: Some("jobs_resume_tailoring_rejected_truth".into()),
+            cost_cents_to_bluey: 8,
+            ..zero_event
+        };
+        crate::db::usage::record(&postgres_pool, "acct-jobs", &restored).unwrap();
+        let row = conn
+            .query_one(
+                "SELECT id, evidence_json FROM jobs_application_evidence
+            WHERE account_id = 'acct-jobs' AND kind = 'application_receipt'",
+                &[],
+            )
+            .unwrap();
+        let id: String = row.get(0);
+        let raw: String = row.get(1);
+        let mut evidence: ApplicationEvidence = parse_json(raw.clone(), "test evidence").unwrap();
+        evidence.id = "forged-pg-evidence-id".into();
+        conn.execute(
+            "UPDATE jobs_application_evidence SET evidence_json = $2 WHERE id = $1",
+            &[&id, &to_json(&evidence, "test evidence").unwrap()],
+        )
+        .unwrap();
+        let before = complete_snapshot(&postgres_pool);
+        let report = read_provider_exposure_report(&postgres_pool, "acct-jobs", window).unwrap();
+        assert!(report
+            .stored_receipt_metadata_consistent_application_ids
+            .is_empty());
+        assert_eq!(
+            report.unverifiable_receipts.get("invalid_evidence"),
+            Some(&1)
+        );
+        assert_eq!(complete_snapshot(&postgres_pool), before);
+        conn.execute(
+            "UPDATE jobs_application_evidence SET evidence_json = $2 WHERE id = $1",
+            &[&id, &raw],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE usage_events SET model = 'wrong-model' WHERE request_id = 'accepted'",
+            &[],
+        )
+        .unwrap();
+        let report = read_provider_exposure_report(&postgres_pool, "acct-jobs", window).unwrap();
+        assert_eq!(report.settled_exact_usage_priced_cents, 0);
+        assert_eq!(report.mismatched_usage_linkage_holds, 1);
+        assert_eq!(report.settled_missing_conservative_cents, 13);
+        // Deliberately corrupt only this required-fresh private fixture schema.
+        conn.execute("DROP INDEX idx_usage_events_dedupe", &[])
+            .unwrap();
+        conn.execute("INSERT INTO usage_events
+            (id, account_id, request_id, origin, kind, task_type, provider, model, cost_cents_to_bluey)
+            SELECT 'duplicate-pg-attempt', account_id, request_id, origin, kind, task_type, provider,
+                model, cost_cents_to_bluey FROM usage_events WHERE request_id = 'accepted'", &[])
+            .unwrap();
+        let before = complete_snapshot(&postgres_pool);
+        assert!(
+            read_provider_exposure_report(&postgres_pool, "acct-jobs", window)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate usage linkage")
+        );
+        assert_eq!(complete_snapshot(&postgres_pool), before);
+        conn.execute(
+            "DELETE FROM usage_events WHERE id = 'duplicate-pg-attempt'",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "ALTER TABLE jobs_application_evidence
+            RENAME TO intentionally_unavailable_evidence",
+            &[],
+        )
+        .unwrap();
+        assert!(read_provider_exposure_report(&postgres_pool, "acct-jobs", window).is_err());
+    }
+}
+
 struct ApprovedSubmissionSnapshot<'a> {
     packet: &'a Value,
     job: &'a Value,
@@ -2418,10 +4056,7 @@ fn approved_submission_snapshot<'a>(
     let admission = approved.get("admission");
     validate_approved_submission_admission(application, schema_version, admission)?;
     let checksum_admission = if matches!(schema_version, 2 | 3) {
-        Some(
-            admission
-                .ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?,
-        )
+        Some(admission.ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?)
     } else {
         None
     };

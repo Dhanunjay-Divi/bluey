@@ -987,6 +987,681 @@ pub fn settle_with_usage(
     })
 }
 
+/// Bounded private input. as_of_ms must be zero: only the database's current
+/// consistent snapshot is supported, not a reconstruction of historical rows.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ProviderExposureWindow {
+    pub attempt_start_ms: i64,
+    pub attempt_end_ms: i64,
+    pub receipt_start_ms: i64,
+    pub receipt_end_ms: i64,
+    pub as_of_ms: i64,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ProviderExposureReport {
+    pub window: ProviderExposureWindow,
+    pub physical_retention_ms: i64,
+    pub receipt_closeout_lag_ms: i64,
+    pub retention_safety_margin_ms: i64,
+    pub retention_window_satisfied: bool,
+    pub usage_query_start_ms: i64,
+    pub usage_timestamp_precision_ms: i64,
+    pub read_byte_limit: usize,
+    pub read_budget_basis: &'static str,
+    pub usage_boundary_ambiguous_events: usize,
+    pub held_unresolved_projection_cents: i64,
+    pub settled_exact_usage_priced_cents: i64,
+    pub settled_estimated_conservative_cents: i64,
+    pub settled_missing_conservative_cents: i64,
+    pub provider_exposure_cents: i64,
+    pub released_nonexposed_holds: usize,
+    pub missing_usage_linkage_holds: usize,
+    pub mismatched_usage_linkage_holds: usize,
+    pub unmatched_usage_events: usize,
+    pub late_usage_events: usize,
+    pub accepted_attempt_events: usize,
+    pub rejected_attempt_events: usize,
+    pub failed_or_unsubmitted_applications: usize,
+    pub unvalidated_late_submitted_applications: usize,
+    pub unvalidated_submitted_applications_outside_receipt_window: usize,
+    pub unverifiable_receipts: std::collections::BTreeMap<&'static str, usize>,
+    /// Stored metadata only, not employer delivery or object-byte readback.
+    pub stored_receipt_metadata_consistent_application_ids: Vec<String>,
+    pub stored_receipt_bindings_revalidated: bool,
+    pub usage_provenance_source: &'static str,
+    pub original_request_fingerprint_recomputed: bool,
+    pub remote_object_bytes: &'static str,
+    pub employer_delivery: &'static str,
+    pub completeness: &'static str,
+    pub per_success_ratio: &'static str,
+}
+
+#[cfg(test)]
+const MAX_PROVIDER_EXPOSURE_HOLDS: usize = 1_000;
+#[cfg(test)]
+const MAX_PROVIDER_EXPOSURE_USAGE_EVENTS: usize = 4_000;
+#[cfg(test)]
+const MAX_PROVIDER_EXPOSURE_RECEIPTS: usize = 1_000;
+#[cfg(test)]
+const MAX_PROVIDER_EXPOSURE_BYTES: usize = super::jobs::STORED_REPORT_BYTE_LIMIT;
+#[cfg(test)]
+const PROVIDER_EXPOSURE_SAFETY_MARGIN_MS: i64 = 60_000;
+
+#[cfg(test)]
+#[derive(Debug, serde::Serialize)]
+struct ExposureHold {
+    request_hash: String,
+    provider: String,
+    model: String,
+    projected: i64,
+    settled: i64,
+    provenance: String,
+    status: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+#[cfg(test)]
+#[derive(Debug, serde::Serialize)]
+struct ExposureUsage {
+    request_id: String,
+    provider: Option<String>,
+    model: Option<String>,
+    cost: i64,
+    task_type: Option<String>,
+    occurred_at_ms: i64,
+}
+
+#[cfg(test)]
+#[derive(Debug, serde::Serialize)]
+struct ExposureApplication {
+    id: String,
+    state: String,
+    submitted_at_ms: Option<i64>,
+}
+
+#[cfg(test)]
+struct ExposureSnapshot {
+    holds: Vec<ExposureHold>,
+    usage: Vec<ExposureUsage>,
+    applications: Vec<ExposureApplication>,
+    remaining_bytes: usize,
+}
+
+#[cfg(test)]
+fn current_exposure_window(
+    mut window: ProviderExposureWindow,
+    cutoff: i64,
+) -> Result<ProviderExposureWindow> {
+    if window.as_of_ms != 0
+        || cutoff <= 0
+        || window.attempt_start_ms <= 0
+        || window.attempt_start_ms >= window.attempt_end_ms
+        || window.attempt_end_ms > cutoff
+        || window.receipt_start_ms <= 0
+        || window.receipt_start_ms > window.attempt_start_ms
+        || window.receipt_end_ms < window.attempt_end_ms
+        || window.receipt_start_ms >= window.receipt_end_ms
+        || window.receipt_end_ms > cutoff
+    {
+        anyhow::bail!("provider exposure report requires valid windows and current database cutoff")
+    }
+    window.as_of_ms = cutoff;
+    Ok(window)
+}
+
+/// Only read-only SQL and existing frozen receipt validators are used. No
+/// observer handle can turn retained historical data into complete history.
+#[cfg(test)]
+pub(crate) fn read_provider_exposure_report(
+    pool: &DbPool,
+    account_id: &str,
+    window: ProviderExposureWindow,
+) -> Result<ProviderExposureReport> {
+    use super::jobs::{bounded_report_projection, charge_report_sql_row};
+    if account_id.trim().is_empty() {
+        anyhow::bail!("provider exposure report requires an explicit account")
+    }
+    let account_hash = account_scope_hash(account_id);
+    let hold_columns = [
+        "request_scope_hash",
+        "provider",
+        "model",
+        "projected_cost_cents",
+        "settled_cost_cents",
+        "usage_provenance",
+        "status",
+        "created_at_ms",
+        "updated_at_ms",
+    ];
+    let usage_columns = [
+        "request_id",
+        "provider",
+        "model",
+        "cost_cents_to_bluey",
+        "task_type",
+    ];
+    let application_columns = ["id", "state", "submitted_at_ms"];
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            // Establish the read snapshot before sampling SQLite's wall clock.
+            let account_count = tx.query_row(
+                "SELECT COUNT(*) FROM accounts WHERE id = ?1",
+                params![account_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if account_count != 1 {
+                anyhow::bail!("provider exposure account is missing")
+            }
+            let window = current_exposure_window(window, sqlite_transaction_now_ms(&tx)?)?;
+            let mut remaining_bytes = MAX_PROVIDER_EXPOSURE_BYTES;
+            let projection = bounded_report_projection(false, &hold_columns, &[0, 1, 2, 5, 6]);
+            let holds = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {projection}
+                    FROM jobs_provider_cost_holds
+                    WHERE account_scope_hash = ?1 AND created_at_ms >= ?2 AND created_at_ms < ?3
+                    ORDER BY created_at_ms, request_scope_hash LIMIT ?4"
+                ))?;
+                let mut rows = stmt.query(params![
+                    account_hash,
+                    window.attempt_start_ms,
+                    window.attempt_end_ms,
+                    (MAX_PROVIDER_EXPOSURE_HOLDS + 1) as i64
+                ])?;
+                let mut values = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if values.len() == MAX_PROVIDER_EXPOSURE_HOLDS {
+                        anyhow::bail!("provider exposure report row cap exceeded")
+                    }
+                    charge_report_sql_row(&mut remaining_bytes, row.get(9)?)?;
+                    values.push(ExposureHold {
+                        request_hash: row.get(0)?,
+                        provider: row.get(1)?,
+                        model: row.get(2)?,
+                        projected: row.get(3)?,
+                        settled: row.get(4)?,
+                        provenance: row.get(5)?,
+                        status: row.get(6)?,
+                        created_at_ms: row.get(7)?,
+                        updated_at_ms: row.get(8)?,
+                    });
+                }
+                values
+            };
+            let projection = bounded_report_projection(false, &usage_columns, &[0, 1, 2, 4]);
+            let usage = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {projection},
+                        CAST(strftime('%s', ts) AS INTEGER) * 1000 FROM usage_events
+                    WHERE account_id = ?1 AND origin = 'server'
+                      AND kind = 'jobs_resume_generation_attempt'
+                      AND ts >= datetime(?2 / 1000, 'unixepoch')
+                      AND ts <= datetime(?3 / 1000, 'unixepoch')
+                    ORDER BY ts, id LIMIT ?4"
+                ))?;
+                let mut rows = stmt.query(params![
+                    account_id,
+                    window.attempt_start_ms,
+                    window.as_of_ms,
+                    (MAX_PROVIDER_EXPOSURE_USAGE_EVENTS + 1) as i64
+                ])?;
+                let mut values = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if values.len() == MAX_PROVIDER_EXPOSURE_USAGE_EVENTS {
+                        anyhow::bail!("provider exposure report row cap exceeded")
+                    }
+                    charge_report_sql_row(&mut remaining_bytes, row.get(5)?)?;
+                    values.push(ExposureUsage {
+                        request_id: row.get(0)?,
+                        provider: row.get(1)?,
+                        model: row.get(2)?,
+                        cost: row.get(3)?,
+                        task_type: row.get(4)?,
+                        occurred_at_ms: row.get(6)?,
+                    });
+                }
+                values
+            };
+            let projection = bounded_report_projection(false, &application_columns, &[0, 1]);
+            let applications = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {projection} FROM jobs_applications
+                    WHERE account_id = ?1 AND
+                      ((submitted_at_ms >= ?2 AND submitted_at_ms <= ?3)
+                        OR (created_at_ms >= ?4 AND created_at_ms < ?5))
+                    ORDER BY id LIMIT ?6"
+                ))?;
+                let mut rows = stmt.query(params![
+                    account_id,
+                    window.receipt_start_ms,
+                    window.as_of_ms,
+                    window.attempt_start_ms,
+                    window.attempt_end_ms,
+                    (MAX_PROVIDER_EXPOSURE_RECEIPTS + 1) as i64
+                ])?;
+                let mut values = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if values.len() == MAX_PROVIDER_EXPOSURE_RECEIPTS {
+                        anyhow::bail!("provider exposure report row cap exceeded")
+                    }
+                    charge_report_sql_row(&mut remaining_bytes, row.get(3)?)?;
+                    values.push(ExposureApplication {
+                        id: row.get(0)?,
+                        state: row.get(1)?,
+                        submitted_at_ms: row.get(2)?,
+                    });
+                }
+                values
+            };
+            let report = summarize_exposure_snapshot(
+                account_id,
+                window,
+                1_000,
+                ExposureSnapshot {
+                    holds,
+                    usage,
+                    applications,
+                    remaining_bytes,
+                },
+                |id, remaining| {
+                    super::jobs::validate_stored_submitted_receipt_sqlite_tx(
+                        &tx,
+                        account_id,
+                        id,
+                        window.receipt_start_ms,
+                        window.receipt_end_ms,
+                        window.as_of_ms,
+                        remaining,
+                    )
+                },
+            )?;
+            tx.rollback()?;
+            Ok(report)
+        }
+        DbPool::Postgres(_) => {
+            use postgres::fallible_iterator::FallibleIterator;
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn
+                .build_transaction()
+                .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                .read_only(true)
+                .start()?;
+            if tx
+                .query_opt("SELECT 1 FROM accounts WHERE id = $1", &[&account_id])?
+                .is_none()
+            {
+                anyhow::bail!("provider exposure account is missing")
+            }
+            // Sample current DB time after acquiring the repeatable snapshot.
+            let cutoff: i64 = tx
+                .query_one(
+                    "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )?
+                .try_get(0)?;
+            let window = current_exposure_window(window, cutoff)?;
+            let mut remaining_bytes = MAX_PROVIDER_EXPOSURE_BYTES;
+            let projection = bounded_report_projection(true, &hold_columns, &[0, 1, 2, 5, 6]);
+            let holds = {
+                let sql = format!(
+                    "SELECT {projection} FROM jobs_provider_cost_holds
+                    WHERE account_scope_hash = $1 AND created_at_ms >= $2 AND created_at_ms < $3
+                    ORDER BY created_at_ms, request_scope_hash LIMIT $4"
+                );
+                let limit = (MAX_PROVIDER_EXPOSURE_HOLDS + 1) as i64;
+                let params: &[&(dyn postgres::types::ToSql + Sync)] = &[
+                    &account_hash,
+                    &window.attempt_start_ms,
+                    &window.attempt_end_ms,
+                    &limit,
+                ];
+                let mut rows = tx.query_raw(&sql, params.iter().copied())?;
+                let mut values = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if values.len() == MAX_PROVIDER_EXPOSURE_HOLDS {
+                        anyhow::bail!("provider exposure report row cap exceeded")
+                    }
+                    charge_report_sql_row(&mut remaining_bytes, row.try_get(9)?)?;
+                    values.push(ExposureHold {
+                        request_hash: row.try_get(0)?,
+                        provider: row.try_get(1)?,
+                        model: row.try_get(2)?,
+                        projected: row.try_get(3)?,
+                        settled: row.try_get(4)?,
+                        provenance: row.try_get(5)?,
+                        status: row.try_get(6)?,
+                        created_at_ms: row.try_get(7)?,
+                        updated_at_ms: row.try_get(8)?,
+                    });
+                }
+                values
+            };
+            let projection = bounded_report_projection(true, &usage_columns, &[0, 1, 2, 4]);
+            let usage = {
+                let sql = format!("SELECT {projection},
+                        FLOOR(EXTRACT(EPOCH FROM ts) * 1000)::bigint FROM usage_events
+                    WHERE account_id = $1 AND origin = 'server'
+                      AND kind = 'jobs_resume_generation_attempt'
+                      AND ts >= to_timestamp((($2::bigint / 1000) * 1000)::double precision / 1000.0)
+                      AND ts <= to_timestamp(($3::bigint)::double precision / 1000.0)
+                    ORDER BY ts, id LIMIT $4");
+                let limit = (MAX_PROVIDER_EXPOSURE_USAGE_EVENTS + 1) as i64;
+                let params: &[&(dyn postgres::types::ToSql + Sync)] = &[
+                    &account_id,
+                    &window.attempt_start_ms,
+                    &window.as_of_ms,
+                    &limit,
+                ];
+                let mut rows = tx.query_raw(&sql, params.iter().copied())?;
+                let mut values = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if values.len() == MAX_PROVIDER_EXPOSURE_USAGE_EVENTS {
+                        anyhow::bail!("provider exposure report row cap exceeded")
+                    }
+                    charge_report_sql_row(&mut remaining_bytes, row.try_get(5)?)?;
+                    values.push(ExposureUsage {
+                        request_id: row.try_get(0)?,
+                        provider: row.try_get(1)?,
+                        model: row.try_get(2)?,
+                        cost: row.try_get(3)?,
+                        task_type: row.try_get(4)?,
+                        occurred_at_ms: row.try_get(6)?,
+                    });
+                }
+                values
+            };
+            let projection = bounded_report_projection(true, &application_columns, &[0, 1]);
+            let applications = {
+                let sql = format!(
+                    "SELECT {projection} FROM jobs_applications
+                    WHERE account_id = $1 AND
+                      ((submitted_at_ms >= $2 AND submitted_at_ms <= $3)
+                        OR (created_at_ms >= $4 AND created_at_ms < $5))
+                    ORDER BY id LIMIT $6"
+                );
+                let limit = (MAX_PROVIDER_EXPOSURE_RECEIPTS + 1) as i64;
+                let params: &[&(dyn postgres::types::ToSql + Sync)] = &[
+                    &account_id,
+                    &window.receipt_start_ms,
+                    &window.as_of_ms,
+                    &window.attempt_start_ms,
+                    &window.attempt_end_ms,
+                    &limit,
+                ];
+                let mut rows = tx.query_raw(&sql, params.iter().copied())?;
+                let mut values = Vec::new();
+                while let Some(row) = rows.next()? {
+                    if values.len() == MAX_PROVIDER_EXPOSURE_RECEIPTS {
+                        anyhow::bail!("provider exposure report row cap exceeded")
+                    }
+                    charge_report_sql_row(&mut remaining_bytes, row.try_get(3)?)?;
+                    values.push(ExposureApplication {
+                        id: row.try_get(0)?,
+                        state: row.try_get(1)?,
+                        submitted_at_ms: row.try_get(2)?,
+                    });
+                }
+                values
+            };
+            let report = summarize_exposure_snapshot(
+                account_id,
+                window,
+                1,
+                ExposureSnapshot {
+                    holds,
+                    usage,
+                    applications,
+                    remaining_bytes,
+                },
+                |id, remaining| {
+                    super::jobs::validate_stored_submitted_receipt_postgres_tx(
+                        &mut tx,
+                        account_id,
+                        id,
+                        window.receipt_start_ms,
+                        window.receipt_end_ms,
+                        window.as_of_ms,
+                        remaining,
+                    )
+                },
+            )?;
+            tx.rollback()?;
+            Ok(report)
+        }
+    })
+}
+
+#[cfg(test)]
+fn summarize_exposure_snapshot(
+    account_id: &str,
+    window: ProviderExposureWindow,
+    usage_precision_ms: i64,
+    snapshot: ExposureSnapshot,
+    mut validate_receipt: impl FnMut(&str, &mut usize) -> Result<super::jobs::StoredReceiptValidation>,
+) -> Result<ProviderExposureReport> {
+    let ExposureSnapshot {
+        holds,
+        usage,
+        applications,
+        remaining_bytes: mut remaining,
+    } = snapshot;
+    if holds.len() > MAX_PROVIDER_EXPOSURE_HOLDS
+        || usage.len() > MAX_PROVIDER_EXPOSURE_USAGE_EVENTS
+        || applications.len() > MAX_PROVIDER_EXPOSURE_RECEIPTS
+    {
+        anyhow::bail!("provider exposure report row cap exceeded")
+    }
+    // SQL bounded each row before transport; its conservative byte charge was
+    // consumed before any owned string/vector/map entry was allocated.
+    let span = window
+        .receipt_end_ms
+        .checked_sub(window.receipt_start_ms)
+        .and_then(|value| value.checked_add(PROVIDER_EXPOSURE_SAFETY_MARGIN_MS))
+        .ok_or_else(|| anyhow::anyhow!("provider exposure window overflow"))?;
+    let age = window
+        .as_of_ms
+        .checked_sub(window.receipt_start_ms)
+        .and_then(|value| value.checked_add(PROVIDER_EXPOSURE_SAFETY_MARGIN_MS))
+        .ok_or_else(|| anyhow::anyhow!("provider exposure window overflow"))?;
+    let mut report = ProviderExposureReport {
+        window,
+        physical_retention_ms: UPSTREAM_SPEND_TRUTH_RETENTION_MS,
+        receipt_closeout_lag_ms: window.receipt_end_ms - window.attempt_end_ms,
+        retention_safety_margin_ms: PROVIDER_EXPOSURE_SAFETY_MARGIN_MS,
+        retention_window_satisfied: span < UPSTREAM_SPEND_TRUTH_RETENTION_MS
+            && age < UPSTREAM_SPEND_TRUTH_RETENTION_MS,
+        usage_query_start_ms: (window.attempt_start_ms / 1000) * 1000,
+        usage_timestamp_precision_ms: usage_precision_ms,
+        read_byte_limit: MAX_PROVIDER_EXPOSURE_BYTES,
+        read_budget_basis: "sql_utf8_json_upper_bound_6x_plus_1024_per_row_and_streamed_output",
+        usage_boundary_ambiguous_events: 0,
+        held_unresolved_projection_cents: 0,
+        settled_exact_usage_priced_cents: 0,
+        settled_estimated_conservative_cents: 0,
+        settled_missing_conservative_cents: 0,
+        provider_exposure_cents: 0,
+        released_nonexposed_holds: 0,
+        missing_usage_linkage_holds: 0,
+        mismatched_usage_linkage_holds: 0,
+        unmatched_usage_events: 0,
+        late_usage_events: 0,
+        accepted_attempt_events: 0,
+        rejected_attempt_events: 0,
+        failed_or_unsubmitted_applications: 0,
+        unvalidated_late_submitted_applications: 0,
+        unvalidated_submitted_applications_outside_receipt_window: 0,
+        unverifiable_receipts: std::collections::BTreeMap::new(),
+        stored_receipt_metadata_consistent_application_ids: Vec::new(),
+        stored_receipt_bindings_revalidated: true,
+        usage_provenance_source: "hold_row",
+        original_request_fingerprint_recomputed: false,
+        remote_object_bytes: "not_checked",
+        employer_delivery: "not_checked",
+        completeness: "unverifiable",
+        per_success_ratio: "unavailable",
+    };
+    let mut usage_by_request = std::collections::BTreeMap::<String, ExposureUsage>::new();
+    for event in usage {
+        if event.request_id.trim().is_empty()
+            || event.cost < 0
+            || event.cost > MAX_AUTHORITATIVE_EVENT_COST_CENTS
+        {
+            anyhow::bail!("provider exposure report found invalid usage identity/amount")
+        }
+        if event.occurred_at_ms >= window.attempt_end_ms {
+            report.late_usage_events += 1;
+        }
+        if event.occurred_at_ms < window.attempt_end_ms
+            && event.occurred_at_ms.saturating_add(usage_precision_ms) > window.attempt_end_ms
+        {
+            report.usage_boundary_ambiguous_events += 1;
+        }
+        let hash = request_scope_hash(account_id, &event.request_id);
+        if usage_by_request.insert(hash, event).is_some() {
+            anyhow::bail!("provider exposure report found duplicate usage linkage")
+        }
+    }
+    let mut seen_holds = std::collections::BTreeSet::new();
+    let mut totals = [0_i128; 4];
+    for hold in holds {
+        if !seen_holds.insert(hold.request_hash.clone())
+            || hold.request_hash.len() != 64
+            || !hold
+                .request_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || hold.provider.trim().is_empty()
+            || hold.model.trim().is_empty()
+            || hold.projected <= 0
+            || hold.projected > MAX_AUTHORITATIVE_EVENT_COST_CENTS
+            || hold.settled < 0
+            || hold.settled > MAX_AUTHORITATIVE_EVENT_COST_CENTS
+            || !matches!(hold.provenance.as_str(), "exact" | "estimated" | "missing")
+            || !matches!(hold.status.as_str(), "held" | "settled" | "released")
+            || hold.updated_at_ms < hold.created_at_ms
+            || hold.updated_at_ms > window.as_of_ms
+        {
+            anyhow::bail!("provider exposure report found invalid hold content")
+        }
+        let event = usage_by_request.remove(&hold.request_hash);
+        if hold.status == "released" {
+            // A release is provably pre-dispatch only when no attempt event
+            // exists. Never discard a released row with contradictory usage.
+            if hold.settled != 0 || hold.provenance != "missing" || event.is_some() {
+                anyhow::bail!("provider exposure report found exposed or invalid released hold")
+            }
+            report.released_nonexposed_holds += 1;
+            continue;
+        }
+        if hold.status == "held" && (hold.settled != 0 || hold.provenance != "missing") {
+            anyhow::bail!("provider exposure report found invalid unresolved hold")
+        }
+        let coherent = match event {
+            None => {
+                report.missing_usage_linkage_holds += 1;
+                false
+            }
+            Some(event) => {
+                let outcome = event.task_type.as_deref().unwrap_or("");
+                let accepted = outcome == "jobs_resume_tailoring_accepted";
+                let rejected = matches!(
+                    outcome,
+                    "jobs_resume_tailoring_rejected_truth"
+                        | "jobs_resume_tailoring_rejected_cost"
+                        | "jobs_resume_tailoring_rejected_deadline"
+                        | "jobs_resume_tailoring_rejected_provider_boundary"
+                        | "jobs_resume_tailoring_rejected_provider_error"
+                        | "jobs_resume_tailoring_rejected_timeout"
+                        | "jobs_resume_tailoring_rejected_cancelled"
+                );
+                report.accepted_attempt_events += usize::from(accepted);
+                report.rejected_attempt_events += usize::from(rejected);
+                // Usage stores the already-settled amount; raw nonexact
+                // reported cost and independent event provenance are absent.
+                let valid = hold.status == "settled"
+                    && (accepted || rejected)
+                    && event.provider.as_deref() == Some(hold.provider.as_str())
+                    && event.model.as_deref() == Some(hold.model.as_str())
+                    && event.occurred_at_ms.saturating_add(usage_precision_ms - 1)
+                        >= hold.created_at_ms
+                    && event.cost == hold.settled
+                    && (hold.provenance == "exact" || hold.settled >= hold.projected);
+                if !valid {
+                    report.mismatched_usage_linkage_holds += 1;
+                }
+                valid
+            }
+        };
+        let (bucket, amount) = if hold.status == "held" {
+            (0, hold.projected)
+        } else if !coherent {
+            (3, hold.settled)
+        } else {
+            (
+                match hold.provenance.as_str() {
+                    "exact" => 1,
+                    "estimated" => 2,
+                    _ => 3,
+                },
+                hold.settled,
+            )
+        };
+        totals[bucket] = totals[bucket]
+            .checked_add(i128::from(amount))
+            .ok_or_else(|| anyhow::anyhow!("provider exposure amount overflow"))?;
+    }
+    report.unmatched_usage_events = usage_by_request.len();
+    report.held_unresolved_projection_cents = i64::try_from(totals[0])?;
+    report.settled_exact_usage_priced_cents = i64::try_from(totals[1])?;
+    report.settled_estimated_conservative_cents = i64::try_from(totals[2])?;
+    report.settled_missing_conservative_cents = i64::try_from(totals[3])?;
+    report.provider_exposure_cents =
+        i64::try_from(totals.into_iter().try_fold(0_i128, |total, value| {
+            total
+                .checked_add(value)
+                .ok_or_else(|| anyhow::anyhow!("provider exposure amount overflow"))
+        })?)?;
+    let mut receipt_ids = std::collections::BTreeSet::new();
+    for application in applications {
+        if application.state != "submitted" {
+            report.failed_or_unsubmitted_applications += 1;
+            continue;
+        }
+        let Some(submitted) = application.submitted_at_ms.filter(|value| *value > 0) else {
+            *report
+                .unverifiable_receipts
+                .entry("missing_submission_time")
+                .or_default() += 1;
+            report.stored_receipt_bindings_revalidated = false;
+            continue;
+        };
+        if submitted < window.receipt_start_ms || submitted >= window.receipt_end_ms {
+            report.unvalidated_submitted_applications_outside_receipt_window += 1;
+            report.unvalidated_late_submitted_applications +=
+                usize::from(submitted >= window.receipt_end_ms);
+            continue;
+        }
+        match validate_receipt(&application.id, &mut remaining)? {
+            super::jobs::StoredReceiptValidation::StoredMetadataValidated => {
+                receipt_ids.insert(application.id);
+            }
+            super::jobs::StoredReceiptValidation::Unverifiable(reason) => {
+                *report.unverifiable_receipts.entry(reason).or_default() += 1;
+                report.stored_receipt_bindings_revalidated = false;
+            }
+        }
+    }
+    report.stored_receipt_metadata_consistent_application_ids = receipt_ids.into_iter().collect();
+    super::jobs::charge_report_serialization(&mut remaining, &report)?;
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1710,495 @@ mod tests {
         crate::db::accounts::Account::create(pool, "holds@bluey.test", "hash")
             .unwrap()
             .id
+    }
+
+    fn exposure_reserve(pool: &DbPool, account_id: &str, request_id: &str, projected: i64) {
+        assert!(matches!(
+            reserve(
+                pool,
+                account_id,
+                &format!("router:{request_id}:llm"),
+                &format!("token:{request_id}"),
+                request_id,
+                "openai",
+                "gpt-5.4-mini",
+                projected,
+                100_000,
+                UpstreamSpendGuard {
+                    limit_cents: 100_000,
+                    window_hours: 24
+                }
+            )
+            .unwrap(),
+            CostHoldReservation::Held { .. }
+        ));
+    }
+
+    fn exposure_event(request_id: &str, outcome: &str, cost: i64) -> UsageEvent {
+        UsageEvent {
+            request_id: request_id.into(),
+            kind: "jobs_resume_generation_attempt".into(),
+            task_type: Some(outcome.into()),
+            lane: Some("deep".into()),
+            provider: Some("openai".into()),
+            model: Some("gpt-5.4-mini".into()),
+            input_tokens: 20,
+            output_tokens: 10,
+            latency_ms: 5,
+            cost_cents_to_bluey: cost,
+            cost_cents_to_customer: 0,
+            was_speculative: false,
+            was_fallback: false,
+        }
+    }
+
+    fn exposure_settle(
+        pool: &DbPool,
+        account_id: &str,
+        id: &str,
+        projected: i64,
+        reported: i64,
+        provenance: UsageProvenance,
+        outcome: &str,
+    ) {
+        exposure_reserve(pool, account_id, id, projected);
+        settle_with_usage(
+            pool,
+            account_id,
+            id,
+            &format!("token:{id}"),
+            reported,
+            provenance,
+            &exposure_event(id, outcome, reported),
+        )
+        .unwrap();
+    }
+
+    fn exposure_window(pool: &DbPool) -> ProviderExposureWindow {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut conn = pool.get().unwrap();
+        let tx = conn.transaction().unwrap();
+        let end = sqlite_transaction_now_ms(&tx).unwrap();
+        tx.rollback().unwrap();
+        ProviderExposureWindow {
+            attempt_start_ms: end - 60_000,
+            attempt_end_ms: end,
+            receipt_start_ms: end - 60_000,
+            receipt_end_ms: end,
+            as_of_ms: 0,
+        }
+    }
+
+    fn exposure_financial_state(pool: &DbPool) -> Vec<Vec<String>> {
+        let conn = pool.get().unwrap();
+        ["jobs_provider_cost_holds", "usage_events"]
+            .into_iter()
+            .map(|table| {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                    .unwrap();
+                let columns = stmt.column_count();
+                let rows = stmt
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .map(|values| format!("{values:?}"))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sqlite_exposure_report_counts_all_attempt_outcomes_once_and_is_read_only() {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        exposure_settle(
+            &pool,
+            &account_id,
+            "accepted",
+            12,
+            3,
+            UsageProvenance::Exact,
+            "jobs_resume_tailoring_accepted",
+        );
+        exposure_settle(
+            &pool,
+            &account_id,
+            "rejected",
+            8,
+            2,
+            UsageProvenance::Estimated,
+            "jobs_resume_tailoring_rejected_truth",
+        );
+        exposure_settle(
+            &pool,
+            &account_id,
+            "unknown-delivery",
+            10,
+            0,
+            UsageProvenance::Missing,
+            "jobs_resume_tailoring_rejected_timeout",
+        );
+        exposure_reserve(&pool, &account_id, "failed-settlement", 7);
+        fail_next_settlement_for_test();
+        assert!(settle_with_usage(
+            &pool,
+            &account_id,
+            "failed-settlement",
+            "token:failed-settlement",
+            2,
+            UsageProvenance::Exact,
+            &exposure_event("failed-settlement", "jobs_resume_tailoring_accepted", 2)
+        )
+        .is_err());
+        let other =
+            crate::db::accounts::Account::create(&pool, "exposure-tenant@example.test", "hash")
+                .unwrap();
+        exposure_settle(
+            &pool,
+            &other.id,
+            "foreign",
+            50,
+            40,
+            UsageProvenance::Exact,
+            "jobs_resume_tailoring_accepted",
+        );
+        let window = exposure_window(&pool);
+        let before = exposure_financial_state(&pool);
+        for _ in 0..2 {
+            let report = read_provider_exposure_report(&pool, &account_id, window).unwrap();
+            assert_eq!(report.provider_exposure_cents, 28);
+            assert_eq!(report.held_unresolved_projection_cents, 7);
+            assert_eq!(report.settled_exact_usage_priced_cents, 3);
+            assert_eq!(report.settled_estimated_conservative_cents, 8);
+            assert_eq!(report.settled_missing_conservative_cents, 10);
+            assert_eq!(report.accepted_attempt_events, 1);
+            assert_eq!(report.rejected_attempt_events, 2);
+            assert_eq!(report.missing_usage_linkage_holds, 1);
+            assert_eq!(report.usage_provenance_source, "hold_row");
+            assert!(report
+                .stored_receipt_metadata_consistent_application_ids
+                .is_empty());
+            assert_eq!(report.per_success_ratio, "unavailable");
+            assert!(report.window.as_of_ms >= window.attempt_end_ms);
+            assert_eq!(
+                report.physical_retention_ms,
+                UPSTREAM_SPEND_TRUTH_RETENTION_MS
+            );
+        }
+        assert_eq!(exposure_financial_state(&pool), before);
+    }
+
+    #[test]
+    fn sqlite_exposure_report_missing_mismatched_and_released_holds_keep_explicit_gaps() {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        exposure_settle(
+            &pool,
+            &account_id,
+            "missing",
+            5,
+            2,
+            UsageProvenance::Exact,
+            "jobs_resume_tailoring_accepted",
+        );
+        exposure_settle(
+            &pool,
+            &account_id,
+            "mismatch",
+            5,
+            3,
+            UsageProvenance::Exact,
+            "jobs_resume_tailoring_rejected_cost",
+        );
+        exposure_reserve(&pool, &account_id, "predispatch-release", 5);
+        let conn = pool.get().unwrap();
+        conn.execute("DELETE FROM usage_events WHERE request_id = 'missing'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE usage_events SET model = 'different-model'
+            WHERE request_id = 'mismatch'",
+            [],
+        )
+        .unwrap();
+        // There is no production release API for provider holds. Exercise the
+        // schema's legacy released state without inventing a dispatch event.
+        conn.execute(
+            "UPDATE jobs_provider_cost_holds SET status = 'released'
+            WHERE request_scope_hash = ?1",
+            params![request_scope_hash(&account_id, "predispatch-release")],
+        )
+        .unwrap();
+        drop(conn);
+        let window = exposure_window(&pool);
+        let report = read_provider_exposure_report(&pool, &account_id, window).unwrap();
+        assert_eq!(report.provider_exposure_cents, 5);
+        assert_eq!(report.settled_exact_usage_priced_cents, 0);
+        assert_eq!(report.settled_missing_conservative_cents, 5);
+        assert_eq!(report.missing_usage_linkage_holds, 1);
+        assert_eq!(report.mismatched_usage_linkage_holds, 1);
+        assert_eq!(report.released_nonexposed_holds, 1);
+        super::super::usage::record(
+            &pool,
+            &account_id,
+            &exposure_event("predispatch-release", "jobs_resume_tailoring_accepted", 0),
+        )
+        .unwrap();
+        assert!(read_provider_exposure_report(&pool, &account_id, window).is_err());
+    }
+
+    #[test]
+    fn sqlite_exposure_report_duplicate_usage_is_a_hard_failure_without_fanout() {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        exposure_settle(
+            &pool,
+            &account_id,
+            "duplicated",
+            8,
+            3,
+            UsageProvenance::Exact,
+            "jobs_resume_tailoring_accepted",
+        );
+        let conn = pool.get().unwrap();
+        // Simulate a legacy/imported violation, after normal atomic settlement.
+        conn.execute("DROP INDEX idx_usage_events_dedupe", [])
+            .unwrap();
+        conn.execute("INSERT INTO usage_events
+            (id, account_id, request_id, origin, kind, task_type, provider, model, cost_cents_to_bluey)
+            SELECT 'duplicate-row', account_id, request_id, origin, kind, task_type, provider, model,
+                cost_cents_to_bluey FROM usage_events WHERE request_id = 'duplicated'", []).unwrap();
+        drop(conn);
+        let window = exposure_window(&pool);
+        let before = exposure_financial_state(&pool);
+        let error = read_provider_exposure_report(&pool, &account_id, window).unwrap_err();
+        assert!(error.to_string().contains("duplicate usage linkage"));
+        assert_eq!(exposure_financial_state(&pool), before);
+    }
+
+    #[test]
+    fn sqlite_exposure_report_created_membership_keeps_late_settlement_and_unmatched_usage() {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        exposure_settle(
+            &pool,
+            &account_id,
+            "late-settlement",
+            9,
+            2,
+            UsageProvenance::Exact,
+            "jobs_resume_tailoring_accepted",
+        );
+        super::super::usage::record(
+            &pool,
+            &account_id,
+            &exposure_event(
+                "unmatched-in-range",
+                "jobs_resume_tailoring_rejected_timeout",
+                6,
+            ),
+        )
+        .unwrap();
+        let mut window = exposure_window(&pool);
+        window.attempt_end_ms -= 10_000;
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_cost_holds SET created_at_ms = ?1",
+                params![window.attempt_end_ms - 1],
+            )
+            .unwrap();
+        let report = read_provider_exposure_report(&pool, &account_id, window).unwrap();
+        assert_eq!(report.provider_exposure_cents, 2);
+        assert_eq!(report.settled_exact_usage_priced_cents, 2);
+        assert_eq!(report.late_usage_events, 2);
+        assert_eq!(report.unmatched_usage_events, 1);
+        assert_eq!(report.receipt_closeout_lag_ms, 10_000);
+        let mut historical = window;
+        historical.as_of_ms = window.attempt_end_ms;
+        assert!(read_provider_exposure_report(&pool, &account_id, historical).is_err());
+    }
+
+    #[test]
+    fn sqlite_exposure_report_old_usage_does_not_exhaust_the_current_window_cap() {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        exposure_reserve(&pool, &account_id, "current-hold", 4);
+        pool.get()
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(x) AS
+            (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 4000)
+            INSERT INTO usage_events(id, account_id, request_id, origin, kind, ts)
+            SELECT 'old-' || x, ?1, 'old-' || x, 'server', 'jobs_resume_generation_attempt',
+                datetime('now', '-32 days') FROM n",
+                params![account_id],
+            )
+            .unwrap();
+        let window = exposure_window(&pool);
+        let report = read_provider_exposure_report(&pool, &account_id, window).unwrap();
+        assert_eq!(report.provider_exposure_cents, 4);
+        assert_eq!(report.unmatched_usage_events, 0);
+        let mut expired = window;
+        expired.attempt_start_ms -= UPSTREAM_SPEND_TRUTH_RETENTION_MS + 2 * 86_400_000;
+        expired.receipt_start_ms = expired.attempt_start_ms;
+        let error = read_provider_exposure_report(&pool, &account_id, expired).unwrap_err();
+        assert!(error.to_string().contains("row cap"));
+    }
+
+    #[test]
+    fn sqlite_exposure_report_retention_unknown_and_byte_row_bounds_fail_closed() {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        let mut window = exposure_window(&pool);
+        window.attempt_start_ms -= UPSTREAM_SPEND_TRUTH_RETENTION_MS;
+        window.receipt_start_ms = window.attempt_start_ms;
+        let report = read_provider_exposure_report(&pool, &account_id, window).unwrap();
+        assert!(!report.retention_window_satisfied);
+        assert_eq!(report.completeness, "unverifiable");
+        exposure_reserve(&pool, &account_id, "huge-model", 4);
+        let window = exposure_window(&pool);
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_cost_holds SET model = ?1",
+                params!["x".repeat(MAX_PROVIDER_EXPOSURE_BYTES + 1)],
+            )
+            .unwrap();
+        assert!(read_provider_exposure_report(&pool, &account_id, window)
+            .unwrap_err()
+            .to_string()
+            .contains("byte cap"));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_cost_holds SET model = 'gpt-5.4-mini'",
+                [],
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(x) AS
+            (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 1000)
+            INSERT INTO jobs_provider_cost_holds(request_scope_hash, account_scope_hash,
+                generation_scope_hash, root_scope_hash, reservation_token, provider, model,
+                projected_cost_cents, created_at_ms, updated_at_ms)
+            SELECT printf('%064x', x), account_scope_hash, generation_scope_hash, root_scope_hash,
+                reservation_token, provider, model, 1, created_at_ms, updated_at_ms
+            FROM n, jobs_provider_cost_holds WHERE reservation_token = 'token:huge-model'",
+                [],
+            )
+            .unwrap();
+        assert!(read_provider_exposure_report(&pool, &account_id, window)
+            .unwrap_err()
+            .to_string()
+            .contains("row cap"));
+    }
+
+    #[test]
+    fn sqlite_exposure_report_validates_hold_content_before_linkage_coercion_and_keeps_exact_zero()
+    {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        exposure_settle(
+            &pool,
+            &account_id,
+            "exact-zero",
+            5,
+            0,
+            UsageProvenance::Exact,
+            "jobs_resume_tailoring_accepted",
+        );
+        let window = exposure_window(&pool);
+        let report = read_provider_exposure_report(&pool, &account_id, window).unwrap();
+        assert_eq!(report.provider_exposure_cents, 0);
+        assert_eq!(report.missing_usage_linkage_holds, 0);
+        assert_eq!(report.mismatched_usage_linkage_holds, 0);
+        assert_eq!(report.per_success_ratio, "unavailable");
+        let conn = pool.get().unwrap();
+        conn.execute("PRAGMA ignore_check_constraints = ON", [])
+            .unwrap();
+        for (column, value) in [("status", "unknown"), ("usage_provenance", "untrusted")] {
+            conn.execute(
+                &format!("UPDATE jobs_provider_cost_holds SET {column} = ?1"),
+                params![value],
+            )
+            .unwrap();
+            assert!(read_provider_exposure_report(&pool, &account_id, window)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid hold content"));
+            conn.execute(
+                "UPDATE jobs_provider_cost_holds SET status = 'settled',
+                usage_provenance = 'exact'",
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE jobs_provider_cost_holds SET settled_cost_cents = -1",
+            [],
+        )
+        .unwrap();
+        assert!(read_provider_exposure_report(&pool, &account_id, window).is_err());
+        conn.execute("PRAGMA ignore_check_constraints = OFF", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn sqlite_exposure_report_charges_cumulative_sql_rows_before_owned_copies() {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        exposure_reserve(&pool, &account_id, "bounded-model", 1);
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE jobs_provider_cost_holds SET model = ?1",
+            params!["x".repeat(64_000)],
+        )
+        .unwrap();
+        conn.execute(
+            "WITH RECURSIVE n(x) AS
+            (VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 29)
+            INSERT INTO jobs_provider_cost_holds(request_scope_hash, account_scope_hash,
+                generation_scope_hash, root_scope_hash, reservation_token, provider, model,
+                projected_cost_cents, created_at_ms, updated_at_ms)
+            SELECT printf('%064x', x), account_scope_hash, generation_scope_hash, root_scope_hash,
+                reservation_token, provider, model, 1, created_at_ms, updated_at_ms
+            FROM n, jobs_provider_cost_holds WHERE reservation_token = 'token:bounded-model'",
+            [],
+        )
+        .unwrap();
+        let projection = super::super::jobs::bounded_report_projection(false, &["model"], &[0]);
+        let (value, charge): (Option<String>, i64) = conn
+            .query_row(
+                &format!("SELECT {projection} FROM jobs_provider_cost_holds LIMIT 1"),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(value.as_ref().map(String::len), Some(64_000));
+        assert!(charge < MAX_PROVIDER_EXPOSURE_BYTES as i64);
+        assert!(charge * 31 > MAX_PROVIDER_EXPOSURE_BYTES as i64);
+        drop(conn);
+        let window = exposure_window(&pool);
+        assert!(read_provider_exposure_report(&pool, &account_id, window)
+            .unwrap_err()
+            .to_string()
+            .contains("byte cap"));
+        let mut small_output_budget = 64;
+        assert!(super::super::jobs::charge_report_serialization(
+            &mut small_output_budget,
+            &"x".repeat(128)
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("byte cap"));
     }
 
     #[test]

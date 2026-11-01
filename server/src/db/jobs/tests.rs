@@ -2442,16 +2442,16 @@ mod tests {
         )
     }
 
-    struct FinalSubmissionFixture {
-        application: JobApplication,
-        run_id: String,
-        lease_token: String,
-        lease_fence: i64,
-        fingerprint: String,
-        receipt: Value,
-        evidence: Vec<ApplicationEvidence>,
-        object_uploads: Vec<ApplicationObjectBinding>,
-        session: BrowserSession,
+    pub(super) struct FinalSubmissionFixture {
+        pub(super) application: JobApplication,
+        pub(super) run_id: String,
+        pub(super) lease_token: String,
+        pub(super) lease_fence: i64,
+        pub(super) fingerprint: String,
+        pub(super) receipt: Value,
+        pub(super) evidence: Vec<ApplicationEvidence>,
+        pub(super) object_uploads: Vec<ApplicationObjectBinding>,
+        pub(super) session: BrowserSession,
     }
 
     fn test_submission_evidence_capacity(
@@ -4326,7 +4326,7 @@ mod tests {
         }
     }
 
-    fn final_submission_fixture(pool: &DbPool, suffix: &str) -> FinalSubmissionFixture {
+    pub(super) fn final_submission_fixture(pool: &DbPool, suffix: &str) -> FinalSubmissionFixture {
         set_entitlement_plan(pool, "acct-jobs", "pro").unwrap();
         let (mut application, run_id, browser_profile_id) = execution_lease_fixture(pool, suffix);
         let posting = get_posting(pool, "acct-jobs", &application.job_id)
@@ -20822,7 +20822,7 @@ mod tests {
         );
     }
 
-    fn postgres_authenticated_worker_pool_or_skip(test_name: &str) -> Option<DbPool> {
+    pub(super) fn postgres_authenticated_worker_pool_or_skip(test_name: &str) -> Option<DbPool> {
         use crate::db::{accounts::Account, jobs_beta_access as beta};
 
         let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
@@ -20939,7 +20939,7 @@ mod tests {
         Some(pool)
     }
 
-    fn authenticated_worker_submit_snapshot(pool: &DbPool) -> Value {
+    pub(super) fn authenticated_worker_submit_snapshot(pool: &DbPool) -> Value {
         let mut snapshot = serde_json::Map::new();
         for table in [
             "jobs_execution_leases",

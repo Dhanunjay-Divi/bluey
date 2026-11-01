@@ -5,6 +5,12 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs docs: define isolated read-only provider-exposure evidence and correct
+  fixed spend-truth retention versus configurable admission-window semantics.
+- Jobs tests: add a private read-only provider-exposure/stored-receipt prototype
+  with relational resume binding and SQL-side byte bounds; qualify16 focused
+  SQLite cases, one physical PostgreSQL case and1,933 full server tests with strict
+  Clippy/source/cleanup proof. This is not invoice COGS or production delivery.
 - Jobs tests: qualify a separate disposable Linux/amd64 QEMU guest with bounded
   resources, private state and observed stop/delete proof; no production or
   employer-facing execution is enabled by this compatibility gate.

@@ -57,12 +57,14 @@ produces unavailable per-success cost, not zero or a divide-by-zero result.
 Use only fully validated stored receipts, not a submitted status string, and count
 distinct applications rather than receipt IDs/replays/aliases as the denominator.
 Existing validation seams are server/src/api/jobs.rs:7642-7680,
-7840-7877 and7940-7974. Choose a complete observation window inside the configured
-retention (maximum 30 days plus 24-hour grace, server/src/config.rs:163-169).
-Require `observation window + receipt closeout lag + safety margin < effective
-configured hold retention`; the maximum 31-day horizon is not permission to ignore
-a shorter configured retention. Fail the report if earliest-row completeness
-cannot be established at the actual report cutoff.
+7840-7877 and7940-7974. November1 source correction: physical hold retention is
+fixed31 days (`UPSTREAM_SPEND_TRUTH_RETENTION_MS`, server/src/config.rs:163-169),
+not the configurable rolling admission window. Require `observation window +
+receipt closeout lag + safety margin < fixed hold retention`. Retention alone
+does not prove completeness: no durable observation watermark currently exists,
+and the earliest retained row is not a history-start witness. A fresh isolated
+fixture may prove its own empty-state observation start, not arbitrary history.
+Fail a completeness claim when that evidence is unavailable at the report cutoff.
 Define start/end, report-as-of cutoff and receipt closeout lag explicitly. Hold
 `created_at_ms` determines attempt-cohort membership; receipt `submitted_at_ms`
 determines success-window membership. Never use mutable `updated_at_ms` for cohort

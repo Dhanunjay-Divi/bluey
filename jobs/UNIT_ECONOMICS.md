@@ -93,21 +93,34 @@ Read-only source inspection, not runtime or invoice qualification:
 - Whole-cent rounded cost records support conservative spend admission but cannot
   establish precise sub-cent aggregate delivery costs. Durable usage events lack a
   direct application/generation key; opaque holds can be rejoined in trusted code
-  only within their retention window (configured maximum 30 days plus 24-hour grace).
-  They cannot by themselves support a reproducible six-month attribution report.
+  only while physically retained. The spend-truth retention threshold is fixed at
+  31 days by `UPSTREAM_SPEND_TRUTH_RETENTION_MS`; the configurable rolling spend
+  window is a separate admission rule. Pruning uses `updated_at_ms`, while report
+  cohort membership uses immutable `created_at_ms`. Retention is not a completeness
+  witness: no durable observation watermark exists, and the earliest retained row
+  does not prove history start. These records cannot by themselves support a
+  reproducible six-month attribution report.
 - Applied rate-version and invoice provenance, discovery/document/storage/network,
   communications, payment/refund/support and shared idle-capacity allocations remain
   measurement gaps. Unknown costs must render the report incomplete, never zero.
 
-Smallest next implementation: a read-only per-success sample within the retention
-window, joining existing application/generation reservations to **all** settled
-attempt exposure and workflow retry/unknown outcomes, with verified receipts as
-denominator. Mark lease wall time `unpriced_proxy` and runner cost `unverified`.
-Test one verified success with accepted plus rejected model attempts, an unknown
-delivery/retry and a failed/released application: all exposed costs stay in the
-numerator, only the verified success enters the denominator. Later precise immutable
-cost attribution and rate/invoice snapshots need their own reviewed bounded phase;
-do not rewrite existing billing/authorization accounting to create a cheap result.
+November 1 source correction: the smallest next measurement slice is a bounded
+read-only partial-provider-exposure sample within the fixed retention threshold.
+For one explicit account/window cohort, include both unresolved held projections
+and all settled hold amounts, with each hold contributing exactly once. Usage rows
+annotate provenance only; they must not add another amount or multiply rows, and
+duplicate linkage fails the report. Revalidate stored receipt/evidence metadata and
+report distinct metadata-consistent application IDs separately; do not treat that
+count as employer delivery or a verified-success denominator. Completeness and the
+per-success ratio remain unavailable without a durable observation watermark and
+independently verified delivery. Mark lease wall time `unpriced_proxy` and runner
+cost `unverified`. Test a metadata-consistent stored submission with accepted and
+rejected model attempts, an unresolved hold, an unknown-delivery retry, and a failed
+or released application: every exposed hold appears once, valid zero-settlement
+released holds remain non-exposed, and no unverified application becomes a success.
+Later precise immutable cost attribution and rate/invoice snapshots need their own
+reviewed bounded phase; do not rewrite existing billing/authorization accounting to
+create a cheap result. This correction changes neither prices nor billing policy.
 
 ## Pricing
 
