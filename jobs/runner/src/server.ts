@@ -30,7 +30,10 @@ import {
   type ReceiptDocument,
   type SubmissionReceipt,
 } from "@bluey/jobs-automation";
-import { managedCloudRuntimeConfig } from "@bluey/jobs-automation/managed-cloud-runtime";
+import {
+  managedCloudRuntimeConfig,
+  type ManagedCloudRuntimeConfig,
+} from "@bluey/jobs-automation/managed-cloud-runtime";
 import {
   managedCloudReleaseMemoBytes,
   parseManagedCloudReleaseMemo,
@@ -1028,6 +1031,8 @@ async function startRunner(): Promise<void> {
   const processInstanceId = createRunnerProcessInstanceId();
   const runnerBuildId = requiredRunnerEnv("BLUEY_JOBS_RUNNER_BUILD_ID");
   const runnerId = requiredRunnerEnv("BLUEY_JOBS_RUNNER_ID");
+  const processRuntimeGrant = runnerProcessRuntimeGrantFromEnv(runnerBuildId);
+  assertManagedRunnerProcessBundleBinding(managedCloudRuntime, processRuntimeGrant.runtime);
   if (managedCloudRuntime && managedCloudRuntime.workerId !== runnerId) {
     throw new Error("Managed-cloud worker ID must equal the runner ID");
   }
@@ -1041,6 +1046,10 @@ async function startRunner(): Promise<void> {
       AbortSignal.timeout(15_000),
     )
     : undefined;
+  assertManagedRunnerProcessArtifactBinding(
+    claimedManagedCloudRuntimeInstance,
+    processRuntimeGrant.runtime,
+  );
   managedCloudRuntimeInstance = claimedManagedCloudRuntimeInstance;
   runnerVolumeClient = new RunnerVolumeClient({
     origin: requiredRunnerEnv("BLUEY_JOBS_API_ORIGIN"),
@@ -1060,7 +1069,7 @@ async function startRunner(): Promise<void> {
     legacyArtifactCount: legacyStorage.legacyArtifactCount,
     runnerBuildId,
     processInstanceId,
-    processRuntimeGrant: runnerProcessRuntimeGrantFromEnv(runnerBuildId),
+    processRuntimeGrant,
     identity,
     residency: accountResidency,
     subjectStorage,
@@ -4099,6 +4108,32 @@ export function runnerDataRootFromEnv(
   const value = env.BLUEY_JOBS_RUNNER_DATA?.trim();
   if (!value) throw new Error("BLUEY_JOBS_RUNNER_DATA is required");
   return value;
+}
+
+export function assertManagedRunnerProcessBundleBinding(
+  measured: Pick<ManagedCloudRuntimeConfig,
+    "componentId" | "expectedRole" | "automationBundleSha256"> | undefined,
+  runtime: { readonly automationBundleSha256: string },
+): void {
+  if (measured === undefined) return;
+  if (measured.componentId !== "jobs-runner"
+    || measured.expectedRole !== "managed_runner"
+    || !measured.automationBundleSha256
+    || !/^[a-f0-9]{64}$/.test(measured.automationBundleSha256)
+    || measured.automationBundleSha256 !== runtime.automationBundleSha256) {
+    throw new Error("Managed runner process automation bundle binding is invalid");
+  }
+}
+
+export function assertManagedRunnerProcessArtifactBinding(
+  instance: Pick<ManagedCloudRuntimeInstance, "artifactSha256"> | undefined,
+  runtime: { readonly runnerImageSha256: string },
+): void {
+  if (instance === undefined) return;
+  if (!/^[a-f0-9]{64}$/.test(instance.artifactSha256)
+    || instance.artifactSha256 !== runtime.runnerImageSha256) {
+    throw new Error("Managed runner process image binding is invalid");
+  }
 }
 
 export function runnerProcessRuntimeGrantFromEnv(
