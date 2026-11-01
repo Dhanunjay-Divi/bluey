@@ -25,6 +25,11 @@ name = "jobs-nonprod-browser-fixture"
 path = "examples/jobs-nonprod-browser-fixture.rs"
 required-features = ["integration-test-support"]
 
+[[example]]
+name = "jobs-nonprod-runner-control-plane-fixture"
+path = "examples/jobs-nonprod-runner-control-plane-fixture.rs"
+required-features = ["integration-test-support"]
+
 [[test]]
 name = "integration_e2e"
 path = "tests/integration_e2e.rs"

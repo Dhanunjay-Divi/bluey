@@ -1,0 +1,21 @@
+BLUEY DEMO CANDIDATE
+Software Engineer
+demo.candidate@example.com | New York, NY
+
+PROFESSIONAL SUMMARY
+Software engineer with four years of synthetic example experience building web applications.
+This resume is fictional test data for the local Bluey Jobs preview only.
+
+SKILLS
+TypeScript, React, Rust, PostgreSQL, automated testing
+
+PROFESSIONAL EXPERIENCE
+Software Engineer | Example Systems | New York, NY
+January 2022 - December 2025
+- Built React and TypeScript interfaces for an internal workflow application.
+- Implemented Rust services backed by PostgreSQL.
+- Added automated tests and documented application behavior for the engineering team.
+
+EDUCATION
+Bachelor of Science in Computer Science | Example University
+2017 - 2021

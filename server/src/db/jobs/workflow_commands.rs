@@ -2314,7 +2314,7 @@ pub fn stage_cloud_workflow_start(
                   WHERE account_id = $1 FOR UPDATE",
                 &[&input.account_id],
             )?;
-            if !entitlement.get::<_, bool>(0) || !cloud_distribution_ready {
+            if !postgres_cloud_browser_enabled(&entitlement)? || !cloud_distribution_ready {
                 anyhow::bail!("cloud browser distribution is unavailable")
             }
             validate_stage_workflow_input(input, &application, &posting)?;
@@ -3096,7 +3096,7 @@ pub fn stage_cloud_workflow_resume(
                   WHERE account_id = $1 FOR UPDATE",
                 &[&input.account_id],
             )?;
-            if !entitlement.get::<_, bool>(0) {
+            if !postgres_cloud_browser_enabled(&entitlement)? {
                 anyhow::bail!("cloud browser distribution is unavailable")
             }
             if application.state != "needs_input"

@@ -1,6 +1,6 @@
 # Bluey Jobs completion ledger
 
-Updated: 2026-10-28. Authority: current Jobs branch, source and dated local
+Updated: 2026-11-01. Authority: current Jobs branch, source and dated local
 handoffs. This is the durable product checklist, not release approval.
 Native Codex work is tracked in project-scoped Ruflo; Phase 631 task:
 `task-1793133316730-ocx7kf`. Do not create a competing board or reinterpret
@@ -81,6 +81,31 @@ access/model/account controls to avoid a safeguard. This boundary preserves the
 full product goal without treating external effects as implementation authority.
 
 ## Latest observed baseline
+
+November1 Phase638 supersedes older live/pending labels below. Full Rust52148
+passed1,916/zero failures or ignored plus formatting and strict both-feature
+all-target Clippy on774/3de70. Actual private API/PG prepared-retry59610 passed
+with rotated live authority, immutable ATS preservation, stale-operation denials
+and complete cleanup on those bytes. The saved-session four-file test-only
+addition then qualified on774/9b1ee: default browser/API/PG33796 v4 9/9,
+headed agent93177 v1 8/8 with actual UI refresh and API/opaque-PG persistence,
+startup and ready SIGTERM negative controllers5512/10800, plus four malformed
+mode denials. No positive report or owned process/storage survived cancellation.
+The saved account is disposable and same-run only, not password login or
+cross-restart durability. Test guide: `TEST-BLUEY-JOBS-2026-11-02.md`.
+
+Current post-fixture Jobs regression56666 passed2,383 offline cases, all five
+typechecks and all builds, final source/status/portal identity and complete
+root/process/group/browser inventory cleanup. Two mandatory browser files remain
+explicit exclusions in that run; their prior61556 actual Chromium proof is
+separate. All other770 inputs reconstruct the exact pre-fixture3de70 manifest
+when just four test-file hashes are restored, including unchanged Rust/browser
+inputs; no old test is described as newly executed. Launcher self-test44139
+passed. Durable exact reports/hashes are in HANDOFF638. Real runner/browser/
+provider-receipt stitching, hosted integrations, full autonomous launch and the
+wider capability/release conditions in this ledger remain unfinished. The
+resettable preview79377 is intentionally still served separately; it is not
+saved-account, runner or provider evidence.
 
 Current Phase637 checkpoint: document font/bundle corrections and actual private
 built-browser PDF/real-worker, DOCX mapped-symbol, TXT, malformed and oversized

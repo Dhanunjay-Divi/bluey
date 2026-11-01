@@ -10437,7 +10437,10 @@ fn prelock_postgres_managed_cloud_effect_admission_inputs(
             &[&input.account_id],
         )
         .map_err(managed_cloud_storage)?
-        .is_some_and(|row| row.get::<_, bool>(0));
+        .map(|row| postgres_cloud_browser_enabled(&row))
+        .transpose()
+        .map_err(managed_cloud_storage)?
+        .unwrap_or(false);
     if !entitled {
         return Err(ManagedCloudRegistryError::Unavailable);
     }
@@ -22194,6 +22197,9 @@ pub(crate) mod managed_cloud_release_authority_tests {
         pub(crate) scope: ManagedCloudScope,
         pub(crate) runtime_instance_id: String,
         pub(crate) runtime_instance_epoch: i64,
+        // The debug integration bridge retains these privately; ordinary tests need only IDs.
+        #[cfg_attr(not(feature = "integration-test-support"), allow(dead_code))]
+        pub(crate) runtime_credentials: Vec<(ManagedCloudRuntimeInstance, String)>,
     }
 
     pub(crate) fn install_managed_runner_runtime_test_fixture(
@@ -22231,6 +22237,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
         });
         let fixture_suffix = uuid::Uuid::new_v4().simple().to_string();
         let mut managed_runner = None;
+        let mut runtime_credentials = Vec::new();
         for (role, component_id) in [
             ("jobs_api", "jobs-api"),
             ("managed_runner", "jobs-runner"),
@@ -22289,7 +22296,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
                 &ManagedCloudRuntimeHeartbeatInput {
                     runtime_instance_id: runtime_instance_id.clone(),
                     worker_id: runtime_worker_id,
-                    session_token: runtime_session_token,
+                    session_token: runtime_session_token.clone(),
                     heartbeat_sequence: 1,
                     observed_head_revision: instance.head_revision,
                     observed_transition_sha256: instance.transition_sha256.clone(),
@@ -22317,6 +22324,9 @@ pub(crate) mod managed_cloud_release_authority_tests {
             if role == "managed_runner" {
                 managed_runner = Some((runtime_instance_id, instance.instance_epoch));
             }
+            let mut ready_instance = instance;
+            ready_instance.next_heartbeat_sequence = heartbeat.heartbeat_sequence + 1;
+            runtime_credentials.push((ready_instance, runtime_session_token));
         }
         let (runtime_instance_id, runtime_instance_epoch) =
             managed_runner.expect("managed-runner fixture role");
@@ -22324,6 +22334,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
             scope,
             runtime_instance_id,
             runtime_instance_epoch,
+            runtime_credentials,
         }
     }
 

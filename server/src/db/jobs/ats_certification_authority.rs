@@ -11765,12 +11765,102 @@ fn validate_ats_phase_a_context_request(
     Ok(())
 }
 
+fn require_prepared_managed_cloud_ats_retry(
+    retry: &PreparedManagedCloudAtsRetry<'_>,
+    request: &AtsCertificationPhaseAContextRequest,
+    record: &AtsApplicationCertificationBindingRecord,
+    now_ms: i64,
+) -> Result<(), AtsCertificationAuthorityError> {
+    let authority = &record.authority;
+    if retry.run_id != request.run_id
+        || retry.lease.account_id != request.account_id
+        || retry.lease.application_id != request.application_id
+        || retry.lease.browser_profile_id != request.browser_profile_id
+        || retry.lease.phase != "prepared"
+        || retry.lease.lease_expires_at_ms <= now_ms
+        || record.phase != "preflight"
+        || record.fence != 0
+        || record.consumed_at_ms.is_some()
+        || authority.expires_at_ms <= now_ms
+        || authority.account_id != request.account_id
+        || authority.application_id != request.application_id
+        || authority.run_id != request.run_id
+        || authority.browser_session_id != request.browser_session_id
+        || authority.browser_profile_id != request.browser_profile_id
+        || !matches!(
+            request.runtime_attestation,
+            AtsCertificationRuntimeAttestation::Cloud { .. }
+        )
+        || authority
+            .certification
+            .selected_runtime
+            .as_ref()
+            .is_none_or(|runtime| {
+                runtime.runtime_kind != "cloud"
+                    || !ats_runtime_matches_attestation(runtime, &request.runtime_attestation)
+            })
+    {
+        return Err(AtsCertificationAuthorityError::IdentityConflict);
+    }
+    Ok(())
+}
+
 pub fn create_ats_application_certification_binding_from_context_sqlite_tx(
     tx: &rusqlite::Transaction<'_>,
     request: &AtsCertificationPhaseAContextRequest,
     now_ms: i64,
 ) -> Result<AtsApplicationCertificationBindingRecord, AtsCertificationAuthorityError> {
+    create_ats_phase_a_from_context_sqlite_tx(tx, request, now_ms, None)
+}
+
+fn create_ats_phase_a_from_context_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    request: &AtsCertificationPhaseAContextRequest,
+    now_ms: i64,
+    retry: Option<&PreparedManagedCloudAtsRetry<'_>>,
+) -> Result<AtsApplicationCertificationBindingRecord, AtsCertificationAuthorityError> {
     validate_ats_phase_a_context_request(request, now_ms)?;
+    let retained = if let Some(retry) = retry {
+        let mut statement = tx.prepare(
+            "SELECT binding_sha256, frozen_certification_base64url, phase, fence, consumed_at_ms
+             FROM jobs_application_ats_certification_bindings
+             WHERE account_id=?1 AND application_id=?2 AND run_id=?3 LIMIT 2",
+        ).map_err(ats_certification_storage)?;
+        let rows = statement
+            .query_map(
+                params![request.account_id, request.application_id, request.run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .map_err(ats_certification_storage)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ats_certification_storage)?;
+        if rows.len() != 1 {
+            return Err(AtsCertificationAuthorityError::IdentityConflict);
+        }
+        let row = rows
+            .into_iter()
+            .next()
+            .ok_or(AtsCertificationAuthorityError::IdentityConflict)?;
+        let record = ats_application_binding_record(row.0, row.1, row.2, row.3, row.4, true)?;
+        require_prepared_managed_cloud_ats_retry(retry, request, &record, now_ms)?;
+        Some(record)
+    } else {
+        None
+    };
+    let retained_request = retained.as_ref().map(|record| {
+        let mut retained_request = request.clone();
+        retained_request.nonce_sha256 = record.authority.nonce_sha256.clone();
+        retained_request
+    });
+    let request = retained_request.as_ref().unwrap_or(request);
     let (job_id, application_json, stored_state) = tx
         .query_row(
             "SELECT job_id, application_json, state FROM jobs_applications
@@ -11861,6 +11951,13 @@ pub fn create_ats_application_certification_binding_from_context_sqlite_tx(
         &request.account_id,
         now_ms,
     )?;
+    if let Some(record) = retained.as_ref() {
+        require_frozen_ats_binding_matches_admission(
+            record.authority.certification.clone(),
+            &admission.certification,
+            &request.runtime_attestation,
+        )?;
+    }
     let runtime = certification
         .selected_runtime
         .as_ref()
@@ -11884,8 +11981,10 @@ pub fn create_ats_application_certification_binding_from_context_sqlite_tx(
         rollout_channel: certification.channel,
         runner_id: runtime.runtime_sha256.clone(),
         nonce_sha256: request.nonce_sha256.clone(),
-        requested_expires_at_ms: now_ms
-            .saturating_add(ATS_CERTIFICATION_APPLICATION_BINDING_TTL_MS),
+        requested_expires_at_ms: retained.as_ref().map_or_else(
+            || now_ms.saturating_add(ATS_CERTIFICATION_APPLICATION_BINDING_TTL_MS),
+            |record| record.authority.requested_expires_at_ms,
+        ),
     };
     create_ats_application_certification_binding_sqlite_tx(tx, &raw_request, now_ms)
 }
@@ -11908,7 +12007,48 @@ pub(crate) fn create_ats_application_certification_binding_from_context_postgres
     request: &AtsCertificationPhaseAContextRequest,
     now_ms: i64,
 ) -> Result<AtsApplicationCertificationBindingRecord, AtsCertificationAuthorityError> {
+    create_ats_phase_a_from_context_postgres_tx_after_prelock(tx, request, now_ms, None)
+}
+
+fn create_ats_phase_a_from_context_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    request: &AtsCertificationPhaseAContextRequest,
+    now_ms: i64,
+    retry: Option<&PreparedManagedCloudAtsRetry<'_>>,
+) -> Result<AtsApplicationCertificationBindingRecord, AtsCertificationAuthorityError> {
     validate_ats_phase_a_context_request(request, now_ms)?;
+    let retained = if let Some(retry) = retry {
+        // The claim's established ATS-row prelock precedes the lease lock. Do not acquire
+        // a new advisory lock or move this read outside the caller-owned transaction.
+        let rows = tx.query(
+            "SELECT binding_sha256, frozen_certification_base64url, phase, fence, consumed_at_ms
+             FROM jobs_application_ats_certification_bindings
+             WHERE account_id=$1 AND application_id=$2 AND run_id=$3 LIMIT 2 FOR UPDATE",
+            &[&request.account_id, &request.application_id, &request.run_id],
+        ).map_err(ats_certification_storage)?;
+        if rows.len() != 1 {
+            return Err(AtsCertificationAuthorityError::IdentityConflict);
+        }
+        let row = &rows[0];
+        let record = ats_application_binding_record(
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+            row.get(4),
+            true,
+        )?;
+        require_prepared_managed_cloud_ats_retry(retry, request, &record, now_ms)?;
+        Some(record)
+    } else {
+        None
+    };
+    let retained_request = retained.as_ref().map(|record| {
+        let mut retained_request = request.clone();
+        retained_request.nonce_sha256 = record.authority.nonce_sha256.clone();
+        retained_request
+    });
+    let request = retained_request.as_ref().unwrap_or(request);
     let row = tx
         .query_opt(
             "SELECT job_id, application_json, state FROM jobs_applications
@@ -11988,6 +12128,13 @@ pub(crate) fn create_ats_application_certification_binding_from_context_postgres
         &request.account_id,
         now_ms,
     )?;
+    if let Some(record) = retained.as_ref() {
+        require_frozen_ats_binding_matches_admission(
+            record.authority.certification.clone(),
+            &admission.certification,
+            &request.runtime_attestation,
+        )?;
+    }
     let runtime = certification
         .selected_runtime
         .as_ref()
@@ -12011,8 +12158,10 @@ pub(crate) fn create_ats_application_certification_binding_from_context_postgres
         rollout_channel: certification.channel,
         runner_id: runtime.runtime_sha256.clone(),
         nonce_sha256: request.nonce_sha256.clone(),
-        requested_expires_at_ms: now_ms
-            .saturating_add(ATS_CERTIFICATION_APPLICATION_BINDING_TTL_MS),
+        requested_expires_at_ms: retained.as_ref().map_or_else(
+            || now_ms.saturating_add(ATS_CERTIFICATION_APPLICATION_BINDING_TTL_MS),
+            |record| record.authority.requested_expires_at_ms,
+        ),
     };
     create_ats_application_certification_binding_postgres_tx_after_prelock(tx, &raw_request, now_ms)
 }
@@ -18945,6 +19094,23 @@ pub(super) mod ats_certification_authority_tests {
         assert!(replay.replayed);
         assert_eq!(replay.binding_sha256, first.binding_sha256);
 
+        for changed in ["deadline", "authorization"] {
+            let mut invalid = request.clone();
+            if changed == "deadline" {
+                invalid.requested_expires_at_ms += 1;
+            } else {
+                invalid.auto_authorization_fingerprint_sha256 = "f".repeat(64);
+            }
+            assert!(matches!(
+                create_ats_application_certification_binding(
+                    &fixture.pool,
+                    &invalid,
+                    TEST_NOW_MS + 1
+                ),
+                Err(AtsCertificationAuthorityError::IdentityConflict)
+            ));
+        }
+
         let mut changed_nonce = request.clone();
         changed_nonce.nonce_sha256 = "b".repeat(64);
         assert!(matches!(
@@ -18995,6 +19161,85 @@ pub(super) mod ats_certification_authority_tests {
             Err(AtsCertificationAuthorityError::ScopeMismatch)
                 | Err(AtsCertificationAuthorityError::IdentityConflict)
         ));
+    }
+
+    #[test]
+    fn managed_cloud_ats_retry_rejects_incompatible_record_and_runtime() {
+        let fixture = imported_cloud_fixture();
+        let raw = test_binding_request("prepared-cloud-retry-record", 'a');
+        let original =
+            create_ats_application_certification_binding(&fixture.pool, &raw, TEST_NOW_MS).unwrap();
+        let lease = StoredExecutionLease {
+            account_id: raw.account_id.clone(),
+            application_id: raw.application_id.clone(),
+            browser_profile_id: raw.browser_profile_id.clone(),
+            owner_id: "worker".into(),
+            lease_token_sha256: "b".repeat(64),
+            fence: 2,
+            phase: "prepared".into(),
+            lease_expires_at_ms: TEST_NOW_MS + 100,
+        };
+        let retry = PreparedManagedCloudAtsRetry {
+            lease: &lease,
+            run_id: &raw.run_id,
+        };
+        let context = AtsCertificationPhaseAContextRequest {
+            account_id: raw.account_id,
+            application_id: raw.application_id,
+            run_id: raw.run_id.clone(),
+            browser_session_id: raw.browser_session_id,
+            browser_profile_id: raw.browser_profile_id,
+            runtime_attestation: cloud_runtime_attestation(),
+            nonce_sha256: "c".repeat(64),
+        };
+        assert!(require_prepared_managed_cloud_ats_retry(
+            &retry,
+            &context,
+            &original,
+            TEST_NOW_MS + 1
+        )
+        .is_ok());
+        for variant in 0..11 {
+            let mut record = original.clone();
+            match variant {
+                0 => record.phase = "consumed".into(),
+                1 => record.phase = "invalidated".into(),
+                2 => record.fence = 1,
+                3 => record.consumed_at_ms = Some(TEST_NOW_MS),
+                4 => record.authority.expires_at_ms = TEST_NOW_MS + 1,
+                5 => record.authority.account_id = "other".into(),
+                6 => record.authority.browser_session_id = "other".into(),
+                7 => record.authority.browser_profile_id = "other".into(),
+                8 => {
+                    record
+                        .authority
+                        .certification
+                        .selected_runtime
+                        .as_mut()
+                        .unwrap()
+                        .runner_image_sha256 = Some("f".repeat(64))
+                }
+                9 => record.authority.application_id = "other".into(),
+                10 => record.authority.run_id = "other".into(),
+                _ => unreachable!(),
+            }
+            assert!(require_prepared_managed_cloud_ats_retry(
+                &retry,
+                &context,
+                &record,
+                TEST_NOW_MS + 1
+            )
+            .is_err());
+        }
+        let mut wrong_runtime = context;
+        wrong_runtime.runtime_attestation = local_runtime_attestation();
+        assert!(require_prepared_managed_cloud_ats_retry(
+            &retry,
+            &wrong_runtime,
+            &original,
+            TEST_NOW_MS + 1
+        )
+        .is_err());
     }
 
     #[test]
@@ -20554,11 +20799,39 @@ pub(super) mod ats_certification_authority_tests {
             runtime_attestation: cloud_runtime_attestation(),
             nonce_sha256: "9".repeat(64),
         };
+        // ATS-context unit fixture: the actual same-owner lease predicate is tested separately;
+        // ordinary API/PG qualification supplies its real locked lease and distinct session.
+        let prepared_lease = StoredExecutionLease {
+            account_id: account_id.into(),
+            application_id: application_id.into(),
+            browser_profile_id: browser_profile_id.into(),
+            owner_id: "cloud-worker".into(),
+            lease_token_sha256: "9".repeat(64),
+            fence: 1,
+            phase: "prepared".into(),
+            lease_expires_at_ms: TEST_NOW_MS + 100,
+        };
+        let retry = PreparedManagedCloudAtsRetry {
+            lease: &prepared_lease,
+            run_id,
+        };
         let phase_a = {
             let mut conn = fixture.pool.get().unwrap();
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .unwrap();
+            assert!(
+                matches!(
+                    create_ats_phase_a_from_context_sqlite_tx(
+                        &tx,
+                        &phase_a_request,
+                        TEST_NOW_MS,
+                        Some(&retry)
+                    ),
+                    Err(AtsCertificationAuthorityError::IdentityConflict)
+                ),
+                "a retry must not create a missing Phase A row"
+            );
             let result = create_ats_application_certification_binding_from_context_sqlite_tx(
                 &tx,
                 &phase_a_request,
@@ -20568,6 +20841,87 @@ pub(super) mod ats_certification_authority_tests {
             tx.commit().unwrap();
             result
         };
+        {
+            let mut conn = fixture.pool.get().unwrap();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let stored = || {
+                tx.query_row(
+                "SELECT binding_sha256,frozen_certification_base64url FROM jobs_application_ats_certification_bindings WHERE binding_id=?1",
+                params![phase_a.authority.binding_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            ).unwrap()
+            };
+            let before = stored();
+            let mut rotated = phase_a_request.clone();
+            rotated.nonce_sha256 = "a".repeat(64);
+            assert!(
+                matches!(
+                    create_ats_application_certification_binding_from_context_sqlite_tx(
+                        &tx,
+                        &rotated,
+                        TEST_NOW_MS + 1
+                    ),
+                    Err(AtsCertificationAuthorityError::IdentityConflict)
+                ),
+                "the generic context creator must keep exact nonce/deadline semantics"
+            );
+            let replay = create_ats_phase_a_from_context_sqlite_tx(
+                &tx,
+                &rotated,
+                TEST_NOW_MS + 1,
+                Some(&retry),
+            )
+            .expect("same-owner prepared cloud retry retains Phase A");
+            assert!(replay.replayed);
+            assert_eq!(replay.authority, phase_a.authority);
+            assert_ne!(replay.authority.nonce_sha256, rotated.nonce_sha256);
+            assert_eq!(
+                replay.authority.requested_expires_at_ms,
+                phase_a.authority.requested_expires_at_ms
+            );
+            assert_eq!(stored(), before);
+
+            tx.execute_batch("SAVEPOINT auto_revoked").unwrap();
+            tx.execute(
+                "UPDATE jobs_auto_submit_authorizations SET revoked_at_ms=?1 WHERE id=?2",
+                params![TEST_NOW_MS + 1, auto_authorization_id],
+            )
+            .unwrap();
+            assert!(create_ats_phase_a_from_context_sqlite_tx(
+                &tx,
+                &rotated,
+                TEST_NOW_MS + 1,
+                Some(&retry)
+            )
+            .is_err());
+            tx.execute_batch("ROLLBACK TO auto_revoked; RELEASE auto_revoked")
+                .unwrap();
+
+            tx.execute_batch("SAVEPOINT packet_changed").unwrap();
+            let mut changed_application = application.clone();
+            changed_application.receipt["approved_execution"]["packet"]["browserProfileId"] =
+                json!("changed-profile");
+            tx.execute(
+                "UPDATE jobs_applications SET application_json=?1 WHERE id=?2",
+                params![
+                    serde_json::to_string(&changed_application).unwrap(),
+                    application_id
+                ],
+            )
+            .unwrap();
+            assert!(create_ats_phase_a_from_context_sqlite_tx(
+                &tx,
+                &rotated,
+                TEST_NOW_MS + 1,
+                Some(&retry)
+            )
+            .is_err());
+            tx.execute_batch("ROLLBACK TO packet_changed; RELEASE packet_changed")
+                .unwrap();
+            assert_eq!(stored(), before);
+            tx.rollback().unwrap();
+        }
         let selected_runtime = phase_a
             .authority
             .certification

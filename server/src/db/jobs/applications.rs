@@ -2482,6 +2482,64 @@ mod queue_admission_tests {
     use crate::db;
     use serde_json::json;
 
+    #[test]
+    fn postgres_cloud_browser_integer_decoder_is_fallible_when_configured() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            if std::env::var("BLUEY_JOBS_REQUIRE_POSTGRES_TESTS").as_deref() == Ok("1") {
+                panic!("PostgreSQL cloud entitlement regression requires BLUEY_TEST_POSTGRES_URL");
+            }
+            eprintln!(
+                "SKIP PostgreSQL cloud entitlement regression: \
+                 BLUEY_TEST_POSTGRES_URL is unavailable"
+            );
+            return;
+        };
+        let _guard = super::managed_cloud_release_authority_tests::postgres_boot_test_lock()
+            .lock()
+            .expect("serialize PostgreSQL lifecycle fixtures");
+        let pool = db::open_postgres_pool(&database_url)
+            .expect("open private PostgreSQL cloud entitlement pool");
+        db::run_migrations(&pool).expect("migrate PostgreSQL cloud entitlement pool");
+        db::run_migrations(&pool).expect("replay PostgreSQL cloud entitlement migrations");
+        let mut connection = pool
+            .get_pg()
+            .expect("read private PostgreSQL entitlement schema");
+        let statement = connection
+            .prepare("SELECT cloud_browser FROM jobs_entitlements LIMIT 0")
+            .expect("prepare actual migrated cloud entitlement column");
+        assert_eq!(statement.columns()[0].name(), "cloud_browser");
+        assert_eq!(statement.columns()[0].type_(), &postgres::types::Type::INT4);
+
+        for (value, expected) in [(0_i32, false), (1, true), (2, true), (-1, true)] {
+            let row = connection
+                .query_one("SELECT $1::int4 AS cloud_browser", &[&value])
+                .expect("read integer cloud entitlement fixture");
+            assert_eq!(
+                super::postgres_cloud_browser_enabled(&row)
+                    .expect("decode integer cloud entitlement"),
+                expected
+            );
+        }
+        // Schema/type drift is a fallible storage error, never Row::get's panic or coercion.
+        for query in [
+            "SELECT TRUE AS cloud_browser",
+            "SELECT 1::int8 AS cloud_browser",
+            "SELECT 1::int4 AS another_column",
+        ] {
+            let row = connection
+                .query_one(query, &[])
+                .expect("read invalid entitlement shape");
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::postgres_cloud_browser_enabled(&row)
+            }))
+            .expect("invalid entitlement shape must not unwind");
+            assert!(
+                decoded.is_err(),
+                "invalid entitlement shape must return an error"
+            );
+        }
+    }
+
     fn commit_prepared_application_source() -> &'static str {
         include_str!("applications.rs")
             .split_once("fn commit_prepared_application(")
@@ -4975,6 +5033,15 @@ fn current_period() -> (i64, i64) {
     (start.timestamp_millis(), end.timestamp_millis())
 }
 
+// PostgreSQL keeps these legacy entitlement flags as INTEGER, not BOOLEAN.
+// Named, fallible decoding preserves the persisted nonzero contract without panicking on drift.
+fn postgres_cloud_browser_enabled(
+    row: &postgres::Row,
+) -> std::result::Result<bool, postgres::Error> {
+    row.try_get::<_, i32>("cloud_browser")
+        .map(|value| value != 0)
+}
+
 pub fn get_entitlement(pool: &DbPool, account_id: &str) -> Result<JobsEntitlement> {
     let (period_start, period_end) = current_period();
     crate::db::run_blocking_db(|| match pool {
@@ -5044,7 +5111,7 @@ pub fn get_entitlement(pool: &DbPool, account_id: &str) -> Result<JobsEntitlemen
                 row.get(4),
                 row.get(5),
                 row.get::<_, i32>(6) != 0,
-                row.get::<_, i32>(7) != 0,
+                postgres_cloud_browser_enabled(&row)?,
             ))
         }
     })

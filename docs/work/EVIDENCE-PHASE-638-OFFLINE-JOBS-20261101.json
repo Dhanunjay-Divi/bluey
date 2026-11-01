@@ -1,0 +1,96 @@
+{
+  "schema": 1,
+  "kind": "offline_jobs_regression_only",
+  "status": "passed",
+  "recipeSha256": "5fabb1af3f5386c9450e2a70fbdeff3754023dc52110f7b967e4828dff009184",
+  "events": [
+    {
+      "event": "phase638_offline_browser_inventory",
+      "stage": "before",
+      "files": 0,
+      "processes": 0,
+      "openFiles": 0
+    },
+    {
+      "event": "phase638_offline_jobs_gate_started",
+      "baseCommit": "409498589b8d2e62b5ef54ebdee1372aeb8d005f",
+      "sourceFiles": 774,
+      "sourceManifestSha256": "3de70edc32c2f4b9b3199747265b5eaa78e75a38ed30f60d3361fef4f14e22c1",
+      "scopedStatusSha256": "6754505e7726bb0a1fb2c63b1c8f37767b2afe525e6f16218ed86c5dfa0f85d5",
+      "worktreeStatusSha256": "e82fb1c735d7c6f424299d53f6efcc7ace829e3215fab0c2816ee0981e1e5516",
+      "privateHome": true,
+      "browserLaunchAuthorized": false,
+      "mandatoryExcludedBrowserFiles": [
+        "jobs/automation/tests/playwright-submit-guard.integration.test.ts",
+        "jobs/portal/src/lib/documents/browser-import.integration.test.ts"
+      ]
+    },
+    {
+      "event": "phase638_offline_jobs_tests_passed",
+      "nodeCounts": [
+        303,
+        7,
+        17
+      ],
+      "vitestCounts": [
+        806,
+        219,
+        310,
+        321,
+        397
+      ],
+      "total": 2380,
+      "baselineFloorOnly": 2083,
+      "extraSkipped": 0,
+      "mandatoryExcludedBrowserFiles": [
+        "jobs/automation/tests/playwright-submit-guard.integration.test.ts",
+        "jobs/portal/src/lib/documents/browser-import.integration.test.ts"
+      ],
+      "fullBrowserGate": "unverified"
+    },
+    {
+      "event": "phase638_offline_browser_inventory",
+      "stage": "after",
+      "files": 0,
+      "processes": 0,
+      "openFiles": 0
+    },
+    {
+      "event": "phase638_offline_jobs_gate_finished",
+      "baseCommit": "409498589b8d2e62b5ef54ebdee1372aeb8d005f",
+      "sourceFiles": 774,
+      "sourceManifestSha256": "3de70edc32c2f4b9b3199747265b5eaa78e75a38ed30f60d3361fef4f14e22c1",
+      "tests": 2380,
+      "baselineFloorOnly": 2083,
+      "mandatoryExcludedBrowserFiles": [
+        "jobs/automation/tests/playwright-submit-guard.integration.test.ts",
+        "jobs/portal/src/lib/documents/browser-import.integration.test.ts"
+      ],
+      "extraSkipped": 0,
+      "typecheckWorkspaces": 5,
+      "builtNonPortalWorkspaces": 4,
+      "portalOutputPrivate": true,
+      "trackedPortalUnchanged": true,
+      "fullBrowserGate": "unverified",
+      "sourceUnchanged": true
+    },
+    {
+      "event": "phase638_offline_browser_inventory",
+      "stage": "finally",
+      "files": 0,
+      "processes": 0,
+      "openFiles": 0
+    }
+  ],
+  "exit": {
+    "code": 0,
+    "signal": null
+  },
+  "cleanup": {
+    "parentEmpty": true
+  },
+  "fullRustGate": "unverified",
+  "fullBrowserGate": "unverified",
+  "productionAccepted": false,
+  "outputSha256": "fd5951541902d6038b38119b57bcca5b255ccd863164e24db84427bf0b4e9c58"
+}

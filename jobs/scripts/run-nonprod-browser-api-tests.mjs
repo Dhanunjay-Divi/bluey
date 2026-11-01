@@ -8,9 +8,12 @@ import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertBrowserApiReport } from "./nonprod-browser-api-report.mjs";
+import {
+  assertBrowserApiReport, assertHumanBrowserApiReport,
+} from "./nonprod-browser-api-report.mjs";
 
-assert.equal(process.argv.length, 2);
+const humanHold = process.argv.length === 3 && process.argv[2] === "--human-hold";
+assert(process.argv.length === 2 || humanHold, "expected no arguments or exact --human-hold");
 const root = realpathSync(process.env.BLUEY_TEST_RUN_ROOT || "/missing-owned-root");
 assert(/^\/(private\/)?tmp\/bluey-test-runs-/.test(root));
 assert.equal(lstatSync(root).uid, process.getuid());
@@ -86,7 +89,8 @@ const childEnv = { ...env,
   BLUEY_NONPROD_PACKET_FIXTURE_BIN: join(process.env.CARGO_TARGET_DIR,
     "debug/examples/jobs-nonprod-browser-fixture"),
 };
-const child = spawn(process.execPath, [join(jobs, "portal/nonprod/browser-api.integration.mjs")], {
+const child = spawn(process.execPath, [join(jobs, "portal/nonprod/browser-api.integration.mjs"),
+  ...(humanHold ? ["--human-hold"] : [])], {
   env: childEnv, stdio: "inherit",
 });
 const completion = new Promise((resolveClose, reject) => {
@@ -94,28 +98,49 @@ const completion = new Promise((resolveClose, reject) => {
   child.once("close", (code, signal) => resolveClose({ code, signal }));
 });
 let interrupted = false;
-const stop = () => { interrupted = true; child.kill("SIGTERM"); };
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, stop);
-const timeout = setTimeout(stop, 240_000);
+let escalation;
+const signalHandlers = new Map();
+const stop = () => {
+  if (interrupted) return;
+  interrupted = true;
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  escalation = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }, 45_000);
+};
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  const handler = () => stop(); signalHandlers.set(signal, handler); process.on(signal, handler);
+}
+const timeout = setTimeout(stop, humanHold ? 780_000 : 240_000);
 try {
   const closed = await completion;
   assert(!interrupted);
   assert.deepEqual(closed, { code: 0, signal: null });
-  const path = join(root, "browser-api-result.json");
+  const path = join(root, humanHold ? "human-browser-api-result.json" : "browser-api-result.json");
   const reportInfo = lstatSync(path);
   assert(reportInfo.isFile() && !reportInfo.isSymbolicLink());
   assert.equal(reportInfo.uid, process.getuid());
   assert.equal(reportInfo.mode & 0o777, 0o600);
-  assert(reportInfo.size > 0 && reportInfo.size < 64 * 1024);
+  assert(reportInfo.size > 0 && reportInfo.size < (humanHold ? 16 : 64) * 1024);
   const report = JSON.parse(readFileSync(path, "utf8"));
-  assertBrowserApiReport(report);
+  if (humanHold) assertHumanBrowserApiReport(report);
+  else assertBrowserApiReport(report);
   for (const [path, digest] of sourceHashes) {
     assert.equal(createHash("sha256").update(readFileSync(path)).digest("hex"), digest,
       "portal source changed during browser qualification");
   }
-  console.log(JSON.stringify({ event: "nonprod_browser_api_finished", ...report }));
+  if (humanHold) {
+    console.log(JSON.stringify({ event: "nonprod_browser_api_finished", mode: report.mode,
+      passed: report.passed, cases: report.cases.length, sourceAccepted: false }));
+  } else console.log(JSON.stringify({ event: "nonprod_browser_api_finished", ...report }));
 } finally {
-  clearTimeout(timeout);
-  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.off(signal, stop);
-  if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  clearTimeout(timeout); clearTimeout(escalation);
+  for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGTERM");
+    const forced = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }, 45_000);
+    await completion; clearTimeout(forced);
+  }
 }

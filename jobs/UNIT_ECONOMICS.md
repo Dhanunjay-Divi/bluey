@@ -4,6 +4,111 @@ Internal operating model. Customer-facing UI should show plan inclusions and pri
 
 Checked July 10, 2026.
 
+## Competitive target update — October 28, 2026
+
+The tables below are historical planning assumptions, not current measured costs,
+verified live entitlements, or a new pricing authorization. The owner now requests
+beating Tsenta's reported $0.05 per application. Its public
+[pricing page](https://tsenta.com/pricing), checked October 28, advertises these
+monthly USD allowances:
+
+| Plan | Monthly price | Applications | Price per application at full use |
+| --- | ---: | ---: | ---: |
+| Starter | $19 | 600 | $0.031667 |
+| Pro | $39 | 1,500 | $0.026000 |
+| Power | $99 | 4,500 | $0.022000 |
+
+These are advertised customer prices, not Tsenta's internal costs or independent
+proof of its delivery. Unused allowance increases effective customer price; billing
+period, geography and terms must match any comparison. The $0.05 target alone would
+not beat these published full-use prices.
+
+Our existing $0.125 cloud-packet budget is 2.5 times $0.05 and approximately 5.68
+times $0.022, before shared service costs. Its $0.06 AI component already exceeds
+$0.05. These assumptions therefore do **not** establish a competitive delivery
+cost. A completed packet is also not necessarily a successful employer submission.
+Do not present either metric as the other or change customer prices from this note.
+
+The pending cost workstream must report separately:
+
+- Effective customer price, variable delivery cost, fully allocated recurring
+  service cost and gross margin, at low/base/high allowance utilization.
+- Total discovery, verification, AI/document, browser/runner, retry/failed/unknown
+  attempt, idle capacity, storage, networking, communication, monitoring, payment,
+  refund and support costs divided by distinct receipt-verified submissions.
+- Source/ATS mix, sample size, observation period, success and intervention rates,
+  duplicate rate, match quality and p50/p95 latency alongside cost. Low-cost failures
+  and unmatched submissions cannot establish an end-to-end win.
+- Per-user monthly and 100-user six-month forecasts, measured inputs versus explicit
+  assumptions, break-even scale and enforceable budgets. Keep one-time development
+  expense separate from recurring service economics.
+
+Candidate optimizations are reusable verified profile facts, bounded truthful
+tailoring, shared source-verification caches with appropriate freshness, deterministic
+supported-ATS paths before semantic fallback, economical quality-tested model routing,
+and higher runner utilization. All require measurements and must preserve consent,
+tenant isolation, apply-once constraints, truthful facts and genuine receipts.
+
+Delivery tracking: existing Asana cost task `1219993283940797`. No measured cost
+advantage, release readiness, unlimited source coverage or new price is established.
+
+### Feasibility boundary, not a new plan
+
+At the published Power full-use price of $0.022 per application, a hypothetical
+60% gross margin permits at most $0.0088 total recurring COGS per verified
+submission; 70% permits $0.0066. These are arithmetic ceilings, not achieved costs,
+chosen margin requirements or authorization to match/change prices. Costs such as
+payment fees, support and idle capacity consume part of that ceiling before an AI
+call or browser step. Low utilization must be modelled separately.
+
+Consequently, a permanently running visual agent plus repeated large-model
+reasoning for every step cannot be assumed competitive. The next measured
+comparison should separate deterministic provider execution, genuinely necessary
+semantic fallback and user-assisted exceptions. Reuse verified candidate facts and
+role-grounded document work only with exact revision/consent/freshness bindings;
+stop runners at completion or intervention; enforce per-attempt time/dollar caps.
+Compare quality and actual receipts alongside costs. These are test candidates,
+not claims that all optimizations or safe budget enforcement are already shipped.
+
+### Current implementation measurement audit — October 28, 2026
+
+Read-only source inspection, not runtime or invoice qualification:
+
+- Managed resume generation already limits output, retries, deadlines and spend
+  exposure. Provider attempt holds and settlement retain accepted and non-accepted
+  outcomes, token counts, provider/model and latency. A positive configured rolling
+  cap is required for paid admission. Source: `server/src/api/jobs_resume_generation.rs`,
+  `server/src/db/jobs_provider_cost_holds.rs` and `server/src/config.rs`.
+- Accepted generation cost alone is an incomplete numerator. Rejected, failed,
+  timeout and uncertain provider attempts also consume resources. Missing usage is
+  conservatively reserved/settled; it is not evidence of a free call.
+- Application-to-generation allowance reservations and receipt/evidence validators
+  provide existing attribution and denominator seams. An aggregate must validate
+  submitted envelopes and exact evidence bindings, not simply count a status string.
+  Source: `server/src/db/jobs/applications.rs`, `jobs_generation_allowance.rs`,
+  `customer_data.rs`, `server/src/db/jobs.rs` and `server/src/api/jobs.rs`.
+- There is no complete browser/runner COGS ledger in the inspected paths. Lease,
+  browser-session and runtime timestamps are coarse wall-time proxies, not measured
+  billed active/idle/startup/intervention time, proxy usage or invoice charges.
+- Whole-cent rounded cost records support conservative spend admission but cannot
+  establish precise sub-cent aggregate delivery costs. Durable usage events lack a
+  direct application/generation key; opaque holds can be rejoined in trusted code
+  only within their retention window (configured maximum 30 days plus 24-hour grace).
+  They cannot by themselves support a reproducible six-month attribution report.
+- Applied rate-version and invoice provenance, discovery/document/storage/network,
+  communications, payment/refund/support and shared idle-capacity allocations remain
+  measurement gaps. Unknown costs must render the report incomplete, never zero.
+
+Smallest next implementation: a read-only per-success sample within the retention
+window, joining existing application/generation reservations to **all** settled
+attempt exposure and workflow retry/unknown outcomes, with verified receipts as
+denominator. Mark lease wall time `unpriced_proxy` and runner cost `unverified`.
+Test one verified success with accepted plus rejected model attempts, an unknown
+delivery/retry and a failed/released application: all exposed costs stay in the
+numerator, only the verified success enters the denominator. Later precise immutable
+cost attribution and rate/invoice snapshots need their own reviewed bounded phase;
+do not rewrite existing billing/authorization accounting to create a cheap result.
+
 ## Pricing
 
 | Plan | Price | Included completed packets | Browser | Inboxes | Packet overage |

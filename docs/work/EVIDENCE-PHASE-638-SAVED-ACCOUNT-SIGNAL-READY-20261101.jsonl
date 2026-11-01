@@ -1,0 +1,17 @@
+{"sequence":1,"time":"2026-11-01T07:12:23.043Z","event":"saved_account_signal_ready_started","recipeSha256":"7137a5e603879f7cfb0b9d31a259ce8835660657d8c7a6207c2930f08cfea122","before":{"files":774,"manifest":"9b1ee47e1deeb796af1d771513f6c2dd60362f832f1f4c5711bd8d9b2990c764","head":"409498589b8d2e62b5ef54ebdee1372aeb8d005f","rawStatus":"932ee3fd34f0e460355ecf5ef07063c2c940cd431cacf8e2fc22da5588722fdc","indexEmpty":true},"prospectiveTree":"e2261e50254a9607e3a89e9d8ce61bcbc450bd3b","ownedPaths":89,"privacyTracked":2958,"privacyText":2679}
+{"sequence":2,"time":"2026-11-01T07:12:24.716Z","event":"private_postgres_admitted","root":"/private/tmp/bluey-test-runs-phase638-saved-account-signal-ready-20261101/run.1793517143.87783.5524247400","pgPid":87902,"launcherPid":87783,"port":62631}
+{"sequence":3,"time":"2026-11-01T07:15:06.962Z","event":"browser_api_build_start","binaries":[{"name":"bluey-jobs-api","sha256":"8e9dbfab1ccd7466f1c1a31950200adc640a5f398f46bd1a456c0ad71a34fab9"},{"name":"bluey-server","sha256":"4445bdb3e5e4209e707ff8092c7d62a5248a876ff74a3fff71ed9abd375e369d"},{"name":"examples/jobs-nonprod-browser-fixture","sha256":"921cbebe3e10867bc6c338d4acb0a9e8f7fdc3750a34e9d8280362eec561350f"}]}
+{"sequence":4,"time":"2026-11-01T07:15:12.926Z","event":"browser_api_chromium_install_start"}
+{"sequence":5,"time":"2026-11-01T07:15:36.253Z","event":"browser_case_passed","case":"profile_reload"}
+{"sequence":6,"time":"2026-11-01T07:15:37.744Z","event":"browser_case_passed","case":"onboarding_complete"}
+{"sequence":7,"time":"2026-11-01T07:15:38.439Z","event":"browser_case_passed","case":"preference_track_reload"}
+{"sequence":8,"time":"2026-11-01T07:15:38.539Z","event":"browser_case_passed","case":"auth_isolation"}
+{"sequence":9,"time":"2026-11-01T07:15:41.192Z","event":"browser_case_passed","case":"effect_availability"}
+{"sequence":10,"time":"2026-11-01T07:15:45.069Z","event":"human_browser_case_passed","case":"bootstrap"}
+{"sequence":11,"time":"2026-11-01T07:15:45.075Z","event":"human_browser_case_passed","case":"ready"}
+{"sequence":12,"time":"2026-11-01T07:15:45.080Z","event":"human_browser_ready","mode":"human_hold","expires_within_seconds":585,"sourceAccepted":false}
+{"sequence":13,"time":"2026-11-01T07:15:46.126Z","event":"saved_account_signal_negative_confirmed","target":"ready","interrupted":true,"reportsAbsent":true,"pidsAbsent":true,"sourceAccepted":false}
+{"sequence":14,"time":"2026-11-01T07:15:46.524Z","event":"nonprod_postgres_finished","status":0,"shutdownAttempted":true,"serverExited":true}
+{"sequence":15,"time":"2026-11-01T07:15:50.544Z","event":"saved_launcher_exit","code":0,"signal":null}
+{"sequence":16,"time":"2026-11-01T07:15:50.888Z","event":"saved_outer_final_verified","after":{"files":774,"manifest":"9b1ee47e1deeb796af1d771513f6c2dd60362f832f1f4c5711bd8d9b2990c764","head":"409498589b8d2e62b5ef54ebdee1372aeb8d005f","rawStatus":"932ee3fd34f0e460355ecf5ef07063c2c940cd431cacf8e2fc22da5588722fdc","indexEmpty":true},"rootAbsent":true,"parentEmpty":true,"postgresPidAbsent":true,"launcherPidAbsent":true,"postgresListenerRefused":true,"indexEmpty":true}
+{"sequence":17,"time":"2026-11-01T07:15:50.894Z","event":"saved_account_signal_ready_complete","acceptedLocalInterruptionEvidence":true,"sourceAccepted":false,"productionAccepted":false}

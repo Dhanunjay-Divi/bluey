@@ -9898,7 +9898,7 @@ fn record_runner_volume_fleet_cutover_postgres(
                       FROM jobs_runner_volume_storage_attestations newer \
                      WHERE newer.volume_id = a.volume_id \
                        AND newer.enrollment_epoch = a.enrollment_epoch \
-                       AND newer.attestation_generation > a.attestation_generation))))",
+                       AND newer.attestation_generation > a.attestation_generation)))",
             &[],
         )?
         .get(0);
@@ -11329,7 +11329,7 @@ pub(crate) fn finalize_runner_volume_lease_binding_postgres_tx(
     tx.execute(
         "INSERT INTO jobs_runner_account_subjects (
             account_id, purge_subject, legacy_unresolved, created_at_ms, updated_at_ms
-         ) VALUES ($1, $2, FALSE, $3, $3)
+         ) VALUES ($1, $2, 0::SMALLINT, $3, $3)
          ON CONFLICT(account_id) DO NOTHING",
         &[&input.account_id, &prepared.purge_subject, &input.now_ms],
     )?;
@@ -11998,15 +11998,44 @@ fn insert_sqlite_standalone_residency(
 
 #[cfg(test)]
 pub(super) mod runner_volume_purge_tests {
-    use super::*;
     use super::production_positive_authority_fixture::{
         install_production_positive_job_authorities_for_runner,
         save_production_positive_verified_import,
     };
+    use super::*;
     use crate::db;
     use std::path::PathBuf;
 
     const TEST_RUNNER_BUILD: &str = "runner-602";
+
+    #[test]
+    fn runner_volume_authority_request_id_prefix_preserves_all_leading_byte_vectors() {
+        let mut unsafe_raw_ids = 0;
+        for leading in 0_u8..=u8::MAX {
+            let mut entropy = [0x5a_u8; 24];
+            entropy[0] = leading;
+            let raw = encode_base64url(&entropy);
+            let request_id = format!("rva-{raw}");
+            assert_eq!(raw.len(), 32);
+            assert_eq!(request_id.len(), 36);
+            assert_eq!(&request_id[4..], raw);
+            assert_eq!(
+                decode_base64url_exact(&request_id[4..], 24).unwrap(),
+                entropy
+            );
+            require_runner_identifier(&request_id).expect("prefixed authority request ID");
+            if matches!(raw.as_bytes()[0], b'-' | b'_') {
+                unsafe_raw_ids += 1;
+                assert!(matches!(
+                    require_runner_identifier(&raw),
+                    Err(RunnerVolumePurgeError::InvalidRequest)
+                ));
+            } else {
+                require_runner_identifier(&raw).expect("raw alphanumeric-leading vector");
+            }
+        }
+        assert_eq!(unsafe_raw_ids, 8);
+    }
 
     pub(super) struct InstalledCertifiedCloudRuntimeFixture {
         pub(super) runtime_target: AtsCertificationRuntimeTarget,
@@ -12214,7 +12243,10 @@ pub(super) mod runner_volume_purge_tests {
         }
 
         fn admit_public_beta_effect_fixture(&self, account_id: &str) {
-            let mut conn = self.pool.get().expect("open public beta fixture connection");
+            let mut conn = self
+                .pool
+                .get()
+                .expect("open public beta fixture connection");
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .expect("begin public beta fixture transaction");
@@ -12785,14 +12817,10 @@ pub(super) mod runner_volume_purge_tests {
         let application = assign_application_run(pool, account_id, &application.id, &run_id)
             .expect("assign runner test run")
             .expect("assigned runner test application exists");
-        let authority = current_application_approval_authority(
-            pool,
-            account_id,
-            email,
-            &application.id,
-        )
-        .expect("load current runner test application approval authority")
-        .expect("runner test application approval authority exists");
+        let authority =
+            current_application_approval_authority(pool, account_id, email, &application.id)
+                .expect("load current runner test application approval authority")
+                .expect("runner test application approval authority exists");
         assert_eq!(authority.posting.id, authority_fixture.posting.id);
         let identity_id = authority
             .application
@@ -12975,7 +13003,7 @@ pub(super) mod runner_volume_purge_tests {
         .expect("complete successor legacy inventory reconciliation");
     }
 
-    fn mark_current_fleet_ready(pool: &DbPool, label: &str, at_ms: i64) {
+    pub(super) fn mark_current_fleet_ready(pool: &DbPool, label: &str, at_ms: i64) {
         ensure_legacy_inventory_ready(pool, label, at_ms.saturating_sub(2));
         let status = runner_volume_fleet_status(pool).expect("load fleet before cutover");
         let mut request = RecordRunnerVolumeFleetCutoverRequest {
@@ -14840,6 +14868,157 @@ pub(super) mod runner_volume_purge_tests {
     }
 
     #[test]
+    fn postgres_runner_volume_fleet_cutover_two_phase_replay_and_stale_snapshot_when_configured() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            if std::env::var("BLUEY_JOBS_REQUIRE_POSTGRES_TESTS").as_deref() == Ok("1") {
+                panic!("PostgreSQL fleet cutover regression requires BLUEY_TEST_POSTGRES_URL");
+            }
+            eprintln!(
+                "SKIP PostgreSQL fleet cutover regression: BLUEY_TEST_POSTGRES_URL is unavailable"
+            );
+            return;
+        };
+        let _guard = super::managed_cloud_release_authority_tests::postgres_boot_test_lock()
+            .lock()
+            .expect("serialize PostgreSQL lifecycle fixtures");
+        let pool =
+            db::open_postgres_pool(&database_url).expect("open private PostgreSQL cutover pool");
+        db::run_migrations(&pool).expect("migrate PostgreSQL cutover pool");
+        db::run_migrations(&pool).expect("replay PostgreSQL cutover migrations");
+
+        // Global authorities are append-only. The canonical launcher must supply a fresh
+        // private database and destroy its owned cluster afterwards; never reset authority SQL.
+        let fresh = runner_volume_fleet_status(&pool).expect("read fresh PostgreSQL fleet");
+        assert_eq!(fresh.legacy_inventory_state, "unknown");
+        assert_eq!(fresh.legacy_inventory_generation, 0);
+        assert_eq!(fresh.cutover_state, "pre_cutover");
+        assert_eq!(fresh.enrollment_generation, 0);
+        assert_eq!(fresh.purge_generation, 0);
+        assert_eq!(fresh.tombstone_generation, 0);
+        assert_eq!(fresh.destruction_generation, 0);
+        assert_eq!(fresh.legacy_reconciliation_generation, 0);
+        assert_eq!(fresh.storage_attestation_generation, 0);
+        assert_eq!(fresh.storage_attestation_count, 0);
+        assert_eq!(fresh.non_destroyed_volume_count, 0);
+        assert_eq!(fresh.destruction_count, 0);
+        assert_eq!(fresh.unresolved_legacy_volume_count, 0);
+        let authority_count: i64 = pool
+            .get_pg()
+            .expect("read private PostgreSQL cutover pool")
+            .query_one(
+                "SELECT count(*) FROM jobs_runner_legacy_inventory_authorities",
+                &[],
+            )
+            .expect("read initial PostgreSQL inventory authority count")
+            .get(0);
+        assert_eq!(
+            authority_count, 0,
+            "cutover regression requires a fresh private database"
+        );
+        let label = format!("postgres-cutover-{}", uuid::Uuid::new_v4().simple());
+        let now = now_ms();
+        ensure_legacy_inventory_ready(&pool, &label, now);
+        let before =
+            runner_volume_fleet_status(&pool).expect("read reconciled empty PostgreSQL fleet");
+        assert_eq!(before.legacy_inventory_state, "ready");
+        assert_eq!(before.legacy_inventory_generation, 2);
+        assert_eq!(before.non_destroyed_volume_count, 0);
+        assert_eq!(before.attested_reconciled_volume_count, 0);
+        let mut request = RecordRunnerVolumeFleetCutoverRequest {
+            cutover_state: "reconciling".to_string(),
+            expected_enrollment_generation: before.enrollment_generation,
+            expected_purge_generation: before.purge_generation,
+            expected_tombstone_generation: before.tombstone_generation,
+            expected_destruction_generation: before.destruction_generation,
+            expected_legacy_reconciliation_generation: before.legacy_reconciliation_generation,
+            expected_storage_attestation_generation: before.storage_attestation_generation,
+            expected_storage_attestation_count: before.storage_attestation_count,
+            expected_storage_attestation_set_sha256: before.storage_attestation_set_sha256.clone(),
+            expected_legacy_inventory_generation: before.legacy_inventory_generation,
+            expected_legacy_inventory_reconciliation_id: before
+                .legacy_inventory_reconciliation_id
+                .clone()
+                .expect("ready inventory reconciliation id"),
+            expected_legacy_inventory_authority_id: before
+                .legacy_inventory_authority_id
+                .clone()
+                .expect("ready inventory authority id"),
+            expected_legacy_inventory_authority_sha256: before
+                .legacy_inventory_authority_sha256
+                .clone()
+                .expect("ready inventory authority hash"),
+            expected_legacy_inventory_root_count: before
+                .legacy_inventory_root_count
+                .expect("ready inventory root count"),
+            expected_legacy_inventory_root_set_sha256: before
+                .legacy_inventory_root_set_sha256
+                .clone()
+                .expect("ready inventory root set hash"),
+            expected_non_destroyed_volume_count: before.non_destroyed_volume_count,
+            expected_destruction_count: before.destruction_count,
+            expected_unresolved_legacy_volume_count: before.unresolved_legacy_volume_count,
+            evidence_ref: format!("cutover-evidence-{label}"),
+            evidence_sha256: sha256(format!("cutover-evidence-{label}")),
+            authorized_by: "configured-postgres-test".to_string(),
+            cutover_at_ms: now.saturating_add(2),
+            now_ms: now.saturating_add(2),
+        };
+        // Both phases execute the actual production PostgreSQL unready-volume query,
+        // including on an empty fleet; a parser error must fail, not be treated as readiness.
+        assert_eq!(
+            record_runner_volume_fleet_cutover(&pool, &request)
+                .expect("freeze actual PostgreSQL empty-fleet snapshot"),
+            RunnerVolumeWriteDisposition::Applied
+        );
+        let frozen = runner_volume_fleet_status(&pool).expect("read frozen PostgreSQL fleet");
+        assert_eq!(frozen.cutover_state, "reconciling");
+        assert_eq!(frozen.cutover_non_destroyed_volume_count, Some(0));
+        assert_eq!(
+            record_runner_volume_fleet_cutover(&pool, &request)
+                .expect("exact PostgreSQL reconciling replay"),
+            RunnerVolumeWriteDisposition::Replay
+        );
+        assert_eq!(
+            runner_volume_fleet_status(&pool).expect("read replayed frozen fleet"),
+            frozen
+        );
+        request.cutover_state = "ready".to_string();
+        request.now_ms = now.saturating_add(3);
+        assert_eq!(
+            record_runner_volume_fleet_cutover(&pool, &request)
+                .expect("activate actual PostgreSQL empty-fleet snapshot"),
+            RunnerVolumeWriteDisposition::Applied
+        );
+        let ready = runner_volume_fleet_status(&pool).expect("read ready PostgreSQL fleet");
+        assert_eq!(ready.cutover_state, "ready");
+        assert_eq!(
+            record_runner_volume_fleet_cutover(&pool, &request)
+                .expect("exact PostgreSQL ready replay"),
+            RunnerVolumeWriteDisposition::Replay
+        );
+        assert_eq!(
+            runner_volume_fleet_status(&pool).expect("read replayed ready fleet"),
+            ready
+        );
+
+        // Advance the real immutable inventory authority through its existing lifecycle.
+        // The previously accepted cutover request is now genuinely stale, not just malformed.
+        advance_legacy_inventory_ready(&pool, &format!("{label}-successor"), now.saturating_add(4));
+        let advanced = runner_volume_fleet_status(&pool).expect("read advanced inventory snapshot");
+        assert_eq!(advanced.legacy_inventory_generation, 4);
+        assert_eq!(advanced.cutover_state, "reconciling");
+        assert!(advanced.cutover_enrollment_generation.is_none());
+        assert!(matches!(
+            record_runner_volume_fleet_cutover(&pool, &request),
+            Err(RunnerVolumePurgeError::Conflict)
+        ));
+        assert_eq!(
+            runner_volume_fleet_status(&pool).expect("read rejected stale snapshot"),
+            advanced
+        );
+    }
+
+    #[test]
     fn cutover_ready_is_bound_to_exact_snapshot_and_enrollment_invalidates_it() {
         let database = TestDatabase::new(&[]);
         let signer = server_signer();
@@ -14973,6 +15152,230 @@ pub(super) mod runner_volume_purge_tests {
             record_runner_volume_fleet_cutover(&database.pool, &request),
             Err(RunnerVolumePurgeError::Conflict)
         ));
+    }
+
+    #[test]
+    fn postgres_runner_volume_finalizer_creates_smallint_subject_and_replays_when_configured() {
+        use crate::db::{accounts::Account, jobs_beta_access as beta};
+
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            if std::env::var("BLUEY_JOBS_REQUIRE_POSTGRES_TESTS").as_deref() == Ok("1") {
+                panic!("PostgreSQL volume finalizer regression requires BLUEY_TEST_POSTGRES_URL");
+            }
+            eprintln!(
+                "SKIP PostgreSQL volume finalizer regression: \
+                BLUEY_TEST_POSTGRES_URL is unavailable"
+            );
+            return;
+        };
+        let _guard = super::managed_cloud_release_authority_tests::postgres_boot_test_lock()
+            .lock()
+            .expect("serialize PostgreSQL lifecycle fixtures");
+        let pool = db::open_postgres_pool(&database_url).expect("open private finalizer pool");
+        db::run_migrations(&pool).expect("migrate private finalizer pool");
+        db::run_migrations(&pool).expect("replay private finalizer migrations");
+        let fresh = runner_volume_fleet_status(&pool).expect("read fresh private fleet");
+        assert_eq!(fresh.non_destroyed_volume_count, 0);
+        assert_eq!(fresh.enrollment_generation, 0);
+        assert_eq!(fresh.legacy_inventory_state, "unknown");
+        // Fresh, disposable PG is required. Use audited account/beta APIs and existing signed
+        // lifecycle fixtures, never direct subject/lease/residency or authority table seeds.
+        let suffix = format!("finalizer-{}", uuid::Uuid::new_v4().simple());
+        let account = Account::create_with_admin(
+            &pool,
+            &format!("{suffix}@example.test"),
+            "synthetic-test-hash",
+            true,
+        )
+        .expect("create synthetic finalizer account");
+        assert_eq!(Account::mark_email_verified(&pool, &account.id).unwrap(), 1);
+        let cohort = beta::get_public_beta_cohort(&pool).expect("read private beta cohort");
+        assert_eq!(
+            cohort.assigned_count, 0,
+            "requires a fresh private database"
+        );
+        let now = now_ms();
+        beta::update_public_beta_cohort_audited(
+            &pool,
+            beta::PublicBetaCohortUpdate {
+                expected_revision: cohort.revision,
+                state: beta::PublicBetaCohortState::Open,
+                opens_at_ms: Some(now.saturating_sub(60_000)),
+                closes_at_ms: Some(now.saturating_add(3_600_000)),
+                hard_cap: cohort.hard_cap.max(1),
+            },
+            &account.id,
+        )
+        .expect("open synthetic cohort through audited lifecycle");
+        assert_eq!(
+            beta::evaluate_or_enroll_public_beta(&pool, &account.id)
+                .unwrap()
+                .reason,
+            beta::PublicBetaAccessReason::Admitted
+        );
+        let (application_id, run_id, profile_id) =
+            runner_execution_lease_fixture(&pool, &account.id, &account.email, &suffix);
+        // This focused DB regression uses the existing debug legacy-context lease API.
+        // It is not the separate ordinary managed HTTP/runner qualification.
+        let lease = claim_execution_lease(
+            &pool,
+            &account.id,
+            &application_id,
+            &run_id,
+            &profile_id,
+            "finalizer-test-owner",
+        )
+        .expect("claim genuine prepared execution lease");
+        assert_eq!(lease.phase, "prepared");
+        assert!(lookup_runner_account_purge_subject(&pool, &account.id)
+            .unwrap()
+            .is_none());
+        let volume = fixed_volume(&pool, 117, &suffix, 10);
+        let claim_now = now_ms();
+        claim_runner_volume_instance(
+            &pool,
+            &volume.volume_id,
+            1,
+            &volume.process_instance_id,
+            claim_now,
+            claim_now.saturating_add(300_000),
+        )
+        .expect("claim current synthetic volume instance");
+        attest_fixed_volume(&pool, &volume, claim_now);
+        activate_reconciled_runner_volume(
+            &pool,
+            &volume.volume_id,
+            1,
+            &volume.process_instance_id,
+            claim_now,
+        )
+        .expect("activate signed synthetic volume");
+        mark_current_fleet_ready(&pool, &suffix, claim_now.saturating_add(1));
+        let request = BindRunnerVolumeResidencyRequest {
+            account_id: account.id.clone(),
+            run_id: run_id.clone(),
+            worker_id: format!("worker-{suffix}"),
+            volume_id: volume.volume_id.clone(),
+            enrollment_epoch: 1,
+            process_instance_id: volume.process_instance_id.clone(),
+            now_ms: claim_now.saturating_add(3),
+        };
+        let snapshot =
+            || {
+                pool.get_pg().unwrap().query(
+                "SELECT 'subject:' || row_to_json(s)::text FROM jobs_runner_account_subjects s
+                   WHERE s.account_id=$1
+                 UNION ALL SELECT 'residency:' || row_to_json(r)::text
+                   FROM jobs_runner_volume_residencies r JOIN jobs_runner_account_subjects s
+                     ON s.purge_subject=r.purge_subject WHERE s.account_id=$1
+                 UNION ALL SELECT 'binding:' || row_to_json(b)::text
+                   FROM jobs_execution_lease_volume_bindings b WHERE b.run_id=$2 ORDER BY 1",
+                &[&account.id, &run_id],
+            ).unwrap().into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>()
+            };
+        assert!(snapshot().is_empty());
+        {
+            let mut connection = pool.get_pg().unwrap();
+            let mut tx = connection.transaction().unwrap();
+            let prepared = prepare_runner_volume_lease_binding_postgres_tx(
+                &mut tx,
+                &request,
+                &new_runner_volume_purge_subject(),
+            )
+            .expect("prepare actual PostgreSQL volume binding");
+            let mut mismatched = request.clone();
+            mismatched.run_id.push_str("-foreign");
+            assert!(matches!(
+                finalize_runner_volume_lease_binding_postgres_tx(&mut tx, &mismatched, &prepared),
+                Err(RunnerVolumePurgeError::Conflict)
+            ));
+            let before: i64 = tx
+                .query_one(
+                    "SELECT (SELECT count(*) FROM jobs_runner_account_subjects WHERE account_id=$1)
+                         + (SELECT count(*) FROM jobs_execution_lease_volume_bindings WHERE run_id=$2)
+                         + (SELECT count(*) FROM jobs_runner_volume_residencies WHERE purge_subject=$3)",
+                    &[&account.id, &run_id, &prepared.purge_subject],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                before, 0,
+                "mismatched finalization must leave subject/residency/binding absent"
+            );
+            let bound =
+                finalize_runner_volume_lease_binding_postgres_tx(&mut tx, &request, &prepared)
+                    .expect("finalize actual PostgreSQL binding before rollback");
+            assert_eq!(bound.disposition, RunnerVolumeWriteDisposition::Applied);
+            let row = tx
+                .query_one(
+                    "SELECT legacy_unresolved FROM jobs_runner_account_subjects
+                WHERE account_id=$1",
+                    &[&account.id],
+                )
+                .unwrap();
+            assert_eq!(row.try_get::<_, i16>(0).unwrap(), 0);
+            tx.rollback()
+                .expect("rollback subject/residency/lease binding atomically");
+        }
+        assert!(
+            snapshot().is_empty(),
+            "rolled-back finalization must leave no partial state"
+        );
+        let bound = bind_runner_volume_residency_and_lease(&pool, &request)
+            .expect("commit actual production prepare/finalize wrapper");
+        assert_eq!(bound.disposition, RunnerVolumeWriteDisposition::Applied);
+        assert_eq!(bound.account_id, account.id);
+        assert_eq!(bound.run_id, run_id);
+        assert_eq!(bound.volume_id, volume.volume_id);
+        assert_eq!(bound.enrollment_epoch, 1);
+        assert_eq!(bound.process_instance_id, volume.process_instance_id);
+        assert_eq!(bound.volume_key_fingerprint, volume.key_fingerprint);
+        let subject = lookup_runner_account_purge_subject(&pool, &account.id)
+            .unwrap()
+            .unwrap();
+        assert!(!subject.legacy_unresolved);
+        assert_eq!(subject.purge_subject, bound.purge_subject);
+        assert_eq!(
+            runner_purge_subject_sha256(&subject.purge_subject).unwrap(),
+            bound.purge_subject_sha256
+        );
+        let row = pool
+            .get_pg()
+            .unwrap()
+            .query_one(
+                "SELECT s.legacy_unresolved,r.volume_id,r.volume_epoch,r.state,r.purge_generation,
+                b.process_instance_id,b.purge_subject_sha256,e.phase
+             FROM jobs_runner_account_subjects s
+             JOIN jobs_runner_volume_residencies r ON r.purge_subject=s.purge_subject
+             JOIN jobs_execution_lease_volume_bindings b ON b.volume_id=r.volume_id
+                AND b.volume_epoch=r.volume_epoch AND b.run_id=$2
+             JOIN jobs_execution_leases e ON e.run_id=b.run_id AND e.account_id=s.account_id
+             WHERE s.account_id=$1",
+                &[&account.id, &run_id],
+            )
+            .expect("read exact committed subject/residency/lease-volume rows");
+        assert_eq!(row.try_get::<_, i16>(0).unwrap(), 0);
+        assert_eq!(row.get::<_, String>(1), bound.volume_id);
+        assert_eq!(row.get::<_, i64>(2), bound.enrollment_epoch);
+        assert_eq!(row.get::<_, String>(3), "resident");
+        assert_eq!(row.get::<_, i64>(4), 0);
+        assert_eq!(row.get::<_, String>(5), bound.process_instance_id);
+        assert_eq!(row.get::<_, String>(6), bound.purge_subject_sha256);
+        assert_eq!(row.get::<_, String>(7), "prepared");
+        let committed = snapshot();
+        assert_eq!(committed.len(), 3);
+        let replay = bind_runner_volume_residency_and_lease(&pool, &request)
+            .expect("exact production finalizer replay");
+        let mut expected_replay = bound;
+        expected_replay.disposition = RunnerVolumeWriteDisposition::Replay;
+        assert_eq!(replay, expected_replay);
+        assert_eq!(
+            snapshot(),
+            committed,
+            "exact replay must leave durable rows unchanged"
+        );
+        // Append-only fleet authority and residency history belong to this fresh private DB;
+        // the canonical launcher destroys its owned cluster rather than resetting authority SQL.
     }
 
     #[test]

@@ -2379,6 +2379,7 @@ include!("jobs/workflow_commands.rs");
 include!("jobs/workflow_cleanup.rs");
 include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
+include!("jobs/execution_session_authority.rs");
 include!("jobs/execution_leases.rs");
 include!("jobs/runner_volume_purge.rs");
 include!("jobs/browser_release_authority.rs");
@@ -2398,6 +2399,11 @@ include!("jobs/workspace.rs");
 #[cfg_attr(feature = "integration-test-support", allow(dead_code))]
 #[path = "jobs/production_positive_authority_fixture.rs"]
 pub(crate) mod production_positive_authority_fixture;
+
+#[cfg(all(debug_assertions, feature = "integration-test-support"))]
+#[doc(hidden)]
+#[path = "jobs/runner_control_plane_fixture.rs"]
+pub mod integration_test_runner_control_plane;
 
 #[cfg(feature = "integration-test-support")]
 #[doc(hidden)]
@@ -2449,5 +2455,9 @@ pub fn install_integration_test_production_positive_job_authorities(
 #[cfg(test)]
 #[path = "jobs/postgres_local_authority_tests.rs"]
 mod postgres_local_authority_tests;
+
+#[cfg(test)]
+#[path = "jobs/execution_session_authority_tests.rs"]
+mod execution_session_authority_db_tests;
 
 include!("jobs/tests.rs");

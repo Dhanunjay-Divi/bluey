@@ -24,6 +24,7 @@ import {
 import {
   canonicalRunnerVolumeAuthorityProof,
   canonicalRunnerVolumeEnrollmentProof,
+  createRunnerVolumeAuthorityRequestId,
   runnerVolumeHttpPayloadSha256,
   runnerProcessRuntimeSha256,
   RunnerVolumeClient,
@@ -106,6 +107,39 @@ afterEach(async () => {
 });
 
 describe("runner volume client", () => {
+  it("preserves all entropy with Rust-safe authority IDs for every leading byte", () => {
+    const rustIdentifier = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
+    let unsafeRawIds = 0;
+    for (let leading = 0; leading <= 255; leading += 1) {
+      const entropy = new Uint8Array(24).fill(0x5a);
+      entropy[0] = leading;
+      const raw = Buffer.from(entropy).toString("base64url");
+      const requestId = createRunnerVolumeAuthorityRequestId(entropy);
+      expect(raw).toHaveLength(32);
+      expect(requestId).toHaveLength(36);
+      expect(requestId).toBe(`rva-${raw}`);
+      expect(requestId.slice(4)).toBe(raw);
+      expect(Buffer.from(requestId.slice(4), "base64url")).toEqual(
+        Buffer.from(entropy),
+      );
+      expect(requestId).toMatch(rustIdentifier);
+      if (!rustIdentifier.test(raw)) {
+        expect(raw[0]).toMatch(/^[-_]$/);
+        unsafeRawIds += 1;
+      }
+    }
+    expect(unsafeRawIds).toBe(8);
+    expect(createRunnerVolumeAuthorityRequestId()).toMatch(/^rva-[A-Za-z0-9_-]{32}$/);
+  });
+
+  it("rejects authority request ID entropy of any tested non-24-byte length", () => {
+    for (const length of [0, 1, 23, 25, 32]) {
+      expect(() =>
+        createRunnerVolumeAuthorityRequestId(new Uint8Array(length)),
+      ).toThrow("Runner volume configuration failed (configuration).");
+    }
+  });
+
   it("freezes the process runtime digest across Rust and TypeScript", () => {
     expect(PROCESS_RUNTIME_SHA256).toBe(
       "0a6faf7674e8166a8d54d0aea177f73842012dcbd68c15a80fc5ed2571c75dfd",

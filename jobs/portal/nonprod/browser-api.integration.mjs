@@ -5,6 +5,7 @@
  */
 import assert from "node:assert/strict";
 import { createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
+import { unlinkSync } from "node:fs";
 import { createServer } from "node:http";
 import { request as httpRequest } from "node:http";
 import { lstat, mkdir, readFile, realpath, stat, writeFile, chmod } from "node:fs/promises";
@@ -14,22 +15,143 @@ import { once } from "node:events";
 import { chromium } from "playwright";
 import { startNonprodObjectStore } from "../../scripts/nonprod-object-store.mjs";
 
-const LIMIT_MS = 180_000;
+const HUMAN_HOLD = process.argv.length === 3 && process.argv[2] === "--human-hold";
+assert(process.argv.length === 2 || HUMAN_HOLD,
+  "expected no arguments or exact --human-hold");
+const HUMAN_HOLD_MS = 600_000;
+const HUMAN_CANARY_URL = "http://bluey-human-hold-canary.invalid/probe";
+const LIMIT_MS = HUMAN_HOLD ? 720_000 : 180_000;
 const OPERATION_MS = 10_000;
 const children = [];
+const transientChildren = new Set();
+const lifecycle = new AbortController();
 const EXPECTED_CASES = ["profile_reload", "onboarding_complete", "preference_track_reload", "auth_isolation", "effect_availability", "packet_review", "approval_fenced", "source_resume_readback", "review_first_queue"];
 const result = { version: 4, cases: [], tests: EXPECTED_CASES.length, passed: 0, failed: [], binaries: [], fixture: null, object_store: null, requests: { jobs: 0, account: 0 } };
+const HUMAN_CASES = ["bootstrap", "ready", "operator_release_received",
+  "prepared_before_reload", "prepared_after_reload", "account_isolation",
+  "zero_effects", "cleanup"];
+const humanResult = { version: 1, mode: "human_hold", cases: [], passed: 0,
+  ready: false, operator_release_received: false, hold_ms: 0,
+  account_status_before: 0, account_status_after: 0, unauthenticated_status: 0,
+  account_rows: 0, profile_rows: 0, application_rows: 0, prepared_rows: 0,
+  submitted_rows: 0, browser_sessions: 0, workflow_commands: 0, run_events: 0,
+  irreversible_receipts: 0, profile_stable: false, application_stable: false,
+  resume_stable: false, isolated_application_rows: 0, network_canary_blocked: false,
+  page_errors: 0, server_errors: 0, engine_ps: -1, engine_lsof: -1, ports_refused: 0,
+  binaries: [], fixture: null,
+  requests: { jobs: 0, account: 0, canary_blocked: 0, denied_non_origin: 0,
+    denied_popups: 0, denied_downloads: 0, denied_websockets: 0 }, object_store: null };
 let outputRoot;
 let liveBrowser;
 let liveProxy;
 let stage = "preflight";
 let objectStore;
+let ownedBrowserRoot;
+let browserClosePromise;
+let proxyClosePromise;
+let childrenStopPromise;
+let transientsStopPromise;
+let abortCode = "";
+let publishedReportPath;
+const cleanupPorts = [];
 
 function fail(code) { throw new Error(code); }
+function checkAbort() {
+  if (lifecycle.signal.aborted) throw new Error(abortCode || "operation_aborted");
+}
+function closeLiveBrowser() {
+  if (!browserClosePromise && liveBrowser) {
+    const owned = liveBrowser;
+    browserClosePromise = owned.close().finally(() => {
+      if (liveBrowser === owned) liveBrowser = undefined;
+    });
+  }
+  return browserClosePromise || Promise.resolve();
+}
+function closeLiveProxy() {
+  if (!proxyClosePromise && liveProxy) {
+    const owned = liveProxy;
+    proxyClosePromise = new Promise((resolveClose, reject) => owned.close((error) => {
+      if (error && error.code !== "ERR_SERVER_NOT_RUNNING") reject(error); else resolveClose();
+    })).finally(() => { if (liveProxy === owned) liveProxy = undefined; });
+  }
+  return proxyClosePromise || Promise.resolve();
+}
+async function closeInteractive() {
+  const outcomes = await Promise.allSettled([
+    withTimeout(closeLiveBrowser(), "cleanup_browser", true),
+    withTimeout(closeLiveProxy(), "cleanup_proxy", true),
+  ]);
+  if (outcomes.some((outcome) => outcome.status === "rejected")) {
+    fail("cleanup_interactive_failure");
+  }
+}
+function requestAbort(code) {
+  if (lifecycle.signal.aborted) return;
+  abortCode = code; result.failed.push(code); process.exitCode = 1;
+  lifecycle.abort(new Error(code));
+  if (publishedReportPath) {
+    try { unlinkSync(publishedReportPath); } catch (error) {
+      if (error.code !== "ENOENT") result.failed.push("report_revoke_failure");
+    }
+  }
+  void closeLiveBrowser().catch(() => {});
+}
+async function withAbort(promise) {
+  checkAbort();
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(lifecycle.signal.reason || new Error("operation_aborted"));
+    lifecycle.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try { return await Promise.race([promise, aborted]); }
+  finally { lifecycle.signal.removeEventListener("abort", onAbort); }
+}
 function passCase(name) {
+  checkAbort();
   assert.equal(EXPECTED_CASES[result.cases.length], name, "case_order");
   result.cases.push(name); result.passed += 1;
   process.stdout.write(`${JSON.stringify({ event: "browser_case_passed", case: name })}\n`);
+}
+function passHumanCase(name) {
+  checkAbort();
+  assert.equal(HUMAN_CASES[humanResult.cases.length], name, "human_case_order");
+  humanResult.cases.push(name); humanResult.passed += 1;
+  process.stdout.write(`${JSON.stringify({ event: "human_browser_case_passed", case: name })}\n`);
+}
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+function canonicalSha256(value) {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+function mountHumanBanner(expectedOrigin) {
+  if (location.origin !== expectedOrigin || sessionStorage.getItem("bluey_human_finish_released")) return;
+  const mount = () => {
+    if (!document.body || document.getElementById("bluey-human-hold")) return;
+    const banner = document.createElement("aside");
+    banner.id = "bluey-human-hold"; banner.setAttribute("role", "region");
+    banner.setAttribute("aria-label", "Non-production test control");
+    banner.style.cssText = "position:fixed;z-index:2147483647;left:12px;bottom:12px;width:22rem;max-width:calc(100vw - 24px);box-sizing:border-box;padding:12px;background:#111827;color:white;border:2px solid #38bdf8;display:grid;gap:12px";
+    const label = document.createElement("strong");
+    label.textContent = "NON-PRODUCTION SYNTHETIC TEST — prepared Review First only. File imports and downloads are disabled; use no real data.";
+    const button = document.createElement("button");
+    button.type = "button"; button.textContent = "Finish synthetic test";
+    button.style.cssText = "min-height:44px;width:100%;padding:8px 12px;background:white;color:#111827;border:2px solid #e5e7eb;outline:3px solid transparent;outline-offset:2px";
+    button.addEventListener("focus", () => { button.style.outlineColor = "#38bdf8"; });
+    button.addEventListener("blur", () => { button.style.outlineColor = "transparent"; });
+    button.addEventListener("click", async () => {
+      button.disabled = true; await window.__blueyHumanFinish();
+      sessionStorage.setItem("bluey_human_finish_released", "1"); banner.remove();
+    });
+    banner.append(label, button); document.body.append(banner);
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", mount, { once: true });
+  } else mount();
 }
 function within(root, target) { const value = relative(root, target); return value === "" || (!value.startsWith("..") && !resolve(root, target).startsWith("..")); }
 function required(name) { const value = process.env[name]; if (!value) fail(`missing_${name.toLowerCase()}`); return value; }
@@ -46,9 +168,12 @@ async function ownedPath(root, value, name) {
   if (!within(root, path) || info.uid !== process.getuid() || (info.mode & 0o077) !== 0) fail(`unowned_${name}`);
   return path;
 }
-async function withTimeout(promise, label) {
+async function withTimeout(promise, label, ignoreAbort = false) {
   let timer;
-  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timeout_${label}`)), OPERATION_MS); })]); }
+  const bounded = Promise.race([promise, new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timeout_${label}`)), OPERATION_MS);
+  })]);
+  try { return await (ignoreAbort ? bounded : withAbort(bounded)); }
   finally { clearTimeout(timer); }
 }
 function fixtureToken(accountId, secret) {
@@ -71,6 +196,7 @@ function fixturePurgeSigningPolicy() {
   return { keyId, seed: privateDer.subarray(privatePrefix.length).toString("base64url"), publicKey: publicDer.subarray(publicPrefix.length).toString("base64url") };
 }
 function child(command, args, env, name, fixture = false) {
+  checkAbort();
   const processHandle = spawn(command, args, { env, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
   processHandle.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-1024); });
@@ -89,17 +215,61 @@ function child(command, args, env, name, fixture = false) {
   return processHandle;
 }
 async function stopChildren() {
-  const active = children.filter(({ processHandle }) => processHandle.exitCode === null && processHandle.signalCode === null && !processHandle.killed);
-  for (const { processHandle } of active) processHandle.kill("SIGTERM");
-  const outcomes = await Promise.allSettled(children.map(async ({ name, fixture, processHandle, completion, stderr }) => {
-    const { code, signal } = await withTimeout(completion, `stop_${name}`);
-    if (fixture) result.fixture = { pid: processHandle.pid, code, signal };
-    else result.binaries.push({ pid: processHandle.pid, code, signal });
-    if (code !== 0 || signal !== null) fail(`${name}_exit_${stderr() || "unexpected"}`);
-  }));
-  const rejected = outcomes.find((outcome) => outcome.status === "rejected");
-  if (rejected) fail("cleanup_child_failure");
-  return outcomes;
+  if (childrenStopPromise) return childrenStopPromise;
+  childrenStopPromise = (async () => {
+    const active = children.filter(({ processHandle }) => processHandle.exitCode === null
+      && processHandle.signalCode === null);
+    for (const { processHandle } of active) processHandle.kill("SIGTERM");
+    const outcomes = await Promise.allSettled(children.map(async ({ name, fixture,
+      processHandle, completion, stderr }) => {
+      let outcome;
+      try { outcome = await withTimeout(completion, `stop_${name}`, true); }
+      catch {
+        if (processHandle.exitCode === null && processHandle.signalCode === null) {
+          processHandle.kill("SIGKILL");
+        }
+        outcome = await withTimeout(completion, `kill_${name}`, true);
+      }
+      const { code, signal } = outcome;
+      if (fixture) result.fixture = { pid: processHandle.pid, code, signal };
+      else result.binaries.push({ pid: processHandle.pid, code, signal });
+      if (!lifecycle.signal.aborted && (code !== 0 || signal !== null)) {
+        fail(`${name}_exit_${stderr() || "unexpected"}`);
+      }
+    }));
+    const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+    if (rejected) fail("cleanup_child_failure");
+    return outcomes;
+  })();
+  return childrenStopPromise;
+}
+function trackTransient(processHandle) {
+  transientChildren.add(processHandle);
+  processHandle.once("close", () => transientChildren.delete(processHandle));
+  return processHandle;
+}
+async function stopTransientChildren() {
+  if (transientsStopPromise) return transientsStopPromise;
+  transientsStopPromise = (async () => {
+    const outcomes = await Promise.allSettled([...transientChildren].map(async (processHandle) => {
+      const completion = once(processHandle, "close");
+      if (processHandle.exitCode === null && processHandle.signalCode === null) {
+        processHandle.kill("SIGTERM");
+      }
+      try { await withTimeout(completion, "stop_transient", true); }
+      catch {
+        if (processHandle.exitCode === null && processHandle.signalCode === null) {
+          processHandle.kill("SIGKILL");
+        }
+        await withTimeout(completion, "kill_transient", true);
+      }
+    }));
+    if (outcomes.some((outcome) => outcome.status === "rejected")) {
+      fail("cleanup_transient_failure");
+    }
+    return outcomes;
+  })();
+  return transientsStopPromise;
 }
 function listen(server) { return new Promise((resolveListen) => server.listen(0, "127.0.0.1", () => resolveListen(server.address().port))); }
 async function freePort() {
@@ -166,6 +336,7 @@ async function ownedJson(path, root, expected) {
 async function waitFor(url, token) {
   const deadline = Date.now() + OPERATION_MS;
   while (Date.now() < deadline) {
+    checkAbort();
     const stopped = children.find(({ processHandle }) => processHandle.exitCode !== null || processHandle.signalCode !== null);
     if (stopped) {
       const marker = stopped.stderr();
@@ -192,7 +363,8 @@ UPDATE jobs_public_beta_cohorts SET assigned_count = (
   SELECT COUNT(*) FROM jobs_public_beta_enrollments WHERE cohort_id = 'public-v1'
 ) WHERE id = 'public-v1';`;
   const env = pgEnv(database, process.env.BLUEY_NONPROD_CHILD_HOME);
-  const psqlChild = spawn(psql, ["-X", "-v", "ON_ERROR_STOP=1", "-q"], { env, stdio: ["pipe", "ignore", "ignore"] });
+  const psqlChild = trackTransient(spawn(psql, ["-X", "-v", "ON_ERROR_STOP=1", "-q"],
+    { env, stdio: ["pipe", "ignore", "ignore"] }));
   psqlChild.stdin.end(sql);
   const [code, signal] = await withTimeout(once(psqlChild, "exit"), "seed");
   assert.equal(code, 0, "fixture_seed_exit_code"); assert.equal(signal, null, "fixture_seed_exit_signal");
@@ -204,7 +376,8 @@ function pgEnv(database, home) {
 }
 async function postgresIdentity(psql, database, home, root) {
   const query = "SELECT json_build_object('data_directory',current_setting('data_directory'),'host',coalesce(host(inet_server_addr()),''),'port',inet_server_port(),'database',current_database(),'version',current_setting('server_version_num'))::text";
-  const check = spawn(psql, ["-X", "-A", "-t", "-q", "-c", query], { env: pgEnv(database, home), stdio: ["ignore", "pipe", "ignore"] });
+  const check = trackTransient(spawn(psql, ["-X", "-A", "-t", "-q", "-c", query],
+    { env: pgEnv(database, home), stdio: ["ignore", "pipe", "ignore"] }));
   let stdout = ""; check.stdout.on("data", (chunk) => { stdout += chunk; });
   const [code, signal] = await withTimeout(once(check, "close"), "postgres_identity");
   assert.equal(code, 0, "postgres_identity_exit"); assert.equal(signal, null, "postgres_identity_signal");
@@ -218,12 +391,235 @@ async function postgresIdentity(psql, database, home, root) {
 async function packetLedgerSnapshot(psql, database, home, accountId) {
   if (!/^ui_fixture_[0-9a-f-]{36}$/.test(accountId)) fail("fixture_account_id");
   const query = "SELECT json_build_object('attempts',(SELECT count(*) FROM jobs_attempt_reservations WHERE account_id=:'fixture_account'),'metering',(SELECT count(*) FROM jobs_packet_metering WHERE account_id=:'fixture_account'),'included_metering',(SELECT count(*) FROM jobs_packet_metering WHERE account_id=:'fixture_account' AND included=1),'metered_amount_cents',coalesce((SELECT sum(amount_cents) FROM jobs_packet_metering WHERE account_id=:'fixture_account'),0),'commands',(SELECT count(*) FROM jobs_workflow_commands WHERE account_id=:'fixture_account'),'balance_events',(SELECT count(*) FROM balance_ledger_entries WHERE account_id=:'fixture_account'),'balance_cents',(SELECT balance_cents FROM accounts WHERE id=:'fixture_account'),'used_packets',coalesce((SELECT used_packets FROM jobs_entitlements WHERE account_id=:'fixture_account'),0))::text";
-  const command = spawn(psql, ["-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-v", `fixture_account=${accountId}`], { env: pgEnv(database, home), stdio: ["pipe", "pipe", "ignore"] });
+  const command = trackTransient(spawn(psql, ["-X", "-A", "-t", "-q", "-v",
+    "ON_ERROR_STOP=1", "-v", `fixture_account=${accountId}`],
+  { env: pgEnv(database, home), stdio: ["pipe", "pipe", "ignore"] }));
   let stdout = ""; command.stdout.on("data", (chunk) => { stdout += chunk; if (stdout.length > 4096) command.kill("SIGTERM"); });
   const completion = once(command, "close"); command.stdin.end(`${query};\n`);
   const [code, signal] = await withTimeout(completion, "ledger_snapshot");
   assert.equal(code, 0, "ledger_snapshot_exit"); assert.equal(signal, null, "ledger_snapshot_signal");
   return JSON.parse(stdout.trim());
+}
+async function humanPgSnapshot(psql, database, home, accountId) {
+  if (!/^ui_fixture_[0-9a-f-]{36}$/.test(accountId)) fail("fixture_account_id");
+  const query = `SELECT json_build_object(
+    'account_rows',(SELECT count(*) FROM accounts WHERE id=:'fixture_account'),
+    'profile_rows',(SELECT count(*) FROM jobs_profiles WHERE account_id=:'fixture_account'),
+    'profile_ciphertext',(SELECT profile_json FROM jobs_profiles WHERE account_id=:'fixture_account'),
+    'application_rows',(SELECT count(*) FROM jobs_applications WHERE account_id=:'fixture_account'),
+    'prepared_rows',(SELECT count(*) FROM jobs_applications WHERE account_id=:'fixture_account'
+      AND state='awaiting_review' AND submitted_at_ms IS NULL),
+    'submitted_rows',(SELECT count(*) FROM jobs_applications WHERE account_id=:'fixture_account'
+      AND submitted_at_ms IS NOT NULL),
+    'application',(SELECT json_build_object('account_id',account_id,'id',id,'job_id',job_id,
+      'resume_version_id',resume_version_id,'state',state,
+      'application_ciphertext',application_json,'created_at_ms',created_at_ms,
+      'submitted_at_ms',submitted_at_ms) FROM jobs_applications
+      WHERE account_id=:'fixture_account'),
+    'resume',(SELECT json_build_object('account_id',resume.account_id,'id',resume.id,
+      'job_id',resume.job_id,'version_no',resume.version_no,'mode',resume.mode,
+      'content_ciphertext',resume.content_json,'diff_ciphertext',resume.diff_json,
+      'claim_ids_ciphertext',resume.claim_ids_json,'checksum',resume.checksum,
+      'created_at_ms',resume.created_at_ms)
+      FROM jobs_resume_versions resume JOIN jobs_applications application
+        ON application.resume_version_id=resume.id AND application.account_id=resume.account_id
+      WHERE application.account_id=:'fixture_account'),
+    'browser_sessions',(SELECT count(*) FROM jobs_browser_sessions
+      WHERE account_id=:'fixture_account'),
+    'workflow_commands',(SELECT count(*) FROM jobs_workflow_commands
+      WHERE account_id=:'fixture_account'),
+    'run_events',(SELECT count(*) FROM jobs_run_events WHERE account_id=:'fixture_account'),
+    'irreversible_receipts',(SELECT count(*)
+      FROM jobs_managed_cloud_irreversible_effect_receipts WHERE account_id=:'fixture_account')
+  )::text`;
+  const command = trackTransient(spawn(psql, ["-X", "-A", "-t", "-q", "-v",
+    "ON_ERROR_STOP=1", "-v", `fixture_account=${accountId}`], {
+    env: pgEnv(database, home), stdio: ["pipe", "pipe", "ignore"],
+  }));
+  let stdout = "";
+  command.stdout.on("data", (chunk) => {
+    stdout += chunk; if (stdout.length > 4 * 1024 * 1024) command.kill("SIGTERM");
+  });
+  const completion = once(command, "close"); command.stdin.end(`${query};\n`);
+  const [code, signal] = await withTimeout(completion, "human_pg_snapshot");
+  assert.equal(code, 0, "human_pg_snapshot_exit"); assert.equal(signal, null, "human_pg_snapshot_signal");
+  return JSON.parse(stdout.trim());
+}
+async function boundedCommand(command, args, label, allowedCodes = [0]) {
+  const processHandle = trackTransient(spawn(command, args,
+    { stdio: ["ignore", "pipe", "ignore"] }));
+  let stdout = "";
+  processHandle.stdout.on("data", (chunk) => {
+    stdout += chunk; if (stdout.length > 1024 * 1024) processHandle.kill("SIGTERM");
+  });
+  const [code, signal] = await withTimeout(once(processHandle, "close"), label, true);
+  assert.equal(signal, null, `${label}_signal`); assert(allowedCodes.includes(code), `${label}_exit`);
+  return stdout;
+}
+async function assertPortRefused(port) {
+  assert(Number.isInteger(port) && port > 0 && port <= 65535, "cleanup_port");
+  await new Promise((resolveRefused, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (!settled) { settled = true; clearTimeout(timer); callback(value); }
+    };
+    const request = httpRequest({ host: "127.0.0.1", port, path: "/", method: "GET",
+      agent: false }, (response) => {
+      response.resume(); finish(reject, new Error("cleanup_port_still_listening"));
+    });
+    const timer = setTimeout(() => {
+      request.destroy(); finish(reject, new Error("cleanup_port_timeout"));
+    }, 1000);
+    request.on("error", (error) => error.code === "ECONNREFUSED"
+      ? finish(resolveRefused) : finish(reject, new Error("cleanup_port_ambiguous")));
+    request.end();
+  });
+}
+async function humanCleanupInventory() {
+  assert(ownedBrowserRoot && cleanupPorts.length === 4
+    && new Set(cleanupPorts).size === 4, "cleanup_inventory_scope");
+  const ps = await boundedCommand("/bin/ps", ["-axo", "pid=,uid=,command="], "cleanup_ps");
+  const owned = new RegExp(`^\\s*\\d+\\s+${process.getuid()}\\s+`);
+  const enginePs = ps.split("\n").filter((line) => owned.test(line)
+    && line.includes(ownedBrowserRoot)).length;
+  const lsof = await boundedCommand("/usr/sbin/lsof",
+    ["-nP", "-Fp", "+D", ownedBrowserRoot], "cleanup_lsof", [0, 1]);
+  const engineLsof = new Set(lsof.split("\n").filter((line) => /^p\d+$/.test(line))).size;
+  for (const port of cleanupPorts) await assertPortRefused(port);
+  return { enginePs, engineLsof, portsRefused: cleanupPorts.length };
+}
+async function humanHoldQualification({ context, page, portalPort, jobsPort, accountPort,
+  token, isolatedToken, tokenIssuedAtMs, psql, database, childHome, accountId, fixtureResult }) {
+  const origin = `http://127.0.0.1:${portalPort}`;
+  let release;
+  const released = new Promise((resolveRelease) => { release = resolveRelease; });
+  await page.exposeBinding("__blueyHumanFinish", ({ frame }) => {
+    assert.equal(frame, page.mainFrame(), "human_finish_main_frame");
+    assert.equal(new URL(frame.url()).origin, origin, "human_finish_own_origin");
+    release(); return true;
+  });
+  await context.addInitScript(mountHumanBanner, origin);
+  await page.evaluate(mountHumanBanner, origin);
+  const canaryRejected = await page.evaluate(async (canary) => {
+    try {
+      await fetch(canary, { method: "GET", credentials: "omit", cache: "no-store",
+        redirect: "error", referrerPolicy: "no-referrer" });
+      return false;
+    } catch { return true; }
+  }, HUMAN_CANARY_URL);
+  assert.equal(canaryRejected, true, "human_canary_transport_blocked");
+  assert.equal(humanResult.requests.canary_blocked, 1, "human_canary_intercept_count");
+  humanResult.network_canary_blocked = true;
+  passHumanCase("bootstrap");
+  humanResult.ready = true; passHumanCase("ready");
+  const remaining = HUMAN_HOLD_MS - (Date.now() - tokenIssuedAtMs);
+  assert(remaining > 0, "human_jwt_hold_expired_before_ready");
+  process.stdout.write(`${JSON.stringify({ event: "human_browser_ready", mode: "human_hold",
+    expires_within_seconds: Math.floor(remaining / 1000), sourceAccepted: false })}\n`);
+  let timer;
+  await withAbort(Promise.race([
+    released,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("human_hold_timeout")), remaining); }),
+    new Promise((_, reject) => page.once("close", () => reject(new Error("human_window_closed")))),
+  ])).finally(() => clearTimeout(timer));
+  humanResult.hold_ms = Date.now() - tokenIssuedAtMs;
+  assert(humanResult.hold_ms <= HUMAN_HOLD_MS, "human_hold_timeout");
+  humanResult.operator_release_received = true; passHumanCase("operator_release_received");
+
+  const accountBefore = await getJson(`http://127.0.0.1:${accountPort}/account/me`, token);
+  humanResult.account_status_before = 200;
+  const workspaceBefore = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token);
+  const pgBefore = await humanPgSnapshot(psql, database, childHome, accountId);
+  assert.equal(workspaceBefore.applications.length, 1, "human_exactly_one_application");
+  const application = workspaceBefore.applications[0];
+  assert.equal(application.job_id, fixtureResult.job_id, "human_fixture_job_binding");
+  assert.equal(application.submission_mode, "review_first", "human_review_first_required");
+  assert.equal(application.state, "awaiting_review", "human_awaiting_review_required");
+  assert.equal(application.submitted_at_ms, null, "human_submission_forbidden");
+  assert.equal(pgBefore.account_rows, 1, "human_pg_account_row");
+  assert.equal(pgBefore.profile_rows, 1, "human_pg_profile_row");
+  assert.equal(pgBefore.application_rows, 1, "human_pg_application_row");
+  assert.equal(pgBefore.prepared_rows, 1, "human_pg_prepared_row");
+  assert.equal(pgBefore.submitted_rows, 0, "human_pg_submitted_row");
+  const resumeBefore = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-versions/${encodeURIComponent(application.resume_version_id)}`, token);
+  assert.equal(pgBefore.application.account_id, accountId, "human_pg_application_account");
+  assert.equal(pgBefore.application.id, application.id, "human_pg_application_id");
+  assert.equal(pgBefore.application.job_id, fixtureResult.job_id, "human_pg_application_job");
+  assert.equal(pgBefore.application.resume_version_id, application.resume_version_id,
+    "human_pg_application_resume");
+  assert.equal(pgBefore.resume.account_id, pgBefore.application.account_id,
+    "human_pg_resume_account");
+  assert.equal(pgBefore.resume.id, pgBefore.application.resume_version_id, "human_pg_resume_id");
+  assert.equal(pgBefore.resume.job_id, pgBefore.application.job_id, "human_pg_resume_job");
+  for (const value of [pgBefore.profile_ciphertext, pgBefore.application.application_ciphertext,
+    pgBefore.resume.content_ciphertext, pgBefore.resume.diff_ciphertext,
+    pgBefore.resume.claim_ids_ciphertext]) {
+    assert.equal(typeof value, "string", "human_pg_opaque_type");
+    assert(value.length > 0 && value.length <= 4 * 1024 * 1024, "human_pg_opaque_bound");
+  }
+  const profileSha = canonicalSha256(pgBefore.profile_ciphertext);
+  const applicationSha = canonicalSha256(pgBefore.application);
+  const resumeSha = canonicalSha256(pgBefore.resume);
+  assert.match(profileSha, /^[a-f0-9]{64}$/); assert.match(applicationSha, /^[a-f0-9]{64}$/);
+  assert.match(resumeSha, /^[a-f0-9]{64}$/); assert.match(canonicalSha256(resumeBefore), /^[a-f0-9]{64}$/);
+  passHumanCase("prepared_before_reload");
+
+  await page.goto(`${origin}/jobs/applications`, { waitUntil: "networkidle", timeout: OPERATION_MS });
+  const row = page.locator(".application-row");
+  assert.equal(await row.count(), 1, "human_visible_single_application");
+  const packetPolicy = row.locator(".application-packet small");
+  await packetPolicy.getByText(/^(?:v[1-9]\d*|Prepared) · Review First$/)
+    .waitFor({ timeout: OPERATION_MS });
+  await row.click();
+  await page.getByRole("heading", { name: "Application kit" }).waitFor({ timeout: OPERATION_MS });
+  await page.reload({ waitUntil: "networkidle", timeout: OPERATION_MS });
+  assert.equal(await page.locator(".application-row").count(), 1, "human_reload_single_application");
+  await page.locator(".application-row").click();
+  await page.getByRole("heading", { name: "Application kit" }).waitFor({ timeout: OPERATION_MS });
+  const accountAfter = await getJson(`http://127.0.0.1:${accountPort}/account/me`, token);
+  humanResult.account_status_after = 200;
+  const workspaceAfter = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token);
+  const pgAfter = await humanPgSnapshot(psql, database, childHome, accountId);
+  const resumeAfter = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-versions/${encodeURIComponent(application.resume_version_id)}`, token);
+  assert.deepEqual(accountAfter, accountBefore, "human_account_reload_stable");
+  assert.deepEqual(workspaceAfter.profile, workspaceBefore.profile, "human_profile_reload_stable");
+  assert.deepEqual(workspaceAfter.applications, workspaceBefore.applications,
+    "human_application_reload_stable");
+  assert.deepEqual(resumeAfter, resumeBefore, "human_resume_reload_stable");
+  assert.equal(pgAfter.application.id, application.id, "human_pg_reload_application_id");
+  assert.equal(pgAfter.application.job_id, fixtureResult.job_id, "human_pg_reload_application_job");
+  assert.equal(pgAfter.application.resume_version_id, application.resume_version_id,
+    "human_pg_reload_application_resume");
+  assert.equal(pgAfter.resume.account_id, pgAfter.application.account_id,
+    "human_pg_reload_resume_account");
+  assert.equal(canonicalSha256(pgAfter.profile_ciphertext), profileSha,
+    "human_pg_profile_hash_stable");
+  assert.equal(canonicalSha256(pgAfter.application), applicationSha,
+    "human_pg_application_hash_stable");
+  assert.equal(canonicalSha256(pgAfter.resume), resumeSha, "human_pg_resume_hash_stable");
+  humanResult.profile_stable = true; humanResult.application_stable = true;
+  humanResult.resume_stable = true; passHumanCase("prepared_after_reload");
+
+  humanResult.unauthenticated_status = await get(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`);
+  assert.equal(humanResult.unauthenticated_status, 401, "human_unauthenticated_exact_denial");
+  const isolatedWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, isolatedToken);
+  humanResult.isolated_application_rows = isolatedWorkspace.applications.length;
+  assert.equal(humanResult.isolated_application_rows, 0, "human_isolated_application_rows");
+  assert.notDeepEqual(isolatedWorkspace.profile, workspaceAfter.profile, "human_profile_isolation");
+  passHumanCase("account_isolation");
+
+  for (const field of ["account_rows", "profile_rows", "application_rows", "prepared_rows",
+    "submitted_rows", "browser_sessions", "workflow_commands", "run_events",
+    "irreversible_receipts"]) humanResult[field] = pgAfter[field];
+  assert.deepEqual({ submitted_rows: pgAfter.submitted_rows,
+    browser_sessions: pgAfter.browser_sessions, workflow_commands: pgAfter.workflow_commands,
+    run_events: pgAfter.run_events, irreversible_receipts: pgAfter.irreversible_receipts },
+  { submitted_rows: 0, browser_sessions: 0, workflow_commands: 0,
+    run_events: 0, irreversible_receipts: 0 }, "human_effect_fence");
+  assert.deepEqual(workspaceAfter.browser_sessions, [], "human_no_browser_sessions");
+  assert.deepEqual(workspaceAfter.interventions, [], "human_no_interventions");
+  assert.deepEqual(workspaceAfter.auto_submit_authorizations, [], "human_no_auto_submit_authority");
+  passHumanCase("zero_effects");
 }
 function mime(path) { return ({ ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".json": "application/json" })[extname(path)] || "text/html"; }
 function proxyServer(dist, jobsPort, accountPort) {
@@ -252,7 +648,7 @@ function proxyServer(dist, jobsPort, accountPort) {
   });
 }
 async function main() {
-  stage = "preflight";
+  checkAbort(); stage = "preflight";
   const requestedRoot = required("BLUEY_TEST_RUN_ROOT");
   const rootInfo = await lstat(requestedRoot);
   if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory() || rootInfo.uid !== process.getuid() || (rootInfo.mode & 0o777) !== 0o700) fail("test_root_identity");
@@ -262,7 +658,8 @@ async function main() {
   const database = onlyLoopbackPostgres(required("BLUEY_TEST_POSTGRES_URL"));
   const target = await ownedPath(root, required("CARGO_TARGET_DIR"), "cargo_target_dir");
   const dist = await ownedPath(root, required("BLUEY_PORTAL_DIST"), "portal_dist");
-  await ownedPath(root, required("PLAYWRIGHT_BROWSERS_PATH"), "playwright_browsers");
+  ownedBrowserRoot = await ownedPath(root, required("PLAYWRIGHT_BROWSERS_PATH"),
+    "playwright_browsers");
   const privateRuntime = join(root, "nonprod-browser-api");
   await mkdir(privateRuntime, { mode: 0o700 });
   const childHome = join(privateRuntime, "child-home"); const childTmp = join(childHome, "tmp");
@@ -290,6 +687,7 @@ async function main() {
   const isolatedAccountId = `ui_isolated_${randomUUID()}`;
   const isolatedEmail = `ui-isolated-${randomUUID()}@example.test`;
   objectStore = await startNonprodObjectStore({ accountId });
+  cleanupPorts.push(Number(new URL(objectStore.endpoint).port)); checkAbort();
   const common = {
     PATH: process.env.PATH, HOME: childHome, TMPDIR: childTmp, TMP: childTmp, TEMP: childTmp,
     SQLITE_TMPDIR: childTmp, LANG: "C", TZ: "UTC",
@@ -317,14 +715,47 @@ async function main() {
   await waitFor(`http://127.0.0.1:${accountPort}/health`);
   stage = "seed";
   await seed(psql, database, accountId, email, isolatedAccountId, isolatedEmail);
+  const tokenIssuedAtMs = Date.now();
   const token = fixtureToken(accountId, secret);
-  const proxy = proxyServer(dist, jobsPort, accountPort); liveProxy = proxy; const portalPort = await listen(proxy);
-  const browser = await withTimeout(chromium.launch({ headless: true }), "browser_launch"); liveBrowser = browser;
+  const humanIsolatedToken = HUMAN_HOLD ? fixtureToken(isolatedAccountId, secret) : null;
+  checkAbort();
+  const proxy = proxyServer(dist, jobsPort, accountPort); liveProxy = proxy;
+  const portalPort = await withTimeout(listen(proxy), "proxy_listen", true);
+  cleanupPorts.push(jobsPort, accountPort, portalPort); checkAbort();
+  const browser = await withTimeout(chromium.launch({ headless: !HUMAN_HOLD }),
+    "browser_launch", true); liveBrowser = browser; checkAbort();
   try {
-    const context = await browser.newContext();
-    await context.route("**/*", (route) => new URL(route.request().url()).origin === `http://127.0.0.1:${portalPort}` ? route.continue() : route.abort());
+    const context = HUMAN_HOLD
+      ? await browser.newContext({ serviceWorkers: "block", acceptDownloads: false }) : await browser.newContext();
+    const portalOrigin = `http://127.0.0.1:${portalPort}`;
+    await context.route("**/*", (route) => {
+      const request = route.request();
+      if (HUMAN_HOLD && request.url() === HUMAN_CANARY_URL) {
+        assert.equal(request.method(), "GET", "human_canary_method");
+        assert.equal(request.postData(), null, "human_canary_body");
+        assert.equal(request.headers().authorization, undefined, "human_canary_authorization");
+        humanResult.requests.canary_blocked += 1; return route.abort();
+      }
+      if (new URL(request.url()).origin === portalOrigin) return route.continue();
+      if (HUMAN_HOLD) humanResult.requests.denied_non_origin += 1;
+      return route.abort();
+    });
+    if (HUMAN_HOLD) await context.routeWebSocket("**/*", (socket) => {
+      humanResult.requests.denied_websockets += 1; socket.close();
+    });
     await context.addInitScript(([access, persistence]) => { localStorage.setItem("bluey_access_token", access); localStorage.setItem("bluey_auth_persistence", persistence); }, [token, "local"]);
     const page = await context.newPage();
+    if (HUMAN_HOLD) {
+      page.on("popup", (popup) => {
+        humanResult.requests.denied_popups += 1; void popup.close();
+      });
+      page.on("download", (download) => {
+        humanResult.requests.denied_downloads += 1; void download.cancel();
+      });
+      page.on("filechooser", (chooser) => {
+        result.failed.push("human_file_chooser_forbidden"); void chooser.setFiles([]);
+      });
+    }
     let pageErrors = 0; let serverErrors = 0;
     page.on("pageerror", () => { pageErrors += 1; });
     page.on("response", (response) => { if (response.status() >= 500) serverErrors += 1; });
@@ -397,7 +828,7 @@ async function main() {
     stage = "account_isolation";
     assert.equal(await get(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`), 401, "unauthenticated_denied");
     const firstSnapshot = structuredClone({ profile: workspace.profile, preferences: workspace.preferences, tracks: workspace.tracks, applications: workspace.applications });
-    const isolatedToken = fixtureToken(isolatedAccountId, secret);
+    const isolatedToken = HUMAN_HOLD ? humanIsolatedToken : fixtureToken(isolatedAccountId, secret);
     const isolatedWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, isolatedToken);
     assert.notEqual(isolatedWorkspace.profile.full_name, "Synthetic Candidate", "isolated_profile_no_leak");
     assert.deepEqual(isolatedWorkspace.profile.employment, [], "isolated_employment_no_leak");
@@ -464,6 +895,14 @@ async function main() {
     assert.equal(fixtureOutcome.code, 0, "packet_fixture_exit"); assert.equal(fixtureOutcome.signal, null, "packet_fixture_signal");
     const fixtureResult = await ownedJson(join(root, "browser-packet-fixture-result.json"), root, { version: "number", job_id: "string" });
     assert.equal(fixtureResult.version, 1, "packet_fixture_version"); assert.ok(fixtureResult.job_id.length > 0, "packet_fixture_job");
+    if (HUMAN_HOLD) {
+      stage = "human_hold";
+      await humanHoldQualification({ context, page, portalPort, jobsPort, accountPort, token,
+        isolatedToken, tokenIssuedAtMs, psql, database, childHome, accountId, fixtureResult });
+      assert.equal(pageErrors, 0, "human_final_page_errors");
+      assert.equal(serverErrors, 0, "human_final_server_errors");
+      humanResult.page_errors = pageErrors; humanResult.server_errors = serverErrors;
+    } else {
     stage = "packet_review";
     await page.goto(`http://127.0.0.1:${portalPort}/jobs/matches`, { waitUntil: "networkidle" });
     await page.getByRole("heading", { name: "Matches" }).waitFor({ timeout: OPERATION_MS });
@@ -592,17 +1031,27 @@ async function main() {
     assert.equal(queueAfter.metered_amount_cents, 0, "queue_ledger_zero_charge");
     assert.equal(queueAfter.balance_cents, queueBefore.balance_cents, "queue_ledger_balance_unchanged");
     const repeatApprove = await postJson(`http://127.0.0.1:${jobsPort}/api/jobs/applications/${encodeURIComponent(reprepare.body.application.id)}/approve`, token, {}); assert.equal(repeatApprove.status, 409, "queue_repeat_conflict"); assert.deepEqual(await packetLedgerSnapshot(psql, database, childHome, accountId), queueAfter, "queue_repeat_no_double_debit"); assert.equal(pageErrors, 0, "final_page_errors"); assert.equal(serverErrors, 0, "final_server_errors"); passCase("review_first_queue");
-    await context.close();
-  } finally { await browser.close(); liveBrowser = undefined; await new Promise((resolveClose) => proxy.close(resolveClose)); liveProxy = undefined; }
-  stage = "cleanup"; await stopChildren();
-  assert.equal(result.passed, result.tests, "all_cases_passed");
+    }
+    await withTimeout(context.close(), "context_close", true);
+  } finally { await closeInteractive(); }
+  stage = "cleanup"; await stopTransientChildren(); await stopChildren();
+  if (HUMAN_HOLD) {
+    humanResult.binaries = result.binaries; humanResult.fixture = result.fixture;
+    humanResult.requests.jobs = result.requests.jobs;
+    humanResult.requests.account = result.requests.account;
+  } else assert.equal(result.passed, result.tests, "all_cases_passed");
   assert.ok(Number.isInteger(result.requests.jobs) && result.requests.jobs > 0, "jobs_request_count");
   assert.ok(Number.isInteger(result.requests.account) && result.requests.account > 0, "account_request_count");
+  checkAbort();
 }
 
 let totalTimer;
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => requestAbort(`signal_${signal.toLowerCase()}`));
+}
 try {
-  await Promise.race([main(), new Promise((_, reject) => { totalTimer = setTimeout(() => reject(new Error("timeout_total")), LIMIT_MS); })]);
+  totalTimer = setTimeout(() => requestAbort("timeout_total"), LIMIT_MS);
+  await main();
 } catch (error) {
   const brokenStage = stage;
   const assertionLabel = error?.code === "ERR_ASSERTION" && typeof error.message === "string"
@@ -610,17 +1059,56 @@ try {
   const candidate = /^[a-z0-9_]{1,120}$/.test(assertionLabel)
     ? assertionLabel : error instanceof Error ? error.message : "unknown_failure";
   const code = /^[a-z0-9_:-]{1,120}$/i.test(candidate) ? candidate : "generic_failure";
-  result.failed.push(code);
-  if (liveBrowser) await liveBrowser.close().catch(() => {});
-  if (liveProxy) await new Promise((resolveClose) => liveProxy.close(resolveClose));
-  try { stage = "cleanup"; await stopChildren(); } catch { result.failed.push("cleanup_failure"); }
+  if (!result.failed.includes(code)) result.failed.push(code);
+  stage = "cleanup";
+  const cleanup = await Promise.allSettled([
+    closeInteractive(), stopTransientChildren(), stopChildren(),
+  ]);
+  if (cleanup.some((outcome) => outcome.status === "rejected")) {
+    result.failed.push("cleanup_failure");
+  }
   process.stdout.write(`${JSON.stringify({ version: 4, passed: 0, stage: brokenStage, failure: code })}\n`);
 } finally {
   clearTimeout(totalTimer);
-  if (objectStore) { result.object_store = objectStore.counters(); await objectStore.close(); objectStore = undefined; }
-  if (result.failed.length === 0 && result.passed === result.tests && outputRoot) {
+  if (objectStore) {
+    result.object_store = objectStore.counters();
+    if (HUMAN_HOLD) humanResult.object_store = result.object_store;
+    await objectStore.close(); objectStore = undefined;
+  }
+  if (HUMAN_HOLD && result.failed.length === 0
+      && humanResult.passed === HUMAN_CASES.length - 1 && outputRoot) {
+    const inventory = await humanCleanupInventory();
+    humanResult.engine_ps = inventory.enginePs; humanResult.engine_lsof = inventory.engineLsof;
+    humanResult.ports_refused = inventory.portsRefused;
+    assert.deepEqual(inventory, { enginePs: 0, engineLsof: 0, portsRefused: 4 },
+      "human_cleanup_inventory");
+    passHumanCase("cleanup");
+    assert.equal(humanResult.passed, HUMAN_CASES.length, "all_human_cases_passed");
+    const output = join(outputRoot, "human-browser-api-result.json");
+    publishedReportPath = output; checkAbort();
+    try {
+      await writeFile(output, `${JSON.stringify(humanResult)}\n`, { flag: "wx", mode: 0o600 });
+      await chmod(output, 0o600); checkAbort();
+    } catch (error) {
+      try { unlinkSync(output); } catch (unlinkError) {
+        if (unlinkError.code !== "ENOENT") throw unlinkError;
+      }
+      throw error;
+    }
+    process.stdout.write(`${JSON.stringify({ version: 1, mode: "human_hold",
+      passed: humanResult.passed, cases: humanResult.cases.length, sourceAccepted: false })}\n`);
+  } else if (!HUMAN_HOLD && result.failed.length === 0 && result.passed === result.tests && outputRoot) {
     const output = join(outputRoot, "browser-api-result.json");
-    await writeFile(output, `${JSON.stringify(result)}\n`, { flag: "wx", mode: 0o600 }); await chmod(output, 0o600);
+    publishedReportPath = output; checkAbort();
+    try {
+      await writeFile(output, `${JSON.stringify(result)}\n`, { flag: "wx", mode: 0o600 });
+      await chmod(output, 0o600); checkAbort();
+    } catch (error) {
+      try { unlinkSync(output); } catch (unlinkError) {
+        if (unlinkError.code !== "ENOENT") throw unlinkError;
+      }
+      throw error;
+    }
     process.stdout.write(`${JSON.stringify({ version: 4, passed: result.passed, tests: result.tests })}\n`);
   }
 }

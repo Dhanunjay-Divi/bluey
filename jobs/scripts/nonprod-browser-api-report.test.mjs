@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { assertBrowserApiReport, BROWSER_API_CASES } from "./nonprod-browser-api-report.mjs";
+import {
+  assertBrowserApiReport, assertHumanBrowserApiReport,
+  BROWSER_API_CASES, HUMAN_BROWSER_API_CASES,
+} from "./nonprod-browser-api-report.mjs";
 
 function report() {
   return {
@@ -75,4 +78,67 @@ test("source object must have one PUT, repeated exact readback and zero normal r
     { put: 1, get: "2", denied: 0, objects: 1 }, { put: 1, get: 101, denied: 0, objects: 1 },
     { put: 1, get: 2, denied: 0, objects: 1, extra: true },
   ]) assert.throws(() => assertBrowserApiReport({ ...report(), object_store }, () => false));
+});
+
+function humanReport() {
+  return {
+    version: 1, mode: "human_hold", cases: [...HUMAN_BROWSER_API_CASES],
+    passed: HUMAN_BROWSER_API_CASES.length, ready: true, operator_release_received: true,
+    hold_ms: 120_000, account_status_before: 200, account_status_after: 200,
+    unauthenticated_status: 401, account_rows: 1, profile_rows: 1,
+    application_rows: 1, prepared_rows: 1, submitted_rows: 0,
+    browser_sessions: 0, workflow_commands: 0, run_events: 0,
+    irreversible_receipts: 0, profile_stable: true, application_stable: true,
+    resume_stable: true, isolated_application_rows: 0, network_canary_blocked: true,
+    page_errors: 0, server_errors: 0, engine_ps: 0, engine_lsof: 0, ports_refused: 4,
+    binaries: [{ pid: 22345, code: 0, signal: null }, { pid: 22346, code: 0, signal: null }],
+    fixture: { pid: 22347, code: 0, signal: null },
+    requests: { jobs: 25, account: 3, canary_blocked: 1, denied_non_origin: 0,
+      denied_popups: 0, denied_downloads: 0, denied_websockets: 0 },
+    object_store: { put: 0, get: 0, denied: 0, objects: 0 },
+  };
+}
+
+test("human hold requires the exact closed schema and absent owned processes", () => {
+  const seen = [];
+  assertHumanBrowserApiReport(humanReport(), (pid) => { seen.push(pid); return false; });
+  assert.deepEqual(seen, [22345, 22346, 22347]);
+  for (const change of [
+    { version: 4 }, { mode: "automated" }, { cases: [] }, { passed: 7 },
+    { ready: false }, { operator_release_received: false }, { hold_ms: 600_001 },
+    { account_status_before: 204 }, { account_status_after: 204 },
+    { unauthenticated_status: 403 }, { application_rows: 0 }, { application_rows: 2 },
+    { prepared_rows: 0 }, { submitted_rows: 1 }, { profile_stable: false },
+    { application_stable: false }, { resume_stable: false },
+    { network_canary_blocked: false }, { page_errors: 1 }, { server_errors: 1 },
+    { engine_ps: 1 }, { engine_lsof: 1 }, { ports_refused: 3 }, { extra: true },
+  ]) assert.throws(() => assertHumanBrowserApiReport({ ...humanReport(), ...change }, () => false));
+  assert.throws(() => assertHumanBrowserApiReport(humanReport(), () => true), /still exists/);
+});
+
+test("human hold rejects every effect, cross-account row and network escape counter", () => {
+  for (const field of ["browser_sessions", "workflow_commands", "run_events",
+    "irreversible_receipts", "isolated_application_rows"]) {
+    assert.throws(() => assertHumanBrowserApiReport({ ...humanReport(), [field]: 1 }, () => false));
+  }
+  for (const field of ["canary_blocked", "denied_non_origin", "denied_popups",
+    "denied_downloads", "denied_websockets"]) {
+    const requests = { ...humanReport().requests,
+      [field]: field === "canary_blocked" ? 0 : 1 };
+    assert.throws(() => assertHumanBrowserApiReport({ ...humanReport(), requests }, () => false));
+  }
+  for (const object_store of [
+    { put: 1, get: 0, denied: 0, objects: 1 },
+    { put: 0, get: 1, denied: 0, objects: 0 },
+    { put: 0, get: 0, denied: 1, objects: 0 },
+  ]) assert.throws(() => assertHumanBrowserApiReport({ ...humanReport(), object_store }, () => false));
+});
+
+test("human hold timeout, window-close and incomplete work cannot be represented as passing", () => {
+  for (const change of [
+    { operator_release_received: false, hold_ms: 1 },
+    { ready: false, cases: HUMAN_BROWSER_API_CASES.slice(0, 1), passed: 1 },
+    { application_rows: 0, prepared_rows: 0 },
+    { binaries: [] }, { fixture: null },
+  ]) assert.throws(() => assertHumanBrowserApiReport({ ...humanReport(), ...change }, () => false));
 });

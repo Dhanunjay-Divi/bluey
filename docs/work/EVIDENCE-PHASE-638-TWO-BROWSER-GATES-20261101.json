@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "kind": "two_synthetic_browser_fixtures_only",
+  "status": "passed",
+  "recipeSha256": "616e53d16e958874570df5f40fbabafcce020287f8c44c410175ed831609b92e",
+  "events": [
+    {
+      "event": "phase638_two_browser_gates_started",
+      "sourceFiles": 774,
+      "sourceManifestSha256": "3de70edc32c2f4b9b3199747265b5eaa78e75a38ed30f60d3361fef4f14e22c1"
+    },
+    {
+      "event": "phase638_browser_stage_started",
+      "stage": "chromium_install"
+    },
+    {
+      "event": "phase638_browser_stage_passed",
+      "stage": "chromium_install"
+    },
+    {
+      "event": "phase638_browser_stage_started",
+      "stage": "exact_submit_guard"
+    },
+    {
+      "event": "phase638_browser_stage_passed",
+      "stage": "exact_submit_guard"
+    },
+    {
+      "event": "phase638_browser_stage_started",
+      "stage": "document_import"
+    },
+    {
+      "event": "phase638_browser_stage_passed",
+      "stage": "document_import"
+    },
+    {
+      "event": "phase638_private_browser_closed",
+      "processes": 0,
+      "openFiles": 0,
+      "forcedCleanup": false
+    },
+    {
+      "event": "phase638_two_browser_gates_passed",
+      "singletonTests": 2,
+      "skipped": 0,
+      "documentCases": 5,
+      "realPdfWorker": true,
+      "unexpectedRequests": 0,
+      "trackedWebJobsUnchanged": true,
+      "sourceUnchanged": true
+    },
+    {
+      "event": "phase638_private_browser_closed",
+      "processes": 0,
+      "openFiles": 0,
+      "forcedCleanup": false
+    }
+  ],
+  "exit": {
+    "code": 0,
+    "signal": null
+  },
+  "cleanup": {
+    "parentEmpty": true
+  },
+  "productionAccepted": false,
+  "outputSha256": "ad9ef8164f4f8930c7caf5c2a14de75c28a8e7d432fc92e429157f66b17077d4"
+}

@@ -1019,15 +1019,15 @@ mod tests {
             "fn execution_finish_allowed",
             "cloud final-submit admission",
         );
-        assert_managed_prelock_is_first_statement(
-            cloud_submit,
-            "if let Some((Some(input), _)) = managed_cloud_context {",
-            "cloud final-submit admission",
-        );
         let cloud_submit_postgres = cloud_submit
             .split("DbPool::Postgres(_) =>")
             .nth(1)
             .expect("PostgreSQL cloud final-submit admission");
+        assert_managed_prelock_is_first_statement(
+            cloud_submit_postgres,
+            "if let Some((Some(input), _)) = managed_cloud_context {",
+            "cloud final-submit admission",
+        );
         assert!(
             cloud_submit_postgres.find("if discovered_lease").unwrap()
                 < cloud_submit_postgres
@@ -2292,7 +2292,10 @@ mod tests {
             .any(|reason| reason.code == "experience_outside_target_range"));
     }
 
-    fn execution_lease_fixture(pool: &DbPool, suffix: &str) -> (JobApplication, String, String) {
+    pub(super) fn execution_lease_fixture(
+        pool: &DbPool,
+        suffix: &str,
+    ) -> (JobApplication, String, String) {
         let (profile, preferences) =
             execution_policy_fixture(pool, "acct-jobs", "jobs@example.com", "track-default");
         set_entitlement_plan(pool, "acct-jobs", "cloud").unwrap();
@@ -5868,11 +5871,20 @@ mod tests {
         lease_fence: i64,
         proof: FinalSubmitProof,
         runtime_target: AtsCertificationRuntimeTarget,
+        worker_id: String,
     }
 
     fn certified_cloud_execution_fixture(
         pool: &DbPool,
         suffix: &str,
+    ) -> CertifiedCloudExecutionFixture {
+        certified_cloud_execution_fixture_with_worker_context(pool, suffix, false)
+    }
+
+    fn certified_cloud_execution_fixture_with_worker_context(
+        pool: &DbPool,
+        suffix: &str,
+        authenticated_worker: bool,
     ) -> CertifiedCloudExecutionFixture {
         let owner_id = format!("certified-cloud-owner-{suffix}");
         let runtime = certified_cloud_runtime(suffix);
@@ -5898,19 +5910,41 @@ mod tests {
         )
         .expect("install exact certified cloud runtime fixture");
         assert_eq!(installed.runtime_target, runtime_target);
-        let grant = claim_execution_lease_for_runner_volume_authorized(
-            pool,
-            "acct-jobs",
-            &fixture.application.id,
-            &fixture.run_id,
-            &fixture.browser_profile_id,
-            &owner_id,
-            &installed.binding_request,
-            &installed.runtime_grant_id,
-            &installed.runtime_sha256,
-            &installed.verified_authority,
-        )
-        .expect("claim exact certified cloud runtime");
+        let worker_id = installed.binding_request.worker_id.clone();
+        let grant = if authenticated_worker {
+            let authorized = claim_managed_execution_lease_for_runner_volume_authorized(
+                pool,
+                "acct-jobs",
+                &fixture.application.id,
+                &fixture.run_id,
+                &fixture.browser_profile_id,
+                &owner_id,
+                &installed.binding_request,
+                &installed.runtime_grant_id,
+                &installed.runtime_sha256,
+                &installed.verified_authority,
+                None,
+                &worker_id,
+                &worker_id,
+            )
+            .expect("authenticated unmanaged worker claims exact certified cloud runtime");
+            assert!(authorized.managed_cloud.is_none());
+            authorized.grant
+        } else {
+            claim_execution_lease_for_runner_volume_authorized(
+                pool,
+                "acct-jobs",
+                &fixture.application.id,
+                &fixture.run_id,
+                &fixture.browser_profile_id,
+                &owner_id,
+                &installed.binding_request,
+                &installed.runtime_grant_id,
+                &installed.runtime_sha256,
+                &installed.verified_authority,
+            )
+            .expect("claim exact certified cloud runtime")
+        };
         assert_eq!(grant.lease.phase, "prepared");
         assert_eq!(grant.runtime_grant_id, installed.runtime_grant_id);
         assert_eq!(grant.runtime_sha256, installed.runtime_sha256);
@@ -5927,15 +5961,16 @@ mod tests {
             lease_fence: grant.lease.fence,
             proof: fixture.proof,
             runtime_target,
+            worker_id,
         }
     }
 
-    struct ManagedCloudAdmissionEnvironment {
+    pub(super) struct ManagedCloudAdmissionEnvironment {
         prior: [(&'static str, Option<std::ffi::OsString>); 7],
     }
 
     impl ManagedCloudAdmissionEnvironment {
-        fn staging() -> Self {
+        pub(super) fn staging() -> Self {
             let prior = [
                 "BLUEY_JOBS_MANAGED_CLOUD_ENVIRONMENT",
                 "BLUEY_JOBS_MANAGED_CLOUD_REGION",
@@ -5974,15 +6009,27 @@ mod tests {
         worker_id: String,
     }
 
-    fn sqlite_test_db_now(pool: &DbPool) -> i64 {
-        pool.get()
-            .unwrap()
-            .query_row(
-                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
+    fn certified_fixture_db_now(pool: &DbPool) -> i64 {
+        match pool {
+            DbPool::Sqlite(_) => pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            DbPool::Postgres(_) => pool
+                .get_pg()
+                .unwrap()
+                .query_one(
+                    "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
+                    &[],
+                )
+                .unwrap()
+                .get(0),
+        }
     }
 
     fn managed_final_submit_execution_fixture(
@@ -6026,49 +6073,88 @@ mod tests {
                 scope.clone(),
                 application_fixture.managed_authority_now_ms,
             );
-        let now = sqlite_test_db_now(pool);
+        let now = certified_fixture_db_now(pool);
         let workflow_id = new_jobs_workflow_id();
-        let mut command = NewJobsWorkflowCommand {
+        let frozen_packet = application_fixture
+            .application
+            .receipt
+            .pointer("/approved_execution/packet")
+            .cloned()
+            .expect("managed fixture has a frozen approved packet");
+        let identity_id = frozen_packet["applicationIdentityId"]
+            .as_str()
+            .expect("managed fixture packet has a frozen identity");
+        let command = new_stage_cloud_workflow_start_command(&StageCloudWorkflowStart {
             account_id: "acct-jobs".to_string(),
             application_id: application_fixture.application.id.clone(),
             run_id: application_fixture.run_id.clone(),
             workflow_id,
-            intervention_id: None,
-            command_kind: JobsWorkflowCommandKind::Start,
             idempotency_key: format!("managed-final-submit-{suffix}"),
-            request: Value::Null,
-            payload: JobsWorkflowCommandPayload::Start(JobsWorkflowStartMaterial {
-                workflow_input: json!({ "fixture": suffix }),
-                browser_session_id: application_fixture.run_id.clone(),
-                result_request_id: format!("managed-final-submit-result-{suffix}"),
+            workflow_input: json!({
+                "accountId": "acct-jobs",
+                "applicationId": application_fixture.application.id,
+                "idempotencyKey": application_fixture.run_id,
+                "runner": "cloud",
+                "applicationIdentityId": identity_id,
+                "browserProfileId": application_fixture.browser_profile_id,
+                "packet": frozen_packet,
             }),
+            browser_session: BrowserSession {
+                id: application_fixture.run_id.clone(),
+                runner: "cloud".to_string(),
+                status: "queued".to_string(),
+                current_company: String::new(),
+                current_step: String::new(),
+                application_id: Some(application_fixture.application.id.clone()),
+                takeover_url: None,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
             now_ms: now,
-        };
-        command.request = stage_workflow_command_request(&command);
-        let (admission, binding) = {
-            let mut connection = pool.get().unwrap();
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
+        })
+        .expect("derive the canonical managed fixture request/result ID");
+        let (admission, binding) = match pool {
+            DbPool::Sqlite(_) => {
+                let mut connection = pool.get().unwrap();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                let admission =
+                    admit_jobs_workflow_command_sqlite_tx(&transaction, &command, true).unwrap();
+                let binding = bind_managed_cloud_workflow_sqlite_tx(
+                    &transaction,
+                    &managed_cloud_binding_input(&admission, scope.clone()),
+                )
                 .unwrap();
-            let admission =
-                admit_jobs_workflow_command_sqlite_tx(&transaction, &command, true).unwrap();
-            let binding = bind_managed_cloud_workflow_sqlite_tx(
-                &transaction,
-                &managed_cloud_binding_input(&admission, scope.clone()),
-            )
-            .unwrap();
-            transaction.commit().unwrap();
-            (admission, binding)
+                transaction.commit().unwrap();
+                (admission, binding)
+            }
+            DbPool::Postgres(_) => {
+                let mut connection = pool.get_pg().unwrap();
+                let mut transaction = connection.transaction().unwrap();
+                lock_managed_cloud_workflow_admission_postgres_tx(&mut transaction, &scope)
+                    .unwrap();
+                let admission =
+                    admit_jobs_workflow_command_postgres_tx(&mut transaction, &command, true)
+                        .unwrap();
+                let binding = bind_managed_cloud_workflow_postgres_tx_after_prelock(
+                    &mut transaction,
+                    &managed_cloud_binding_input(&admission, scope.clone()),
+                )
+                .unwrap();
+                transaction.commit().unwrap();
+                (admission, binding)
+            }
         };
         let command_lease =
-            claim_jobs_workflow_command(pool, &worker_id, sqlite_test_db_now(pool), 60_000)
+            claim_jobs_workflow_command(pool, &worker_id, certified_fixture_db_now(pool), 60_000)
                 .unwrap()
                 .expect("claim managed workflow command");
         assert_eq!(command_lease.command.id, admission.command.id);
         let (_, request_start) = mark_jobs_workflow_command_request_started_with_managed_cloud(
             pool,
             &command_lease,
-            sqlite_test_db_now(pool),
+            certified_fixture_db_now(pool),
         )
         .expect("mark exact managed workflow request-start");
         assert!(request_start.is_some());
@@ -6083,6 +6169,32 @@ mod tests {
             managed_cloud_runtime_instance_epoch: managed_runtime.runtime_instance_epoch,
         };
         assert_eq!(managed_runtime.scope, scope);
+        // A real managed START/request-start cannot be downgraded to the authenticated
+        // unmanaged claim selector. The failed attempt must not consume any claim authority
+        // or alter volume, ATS, application, attempt, workflow or session state.
+        let before_omitted_claim = authenticated_worker_submit_snapshot(pool);
+        assert!(matches!(
+            claim_managed_execution_lease_for_runner_volume_authorized(
+                pool,
+                "acct-jobs",
+                &application_fixture.application.id,
+                &application_fixture.run_id,
+                &application_fixture.browser_profile_id,
+                &owner_id,
+                &installed.binding_request,
+                &installed.runtime_grant_id,
+                &installed.runtime_sha256,
+                &installed.verified_authority,
+                None,
+                &worker_id,
+                &worker_id,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            authenticated_worker_submit_snapshot(pool),
+            before_omitted_claim
+        );
         let grant = claim_managed_execution_lease_for_runner_volume_authorized(
             pool,
             "acct-jobs",
@@ -6123,6 +6235,7 @@ mod tests {
             lease_fence: grant.grant.lease.fence,
             proof: application_fixture.proof,
             runtime_target,
+            worker_id: worker_id.clone(),
         };
         assert_eq!(
             heartbeat_execution_lease(
@@ -6164,11 +6277,7 @@ mod tests {
         let application = get_application(pool, "acct-jobs", application_id)
             .unwrap()
             .unwrap();
-        let mut state = pool
-            .get()
-            .unwrap()
-            .query_row(
-                "SELECT lease.phase, binding.phase, binding.fence,
+        let sql = "SELECT lease.phase, binding.phase, binding.fence,
                         binding.phase_b_request_sha256,
                         (SELECT COUNT(*) FROM jobs_ats_certification_canary_reservations
                           WHERE binding_id = binding.binding_id),
@@ -6187,9 +6296,12 @@ mod tests {
                     AND binding.application_id = lease.application_id
                     AND binding.run_id = lease.run_id
                   WHERE lease.account_id = 'acct-jobs'
-                    AND lease.application_id = ?1 AND lease.run_id = ?2",
-                params![application_id, run_id],
-                |row| {
+                    AND lease.application_id = ?1 AND lease.run_id = ?2";
+        let mut state = match pool {
+            DbPool::Sqlite(_) => pool
+                .get()
+                .unwrap()
+                .query_row(sql, params![application_id, run_id], |row| {
                     Ok(ManagedFinalSubmitBoundaryState {
                         lease_phase: row.get(0)?,
                         certification_phase: row.get(1)?,
@@ -6200,9 +6312,29 @@ mod tests {
                         managed_receipt_count: row.get(6)?,
                         final_submit_proof_present: false,
                     })
-                },
-            )
-            .unwrap();
+                })
+                .unwrap(),
+            DbPool::Postgres(_) => {
+                let row = pool
+                    .get_pg()
+                    .unwrap()
+                    .query_one(
+                        &sql.replace("?1", "$1").replace("?2", "$2"),
+                        &[&application_id, &run_id],
+                    )
+                    .unwrap();
+                ManagedFinalSubmitBoundaryState {
+                    lease_phase: row.get(0),
+                    certification_phase: row.get(1),
+                    certification_fence: row.get(2),
+                    phase_b_request_sha256: row.get(3),
+                    canary_reservation_count: row.get(4),
+                    capacity_count: row.get(5),
+                    managed_receipt_count: row.get(6),
+                    final_submit_proof_present: false,
+                }
+            }
+        };
         state.final_submit_proof_present =
             application.receipt.get(FINAL_SUBMIT_PROOF_KEY).is_some();
         state
@@ -20690,7 +20822,359 @@ mod tests {
         );
     }
 
+    fn postgres_authenticated_worker_pool_or_skip(test_name: &str) -> Option<DbPool> {
+        use crate::db::{accounts::Account, jobs_beta_access as beta};
+
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            assert_ne!(
+                std::env::var("BLUEY_JOBS_REQUIRE_POSTGRES_TESTS").as_deref(),
+                Ok("1"),
+                "{test_name} requires BLUEY_TEST_POSTGRES_URL"
+            );
+            eprintln!("SKIP {test_name}: BLUEY_TEST_POSTGRES_URL is unavailable");
+            return None;
+        };
+        let pool = db::open_postgres_pool(&database_url).unwrap();
+        db::run_migrations(&pool).unwrap();
+        db::run_migrations(&pool).unwrap();
+        // A separately owned fresh database per case is mandatory: do not reset immutable
+        // global authorities or delete another case's account to make this fixture fit.
+        let mut connection = pool.get_pg().unwrap();
+        for table in [
+            "accounts",
+            "jobs_execution_leases",
+            "jobs_workflow_commands",
+            "jobs_runner_volumes",
+            "jobs_ats_certification_manifests",
+            "jobs_managed_cloud_manifests",
+        ] {
+            assert_eq!(
+                connection
+                    .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
+                    .unwrap()
+                    .get::<_, i64>(0),
+                0,
+                "{test_name} requires a fresh private database ({table})"
+            );
+        }
+        // Only candidate account creation uses a fixed ID so the existing certified helper
+        // remains unchanged. Verification, beta admission and all trust use ordinary APIs.
+        connection
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+             VALUES ('acct-jobs', 'jobs@example.com', 'synthetic-test-hash', 0)",
+                &[],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(Account::mark_email_verified(&pool, "acct-jobs").unwrap(), 1);
+        assert!(
+            !Account::fetch_by_id(&pool, "acct-jobs")
+                .unwrap()
+                .unwrap()
+                .is_admin
+        );
+        // Cohort administration belongs to a separate synthetic actor, never the candidate.
+        let admin = Account::create_with_admin(
+            &pool,
+            &format!(
+                "worker-claim-beta-admin-{}@example.test",
+                uuid::Uuid::new_v4().simple()
+            ),
+            "synthetic-admin-test-hash",
+            true,
+        )
+        .unwrap();
+        assert_eq!(Account::mark_email_verified(&pool, &admin.id).unwrap(), 1);
+        let cohort = beta::get_public_beta_cohort(&pool).unwrap();
+        assert_eq!(cohort.assigned_count, 0);
+        let now = now_ms();
+        beta::update_public_beta_cohort_audited(
+            &pool,
+            beta::PublicBetaCohortUpdate {
+                expected_revision: cohort.revision,
+                state: beta::PublicBetaCohortState::Open,
+                opens_at_ms: Some(now.saturating_sub(60_000)),
+                closes_at_ms: Some(now.saturating_add(3_600_000)),
+                hard_cap: cohort.hard_cap.max(1),
+            },
+            &admin.id,
+        )
+        .unwrap();
+        assert_eq!(
+            beta::evaluate_or_enroll_public_beta(&pool, "acct-jobs")
+                .unwrap()
+                .reason,
+            beta::PublicBetaAccessReason::Admitted
+        );
+        let identity =
+            ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        upsert_track(
+            &pool,
+            "acct-jobs",
+            &CareerTrack {
+                id: "track-default".to_string(),
+                name: "Software engineering".to_string(),
+                role: "Software Engineer".to_string(),
+                locations: vec!["New York, NY".to_string()],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: Some(identity.id),
+                policy: CareerTrackPolicy {
+                    role_family: "software_engineering".to_string(),
+                    ..CareerTrackPolicy::default()
+                },
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            !Account::fetch_by_id(&pool, "acct-jobs")
+                .unwrap()
+                .unwrap()
+                .is_admin
+        );
+        Some(pool)
+    }
+
+    fn authenticated_worker_submit_snapshot(pool: &DbPool) -> Value {
+        let mut snapshot = serde_json::Map::new();
+        for table in [
+            "jobs_execution_leases",
+            "jobs_application_ats_certification_bindings",
+            "jobs_ats_certification_canary_reservations",
+            "jobs_submission_evidence_capacity",
+            "jobs_attempt_reservations",
+            "jobs_workflow_commands",
+            "jobs_managed_cloud_workflow_bindings",
+            "jobs_managed_cloud_request_start_authorities",
+            "jobs_managed_cloud_irreversible_effect_receipts",
+            "jobs_execution_lease_volume_bindings",
+            "jobs_execution_lease_process_runtime_bindings",
+            "jobs_runner_account_subjects",
+            "jobs_runner_volume_residencies",
+            "jobs_runner_volume_authority_uses",
+            "jobs_runner_process_runtime_bindings",
+            "jobs_browser_sessions",
+        ] {
+            // Every caller owns an isolated SQLite DB or required-fresh private PG DB.
+            // Snapshot each whole tiny synthetic family, including opaque/HMAC-subject
+            // rows and any unexpected orphan, without assuming an account column exists.
+            let mut rows: Vec<Value> = match pool {
+                DbPool::Sqlite(_) => {
+                    let connection = pool.get().unwrap();
+                    let mut statement = connection
+                        .prepare(&format!("SELECT * FROM {table}"))
+                        .unwrap();
+                    let columns = statement
+                        .column_names()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    let rows = statement
+                        .query_map([], |row| {
+                            let mut object = serde_json::Map::new();
+                            for (index, column) in columns.iter().enumerate() {
+                                use rusqlite::types::ValueRef;
+                                let value = match row.get_ref(index)? {
+                                    ValueRef::Null => Value::Null,
+                                    ValueRef::Integer(value) => json!(value),
+                                    ValueRef::Real(value) => json!(value),
+                                    ValueRef::Text(value) => json!(String::from_utf8_lossy(value)),
+                                    ValueRef::Blob(value) => json!(hex::encode(value)),
+                                };
+                                object.insert(column.clone(), value);
+                            }
+                            Ok(Value::Object(object))
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    rows
+                }
+                DbPool::Postgres(_) => pool
+                    .get_pg()
+                    .unwrap()
+                    .query(
+                        &format!("SELECT to_jsonb(snapshot_row) FROM {table} snapshot_row"),
+                        &[],
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get::<_, Value>(0))
+                    .collect(),
+            };
+            rows.sort_by_key(Value::to_string);
+            snapshot.insert(table.to_string(), Value::Array(rows));
+        }
+        snapshot.insert(
+            "application".to_string(),
+            serde_json::to_value(list_applications(pool, "acct-jobs").unwrap()).unwrap(),
+        );
+        Value::Object(snapshot)
+    }
+
+    fn assert_authenticated_unmanaged_worker_claim_submit_replays(pool: &DbPool, suffix: &str) {
+        // This is the existing unmanaged aligned-run/session contract, not a fabricated
+        // managed START or proof of the distinct-session managed recovery contract.
+        let fixture = certified_cloud_execution_fixture_with_worker_context(pool, suffix, true);
+        let before =
+            managed_final_submit_boundary_state(pool, &fixture.application.id, &fixture.run_id);
+        assert_eq!(before.lease_phase, "prepared");
+        assert_eq!(before.certification_phase, "preflight");
+        assert_eq!(before.certification_fence, 0);
+        assert!(before.phase_b_request_sha256.is_none());
+        assert_eq!(before.canary_reservation_count, 0);
+        assert_eq!(before.capacity_count, 0);
+        assert_eq!(before.managed_receipt_count, 0);
+        assert!(!before.final_submit_proof_present);
+        let prepared = authenticated_worker_submit_snapshot(pool);
+        for table in [
+            "jobs_workflow_commands",
+            "jobs_managed_cloud_workflow_bindings",
+            "jobs_managed_cloud_request_start_authorities",
+        ] {
+            assert!(
+                prepared[table].as_array().unwrap().is_empty(),
+                "unexpected {table}"
+            );
+        }
+        let lease = &prepared["jobs_execution_leases"][0];
+        for column in [
+            "managed_cloud_workflow_request_id",
+            "managed_cloud_request_command_id",
+            "managed_cloud_execution_command_id",
+            "managed_cloud_binding_sha256",
+            "managed_cloud_release_memo_base64url",
+            "managed_cloud_release_sha256",
+            "managed_cloud_runtime_instance_id",
+            "managed_cloud_runtime_instance_epoch",
+            "managed_cloud_worker_id",
+            "managed_cloud_gateway_authority_base64url",
+            "managed_cloud_gateway_authority_sha256",
+            "managed_cloud_lease_authority_sha256",
+        ] {
+            assert!(
+                lease.as_object().unwrap().contains_key(column),
+                "missing {column}"
+            );
+            assert!(lease[column].is_null(), "unmanaged lease contains {column}");
+        }
+        let capacity = test_submission_evidence_capacity(&fixture.application.id, &fixture.run_id);
+        let start = || {
+            start_irreversible_submission_authorized(
+                pool,
+                "acct-jobs",
+                &fixture.application.id,
+                &fixture.run_id,
+                &fixture.lease_token,
+                fixture.lease_fence,
+                &fixture.proof,
+                &capacity,
+                None,
+                &fixture.worker_id,
+            )
+        };
+        let started = start().expect("authenticated unmanaged worker starts irreversible boundary");
+        assert_eq!(started.record.phase, "click_started");
+        assert!(started.managed_cloud.is_none());
+        let after =
+            managed_final_submit_boundary_state(pool, &fixture.application.id, &fixture.run_id);
+        assert_eq!(after.lease_phase, "click_started");
+        assert_eq!(after.certification_phase, "consumed");
+        assert_eq!(after.certification_fence, 1);
+        assert!(after.phase_b_request_sha256.is_some());
+        assert_eq!(after.canary_reservation_count, 1);
+        assert_eq!(after.capacity_count, 1);
+        assert_eq!(after.managed_receipt_count, 0);
+        let application = get_application(pool, "acct-jobs", &fixture.application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_final_submit_proof(&application).unwrap(),
+            fixture.proof
+        );
+        let committed = authenticated_worker_submit_snapshot(pool);
+        assert_eq!(
+            start().expect("exact authenticated unmanaged replay"),
+            started
+        );
+        assert_eq!(authenticated_worker_submit_snapshot(pool), committed);
+    }
+
     #[test]
+    #[serial_test::serial]
+    fn sqlite_unmanaged_authenticated_worker_claim_submit_and_replay_accept_absent_managed_authority(
+    ) {
+        let pool = test_pool();
+        assert_authenticated_unmanaged_worker_claim_submit_replays(&pool, "sqlite-auth-unmanaged");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_unmanaged_authenticated_worker_claim_submit_and_replay_accept_absent_managed_authority_when_configured(
+    ) {
+        let _guard = super::managed_cloud_release_authority_tests::postgres_boot_test_lock()
+            .lock()
+            .unwrap();
+        let Some(pool) = postgres_authenticated_worker_pool_or_skip(
+            "postgres_unmanaged_authenticated_worker_claim_submit_and_replay_accept_absent_managed_authority_when_configured",
+        ) else { return; };
+        assert_authenticated_unmanaged_worker_claim_submit_replays(
+            &pool,
+            "postgres-auth-unmanaged",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_managed_cloud_final_submit_omission_is_denied_without_mutation_when_configured() {
+        let _environment = ManagedCloudAdmissionEnvironment::staging();
+        let _guard = super::managed_cloud_release_authority_tests::postgres_boot_test_lock()
+            .lock()
+            .unwrap();
+        let Some(pool) = postgres_authenticated_worker_pool_or_skip(
+            "postgres_managed_cloud_final_submit_omission_is_denied_without_mutation_when_configured",
+        ) else { return; };
+        let fixture = managed_final_submit_execution_fixture(&pool, "postgres-managed-omission");
+        let cloud = &fixture.cloud;
+        let before =
+            managed_final_submit_boundary_state(&pool, &cloud.application.id, &cloud.run_id);
+        assert_eq!(before.lease_phase, "prepared");
+        assert_eq!(before.certification_phase, "preflight");
+        assert_eq!(before.certification_fence, 0);
+        let snapshot = authenticated_worker_submit_snapshot(&pool);
+        let capacity = test_submission_evidence_capacity(&cloud.application.id, &cloud.run_id);
+        for (input, worker) in [
+            (None, fixture.worker_id.as_str()),
+            (
+                Some(&fixture.managed_cloud),
+                "wrong-managed-worker-final-submit",
+            ),
+        ] {
+            assert!(matches!(
+                start_irreversible_submission_authorized(
+                    &pool,
+                    "acct-jobs",
+                    &cloud.application.id,
+                    &cloud.run_id,
+                    &cloud.lease_token,
+                    cloud.lease_fence,
+                    &cloud.proof,
+                    &capacity,
+                    input,
+                    worker,
+                ),
+                Err(ExecutionLeaseError::Conflict)
+            ));
+            assert_eq!(authenticated_worker_submit_snapshot(&pool), snapshot);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn unmanaged_cloud_worker_submit_and_replay_accept_absent_managed_authority() {
         let pool = test_pool();
         let fixture =

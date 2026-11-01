@@ -5,6 +5,51 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs tests: add a bounded, headed synthetic saved-account session with exact
+  PostgreSQL/API reload checks, separate reports and cancellation cleanup;
+  preserve the original automated journey and disable all external effects.
+- Jobs tests: snapshot complete isolated synthetic authority families without
+  assuming plaintext account columns on HMAC-subject tables; preserve all guards.
+- Jobs tests: use a separate synthetic admin for private PostgreSQL cohort setup,
+  while asserting the application candidate remains non-admin throughout.
+- Jobs tests: scope the strict final-submit prelock source guard to its PostgreSQL
+  branch when both backends share a marker; keep every lock-order assertion.
+- Jobs: distinguish worker authentication from managed workflow input when
+  selecting claim/final-submit sessions in both databases; retain strict
+  managed-omission fences and explicit unmanaged compatibility. Verification pending.
+- Jobs: add explicit review-first and auto-submit private prepared-protocol
+  negative scenarios with exact denial fingerprints and twenty-family state
+  preservation per case; no external applications or production flags enabled.
+- Jobs: recover the exact retained managed START/RESUME browser session without
+  current-head dependencies or new command locks; preserve explicit unmanaged
+  legacy handling and trusted-submitted replay ordering. Private prepared
+  recovery/replay passes in review-first and auto-submit; full gates remain open.
+- Jobs: retain immutable ATS preflight authority for an exact same-owner,
+  unexpired prepared managed-cloud retry while rotating its live token/fence;
+  preserve strict generic replay and add a separate real-client green retry
+  contract with stale-credential denials. Private protocol qualification passed;
+  full source, recovery and release gates remain pending.
+- Jobs: prefix runner-volume authority request IDs to satisfy the server's
+  alphanumeric-first grammar while preserving all192 random bits; production and
+  private protocol clients share the generator. Qualification remains pending.
+- Jobs: correct the PostgreSQL runner-subject finalizer's Boolean-to-SMALLINT
+  assignment without altering schema or admission guards; runtime qualification
+  remains pending.
+- Jobs: record the dated public Tsenta price benchmark and historical cloud-packet
+  budget gap; require separate price, measured delivery cost and quality evidence
+  without changing customer pricing or claiming a proven competitive advantage.
+- Jobs: bind active managed execution to the exact durable START browser session
+  instead of assuming session and run IDs coincide; preserve retained replay and
+  add protocol-only prepared-lease lifecycle checks. Qualification remains pending.
+- Jobs: decode PostgreSQL cloud-browser entitlement integer flags through one
+  fallible reader across queue/resume, managed admission and lease operations,
+  preserving nonzero-enabled semantics without worker panics on type mismatch.
+- Jobs: correct the PostgreSQL fleet-cutover attestation query's extra closing
+  parenthesis; retain readiness, exact-snapshot and replay guards unchanged.
+- Jobs: add a debug-only, private-PostgreSQL runner control-plane reproduction
+  harness using ordinary candidate/packet/run APIs and the real lease client.
+  Synthetic runtime authority and loopback gateway ambiguity are explicitly not
+  cloud execution, Temporal acceptance, submission or production-readiness proof.
 - Jobs: resolve PDF.js standard fonts from local installed assets without network
   fallback, and preserve the complete DOCX symbol mapping in a narrowly deferred
   chunk. Verify synthetic built-browser imports and final source gates locally;

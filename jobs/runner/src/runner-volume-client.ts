@@ -1591,7 +1591,7 @@ export class RunnerVolumeClient {
       version: 1,
       audience: AUTHORITY_AUDIENCE,
       operation,
-      requestId: randomBytes(24).toString("base64url"),
+      requestId: createRunnerVolumeAuthorityRequestId(),
       volumeId: this.volumeId,
       enrollmentEpoch: ENROLLMENT_EPOCH,
       processInstanceId: this.#processInstanceId,
@@ -1896,6 +1896,17 @@ export function canonicalRunnerVolumeEnrollmentProof(
     ].join("\n"),
     "utf8",
   );
+}
+
+// Rust identifiers require an alphanumeric first byte. Preserve all 192 random bits;
+// a fixed prefix prevents base64url's '-'/'_' alphabet from violating that boundary.
+export function createRunnerVolumeAuthorityRequestId(
+  entropy: Uint8Array = randomBytes(24),
+): string {
+  if (!(entropy instanceof Uint8Array) || entropy.byteLength !== 24) {
+    throw new RunnerVolumeClientError("configuration", "configuration");
+  }
+  return `rva-${Buffer.from(entropy).toString("base64url")}`;
 }
 
 export function canonicalRunnerVolumeAuthorityProof(
