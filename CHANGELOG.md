@@ -5,6 +5,12 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs runner image: support bounded layer-local PAX path/link metadata while
+  retaining security-attribute rejection, and remove the unused capability-bearing
+  PTP helper and two exact inactive escaped-name systemd units before measurement
+  and the final rootfs copy. Local source gates passed; exact final image/runtime
+  qualification remains pending. No production automation was enabled.
+
 - Jobs runner qualification: integrate current-source diagnostics and failure-
   only archive retention while preserving native packaging quarantine; require
   one explicit approved source commit instead of a self-referential source pin.

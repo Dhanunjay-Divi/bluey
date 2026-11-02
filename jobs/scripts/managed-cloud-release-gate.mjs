@@ -270,6 +270,12 @@ const MAX_SIGNED_OBJECT_BYTES = 128 * 1024;
 const MAX_INVENTORY_ATTACHMENT_BYTES = 12 * 1024 * 1024;
 const MAX_INVENTORY_ATTACHMENT_TRANSPORT_BYTES = 16 * 1024 * 1024 + 1_024;
 const MAX_INVENTORY_ENTRIES = 100_000;
+const MAX_TAR_HEADERS = 100_000;
+const MAX_LOCAL_PAX_BYTES = 64 * 1024;
+const MAX_LOCAL_PAX_VALUE_BYTES = 4096;
+const MAX_LOCAL_PAX_TOTAL_BYTES = 8 * 1024 * 1024;
+const RUNNER_UNUSED_PTP_HELPER =
+  "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper";
 const MAX_ACTIVATION_EVIDENCE_FILE_BYTES = 128 * 1024;
 const MAX_ACTIVATION_EVIDENCE_TOTAL_BYTES = 1024 * 1024;
 const MAX_PORTAL_OCI_MANIFEST_BYTES = 32 * 1024;
@@ -1758,7 +1764,14 @@ export async function createRuntimeMeasurementFromFilesystem({
 function tarText(buffer, start, length) {
   const end = buffer.indexOf(0, start);
   const finish = end >= start && end < start + length ? end : start + length;
-  return buffer.subarray(start, finish).toString("utf8");
+  if (buffer.subarray(finish, start + length).some((byte) => byte !== 0)) {
+    fail("Tar entry must use canonical text field padding");
+  }
+  try {
+    const value = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer.subarray(start, finish));
+    if (/[\u0080-\u009f]/.test(value)) fail("Tar entry must use canonical UTF-8 text fields");
+    return value;
+  } catch { fail("Tar entry must use canonical UTF-8 text fields"); }
 }
 
 function tarInteger(buffer, start, length, label) {
@@ -1959,9 +1972,41 @@ async function tarRejectionDiagnostic(handle, header, context, ordinal, type, si
   return validateTarRejectionDiagnostic(value);
 }
 
+function localPaxPathNames(body) {
+  // Admission is intentionally independent of the diagnostic key summarizer.
+  // No global state, deletion semantics, numeric or security-attribute overrides.
+  const values = Object.create(null);
+  let offset = 0;
+  while (offset < body.length) {
+    const space = body.indexOf(32, offset);
+    if (space < offset + 1 || space - offset > 5) return null;
+    if (!body.subarray(offset, space).every((byte) => byte >= 48 && byte <= 57)) return null;
+    const digits = body.subarray(offset, space).toString("ascii");
+    if (!/^[1-9][0-9]{0,4}$/.test(digits)) return null;
+    const end = offset + Number(digits);
+    if (end > body.length || end <= space + 3 || body[end - 1] !== 10) return null;
+    const equals = body.indexOf(61, space + 1);
+    if (equals <= space + 1 || equals >= end - 1) return null;
+    const keyBytes = body.subarray(space + 1, equals);
+    if (!keyBytes.every((byte) => byte < 128)) return null;
+    const key = keyBytes.toString("ascii");
+    if (!["path", "linkpath"].includes(key) || Object.hasOwn(values, key)) return null;
+    const raw = body.subarray(equals + 1, end - 1);
+    if (raw.length === 0 || raw.length > MAX_LOCAL_PAX_VALUE_BYTES) return null;
+    let value;
+    try { value = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw); }
+    catch { return null; }
+    if (value !== value.normalize("NFC") || /[\u0000-\u001f\u007f-\u009f\ud800-\udfff\ufffd]/.test(value)) return null;
+    values[key] = value;
+    offset = end;
+  }
+  return Object.keys(values).length > 0 ? values : null;
+}
+
 async function readTarEntries(
   archivePath,
-  { length, start = 0, allowLinks = false, diagnosticContext = { scope: "runtime-bundle" } } = {},
+  { length, start = 0, allowLinks = false, allowLocalPaxNames = false,
+    tarBudget = { headers: 0, paxBytes: 0 }, diagnosticContext = { scope: "runtime-bundle" } } = {},
 ) {
   const metadata = await requireRegularFile(archivePath, "tar archive");
   const archiveLength = length ?? metadata.size - start;
@@ -1980,6 +2025,8 @@ async function readTarEntries(
   const names = new Set();
   let offset = 0;
   let zeroBlocks = 0;
+  let headerOrdinal = 0;
+  let pending = null;
   try {
     while (offset + 512 <= archiveLength) {
       const header = Buffer.alloc(512);
@@ -1988,6 +2035,7 @@ async function readTarEntries(
         fail("Tar header is truncated");
       }
       if (header.every((byte) => byte === 0)) {
+        if (pending) await pending.reject();
         zeroBlocks += 1;
         offset += 512;
         if (zeroBlocks === 2) {
@@ -1998,6 +2046,9 @@ async function readTarEntries(
       if (zeroBlocks !== 0) {
         fail("Tar archive has a nonterminal zero block");
       }
+      headerOrdinal += 1;
+      tarBudget.headers += 1;
+      if (tarBudget.headers > MAX_TAR_HEADERS) fail("Tar archive contains too many physical headers");
       if (
         tarText(header, 257, 6) !== "ustar" ||
         header.subarray(263, 265).toString("ascii") !== "00"
@@ -2016,46 +2067,41 @@ async function readTarEntries(
         path = path.slice(0, -1);
       }
       requireSafeRelativePath(path, "tar path");
-      if (names.has(path)) {
-        fail("Tar archive contains a duplicate path: " + path);
-      }
-      names.add(path);
       const sizeBytes = tarInteger(header, 124, 12, "size");
       const mode = tarInteger(header, 100, 8, "mode");
       const uid = tarInteger(header, 108, 8, "uid");
       const gid = tarInteger(header, 116, 8, "gid");
       const mtime = tarInteger(header, 136, 12, "mtime");
-      const linkTarget = tarText(header, 157, 100);
+      let linkTarget = tarText(header, 157, 100);
+      if (linkTarget !== linkTarget.normalize("NFC") || linkTarget.includes("\\")
+        || /[\u0000-\u001f\u007f-\u009f\ud800-\udfff\ufffd]/.test(linkTarget)) {
+        fail("Tar link target must use canonical UTF-8 text");
+      }
       const allowedTypes = allowLinks ? ["0", "1", "2", "5"] : ["0", "5"];
-      if (!allowedTypes.includes(type)) {
+      const reject = async () => {
         const error = new ManagedCloudReleaseGateError("Tar archive contains unsupported entry type " + type);
         try {
           error.tarDiagnostic = await tarRejectionDiagnostic(handle, header, diagnosticContext,
-            entries.length + 1, type, sizeBytes, start, offset, archiveLength);
+            headerOrdinal, type, sizeBytes, start, offset, archiveLength);
         } catch { /* Diagnostic failure cannot change the original unsupported-type rejection. */ }
         throw error;
+      };
+      if (!allowedTypes.includes(type) && !(allowLocalPaxNames && type === "x")) await reject();
+      if (pending && !allowedTypes.includes(type)) await reject();
+      if (!["1", "2"].includes(type) && linkTarget !== "") {
+        fail("Tar link target is present on a non-link entry");
       }
-      if (type !== "0" && sizeBytes !== 0) {
+      // Raw link fields must remain well formed. A symbolic relative target
+      // is resolved only after BOTH effective names are known: a path override
+      // can legitimately move that link beneath its parent directory.
+      if (type === "1" && linkTarget !== "") normalizeContainerPath(linkTarget);
+      if (type !== "0" && type !== "x" && sizeBytes !== 0) {
         fail("Non-file tar entries must have zero content size");
-      }
-      if ((type === "1" || type === "2") && linkTarget.length === 0) {
-        fail("Tar link target must be nonempty");
       }
       const paddedSize = Math.ceil(sizeBytes / 512) * 512;
       if (offset + 512 + paddedSize > archiveLength) {
         fail("Tar entry content is truncated");
       }
-      entries.push({
-        dataOffset: start + offset + 512,
-        gid,
-        linkTarget,
-        mode,
-        mtime,
-        path,
-        sizeBytes,
-        type,
-        uid,
-      });
       const paddingLength = paddedSize - sizeBytes;
       if (paddingLength > 0) {
         const padding = Buffer.alloc(paddingLength);
@@ -2072,11 +2118,44 @@ async function readTarEntries(
           fail("Tar entry padding must be all zero");
         }
       }
+      if (type === "x") {
+        if (pending || sizeBytes === 0 || sizeBytes > MAX_LOCAL_PAX_BYTES
+          || tarBudget.paxBytes + sizeBytes > MAX_LOCAL_PAX_TOTAL_BYTES) await reject();
+        tarBudget.paxBytes += sizeBytes;
+        const body = Buffer.alloc(sizeBytes);
+        const bodyRead = await handle.read(body, 0, sizeBytes, start + offset + 512);
+        if (bodyRead.bytesRead !== sizeBytes) fail("Tar entry content is truncated");
+        const values = localPaxPathNames(body);
+        if (!values) await reject();
+        // Retain the physical extension header for bounded redacted rejection
+        // if its required next ordinary entry is missing or incompatible.
+        const at = offset, ordinal = headerOrdinal;
+        pending = { values, reject: async () => {
+          const error = new ManagedCloudReleaseGateError("Tar archive contains unsupported entry type x");
+          try { error.tarDiagnostic = await tarRejectionDiagnostic(handle, header, diagnosticContext,
+            ordinal, "x", sizeBytes, start, at, archiveLength); } catch { /* Remain refused. */ }
+          throw error;
+        } };
+      } else {
+        if (pending) {
+          if (Object.hasOwn(pending.values, "linkpath") && !["1", "2"].includes(type)) await pending.reject();
+          path = pending.values.path ?? path;
+          linkTarget = pending.values.linkpath ?? linkTarget;
+          if (type === "5" && path.endsWith("/")) path = path.slice(0, -1);
+          pending = null;
+        }
+        requireSafeRelativePath(path, "tar path");
+        if (names.has(path)) fail("Tar archive contains a duplicate path");
+        names.add(path);
+        if (["1", "2"].includes(type) && linkTarget.length === 0) fail("Tar link target must be nonempty");
+        entries.push({ dataOffset: start + offset + 512, gid, linkTarget, mode, mtime, path, sizeBytes, type, uid });
+      }
       offset += 512 + paddedSize;
       if (entries.length > MAX_INVENTORY_ENTRIES) {
         fail("Tar archive contains too many entries");
       }
     }
+    if (pending) await pending.reject();
   } finally {
     await handle.close();
   }
@@ -2184,7 +2263,7 @@ function requireUnblockedContainerAncestors(entries, path) {
     const ancestor = parts.slice(0, index).join("/");
     const value = entries.get(ancestor);
     if (value && value.type !== "directory") {
-      fail("OCI layer writes beneath a non-directory ancestor: " + ancestor);
+      fail("OCI layer writes beneath a non-directory ancestor");
     }
   }
 }
@@ -2217,7 +2296,7 @@ function validateContainerSymlinkGraph(inventory) {
     for (;;) {
       const resolved = inventory.get(target);
       if (!resolved) {
-        fail("OCI symbolic link target is missing: " + entry.path);
+        fail("OCI symbolic link target is missing");
       }
       if (resolved.type !== "symlink") {
         break;
@@ -2231,9 +2310,11 @@ function validateContainerSymlinkGraph(inventory) {
   }
 }
 
-async function applyOciLayer(archivePath, layerEntry, inventory, descriptor, layerOrdinal) {
+async function applyOciLayer(archivePath, layerEntry, inventory, descriptor, layerOrdinal, tarBudget) {
   const entries = await readTarEntries(archivePath, {
     allowLinks: true,
+    allowLocalPaxNames: true,
+    tarBudget,
     length: layerEntry.sizeBytes,
     start: layerEntry.dataOffset,
     diagnosticContext: { scope: "layer", layerDigest: descriptor.digest,
@@ -2246,6 +2327,9 @@ async function applyOciLayer(archivePath, layerEntry, inventory, descriptor, lay
   for (const entry of layerEntries) {
     const path = entry.path;
     const name = basename(path);
+    if (name.startsWith(".wh.") && (entry.type !== "0" || entry.sizeBytes !== 0 || entry.linkTarget !== "")) {
+      fail("OCI whiteout must be an empty regular file");
+    }
     if (name === ".wh..wh..opq") {
       const parent = dirname(path) === "." ? "" : dirname(path);
       for (const existing of inventory.keys()) {
@@ -2356,7 +2440,7 @@ function requireClosedRuntimeContent(componentId, entries) {
         /\.(?:map|ts|tsx)$/.test(path) ||
         /(?:^|\/)(?:Dockerfile|package-lock\.json)$/.test(path))
     ) {
-      fail(componentId + " runtime contains development content: " + path);
+      fail(componentId + " runtime contains development content");
     }
     if (/original[-_]?source[-_]?verifier|source[-_]?verifier/i.test(path)) {
       const entry = byPath.get(path);
@@ -2366,8 +2450,7 @@ function requireClosedRuntimeContent(componentId, entries) {
       ) {
         fail(
           componentId +
-            " runtime contains unexpected source-verifier path: " +
-            path,
+            " runtime contains unexpected source-verifier path",
         );
       }
       if (!entry || entry.type !== "file" || entry.sizeBytes < 1) {
@@ -2378,6 +2461,9 @@ function requireClosedRuntimeContent(componentId, entries) {
     }
   }
   if (componentId === "jobs-runner") {
+    if (paths.has(RUNNER_UNUSED_PTP_HELPER)) {
+      fail("Managed runner image contains the unused privileged PTP helper");
+    }
     const browserEntries = entries.filter((entry) =>
       entry.path.startsWith("ms-playwright/"),
     );
@@ -2728,6 +2814,9 @@ export async function inspectOciImageArtifact(archivePath, componentId) {
   ) {
     fail("OCI layout contains an unreferenced or duplicate-selected blob");
   }
+  // One budget across all layer readers: splitting metadata across layers
+  // cannot evade physical-header or cumulative extension-byte limits.
+  const tarBudget = { headers: 0, paxBytes: 0 };
   for (const [index, descriptor] of manifest.layers.entries()) {
     requireOciDescriptor(descriptor, "OCI layer[" + index + "]");
     if (descriptor.mediaType !== "application/vnd.oci.image.layer.v1.tar") {
@@ -2737,7 +2826,7 @@ export async function inspectOciImageArtifact(archivePath, componentId) {
     if (!layerEntry || layerEntry.sizeBytes !== descriptor.size) {
       fail("OCI layer descriptor is not size-bound");
     }
-    await applyOciLayer(archivePath, layerEntry, inventory, descriptor, index + 1);
+    await applyOciLayer(archivePath, layerEntry, inventory, descriptor, index + 1, tarBudget);
   }
   validateContainerSymlinkGraph(inventory);
   const entries = [...inventory.values()].sort((left, right) =>

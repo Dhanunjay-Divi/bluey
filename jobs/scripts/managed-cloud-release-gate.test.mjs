@@ -6257,18 +6257,16 @@ test("runner bundle cannot omit its package or executable module", () => {
 });
 
 function paxRecord(key, value) {
-  const payload = `${key}=${value}\n`;
-  let length = Buffer.byteLength(payload) + 2;
+  const payload = Buffer.concat([Buffer.from(`${key}=`), Buffer.from(value), Buffer.from("\n")]);
+  let length = payload.length + 2;
   for (;;) {
-    const next = Buffer.byteLength(payload) + String(length).length + 1;
-    if (next === length) return Buffer.from(`${length} ${payload}`);
+    const next = payload.length + String(length).length + 1;
+    if (next === length) return Buffer.concat([Buffer.from(`${length} `), payload]);
     length = next;
   }
 }
 
 for (const [kind, key, value] of [
-  ["long path", "path", `app/${"a".repeat(110)}`],
-  ["long link", "linkpath", `/${"a".repeat(110)}`],
   ["capability metadata", "SCHILY.xattr.security.capability", "synthetic-only"],
 ]) {
   test(`OCI layer rejects unsupported PAX ${kind} before runtime admission`, async (t) => {
@@ -6279,9 +6277,8 @@ for (const [kind, key, value] of [
       { name: "PaxHeaders/synthetic", type: "x", body },
       { name: "synthetic", body: "synthetic-only\n" },
     ]);
-    // BuildKit's containerd writer can produce PAX extension records. These
-    // source-derived minimal fixtures prove the current parser boundary only;
-    // they cannot establish the cause of the lost actual-image archive.
+    // Actual retained Phase646 bytes contain capability metadata. It remains
+    // unsupported; path support must never silently discard security semantics.
     await writeOciFixture(archive, { rawLayers: [layer] });
     await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"),
       (error) => {
@@ -6418,6 +6415,318 @@ test("truncated PAX bodies and other unsupported types preserve the exact origin
       assert.equal(detail.paxState, state); assert.equal(detail.paxBodySha256, null);
       return true;
     });
+  }
+});
+
+function paxLayer(entries) {
+  return tarArchive([
+    { name: "app", type: "5" },
+    { name: "usr/local/bin/bluey-jobs-api", mode: 0o555, body: "synthetic-api\n" },
+    { name: "app/.bluey/managed-cloud-runtime-measurement.json", body: "{}\n" },
+    ...entries,
+  ]);
+}
+
+function localPax(values, entry) {
+  return [{ name: "PaxHeaders/synthetic", type: "x",
+    body: Buffer.concat(Object.entries(values).map(([key, value]) => paxRecord(key, value))) }, entry];
+}
+
+test("OCI layer PAX preserves the observed UTF-8 CA regular file and absolute symlink chain", async (t) => {
+  const root = await temporaryDirectory(t, "pax-ca-chain"), archive = join(root, "ca.oci.tar");
+  const stem = "NetLock_Arany_=Class_Gold=_Főtanúsítvány";
+  const certificate = `usr/share/ca-certificates/mozilla/${stem}.crt`;
+  const pem = `etc/ssl/certs/${stem}.pem`, hashed = "etc/ssl/certs/988a38cb.0";
+  await writeOciFixture(archive, { rawLayers: [paxLayer([
+    ...localPax({ path: certificate }, { name: "certificate-stub", body: "synthetic-certificate\n" }),
+    ...localPax({ path: pem, linkpath: "/" + certificate },
+      { name: "pem-stub", type: "2", linkTarget: "placeholder" }),
+    ...localPax({ linkpath: stem + ".pem" }, { name: hashed, type: "2", linkTarget: "placeholder" }),
+    { name: "after-extension", body: "not-renamed\n" },
+  ])] });
+  for (const inspect of [inspectOciImageArchive,
+    async (path, component) => (await inspectOciImageArtifact(path, component)).inventory]) {
+    const inventory = await inspect(archive, "jobs-api"), byPath = new Map(inventory.entries.map(v => [v.path, v]));
+    assert.equal(byPath.get(certificate).sha256, sha256(Buffer.from("synthetic-certificate\n")));
+    assert.equal(byPath.get(pem).target, "/" + certificate); assert.equal(byPath.get(pem).resolvedTarget, certificate);
+    assert.equal(byPath.get(hashed).target, stem + ".pem"); assert.equal(byPath.get(hashed).resolvedTarget, pem);
+    assert(byPath.has("after-extension"));
+    assert.equal(inventory.entries.some(v => v.path.includes("stub") || v.path.startsWith("PaxHeaders/")), false);
+  }
+});
+
+test("OCI layer PAX accepts the exact bounded path value without normalization", async (t) => {
+  const root = await temporaryDirectory(t, "pax-value-bound"), archive = join(root, "path.oci.tar");
+  const path = Array(16).fill("x".repeat(250)).join("/") + "/" + "y".repeat(80);
+  assert.equal(Buffer.byteLength(path), 4096);
+  await writeOciFixture(archive, { rawLayers: [paxLayer(localPax({ path }, { name: "stub", body: "bounded" }))] });
+  const inventory = await inspectOciImageArchive(archive, "jobs-api");
+  assert.equal(inventory.entries.find(v => v.path === path).sha256, sha256(Buffer.from("bounded")));
+});
+
+for (const scope of ["layout", "runtime-bundle"]) {
+  test(`complete local PAX names remain forbidden in ${scope}`, async (t) => {
+    const root = await temporaryDirectory(t, "pax-wrong-scope"), archive = join(root, "bad.tar");
+    await writeFile(archive, tarArchive(localPax({ path: "index.html" }, { name: "stub", body: "synthetic" })));
+    await assert.rejects(() => scope === "layout" ? inspectOciImageArtifact(archive, "jobs-api")
+      : inspectStaticBundleArchive(archive), error => {
+      assert.equal(error.message, "Tar archive contains unsupported entry type x");
+      assert.equal(validateTarRejectionDiagnostic(error.tarDiagnostic).scope, scope); return true;
+    });
+  });
+}
+
+for (const [kind, target, type, resolved] of [
+  ["absolute image-root symlink", "/target", "2", "target"],
+  ["relative parent symlink", "../target", "2", "target"],
+  ["earlier-file hardlink", "target", "1", null],
+]) {
+  test(`OCI layer PAX keeps ${kind} semantics`, async (t) => {
+    const root = await temporaryDirectory(t, "pax-links"), archive = join(root, "links.oci.tar");
+    await writeOciFixture(archive, { rawLayers: [paxLayer([
+      { name: "target", body: "target-bytes\n" },
+      ...localPax({ path: "directory/alias", linkpath: target },
+        { name: "stub", type, linkTarget: "target" }),
+    ])] });
+    const inventory = await inspectOciImageArchive(archive, "jobs-api");
+    const entry = inventory.entries.find(v => v.path === "directory/alias");
+    if (resolved) assert.equal(entry.resolvedTarget, resolved);
+    else { assert.equal(entry.type, "file"); assert.equal(entry.sha256, sha256(Buffer.from("target-bytes\n"))); }
+  });
+}
+
+test("OCI PAX path-only override resolves the existing parent-relative symlink at its effective path", async (t) => {
+  const root = await temporaryDirectory(t, "pax-path-only-link"), archive = join(root, "link.oci.tar");
+  await writeOciFixture(archive, { rawLayers: [paxLayer([
+    { name: "target", body: "target" },
+    ...localPax({ path: "directory/alias" }, { name: "stub", type: "2", linkTarget: "../target" }),
+  ])] });
+  const inventory = await inspectOciImageArchive(archive, "jobs-api");
+  const link = inventory.entries.find(v => v.path === "directory/alias");
+  assert.equal(link.target, "../target"); assert.equal(link.resolvedTarget, "target");
+});
+
+test("OCI layer PAX effective paths drive ordinary and opaque whiteouts", async (t) => {
+  const root = await temporaryDirectory(t, "pax-whiteouts"), archive = join(root, "whiteouts.oci.tar");
+  await writeOciFixture(archive, { rawLayers: [paxLayer([
+    { name: "old/leaf", body: "old" }, { name: "directory/child", body: "old" },
+  ]), tarArchive([
+    ...localPax({ path: "old/.wh.leaf" }, { name: "whiteout-stub" }),
+    ...localPax({ path: "directory/.wh..wh..opq" }, { name: "opaque-stub" }),
+    { name: "directory/current", body: "current" },
+  ])] });
+  const paths = (await inspectOciImageArchive(archive, "jobs-api")).entries.map(v => v.path);
+  assert(!paths.includes("old/leaf") && !paths.includes("directory/child"));
+  assert(paths.includes("directory/current")); assert(!paths.some(v => v.includes("stub") || v.includes(".wh.")));
+});
+
+const paxSemanticRejections = [
+  ["duplicate effective entry", [
+    ...localPax({ path: "same" }, { name: "first-stub" }),
+    ...localPax({ path: "same" }, { name: "second-stub" }),
+  ], /duplicate path/],
+  ["missing symbolic target", localPax({ linkpath: "missing" },
+    { name: "alias", type: "2", linkTarget: "placeholder" }), /target is missing/],
+  ["symbolic cycle", [
+    ...localPax({ linkpath: "b" }, { name: "a", type: "2", linkTarget: "placeholder" }),
+    ...localPax({ linkpath: "a" }, { name: "b", type: "2", linkTarget: "placeholder" }),
+  ], /contains a cycle/],
+  ["escaping relative symlink", localPax({ linkpath: "../escape" },
+    { name: "alias", type: "2", linkTarget: "placeholder" }), /escapes the image root/],
+  ["absolute hardlink", [{ name: "target", body: "bytes" },
+    ...localPax({ linkpath: "/target" }, { name: "alias", type: "1", linkTarget: "target" })], /canonical relative path/],
+  ["parent hardlink", localPax({ linkpath: "../target" },
+    { name: "alias", type: "1", linkTarget: "target" }), /canonical relative path/],
+  ["forward hardlink", [...localPax({ linkpath: "target" },
+    { name: "alias", type: "1", linkTarget: "target" }), { name: "target", body: "later" }], /earlier regular file/],
+  ["non-directory ancestor", [
+    ...localPax({ path: "parent" }, { name: "parent-stub", body: "file" }),
+    ...localPax({ path: "parent/child" }, { name: "child-stub" }),
+  ], /non-directory ancestor/],
+  ["symlink whiteout", localPax({ path: ".wh.target", linkpath: "target" },
+    { name: "stub", type: "2", linkTarget: "target" }), /whiteout must be an empty regular file/],
+  ["nonempty whiteout", localPax({ path: ".wh.target" }, { name: "stub", body: "hidden" }),
+    /whiteout must be an empty regular file/],
+];
+for (const [name, entries, error] of paxSemanticRejections) {
+  test(`OCI layer PAX rejects ${name}`, async (t) => {
+    const root = await temporaryDirectory(t, "pax-semantic"), archive = join(root, "bad.oci.tar");
+    await writeOciFixture(archive, { rawLayers: [paxLayer(entries)] });
+    await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"), error);
+  });
+}
+
+for (const path of ["/absolute", "../escape", "safe/../escape", "safe//file", "./file", "safe\\file"]) {
+  test(`OCI layer PAX rejects noncanonical entry path ${JSON.stringify(path)}`, async (t) => {
+    const root = await temporaryDirectory(t, "pax-path"), archive = join(root, "bad.oci.tar");
+    await writeOciFixture(archive, { rawLayers: [paxLayer(localPax({ path }, { name: "safe-stub" }))] });
+    await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"), /canonical relative path/);
+  });
+}
+
+const malformedLocalPax = [
+  ["empty body", Buffer.alloc(0)],
+  ["empty path", paxRecord("path", "")],
+  ["duplicate path", Buffer.concat([paxRecord("path", "one"), paxRecord("path", "two")])],
+  ["duplicate linkpath", Buffer.concat([paxRecord("linkpath", "one"), paxRecord("linkpath", "two")])],
+  ["unknown key", paxRecord("unknown", "private-value")],
+  ...["size", "uid", "gid", "mtime", "atime", "ctime", "GNU.sparse.map", "SCHILY.xattr.user.test",
+    "SCHILY.xattr.security.capability", "LIBARCHIVE.xattr.security.capability"]
+    .map(key => [key + " override", Buffer.concat([paxRecord("path", "safe"), paxRecord(key, "1")])]),
+  ["binary capability value", paxRecord("SCHILY.xattr.security.capability", Buffer.alloc(20, 255))],
+  ["invalid UTF8", paxRecord("path", Buffer.from([255]))],
+  ["NFD path", paxRecord("path", "certificate/Cafe\u0301.crt")],
+  ["NFD linkpath", paxRecord("linkpath", "Cafe\u0301.crt")],
+  ["NUL value", paxRecord("path", "safe\0hidden")],
+  ["newline value", paxRecord("path", "safe\nhidden")],
+  ["DEL value", paxRecord("path", "safe\x7fhidden")],
+  ["C1 control value", paxRecord("path", "safe\u0085hidden")],
+  ["empty linkpath", paxRecord("linkpath", "")],
+  ["oversize value", paxRecord("path", "x".repeat(4097))],
+  ["oversize UTF8 bytes", paxRecord("path", "ő".repeat(2049))],
+  ["oversize body", Buffer.alloc(65537, 120)],
+  ["leading-zero length", Buffer.from("011 path=x\n")],
+  ["signed length", Buffer.from("+10 path=x\n")],
+  ["missing delimiter", Buffer.from("10 path x\n")],
+  ["missing newline", Buffer.from("10 path=x!")],
+  ["declared length outside body", Buffer.from("65536 path=x\n")],
+  ["trailing bytes", Buffer.concat([paxRecord("path", "safe"), Buffer.from("tail")])],
+  ["high-bit decimal byte", (() => { const body = paxRecord("path", "safe"); body[0] |= 128; return body; })()],
+  ["character-count length", (() => {
+    const body = paxRecord("path", "certificate/ő.crt"); body.write(String(body.length - 1)); return body;
+  })()],
+];
+for (const [name, body] of malformedLocalPax) {
+  test(`OCI local PAX rejects ${name} with bounded redacted evidence`, async (t) => {
+    const root = await temporaryDirectory(t, "pax-invalid"), archive = join(root, "bad.oci.tar");
+    await writeOciFixture(archive, { rawLayers: [paxLayer([
+      { name: "PaxHeaders/private-sentinel", type: "x", body }, { name: "safe-stub" },
+    ])] });
+    await assert.rejects(() => inspectOciImageArtifact(archive, "jobs-api"), error => {
+      assert.equal(error.message, "Tar archive contains unsupported entry type x");
+      const detail = validateTarRejectionDiagnostic(error.tarDiagnostic);
+      assert.equal(detail.scope, "layer"); assert.equal(detail.headerOrdinal, 4);
+      assert(!JSON.stringify(detail).includes("private-")); assert(canonicalJsonBytes(detail).length <= 1536);
+      return true;
+    });
+  });
+}
+
+for (const type of ["0", "5"]) {
+  test(`OCI layer PAX rejects linkpath on non-link type ${type}`, async (t) => {
+    const root = await temporaryDirectory(t, "pax-nonlink"), archive = join(root, "bad.oci.tar");
+    await writeOciFixture(archive, { rawLayers: [paxLayer(localPax({ linkpath: "target" }, { name: "stub", type }))] });
+    await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"), /unsupported entry type x/);
+  });
+}
+
+for (const [name, entries] of [
+  ["consecutive local headers", [{ name: "PaxHeaders/one", type: "x", body: paxRecord("path", "one") },
+    ...localPax({ path: "two" }, { name: "stub" })]],
+  ["dangling local header", [{ name: "PaxHeaders/dangling", type: "x", body: paxRecord("path", "one") }]],
+  ...["g", "L", "K", "3", "4", "6"].map(type => ["pending then type " + type, [
+    { name: "PaxHeaders/one", type: "x", body: paxRecord("path", "one") }, { name: "unsupported", type }]]),
+  ["global header", [{ name: "PaxHeaders/global", type: "g", body: paxRecord("path", "one") }, { name: "stub" }]],
+]) {
+  test(`OCI layer PAX rejects ${name}`, async (t) => {
+    const root = await temporaryDirectory(t, "pax-scope"), archive = join(root, "bad.oci.tar");
+    await writeOciFixture(archive, { rawLayers: [paxLayer(entries)] });
+    await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"), /unsupported entry type/);
+  });
+}
+
+function rewriteTarChecksum(bytes, at) {
+  bytes.fill(32, at + 148, at + 156);
+  let sum = 0; for (const byte of bytes.subarray(at, at + 512)) sum += byte;
+  bytes.write(octal(sum, 8), at + 148, 8, "ascii");
+}
+
+for (const [name, mutate, error] of [
+  ["extension checksum", bytes => { bytes[0] ^= 1; }, /checksum/],
+  ["extension padding", bytes => { bytes[512 + paxRecord("path", "effective").length] = 1; }, /padding/],
+  ["payload checksum", bytes => { bytes[1024] ^= 1; }, /checksum/],
+  ["payload padding", bytes => { bytes[1537] = 1; }, /padding/],
+  ["payload invalid UTF8", bytes => { bytes[1024] = 255; rewriteTarChecksum(bytes, 1024); }, /UTF-8/],
+  ["payload escaping raw path", bytes => {
+    bytes.fill(0, 1024, 1124); bytes.write("../escape", 1024); rewriteTarChecksum(bytes, 1024);
+  }, /canonical relative path/],
+  ["payload hidden name bytes", bytes => { bytes[1024 + 20] = 120; rewriteTarChecksum(bytes, 1024); }, /text field padding/],
+  ["payload link field on regular", bytes => { bytes.write("hidden", 1024 + 157); rewriteTarChecksum(bytes, 1024); }, /non-link entry/],
+  ["payload nonzero symlink size", bytes => {
+    bytes[1024 + 156] = 50; bytes.write("target", 1024 + 157); rewriteTarChecksum(bytes, 1024);
+  }, /Non-file tar entries/],
+  ["payload size outside layer", bytes => { bytes.write(octal(65536, 12), 1024 + 124); rewriteTarChecksum(bytes, 1024); }, /truncated/],
+]) {
+  test(`OCI PAX cannot hide ${name}`, async (t) => {
+    const root = await temporaryDirectory(t, "pax-header"), archive = join(root, "bad.oci.tar");
+    const bytes = tarArchive(localPax({ path: "effective" }, { name: "stub", body: "x" })); mutate(bytes);
+    await writeOciFixture(archive, { rawLayers: [bytes] });
+    await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"), error);
+  });
+}
+
+test("OCI PAX cumulative metadata cap is shared across layers", async (t) => {
+  const root = await temporaryDirectory(t, "pax-total"), archive = join(root, "bad.oci.tar");
+  const layer = batch => paxLayer(Array.from({ length: 1100 }, (_, i) => localPax({
+    path: `metadata-${batch}/${i}/` + ("x".repeat(250) + "/").repeat(15) + "x".repeat(250),
+  }, { name: "stub-" + i })).flat());
+  await writeOciFixture(archive, { rawLayers: [layer(0), layer(1)] });
+  await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"), /unsupported entry type x/);
+});
+
+test("OCI physical header cap counts across layers independently of surviving inventory", async (t) => {
+  const root = await temporaryDirectory(t, "pax-headers"), archive = join(root, "bad.oci.tar");
+  const entries = Array.from({ length: 50_000 }, (_, i) => ({ name: "header-" + i, type: "5" }));
+  await writeOciFixture(archive, { rawLayers: [tarArchive(entries), tarArchive(entries.slice(0, -1).reverse()),
+    tarArchive(localPax({ path: "effective" }, { name: "stub" }))] });
+  await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"), /too many physical headers/);
+});
+
+const escapedSystemdUnits = [
+  "usr/lib/systemd/system/system-systemd\\x2dcryptsetup.slice",
+  "usr/lib/systemd/system/system-systemd\\x2dveritysetup.slice",
+];
+
+test("runner producer removes the observed PTP helper and two exact escaped units before measurement and flattening", async () => {
+  const dockerfile = await readFile(new URL("../runner/Dockerfile", import.meta.url), "utf8");
+  let prior = dockerfile.indexOf("AS runtime-rootfs");
+  const argumentsToRemove = ["/usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper",
+    ...escapedSystemdUnits.map(path => "'/" + path + "'")];
+  for (const path of argumentsToRemove) {
+    const required = [`test -f ${path}`, `! test -L ${path}`, `rm -- ${path}`, `! test -e ${path}`, `! test -L ${path}`];
+    for (const token of required) { const at = dockerfile.indexOf(token, prior + 1); assert(at > prior); prior = at; }
+  }
+  const unitRemovals = dockerfile.split("\n").filter(line => line.includes("rm --")
+    && line.includes("/usr/lib/systemd/")).map(line => line.trim());
+  assert.deepEqual(unitRemovals, escapedSystemdUnits.map(path => `&& rm -- '/${path}' ` + "\\"));
+  assert(prior < dockerfile.indexOf(" runtime-measurement ", prior));
+  assert(prior < dockerfile.indexOf("FROM scratch", prior));
+  assert(!/rm[^\n]*(?:ca-certificates|ssl\/certs)/.test(dockerfile));
+});
+
+for (const format of ["raw", "PAX"]) {
+  test(`runner OCI inventory rejects ${format} backslash systemd unit entries`, async (t) => {
+    const root = await temporaryDirectory(t, "systemd-path-denial");
+    for (const [index, path] of escapedSystemdUnits.entries()) {
+      const archive = join(root, `runner-${index}.oci.tar`);
+      const entries = format === "raw" ? [{ name: path, body: "synthetic-unit\n" }]
+        : localPax({ path }, { name: "systemd-stub", body: "synthetic-unit\n" });
+      await writeOciFixture(archive, { runtime: runnerRuntime(), rawLayers: [paxLayer(entries)] });
+      for (const inspect of [inspectOciImageArchive, inspectOciImageArtifact]) {
+        await assert.rejects(() => inspect(archive, "jobs-runner"), /tar path must be a canonical relative path/);
+      }
+    }
+  });
+}
+
+test("runner final OCI inventory rejects reintroduced PTP helper without requiring PAX", async (t) => {
+  const root = await temporaryDirectory(t, "ptp-denial"), archive = join(root, "runner.oci.tar");
+  const required = MANAGED_CLOUD_RUNTIME_CONTRACTS["jobs-runner"].requiredPaths
+    .map(name => ({ name, body: "synthetic-only\n", mode: 0o555 }));
+  await writeOciFixture(archive, { runtime: runnerRuntime(), layers: [[...required,
+    { name: "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper", body: "synthetic-helper" }]] });
+  for (const inspect of [inspectOciImageArchive, inspectOciImageArtifact]) {
+    await assert.rejects(() => inspect(archive, "jobs-runner"), /unused privileged PTP helper/);
   }
 });
 

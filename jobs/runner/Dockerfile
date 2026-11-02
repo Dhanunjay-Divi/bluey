@@ -67,6 +67,10 @@ COPY --from=build --chown=pwuser:pwuser /build/runner/package.json \
 COPY --from=build --chown=pwuser:pwuser /build/runner/dist ./runner/dist
 COPY scripts/managed-cloud-release-gate.mjs \
     /tmp/managed-cloud-release-gate.mjs
+# Exclude the inherited privileged PTP helper before measurement/final flattening;
+# the final inventory contract independently rejects its reintroduction.
+# The Node runner does not boot systemd; remove only the two observed escaped
+# unit files rather than relaxing the canonical inventory path contract.
 RUN test "$(command -v node)" = /usr/bin/node \
     && install -m 0555 /usr/bin/node /usr/local/bin/node \
     && test -f /usr/local/bin/node \
@@ -74,6 +78,21 @@ RUN test "$(command -v node)" = /usr/bin/node \
     && find /ms-playwright -mindepth 1 -maxdepth 1 \
         ! -name 'chromium_headless_shell-*' \
         ! -name 'ffmpeg-*' -exec rm -rf '{}' + \
+    && test -f /usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper \
+    && ! test -L /usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper \
+    && rm -- /usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper \
+    && ! test -e /usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper \
+    && ! test -L /usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper \
+    && test -f '/usr/lib/systemd/system/system-systemd\x2dcryptsetup.slice' \
+    && ! test -L '/usr/lib/systemd/system/system-systemd\x2dcryptsetup.slice' \
+    && rm -- '/usr/lib/systemd/system/system-systemd\x2dcryptsetup.slice' \
+    && ! test -e '/usr/lib/systemd/system/system-systemd\x2dcryptsetup.slice' \
+    && ! test -L '/usr/lib/systemd/system/system-systemd\x2dcryptsetup.slice' \
+    && test -f '/usr/lib/systemd/system/system-systemd\x2dveritysetup.slice' \
+    && ! test -L '/usr/lib/systemd/system/system-systemd\x2dveritysetup.slice' \
+    && rm -- '/usr/lib/systemd/system/system-systemd\x2dveritysetup.slice' \
+    && ! test -e '/usr/lib/systemd/system/system-systemd\x2dveritysetup.slice' \
+    && ! test -L '/usr/lib/systemd/system/system-systemd\x2dveritysetup.slice' \
     && /usr/local/bin/node /tmp/managed-cloud-release-gate.mjs runtime-measurement \
         --root / \
         --component jobs-runner \
