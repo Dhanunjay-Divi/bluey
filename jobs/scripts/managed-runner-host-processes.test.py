@@ -247,13 +247,14 @@ class ReviewedPythonPairTests(unittest.TestCase):
                             result["records"][0]["executableIdentitySha256"])
 
     def test_unknown_launcher_canonical_native_or_swapped_pair_denies(self):
-        for launcher in (self.native, "/usr/bin/python3", "/Library/Developer/CommandLineTools/usr/bin/python3"):
+        for launcher in (self.native, "/usr/bin/python3",
+                         "/Library/Developer/CommandLineTools-Beta/usr/bin/python3"):
             with self.assertRaises(M.ClosedError):
                 M.reviewed_python_pair(self.filesystem, launcher)
         for path, changed in (
             (self.launcher, replace(self.launcher_file, canonical_path=self.native)),
             (self.native, replace(self.native_file,
-                                  canonical_path=M.REVIEWED_PYTHON_LAUNCHER_CANONICAL)),
+                                  canonical_path=self.launcher_file.canonical_path)),
         ):
             original = self.filesystem.entries[path]
             self.filesystem.entries[path] = changed
@@ -299,6 +300,33 @@ class ReviewedPythonPairTests(unittest.TestCase):
         with self.assertRaises(M.ClosedError) as raised:
             self.capture()
         self.assertEqual(raised.exception.code, "host_process_self_probe")
+
+    def test_other_reviewed_pair_cannot_supply_native_image_for_launcher(self):
+        other = (M.REVIEWED_CLT_PYTHON_NATIVE if self.native == M.REVIEWED_PYTHON_NATIVE
+                 else M.REVIEWED_PYTHON_NATIVE)
+        self.filesystem.entries[other] = M.ExecutableObservation(
+            other, 1, 5000, stat.S_IFREG | 0o755, 0,
+        )
+        self.provider.paths[10] = other
+        with self.assertRaises(M.ClosedError) as raised:
+            self.capture()
+        self.assertEqual(raised.exception.code, "host_process_self_probe")
+
+
+class ReviewedCommandLineToolsPythonPairTests(ReviewedPythonPairTests):
+    def setUp(self):
+        super().setUp()
+        del self.filesystem.entries[self.launcher]
+        del self.filesystem.entries[self.native]
+        self.launcher = M.REVIEWED_CLT_PYTHON_LAUNCHER
+        self.native = M.REVIEWED_CLT_PYTHON_NATIVE
+        self.launcher_file = M.ExecutableObservation(
+            M.REVIEWED_CLT_PYTHON_LAUNCHER_CANONICAL, 1, 6000, stat.S_IFREG | 0o755, 0,
+        )
+        self.native_file = M.ExecutableObservation(self.native, 1, 7000, stat.S_IFREG | 0o755, 0)
+        self.filesystem.entries[self.launcher] = self.launcher_file
+        self.filesystem.entries[self.native] = self.native_file
+        self.provider.paths[10] = self.native
 
 
 class SelectedSnapshotTests(unittest.TestCase):

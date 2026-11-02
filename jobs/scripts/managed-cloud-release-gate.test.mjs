@@ -41,9 +41,11 @@ import {
   deriveManagedCloudRuntimeIdentitySha256,
   deriveManagedRunnerAutomationBundleSha256,
   deriveManagedCloudTaskQueueSha256,
+  inspectOciImageArtifact,
   inspectOciImageArchive,
   inspectManagedCloudArtifactPublicationReadback,
   inspectStaticBundleArchive,
+  validateTarRejectionDiagnostic,
   MANAGED_CLOUD_AUDIENCES,
   MANAGED_CLOUD_BASE_CAPABILITIES,
   MANAGED_CLOUD_BASE_RUNTIME_ROLES,
@@ -182,7 +184,7 @@ function tarArchive(entries) {
     header.write(octal(item.mode ?? (type === "5" ? 0o555 : 0o444), 8), 100);
     header.write(octal(item.uid ?? 0, 8), 108);
     header.write(octal(item.gid ?? 0, 8), 116);
-    header.write(octal(type === "0" ? body.length : 0, 12), 124);
+    header.write(octal(["0", "x", "g"].includes(type) ? body.length : 0, 12), 124);
     header.write(octal(item.mtime ?? 0, 12), 136);
     header.fill(32, 148, 156);
     header.write(type, 156, 1, "ascii");
@@ -193,7 +195,7 @@ function tarArchive(entries) {
     for (const byte of header) checksum += byte;
     header.write(octal(checksum, 8), 148, 8, "ascii");
     blocks.push(header);
-    if (type === "0") {
+    if (["0", "x", "g"].includes(type)) {
       blocks.push(body);
       const padding = (512 - (body.length % 512)) % 512;
       if (padding > 0) blocks.push(Buffer.alloc(padding));
@@ -317,6 +319,7 @@ async function writeOciFixture(
   path,
   {
     extraBlob,
+    rawLayers,
     indexReferenceName,
     layers = [
       [
@@ -345,7 +348,7 @@ async function writeOciFixture(
       name: "app/.bluey/managed-cloud-runtime-measurement.json",
     });
   }
-  const layerBytes = exactLayers.map((entries) => tarArchive(entries));
+  const layerBytes = rawLayers ?? exactLayers.map((entries) => tarArchive(entries));
   const layerDescriptors = layerBytes.map((bytes) =>
     descriptor(bytes, "application/vnd.oci.image.layer.v1.tar"),
   );
@@ -412,7 +415,10 @@ async function writeOciFixture(
     });
   }
   await writeFile(path, tarArchive(outerEntries));
-  return manifestDescriptor.digest.slice(7);
+  return {
+    imageConfigSha256: configDescriptor.digest.slice(7),
+    imageManifestSha256: manifestDescriptor.digest.slice(7),
+  };
 }
 
 function releaseFixture() {
@@ -3210,7 +3216,7 @@ test("static bundle inspection rejects ambiguous archives and non-file index", a
 test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", async (t) => {
   const root = await temporaryDirectory(t, "oci-gate");
   const good = join(root, "good.oci.tar");
-  await writeOciFixture(good, {
+  const fixtureIdentity = await writeOciFixture(good, {
     layers: [
       [
         { name: "app", type: "5" },
@@ -3228,9 +3234,35 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
       ],
     ],
   });
+  const artifact = await inspectOciImageArtifact(good, "jobs-api");
   const inspected = await inspectOciImageArchive(good, "jobs-api");
+  assert.deepEqual(Object.keys(artifact).sort(), ["imageConfigSha256", "inventory"]);
+  assert.equal(artifact.imageConfigSha256, fixtureIdentity.imageConfigSha256);
+  assert.equal(artifact.inventory.artifactSha256, fixtureIdentity.imageManifestSha256);
+  assert.deepEqual(artifact.inventory, inspected);
   assert.ok(inspected.entries.some((entry) => entry.path === "app/cache/new"));
   assert.ok(!inspected.entries.some((entry) => entry.path === "app/cache/old"));
+
+  const tamperedConfig = join(root, "tampered-config.oci.tar");
+  const tamperedBytes = Buffer.from(await readFile(good));
+  const architecture = Buffer.from('"architecture":"amd64"');
+  const architectureOffset = tamperedBytes.indexOf(architecture);
+  assert.ok(architectureOffset >= 0);
+  tamperedBytes.set(Buffer.from('"architecture":"arm64"'), architectureOffset);
+  await writeFile(tamperedConfig, tamperedBytes);
+  await assert.rejects(
+    () => inspectOciImageArtifact(tamperedConfig, "jobs-api"),
+    /content digest/,
+  );
+
+  const tamperedRuntime = join(root, "tampered-runtime-config.oci.tar");
+  await writeOciFixture(tamperedRuntime, {
+    runtime: apiRuntime({ AttachStdin: true }),
+  });
+  await assert.rejects(
+    () => inspectOciImageArtifact(tamperedRuntime, "jobs-api"),
+    /unknown key/,
+  );
 
   const hostilePath = join(root, "hostile-path.oci.tar");
   await writeOciFixture(hostilePath, {
@@ -3467,6 +3499,184 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
     () => inspectOciImageArchive(unknownConfig, "jobs-api"),
     /unknown key/,
   );
+});
+
+async function writeRuntimeConfigFixture(path, componentId, runtime) {
+  const entries = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId].requiredPaths.map(
+    (name) => ({
+      body: name.endsWith("managed-cloud-runtime-measurement.json")
+        ? "{}\n"
+        : "synthetic-runtime-only\n",
+      mode: name.startsWith("usr/local/bin/") || name.endsWith(".node")
+        ? 0o555
+        : 0o444,
+      name,
+    }),
+  );
+  if (componentId === "jobs-runner") {
+    entries.push(
+      { body: "automation\n", name: "app/automation/dist/index.js" },
+      {
+        body: "headless\n",
+        mode: 0o555,
+        name: "ms-playwright/chromium_headless_shell-1/" +
+          "chrome-headless-shell-linux64/chrome-headless-shell",
+      },
+      { body: "ffmpeg\n", mode: 0o555, name: "ms-playwright/ffmpeg-1/ffmpeg" },
+    );
+  }
+  return writeOciFixture(path, { layers: [entries], runtime });
+}
+
+test("OCI exact environment sets admit builder order without changing normalized runtime authority", async (t) => {
+  const root = await temporaryDirectory(t, "oci-env-set-positive");
+  for (const [componentId, factory] of [
+    ["jobs-api", apiRuntime], ["jobs-runner", runnerRuntime], ["jobs-workflows", workflowsRuntime],
+  ]) {
+    const baseline = factory();
+    const variants = [baseline.Env, [...baseline.Env].reverse(), [
+      ...baseline.Env.filter((value) => value.startsWith("PATH=")),
+      ...baseline.Env.filter((value) => !value.startsWith("PATH=")),
+    ]];
+    const inspected = [];
+    for (const [index, environment] of variants.entries()) {
+      const archive = join(root, `${componentId}-${index}.oci.tar`);
+      const identity = await writeRuntimeConfigFixture(archive, componentId,
+        factory({ Env: environment }));
+      const artifact = await inspectOciImageArtifact(archive, componentId);
+      assert.equal(artifact.imageConfigSha256, identity.imageConfigSha256);
+      assert.deepEqual(artifact.inventory, await inspectOciImageArchive(archive, componentId));
+      assert.deepEqual(artifact.inventory.runtime.environment, [...baseline.Env].sort());
+      inspected.push(artifact);
+    }
+    for (const artifact of inspected.slice(1)) {
+      assert.deepEqual(artifact.inventory.runtime, inspected[0].inventory.runtime);
+    }
+    // Exact config bytes remain hash-bound even though effective environment
+    // normalization deliberately ignores the serialized array order.
+    assert.notEqual(inspected[0].imageConfigSha256, inspected[1].imageConfigSha256);
+  }
+});
+
+test("OCI reordered environment sets still reject extras duplicates changed values and unsafe entries", async (t) => {
+  const root = await temporaryDirectory(t, "oci-env-set-negative");
+  for (const [componentId, factory] of [
+    ["jobs-api", apiRuntime], ["jobs-runner", runnerRuntime], ["jobs-workflows", workflowsRuntime],
+  ]) {
+    const environment = [...factory().Env].reverse();
+    const cases = [
+      ["extra-known", [...environment, "LANG=C"], /not the exact closed set/],
+      ["extra-other-component", [...environment, componentId === "jobs-api"
+        ? "BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs-runner" : "BLUEY_JOBS_API_PORT=8081"],
+      /not the exact closed set/],
+      ["duplicate", [...environment, environment[0]], /duplicated, unsafe, or unknown/],
+      ["wrong-value", environment.map((value, index) => index === 0 ? value + "wrong" : value),
+      /environment is missing/],
+      ["missing", environment.slice(1), /environment is missing/],
+      ["unknown", [...environment, "PRIVATE_UNKNOWN=PRIVATE_VALUE"], /duplicated, unsafe, or unknown/],
+      ["dangerous", [...environment, "NODE_OPTIONS=--inspect"], /duplicated, unsafe, or unknown/],
+      ["control", [...environment, "LANG=C\nPRIVATE_VALUE"], /unsafe or oversized/],
+      ["oversized", [...environment, "LANG=" + "x".repeat(4096)], /unsafe or oversized/],
+      ["object", { Env: environment }, /Env must be an array/],
+    ];
+    for (const [label, Env, expected] of cases) {
+      const archive = join(root, `${componentId}-${label}.oci.tar`);
+      await writeRuntimeConfigFixture(archive, componentId, factory({ Env }));
+      for (const inspect of [inspectOciImageArtifact, inspectOciImageArchive]) {
+        await assert.rejects(() => inspect(archive, componentId), expected);
+      }
+    }
+  }
+});
+
+test("OCI Linux command runtimes admit absent or true ArgsEscaped without changing normalized contracts", async (t) => {
+  const root = await temporaryDirectory(t, "oci-args-escaped-positive");
+  for (const [componentId, factory] of [
+    ["jobs-runner", runnerRuntime],
+    ["jobs-workflows", workflowsRuntime],
+  ]) {
+    const baseline = factory();
+    assert.equal(Object.hasOwn(baseline, "ArgsEscaped"), false);
+    const inspected = [];
+    for (const [label, runtime] of [
+      ["absent", baseline],
+      ["true", factory({ ArgsEscaped: true })],
+    ]) {
+      assert.deepEqual(Object.keys(runtime).sort(), [
+        ...Object.keys(baseline), ...(label === "true" ? ["ArgsEscaped"] : []),
+      ].sort());
+      assert.equal(Object.hasOwn(runtime, "ArgsEscaped"), label === "true");
+      if (label === "true") {
+        assert.equal(typeof runtime.ArgsEscaped, "boolean");
+        assert.equal(runtime.ArgsEscaped, true);
+      }
+      assert.deepEqual(runtime.Cmd, MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId].cmd);
+      assert.deepEqual(runtime.Entrypoint, MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId].entrypoint);
+      const archive = join(root, `${componentId}-${label}.oci.tar`);
+      const identity = await writeRuntimeConfigFixture(archive, componentId, runtime);
+      const artifact = await inspectOciImageArtifact(archive, componentId);
+      const inventory = await inspectOciImageArchive(archive, componentId);
+      assert.equal(artifact.imageConfigSha256, identity.imageConfigSha256);
+      assert.equal(inventory.artifactSha256, identity.imageManifestSha256);
+      assert.deepEqual(artifact.inventory, inventory);
+      assert.deepEqual(Object.keys(inventory.runtime).sort(), [
+        "cmd", "entrypoint", "environment", "exposedPorts", "user", "workingDirectory",
+      ]);
+      assert.deepEqual(inventory.runtime.cmd, baseline.Cmd);
+      assert.deepEqual(inventory.runtime.entrypoint, baseline.Entrypoint);
+      inspected.push(artifact);
+    }
+    assert.notEqual(inspected[0].imageConfigSha256, inspected[1].imageConfigSha256);
+    assert.deepEqual(inspected[0].inventory.runtime, inspected[1].inventory.runtime);
+  }
+});
+
+test("OCI command runtimes reject non-true ArgsEscaped and command or unknown-key bypasses", async (t) => {
+  const root = await temporaryDirectory(t, "oci-args-escaped-negative");
+  for (const [componentId, factory] of [
+    ["jobs-runner", runnerRuntime],
+    ["jobs-workflows", workflowsRuntime],
+  ]) {
+    for (const [label, value] of [
+      ["false", false], ["null", null], ["string", "true"],
+      ["number", 1], ["object", {}], ["array", []],
+    ]) {
+      const archive = join(root, `${componentId}-${label}.oci.tar`);
+      await writeRuntimeConfigFixture(archive, componentId, factory({ ArgsEscaped: value }));
+      for (const inspect of [inspectOciImageArtifact, inspectOciImageArchive]) {
+        await assert.rejects(() => inspect(archive, componentId), /OCI ArgsEscaped is not admitted/);
+      }
+    }
+    for (const [label, overrides, expected] of [
+      ["unknown-key", { AttachStdin: true }, /OCI runtime config contains an unknown key/],
+      ["cmd", { Cmd: ["/bin/sh", "-c", "id"] }, /OCI runtime user or entrypoint is not canonical/],
+      ["entrypoint", { Entrypoint: ["/bin/sh"] }, /OCI runtime user or entrypoint is not canonical/],
+    ]) {
+      const archive = join(root, `${componentId}-${label}.oci.tar`);
+      await writeRuntimeConfigFixture(archive, componentId, factory({ ArgsEscaped: true, ...overrides }));
+      for (const inspect of [inspectOciImageArtifact, inspectOciImageArchive]) {
+        await assert.rejects(() => inspect(archive, componentId), expected);
+      }
+    }
+  }
+});
+
+test("OCI jobs-api rejects every ArgsEscaped presence while its historical absent config stays valid", async (t) => {
+  const root = await temporaryDirectory(t, "oci-api-args-escaped");
+  const absent = join(root, "api-absent.oci.tar");
+  await writeRuntimeConfigFixture(absent, "jobs-api", apiRuntime());
+  assert.deepEqual((await inspectOciImageArtifact(absent, "jobs-api")).inventory,
+    await inspectOciImageArchive(absent, "jobs-api"));
+  for (const [label, value] of [
+    ["true", true], ["false", false], ["null", null], ["string", "true"],
+    ["number", 1], ["object", {}], ["array", []],
+  ]) {
+    const archive = join(root, `api-${label}.oci.tar`);
+    await writeRuntimeConfigFixture(archive, "jobs-api", apiRuntime({ ArgsEscaped: value }));
+    for (const inspect of [inspectOciImageArtifact, inspectOciImageArchive]) {
+      await assert.rejects(() => inspect(archive, "jobs-api"), /OCI ArgsEscaped is not admitted/);
+    }
+  }
 });
 
 test("portal manifest transport admits 32768 bytes and leaves no 32769-byte partial", async (t) => {
@@ -6043,6 +6253,171 @@ test("runner bundle cannot omit its package or executable module", () => {
     fixture.context.inventory.entries = fixture.context.inventory.entries.filter((entry) => entry.path !== path);
     refreshRunnerAutomationBundleEvidence(fixture);
     assert.throws(() => runnerAutomationBundleDigest(fixture), /bundle is incomplete/);
+  }
+});
+
+function paxRecord(key, value) {
+  const payload = `${key}=${value}\n`;
+  let length = Buffer.byteLength(payload) + 2;
+  for (;;) {
+    const next = Buffer.byteLength(payload) + String(length).length + 1;
+    if (next === length) return Buffer.from(`${length} ${payload}`);
+    length = next;
+  }
+}
+
+for (const [kind, key, value] of [
+  ["long path", "path", `app/${"a".repeat(110)}`],
+  ["long link", "linkpath", `/${"a".repeat(110)}`],
+  ["capability metadata", "SCHILY.xattr.security.capability", "synthetic-only"],
+]) {
+  test(`OCI layer rejects unsupported PAX ${kind} before runtime admission`, async (t) => {
+    const directory = await temporaryDirectory(t, "pax-denial");
+    const archive = join(directory, "synthetic-pax.oci.tar");
+    const body = paxRecord(key, value);
+    const layer = tarArchive([
+      { name: "PaxHeaders/synthetic", type: "x", body },
+      { name: "synthetic", body: "synthetic-only\n" },
+    ]);
+    // BuildKit's containerd writer can produce PAX extension records. These
+    // source-derived minimal fixtures prove the current parser boundary only;
+    // they cannot establish the cause of the lost actual-image archive.
+    await writeOciFixture(archive, { rawLayers: [layer] });
+    await assert.rejects(() => inspectOciImageArchive(archive, "jobs-api"),
+      (error) => {
+        assert.equal(error.message, "Tar archive contains unsupported entry type x");
+        const detail = validateTarRejectionDiagnostic(error.tarDiagnostic);
+        assert.equal(detail.scope, "layer");
+        assert.equal(detail.layerDigest, "sha256:" + sha256(layer));
+        assert.equal(detail.layerSizeBytes, layer.length);
+        assert.equal(detail.layerOrdinal, 1);
+        assert.equal(detail.headerOrdinal, 1);
+        assert.equal(detail.paxState, "parsed");
+        assert.deepEqual(detail.paxKnownKeys, [key]);
+        return true;
+      });
+  });
+}
+
+for (const scope of ["layout", "layer", "runtime-bundle"]) {
+  test(`unsupported tar diagnostic identifies ${scope} without admitting PAX`, async (t) => {
+    const directory = await temporaryDirectory(t, "pax-scope");
+    const archive = join(directory, "synthetic.tar");
+    const name = "PaxHeaders/private-secret-sentinel";
+    const body = paxRecord("path", "private-secret-sentinel/application");
+    const bytes = tarArchive([{ name: "earlier", body: "earlier\n" }, { name, type: "x", body }]);
+    if (scope === "layer") {
+      await writeOciFixture(archive, { rawLayers: [tarArchive([{ name: "first", body: "first\n" }]), bytes] });
+    } else await writeFile(archive, bytes);
+    const inspect = scope === "runtime-bundle"
+      ? () => inspectStaticBundleArchive(archive)
+      : () => inspectOciImageArchive(archive, "jobs-api");
+    await assert.rejects(inspect, (error) => {
+      assert.equal(error.message, "Tar archive contains unsupported entry type x");
+      const detail = validateTarRejectionDiagnostic(error.tarDiagnostic);
+      assert.equal(detail.scope, scope);
+      assert.equal(detail.headerOrdinal, 2);
+      assert.equal(detail.headerNameSha256, sha256(Buffer.from(name)));
+      assert.equal(detail.headerNameBytes, Buffer.byteLength(name));
+      assert.equal(detail.paxBodyBytes, body.length);
+      assert.equal(detail.paxBodySha256, sha256(body));
+      assert.equal(detail.pathOverride, true);
+      if (scope === "layer") {
+        assert.equal(detail.layerDigest, "sha256:" + sha256(bytes));
+        assert.equal(detail.layerSizeBytes, bytes.length);
+        assert.equal(detail.layerOrdinal, 2);
+      } else {
+        assert.equal(detail.layerDigest, null); assert.equal(detail.layerSizeBytes, null);
+        assert.equal(detail.layerOrdinal, null);
+      }
+      assert.equal(JSON.stringify(detail).includes("private-secret-sentinel"), false);
+      assert.ok(canonicalJsonBytes(detail).length <= 1536);
+      return true;
+    });
+  });
+}
+
+const diagnosticPaxBodies = [
+  ["unknown secret key and value", paxRecord("private-secret-key", "private-secret-value"), "parsed"],
+  ["duplicate unknown keys", Buffer.concat([paxRecord("private-secret-key", "one"),
+    paxRecord("private-secret-key", "two")]), "parsed"],
+  ["canonical record cap", Buffer.concat(Array.from({ length: 128 }, () => paxRecord("uid", "1"))), "parsed"],
+  ["record cap exceeded", Buffer.concat(Array.from({ length: 129 }, () => paxRecord("uid", "1"))), "malformed"],
+  ["leading-zero length", Buffer.from("011 path=x\n"), "malformed"],
+  ["signed length", Buffer.from("+10 path=x\n"), "malformed"],
+  ["missing equal delimiter", Buffer.from("10 path x\n"), "malformed"],
+  ["missing newline", Buffer.from("10 path=x!"), "malformed"],
+  ["trailing bytes", Buffer.concat([paxRecord("path", "x"), Buffer.from("secret")]), "malformed"],
+  ["embedded key control", paxRecord("private\nsecret", "value"), "malformed"],
+  ["length out of body", Buffer.from("65536 path=private-secret-value\n"), "malformed"],
+  ["invalid UTF8", Buffer.from([49, 49, 32, 112, 97, 116, 104, 61, 255, 10]), "invalid-utf8"],
+  ["bounded large value", paxRecord("path", "private-secret-value".repeat(3000)), "parsed"],
+  ["exact 64KiB body", paxRecord("path", "x".repeat(65524)), "parsed"],
+  ["oversize body", Buffer.alloc(64 * 1024 + 1, 120), "oversize"],
+];
+for (const [name, body, state] of diagnosticPaxBodies) {
+  test(`PAX diagnostic ${name} remains a redacted unsupported-type rejection`, async (t) => {
+    const directory = await temporaryDirectory(t, "pax-body");
+    const archive = join(directory, "synthetic.tar");
+    await writeFile(archive, tarArchive([{ name: "PaxHeaders/private-secret-header", type: "x", body }]));
+    await assert.rejects(() => inspectStaticBundleArchive(archive), (error) => {
+      assert.equal(error.message, "Tar archive contains unsupported entry type x");
+      const detail = validateTarRejectionDiagnostic(error.tarDiagnostic);
+      assert.equal(detail.paxState, state); assert.equal(detail.paxBodyBytes, body.length);
+      assert.equal(detail.paxBodySha256, state === "oversize" ? null : sha256(body));
+      if (state !== "parsed") {
+        assert.equal(detail.paxRecordCount, null); assert.deepEqual(detail.paxKnownKeys, []);
+        assert.equal(detail.paxUnknownKeyCount, null); assert.equal(detail.paxKeySetSha256, null);
+        assert.equal(detail.pathOverride, false); assert.equal(detail.ownershipOverride, false);
+      } else if (name.includes("unknown")) {
+        assert.equal(detail.paxUnknownKeyCount, 1);
+        assert.equal(detail.paxKeySetSha256, sha256(canonicalJsonBytes(["private-secret-key"])));
+      }
+      assert.equal(JSON.stringify(detail).includes("private-secret"), false);
+      assert.ok(canonicalJsonBytes(detail).length <= 1536);
+      return true;
+    });
+  });
+}
+
+test("PAX diagnostics cover fixed override classes and bounded known-key output only", async (t) => {
+  const keys = ["path", "linkpath", "size", "uid", "gid", "mtime", "atime", "ctime",
+    "SCHILY.xattr.security.capability", "SCHILY.xattr.security.selinux",
+    "SCHILY.xattr.trusted.overlay.opaque", "SCHILY.xattr.user.overlay.opaque",
+    "GNU.sparse.map", "GNU.sparse.size", "GNU.sparse.realsize", "GNU.sparse.name",
+    "GNU.sparse.major", "GNU.sparse.minor", "GNU.sparse.numblocks",
+    "GNU.sparse.offset", "GNU.sparse.numbytes", "SCHILY.realsize"];
+  const directory = await temporaryDirectory(t, "pax-keys"), archive = join(directory, "synthetic.tar");
+  await writeFile(archive, tarArchive([{ name: "PaxHeaders/synthetic", type: "g",
+    body: Buffer.concat(keys.map((key) => paxRecord(key, "private-secret-value"))) }]));
+  await assert.rejects(() => inspectStaticBundleArchive(archive), (error) => {
+    assert.equal(error.message, "Tar archive contains unsupported entry type g");
+    const detail = validateTarRejectionDiagnostic(error.tarDiagnostic);
+    assert.deepEqual(detail.paxKnownKeys, [...keys].sort());
+    assert.equal(detail.paxUnknownKeyCount, 0); assert.equal(detail.paxRecordCount, keys.length);
+    for (const key of ["pathOverride", "linkOverride", "sizeOverride", "ownershipOverride",
+      "timeOverride", "xattrOverride", "sparseOverride"]) assert.equal(detail[key], true);
+    assert.ok(canonicalJsonBytes(detail).length <= 1536);
+    assert.equal(JSON.stringify(detail).includes("private-secret-value"), false);
+    return true;
+  });
+});
+
+test("truncated PAX bodies and other unsupported types preserve the exact original rejection", async (t) => {
+  const directory = await temporaryDirectory(t, "pax-truncated");
+  const truncated = tarArchive([{ name: "PaxHeaders/synthetic", type: "x", body: paxRecord("path", "value") }]);
+  truncated.write(octal(4096, 12), 124); truncated.fill(32, 148, 156);
+  let checksum = 0; for (const byte of truncated.subarray(0, 512)) checksum += byte;
+  truncated.write(octal(checksum, 8), 148, 8, "ascii");
+  for (const [type, bytes, state] of [["x", truncated, "out-of-bounds"],
+    ["L", tarArchive([{ name: "synthetic", type: "L" }]), "not-pax"]]) {
+    const archive = join(directory, `synthetic-${type}.tar`); await writeFile(archive, bytes);
+    await assert.rejects(() => inspectStaticBundleArchive(archive), (error) => {
+      assert.equal(error.message, "Tar archive contains unsupported entry type " + type);
+      const detail = validateTarRejectionDiagnostic(error.tarDiagnostic);
+      assert.equal(detail.paxState, state); assert.equal(detail.paxBodySha256, null);
+      return true;
+    });
   }
 });
 

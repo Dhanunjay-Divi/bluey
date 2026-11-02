@@ -33,6 +33,15 @@ REVIEWED_PYTHON_NATIVE = (
     "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/"
     "Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python"
 )
+REVIEWED_CLT_PYTHON_LAUNCHER = "/Library/Developer/CommandLineTools/usr/bin/python3"
+REVIEWED_CLT_PYTHON_LAUNCHER_CANONICAL = (
+    "/Library/Developer/CommandLineTools/Library/Frameworks/"
+    "Python3.framework/Versions/3.9/bin/python3.9"
+)
+REVIEWED_CLT_PYTHON_NATIVE = (
+    "/Library/Developer/CommandLineTools/Library/Frameworks/"
+    "Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python"
+)
 ERROR_CODES = frozenset((
     "host_process_arguments", "host_process_platform", "host_process_layout",
     "host_process_self_probe", "host_process_native", "host_process_uninspectable",
@@ -333,17 +342,26 @@ def capture_local(selected_pids=None):
 
 
 def reviewed_python_pair(filesystem, launcher):
-    # The fixed /usr/bin/python3 invocation resolves through this observed Xcode launcher
-    # to its distinct framework interpreter. No suffix, PATH or sys-prefix inference.
-    require(launcher == REVIEWED_PYTHON_LAUNCHER, "host_process_self_probe")
+    # These two exact Apple launcher/native pairs were observed independently.
+    # No suffix, PATH, sys-prefix or arbitrary active-developer-directory inference.
+    pairs = {
+        REVIEWED_PYTHON_LAUNCHER: (
+            REVIEWED_PYTHON_LAUNCHER_CANONICAL, REVIEWED_PYTHON_NATIVE,
+        ),
+        REVIEWED_CLT_PYTHON_LAUNCHER: (
+            REVIEWED_CLT_PYTHON_LAUNCHER_CANONICAL, REVIEWED_CLT_PYTHON_NATIVE,
+        ),
+    }
+    require(launcher in pairs, "host_process_self_probe")
+    expected_launcher, expected_native = pairs[launcher]
     try:
         launcher_file = filesystem.executable(launcher)
-        native_file = filesystem.executable(REVIEWED_PYTHON_NATIVE)
+        native_file = filesystem.executable(expected_native)
     except (OSError, ValueError, TypeError):
         raise ClosedError("host_process_self_probe") from None
     for observed, expected in (
-        (launcher_file, REVIEWED_PYTHON_LAUNCHER_CANONICAL),
-        (native_file, REVIEWED_PYTHON_NATIVE),
+        (launcher_file, expected_launcher),
+        (native_file, expected_native),
     ):
         require(isinstance(observed, ExecutableObservation)
                 and observed.canonical_path == expected
@@ -360,7 +378,7 @@ def capture_reviewed_python_snapshot(provider, filesystem, own_pid, uid, launche
     before = reviewed_python_pair(filesystem, launcher)
     # Generic capture still compares the actual native self PID path against the exact
     # expected root-owned interpreter; the launcher is not substituted for that identity.
-    result = capture_snapshot(provider, filesystem, own_pid, uid, REVIEWED_PYTHON_NATIVE,
+    result = capture_snapshot(provider, filesystem, own_pid, uid, before[1].canonical_path,
                               clock_us, selected_pids)
     require(reviewed_python_pair(filesystem, launcher) == before, "host_process_changed")
     return result

@@ -1787,9 +1787,181 @@ function tarChecksum(header) {
   return total;
 }
 
+const TAR_DIAGNOSTIC_SCOPES = new Set(["layout", "layer", "runtime-bundle"]);
+const PAX_DIAGNOSTIC_LIMIT = 64 * 1024;
+const PAX_DIAGNOSTIC_RECORD_LIMIT = 128;
+const PAX_DIAGNOSTIC_KEYS = Object.freeze([
+  "path", "linkpath", "size", "uid", "gid", "mtime", "atime", "ctime",
+  "SCHILY.xattr.security.capability", "SCHILY.xattr.security.selinux",
+  "SCHILY.xattr.trusted.overlay.opaque", "SCHILY.xattr.user.overlay.opaque",
+  "GNU.sparse.map", "GNU.sparse.size", "GNU.sparse.realsize", "GNU.sparse.name",
+  "GNU.sparse.major", "GNU.sparse.minor", "GNU.sparse.numblocks",
+  "GNU.sparse.offset", "GNU.sparse.numbytes", "SCHILY.realsize",
+]);
+const TAR_DIAGNOSTIC_FLAGS = ["pathOverride", "linkOverride", "sizeOverride",
+  "ownershipOverride", "timeOverride", "xattrOverride", "sparseOverride"];
+const TAR_DIAGNOSTIC_FIELDS = ["version", "scope", "layerDigest", "layerSizeBytes", "layerOrdinal",
+  "headerOrdinal", "headerNameSha256", "headerNameBytes", "paxState", "paxBodyBytes",
+  "paxBodySha256", "paxRecordCount", "paxKnownKeys", "paxUnknownKeyCount", "paxKeySetSha256",
+  ...TAR_DIAGNOSTIC_FLAGS];
+
+function closedTarDiagnosticObject(value) {
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype) fail("Invalid tar rejection diagnostic");
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Reflect.ownKeys(descriptors).sort().join("\n") !== [...TAR_DIAGNOSTIC_FIELDS].sort().join("\n")) {
+    fail("Invalid tar rejection diagnostic");
+  }
+  const copy = {};
+  for (const key of TAR_DIAGNOSTIC_FIELDS) {
+    if (!Object.hasOwn(descriptors[key], "value") || !descriptors[key].enumerable) {
+      fail("Invalid tar rejection diagnostic");
+    }
+    copy[key] = descriptors[key].value;
+  }
+  return copy;
+}
+
+// This closed, cloned diagnostic is never archive admission or a release receipt.
+export function validateTarRejectionDiagnostic(input) {
+  const value = closedTarDiagnosticObject(input);
+  const integer = (number, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) =>
+    Number.isSafeInteger(number) && number >= minimum && number <= maximum;
+  const digest = (text) => typeof text === "string" && /^[a-f0-9]{64}$/.test(text);
+  if (value.version !== 1 || !TAR_DIAGNOSTIC_SCOPES.has(value.scope) ||
+      !integer(value.headerOrdinal, 1, MAX_INVENTORY_ENTRIES + 1) ||
+      !integer(value.headerNameBytes, 1, 256) || !digest(value.headerNameSha256) ||
+      TAR_DIAGNOSTIC_FLAGS.some((key) => typeof value[key] !== "boolean")) {
+    fail("Invalid tar rejection diagnostic");
+  }
+  const unknownLayer = value.layerDigest === null && value.layerSizeBytes === null && value.layerOrdinal === null;
+  if (!unknownLayer && (value.scope !== "layer" ||
+      typeof value.layerDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.layerDigest) ||
+      !integer(value.layerSizeBytes, 1) || !integer(value.layerOrdinal, 1))) {
+    fail("Invalid tar rejection diagnostic");
+  }
+  const array = value.paxKnownKeys;
+  if (!Array.isArray(array) || Object.getPrototypeOf(array) !== Array.prototype ||
+      array.length > PAX_DIAGNOSTIC_KEYS.length ||
+      Reflect.ownKeys(array).length !== array.length + 1) fail("Invalid tar rejection diagnostic");
+  const keys = [];
+  for (let index = 0; index < array.length; index += 1) {
+    const item = Object.getOwnPropertyDescriptor(array, String(index));
+    if (!item || !Object.hasOwn(item, "value") || !PAX_DIAGNOSTIC_KEYS.includes(item.value)) {
+      fail("Invalid tar rejection diagnostic");
+    }
+    keys.push(item.value);
+  }
+  if (keys.join("\n") !== [...new Set(keys)].sort(compareUtf8).join("\n")) {
+    fail("Invalid tar rejection diagnostic");
+  }
+  value.paxKnownKeys = keys;
+  if (value.paxState === "parsed") {
+    if (!integer(value.paxBodyBytes, 0, PAX_DIAGNOSTIC_LIMIT) || !digest(value.paxBodySha256) ||
+        !integer(value.paxRecordCount, 0, PAX_DIAGNOSTIC_RECORD_LIMIT) ||
+        !integer(value.paxUnknownKeyCount, 0, value.paxRecordCount) ||
+        keys.length + value.paxUnknownKeyCount > value.paxRecordCount || !digest(value.paxKeySetSha256)) {
+      fail("Invalid tar rejection diagnostic");
+    }
+    const knownFlags = paxOverrideClasses(keys);
+    if (TAR_DIAGNOSTIC_FLAGS.some((key, index) =>
+      index < 5 || value.paxUnknownKeyCount === 0
+        ? value[key] !== knownFlags[key] : knownFlags[key] && !value[key]) ||
+        (value.paxUnknownKeyCount === 0 && value.paxKeySetSha256 !== sha256(canonicalJsonBytes(keys)))) {
+      fail("Invalid tar rejection diagnostic");
+    }
+  } else {
+    if (!["not-pax", "out-of-bounds", "oversize", "unavailable", "invalid-utf8", "malformed"].includes(value.paxState) ||
+        keys.length !== 0 || value.paxRecordCount !== null || value.paxUnknownKeyCount !== null ||
+        value.paxKeySetSha256 !== null || TAR_DIAGNOSTIC_FLAGS.some((key) => value[key])) {
+      fail("Invalid tar rejection diagnostic");
+    }
+    if (value.paxState === "not-pax") {
+      if (value.paxBodyBytes !== null || value.paxBodySha256 !== null) fail("Invalid tar rejection diagnostic");
+    } else if (!integer(value.paxBodyBytes) ||
+        (["invalid-utf8", "malformed"].includes(value.paxState)
+          ? !digest(value.paxBodySha256) || value.paxBodyBytes > PAX_DIAGNOSTIC_LIMIT
+          : value.paxBodySha256 !== null) ||
+        (value.paxState === "oversize" && value.paxBodyBytes <= PAX_DIAGNOSTIC_LIMIT)) {
+      fail("Invalid tar rejection diagnostic");
+    }
+  }
+  if (canonicalJsonBytes(value).length > 1536) fail("Invalid tar rejection diagnostic");
+  return value;
+}
+
+function paxOverrideClasses(keys) {
+  return {
+    pathOverride: keys.includes("path"), linkOverride: keys.includes("linkpath"), sizeOverride: keys.includes("size"),
+    ownershipOverride: keys.includes("uid") || keys.includes("gid"),
+    timeOverride: ["mtime", "atime", "ctime"].some((key) => keys.includes(key)),
+    xattrOverride: keys.some((key) => key.startsWith("SCHILY.xattr.") || key.startsWith("LIBARCHIVE.xattr.")),
+    sparseOverride: keys.some((key) => key.startsWith("GNU.sparse.") || key === "SCHILY.realsize"),
+  };
+}
+
+function paxDiagnosticRecords(bytes) {
+  // Validate all UTF-8 before parsing any record; never retain values or partial keys.
+  try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return { paxState: "invalid-utf8" }; }
+  const keys = new Set(); let offset = 0, records = 0;
+  while (offset < bytes.length) {
+    if (++records > PAX_DIAGNOSTIC_RECORD_LIMIT) return { paxState: "malformed" };
+    const space = bytes.indexOf(32, offset);
+    if (space < offset + 1 || space - offset > 6) return { paxState: "malformed" };
+    const lengthText = bytes.subarray(offset, space).toString("ascii");
+    if (!/^[1-9][0-9]{0,5}$/.test(lengthText)) return { paxState: "malformed" };
+    const end = offset + Number(lengthText);
+    const equals = bytes.indexOf(61, space + 1);
+    if (end > bytes.length || end <= space + 3 || bytes[end - 1] !== 10 ||
+        equals <= space + 1 || equals >= end - 1) return { paxState: "malformed" };
+    const key = bytes.subarray(space + 1, equals).toString("utf8");
+    if (/[\u0000-\u0020\u007f=]/u.test(key)) return { paxState: "malformed" };
+    keys.add(key); offset = end;
+  }
+  const sorted = [...keys].sort(compareUtf8);
+  return { paxState: "parsed", paxRecordCount: records,
+    paxKnownKeys: sorted.filter((key) => PAX_DIAGNOSTIC_KEYS.includes(key)),
+    paxUnknownKeyCount: sorted.filter((key) => !PAX_DIAGNOSTIC_KEYS.includes(key)).length,
+    paxKeySetSha256: sha256(canonicalJsonBytes(sorted)), ...paxOverrideClasses(sorted) };
+}
+
+async function tarRejectionDiagnostic(handle, header, context, ordinal, type, sizeBytes,
+  start, offset, archiveLength) {
+  const raw = (at, length) => {
+    const bytes = header.subarray(at, at + length), zero = bytes.indexOf(0);
+    return zero < 0 ? bytes : bytes.subarray(0, zero);
+  };
+  const prefix = raw(345, 155), name = raw(0, 100);
+  const headerName = prefix.length ? Buffer.concat([prefix, Buffer.from("/"), name]) : name;
+  const value = { version: 1, scope: context.scope, layerDigest: context.layerDigest ?? null,
+    layerSizeBytes: context.layerSizeBytes ?? null, layerOrdinal: context.layerOrdinal ?? null,
+    headerOrdinal: ordinal, headerNameSha256: sha256(headerName), headerNameBytes: headerName.length,
+    paxState: "not-pax", paxBodyBytes: null, paxBodySha256: null, paxRecordCount: null,
+    paxKnownKeys: [], paxUnknownKeyCount: null, paxKeySetSha256: null,
+    ...Object.fromEntries(TAR_DIAGNOSTIC_FLAGS.map((key) => [key, false])) };
+  if (type === "x" || type === "g") {
+    value.paxBodyBytes = sizeBytes;
+    const padded = Math.ceil(sizeBytes / 512) * 512;
+    if (!Number.isSafeInteger(offset + 512 + padded) || offset + 512 + padded > archiveLength) {
+      value.paxState = "out-of-bounds";
+    } else if (sizeBytes > PAX_DIAGNOSTIC_LIMIT) {
+      value.paxState = "oversize";
+    } else {
+      value.paxState = "unavailable";
+      const body = Buffer.alloc(sizeBytes);
+      const read = await handle.read(body, 0, sizeBytes, start + offset + 512);
+      if (read.bytesRead === sizeBytes) {
+        value.paxBodySha256 = sha256(body);
+        Object.assign(value, paxDiagnosticRecords(body));
+      }
+    }
+  }
+  return validateTarRejectionDiagnostic(value);
+}
+
 async function readTarEntries(
   archivePath,
-  { length, start = 0, allowLinks = false } = {},
+  { length, start = 0, allowLinks = false, diagnosticContext = { scope: "runtime-bundle" } } = {},
 ) {
   const metadata = await requireRegularFile(archivePath, "tar archive");
   const archiveLength = length ?? metadata.size - start;
@@ -1856,7 +2028,12 @@ async function readTarEntries(
       const linkTarget = tarText(header, 157, 100);
       const allowedTypes = allowLinks ? ["0", "1", "2", "5"] : ["0", "5"];
       if (!allowedTypes.includes(type)) {
-        fail("Tar archive contains unsupported entry type " + type);
+        const error = new ManagedCloudReleaseGateError("Tar archive contains unsupported entry type " + type);
+        try {
+          error.tarDiagnostic = await tarRejectionDiagnostic(handle, header, diagnosticContext,
+            entries.length + 1, type, sizeBytes, start, offset, archiveLength);
+        } catch { /* Diagnostic failure cannot change the original unsupported-type rejection. */ }
+        throw error;
       }
       if (type !== "0" && sizeBytes !== 0) {
         fail("Non-file tar entries must have zero content size");
@@ -2054,11 +2231,13 @@ function validateContainerSymlinkGraph(inventory) {
   }
 }
 
-async function applyOciLayer(archivePath, layerEntry, inventory) {
+async function applyOciLayer(archivePath, layerEntry, inventory, descriptor, layerOrdinal) {
   const entries = await readTarEntries(archivePath, {
     allowLinks: true,
     length: layerEntry.sizeBytes,
     start: layerEntry.dataOffset,
+    diagnosticContext: { scope: "layer", layerDigest: descriptor.digest,
+      layerSizeBytes: descriptor.size, layerOrdinal },
   });
   const layerEntries = entries.map((entry) => ({
     ...entry,
@@ -2256,6 +2435,7 @@ function validateOciRuntimeConfig(runtime, imageConfig, componentId, contract) {
     fail(componentId + " OCI config must be exactly linux/amd64");
   }
   const allowedRuntimeKeys = new Set([
+    "ArgsEscaped",
     "Cmd",
     "Entrypoint",
     "Env",
@@ -2271,6 +2451,18 @@ function validateOciRuntimeConfig(runtime, imageConfig, componentId, contract) {
   ]);
   if (Object.keys(runtime).some((key) => !allowedRuntimeKeys.has(key))) {
     fail(componentId + " OCI runtime config contains an unknown key");
+  }
+  // Pinned BuildKit emits this optional CMD compatibility metadata on Linux.
+  // Admit only true for these exact linux/amd64 command runtimes; omission
+  // remains valid; null is not an admitted absence representation. The admitted
+  // Linux/containerd path ignores Windows command-line escaping metadata, and
+  // this field grants no authority to change the exact Cmd or Entrypoint.
+  if (
+    Object.hasOwn(runtime, "ArgsEscaped") &&
+    (runtime.ArgsEscaped !== true ||
+      !["jobs-runner", "jobs-workflows"].includes(componentId))
+  ) {
+    fail(componentId + " OCI ArgsEscaped is not admitted for this runtime");
   }
   const environment = runtime.Env ?? [];
   if (!Array.isArray(environment)) {
@@ -2324,12 +2516,12 @@ function validateOciRuntimeConfig(runtime, imageConfig, componentId, contract) {
       fail(componentId + " OCI environment is missing " + required);
     }
   }
-  if (
-    environment.length !== contract.requiredEnvironment.length ||
-    environment.some(
-      (value, index) => value !== contract.requiredEnvironment[index],
-    )
-  ) {
+  // Env is a unique name/value set, not an ordered command vector. BuildKit
+  // inserts PATH for scratch stages before dispatching Dockerfile ENV, and
+  // replacing PATH retains that position. The checks above already require
+  // every exact value and reject duplicate/unsafe/unknown names; cardinality
+  // closes the set without depending on builder serialization order.
+  if (environment.length !== contract.requiredEnvironment.length) {
     fail(componentId + " OCI environment is not the exact closed set");
   }
   if ((runtime.WorkingDir ?? "") !== contract.workingDirectory) {
@@ -2378,12 +2570,12 @@ function validateOciRuntimeConfig(runtime, imageConfig, componentId, contract) {
   }
 }
 
-export async function inspectOciImageArchive(archivePath, componentId) {
+export async function inspectOciImageArtifact(archivePath, componentId) {
   const contract = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId];
   if (!contract) {
     fail("OCI inventory supports only managed cloud runtime components");
   }
-  const tarEntries = await readTarEntries(archivePath);
+  const tarEntries = await readTarEntries(archivePath, { diagnosticContext: { scope: "layout" } });
   const files = new Map();
   for (const entry of tarEntries) {
     if (entry.type === "5") {
@@ -2545,14 +2737,14 @@ export async function inspectOciImageArchive(archivePath, componentId) {
     if (!layerEntry || layerEntry.sizeBytes !== descriptor.size) {
       fail("OCI layer descriptor is not size-bound");
     }
-    await applyOciLayer(archivePath, layerEntry, inventory);
+    await applyOciLayer(archivePath, layerEntry, inventory, descriptor, index + 1);
   }
   validateContainerSymlinkGraph(inventory);
   const entries = [...inventory.values()].sort((left, right) =>
     compareUtf8(left.path, right.path),
   );
   requireClosedRuntimeContent(componentId, entries);
-  return {
+  const contentInventory = {
     artifactKind: "oci_image",
     artifactSha256: imageDescriptor.digest.slice(7),
     audience: MANAGED_CLOUD_AUDIENCES.contentInventory,
@@ -2568,6 +2760,14 @@ export async function inspectOciImageArchive(archivePath, componentId) {
     },
     version: 1,
   };
+  return Object.freeze({
+    imageConfigSha256: manifest.config.digest.slice(7),
+    inventory: contentInventory,
+  });
+}
+
+export async function inspectOciImageArchive(archivePath, componentId) {
+  return (await inspectOciImageArtifact(archivePath, componentId)).inventory;
 }
 
 export async function inspectStaticBundleArchive(
@@ -2577,7 +2777,7 @@ export async function inspectStaticBundleArchive(
   if (componentId !== "jobs-portal") {
     fail("Static bundle inventory is reserved for jobs-portal");
   }
-  const entries = await readTarEntries(archivePath);
+  const entries = await readTarEntries(archivePath, { diagnosticContext: { scope: "runtime-bundle" } });
   const inventory = [];
   for (const entry of entries) {
     if (entry.uid !== 0 || entry.gid !== 0 || entry.mtime !== 0) {

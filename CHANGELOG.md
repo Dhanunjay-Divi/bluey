@@ -5,6 +5,11 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs runner qualification: integrate current-source diagnostics and failure-
+  only archive retention while preserving native packaging quarantine; require
+  one explicit approved source commit instead of a self-referential source pin.
+  Qualification is pending; no runner or employer action is enabled.
+
 - Jobs public entry: prepare the existing landing content as build-time HTML
   and load the workspace separately, with guarded storage/theme and recoverable
   application loading. Local tests/builds and script-blocked browser checks

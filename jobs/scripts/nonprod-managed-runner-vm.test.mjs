@@ -26,6 +26,8 @@ import {
   diagnosticRetentionPlan,
   executableIdentitySha256,
   failureReport,
+  failedArchiveFinalizationAllowed,
+  validateFailureArchiveRetention,
   hostProcessEvidence,
   isolatedEnvironment,
   listenerDeltaFailureEvidence,
@@ -37,6 +39,28 @@ import {
   parseHostProcessSnapshot,
   parseListenerRecords,
   parseUsernetPid,
+  parseVmMode,
+  parseArtifactOptions,
+  requireExpectedSourceCommit,
+  sourceCommitPreflight,
+  artifactExportDeadline,
+  ARTIFACT_CLEANUP_RESERVE_MS,
+  ARTIFACT_REMAINING_BUDGET_MS,
+  ARTIFACT_WORKLOAD_CLEANUP_MS,
+  ARTIFACT_WORKLOAD_PENDING_MS,
+  ARTIFACT_POST_OBSERVATION_MS,
+  ARTIFACT_SOURCE_FINAL_MS,
+  phaseCommandTimeout,
+  qualificationDuration,
+  observeGuestReaderRuntime,
+  READER_OBSERVATION_OPERATIONS,
+  readerArchiveArguments,
+  validateReaderArchive,
+  readerOperationDiagnostic,
+  refuseReaderStderr,
+  readerRuntimeObservationReport,
+  emitImageReport,
+  imageProgressRecord,
   preStopEvidence,
   qemuInventoryPids,
   qemuManagementPort,
@@ -49,6 +73,234 @@ import {
 } from "./run-nonprod-managed-runner-vm-tests.mjs";
 
 const GIB = 1024 ** 3;
+const expectedSource = "b".repeat(40);
+const vmArgs = (mode, commit = expectedSource) => [mode, "--source-commit", commit];
+
+test("VM modes and progress reject added authority, paths and arbitrary options", () => {
+  assert.equal(parseVmMode(vmArgs("--preflight-only")), "compatibility");
+  assert.equal(parseVmMode(vmArgs("--runner-image-smoke")), "image");
+  assert.equal(parseVmMode(vmArgs("--reader-runtime-observation")), "reader");
+  for (const args of [[], ["--production"], ["--runner-image-smoke", "--submit"],
+    ["--preflight-only", "--runner-image-smoke"], ["--workload", "/arbitrary"], null]) {
+    assert.throws(() => parseVmMode(args), /exact_preflight_cli_required/);
+  }
+  for (const phase of ["vm_starting", "vm_isolation_checked", "inputs_prepared",
+    "builder_started", "image_build_started", "image_build_finished",
+    "image_inspection_started", "image_inspection_finished"]) {
+    assert.deepEqual(imageProgressRecord(phase), {
+      event: "managed_runner_vm_image_progress", version: 1, phase,
+    });
+  }
+  for (const invalid of [null, 1, "production", "/private/path", "image_build_started\nextra"]) {
+    assert.throws(() => imageProgressRecord(invalid), /image_progress_phase/);
+  }
+});
+
+test("artifact export is explicit image-only with an owner-selected filesystem and approval", () => {
+  for (const flag of ["--preflight-only", "--runner-image-smoke", "--reader-runtime-observation"]) {
+    assert.deepEqual(parseArtifactOptions(vmArgs(flag)), {
+      mode: parseVmMode(vmArgs(flag)), sourceCommit: expectedSource, artifact: null,
+    });
+  }
+  const args = [...vmArgs("--runner-image-smoke"), "--artifact-parent", "/private/artifacts",
+    "--artifact-filesystem-dev", "16777230", "--guest-reader-approval", "/private/reader-approval.json"];
+  assert.deepEqual(parseArtifactOptions(args), { mode: "image", sourceCommit: expectedSource, artifact: {
+    parent: "/private/artifacts", filesystemDev: "16777230", approvalPath: "/private/reader-approval.json",
+  } });
+  for (const invalid of [
+    ["--preflight-only", ...args.slice(1)], [...args, "--submit"], args.slice(0, -1),
+    ["--reader-runtime-observation", ...args.slice(1)],
+    args.map((value, index) => index === 4 ? "/" : value),
+    args.map((value, index) => index === 4 ? "relative" : value),
+    args.map((value, index) => index === 6 ? "001" : value),
+    args.map((value, index) => index === 7 ? "--arbitrary-reader" : value),
+  ]) assert.throws(() => parseArtifactOptions(invalid));
+});
+
+test("every executing mode requires exactly one independently supplied canonical nonzero source commit", () => {
+  for (const flag of ["--preflight-only", "--runner-image-smoke", "--reader-runtime-observation"]) {
+    for (const commit of [expectedSource, "c".repeat(40)]) {
+      assert.equal(parseArtifactOptions(vmArgs(flag, commit)).sourceCommit, commit);
+    }
+    for (const commit of [undefined, null, "", "0".repeat(40), "B".repeat(40), "b".repeat(39),
+      "b".repeat(41), ` ${expectedSource}`, `${expectedSource}\n`, "HEAD", "main", [expectedSource]]) {
+      assert.throws(() => parseArtifactOptions([flag, "--source-commit", commit]), /exact_preflight_cli_required/);
+    }
+    for (const args of [[flag], [flag, "--source-commit"], [flag, expectedSource],
+      [...vmArgs(flag), "--source-commit", expectedSource], ["--source-commit", expectedSource, flag]]) {
+      assert.throws(() => parseArtifactOptions(args), /exact_preflight_cli_required/);
+    }
+  }
+});
+
+test("source preflight refuses invalid input before Git and mismatched HEAD before any setup", async () => {
+  let reads = 0, setups = 0;
+  const read = async () => { reads += 1; return expectedSource; };
+  for (const invalid of [undefined, "0".repeat(40), "HEAD", "b".repeat(39), `${expectedSource}\n`]) {
+    await assert.rejects(() => sourceCommitPreflight(invalid, read), /expected_source_commit_required/);
+  }
+  assert.equal(reads, 0);
+  await assert.rejects(async () => {
+    await sourceCommitPreflight(expectedSource, async () => "c".repeat(40));
+    setups += 1;
+  }, /base_commit_changed/);
+  assert.equal(setups, 0);
+  assert.equal(await sourceCommitPreflight(expectedSource, read), expectedSource);
+  assert.equal(reads, 1);
+});
+
+test("all source checkpoints compare with the captured independent commit rather than report claims", async () => {
+  assert.equal(requireExpectedSourceCommit(expectedSource, expectedSource), expectedSource);
+  for (const changed of ["c".repeat(40), "0".repeat(40), "", undefined]) {
+    assert.throws(() => requireExpectedSourceCommit(changed, expectedSource), /base_commit_changed/);
+  }
+  assert.throws(() => requireExpectedSourceCommit(expectedSource), /expected_source_commit_required/);
+  const source = await readFile(new URL("./run-nonprod-managed-runner-vm-tests.mjs", import.meta.url), "utf8");
+  const main = source.slice(source.indexOf("export async function main("));
+  assert(main.indexOf("await sourceCommitPreflight(expectedSourceCommit)") < main.indexOf("stateRoot = await mkdtemp"));
+  assert(main.includes("const expectedSourceCommit = options.sourceCommit"));
+  assert(!source.includes("IMAGE_SOURCE_COMMIT") && !source.includes("BASE_COMMIT"));
+  assert(!source.includes("result?.baseCommit ?? expectedSourceCommit"));
+  assert(main.includes("validateQualification(imageEvidence, expectedSourceCommit)"));
+  assert(main.includes("sourceCommit: expectedSourceCommit"));
+  assert.equal((main.match(/requireExpectedSourceCommit\(\(await run\("git", \["rev-parse", "HEAD"\]\)\)/g) ?? []).length, 4);
+});
+
+test("artifact export reserves only the actual outer tail and mandatory post-export proof", async () => {
+  assert.deepEqual(ARTIFACT_REMAINING_BUDGET_MS, {
+    vmCleanup: 450_000, cleanupGrace: 45_000, sourceAfter: 35_000,
+    qualification: 35_000, localIoMargin: 120_000, activeTeardown: 5_000,
+  });
+  assert.equal(ARTIFACT_CLEANUP_RESERVE_MS, 690_000);
+  assert.equal(ARTIFACT_WORKLOAD_CLEANUP_MS, 260_000);
+  assert.equal(ARTIFACT_WORKLOAD_PENDING_MS, 295_000);
+  assert.equal(ARTIFACT_POST_OBSERVATION_MS, 120_000);
+  assert.equal(ARTIFACT_SOURCE_FINAL_MS, 35_000);
+  const reserve = ARTIFACT_CLEANUP_RESERVE_MS + ARTIFACT_POST_OBSERVATION_MS + ARTIFACT_SOURCE_FINAL_MS;
+  const now = 1000;
+  assert.equal(artifactExportDeadline(now, now + reserve + 20 * 60_000),
+    now + 15 * 60_000);
+  assert.equal(artifactExportDeadline(now, now + reserve + 12345), now + 12345);
+  let sinks = 0;
+  for (const remaining of [reserve - 1, reserve]) {
+    assert.throws(() => {
+      artifactExportDeadline(now, now + remaining);
+      sinks += 1;
+    }, /artifact_cleanup_reserve/);
+  }
+  assert.equal(sinks, 0);
+  for (const invalid of [[NaN, 1], [1, Infinity], [-1, 1], [1, 1.5]]) {
+    assert.throws(() => artifactExportDeadline(...invalid), /artifact_cleanup_reserve/);
+  }
+  const source = await readFile(new URL("./run-nonprod-managed-runner-vm-tests.mjs", import.meta.url), "utf8");
+  const exportStart = source.indexOf("async function exportAttachments(input)");
+  const budgetCheck = source.indexOf("const deadline = artifactExportDeadline", exportStart);
+  const firstSink = source.indexOf('artifactControl("host-init"', exportStart);
+  assert(budgetCheck > exportStart && budgetCheck < firstSink);
+  const beforeBuilder = source.slice(source.indexOf("beforeBuild: async () =>"),
+    source.indexOf('} else if (mode === "reader")', source.indexOf("beforeBuild: async () =>")));
+  assert(beforeBuilder.includes("workloadCleanupPending = true"));
+  assert(beforeBuilder.includes("commandBudget(30_000)") && beforeBuilder.includes("commandBudget(1)"));
+  assert(source.includes("overall = setTimeout(stop, overallDuration)"));
+});
+
+test("only explicit retained-artifact mode receives one 60-minute absolute envelope", async () => {
+  for (const flag of ["--preflight-only", "--runner-image-smoke", "--reader-runtime-observation"]) {
+    assert.equal(qualificationDuration(parseArtifactOptions(vmArgs(flag))), 45 * 60_000);
+  }
+  const artifact = parseArtifactOptions([...vmArgs("--runner-image-smoke"), "--artifact-parent", "/private/artifacts",
+    "--artifact-filesystem-dev", "1", "--guest-reader-approval", "/private/pin.json"]);
+  assert.equal(qualificationDuration(artifact), 60 * 60_000);
+  assert.throws(() => qualificationDuration({ mode: "reader", artifact: {} }));
+  assert.throws(() => qualificationDuration({ mode: "production", artifact: null }));
+  const source = await readFile(new URL("./run-nonprod-managed-runner-vm-tests.mjs", import.meta.url), "utf8");
+  assert.equal(source.match(/const overallDeadline =/g).length, 1);
+  assert(source.indexOf("const overallDeadline =") < source.indexOf('stage = "source_snapshot"'));
+});
+
+test("phase budgets clamp every child and retry including grace without spending the hard tail", () => {
+  const overall = 60 * 60_000;
+  const pending = ARTIFACT_CLEANUP_RESERVE_MS + ARTIFACT_WORKLOAD_PENDING_MS + 155_000;
+  assert.equal(phaseCommandTimeout(30 * 60_000, 5 * 60_000, overall, pending), 30 * 60_000);
+  const late = overall - pending - 12_000;
+  assert.equal(phaseCommandTimeout(30_000, late, overall, pending), 12_000);
+  let spawns = 0;
+  for (const time of [overall - pending, overall - pending + 1]) {
+    assert.throws(() => { phaseCommandTimeout(30_000, time, overall, pending); spawns += 1; },
+      /phase_budget_exhausted/);
+  }
+  assert.equal(spawns, 0);
+  const observationEnd = 120_000;
+  assert.equal(phaseCommandTimeout(30_000, 100_000, overall, 725_000, observationEnd), 15_000);
+  assert.throws(() => phaseCommandTimeout(30_000, 115_000, overall, 725_000, observationEnd),
+    /phase_budget_exhausted/);
+  // No retry gets a fresh 120-second clock.
+  assert.equal(phaseCommandTimeout(30_000, 110_000, overall, 725_000, observationEnd), 5_000);
+  for (const args of [[0, 0, overall, 0], [30_000, NaN, overall, 0], [30_000, 0, overall, -1]]) {
+    assert.throws(() => phaseCommandTimeout(...args), /phase_budget_shape/);
+  }
+});
+
+test("slow build reduces the export window and exhausted windows cannot qualify", async () => {
+  const total = 60 * 60_000;
+  const now = 40 * 60_000; // synthetic clock, not a performance claim
+  const deadline = artifactExportDeadline(now, total);
+  assert.equal(deadline, total - 845_000);
+  assert(deadline - now > 0 && deadline - now < 15 * 60_000);
+  let receipts = 0;
+  const finalize = async (time) => {
+    phaseCommandTimeout(30_000, time, total, 5_000, total);
+    receipts += 1;
+  };
+  await assert.rejects(() => finalize(total - 5000), /phase_budget_exhausted/);
+  assert.equal(receipts, 0);
+  const failed = failureReport({ stage: "post_image_listener_observation",
+    primaryFailure: "phase_budget_exhausted", interrupted: false, retained: true,
+    cleanupProven: false, retainedDiagnosticsOnly: false, diagnostics: [], stateRoot: "/private/owned" });
+  assert.equal(failed.cleanupProven, false);
+  assert.equal(failed.code, "phase_budget_exhausted");
+});
+
+test("qualification hashes and emission share exact UTF-8 report bytes including newline and key order", async () => {
+  const report = { z: "é", a: { second: 2, first: 1 } };
+  const expected = Buffer.from(`${JSON.stringify(report)}\n`, "utf8");
+  const writes = [];
+  let qualifiedHash;
+  await emitImageReport(report, async (digest) => {
+    assert.equal(writes.length, 0);
+    qualifiedHash = digest;
+  }, (bytes) => writes.push(bytes));
+  assert.equal(writes.length, 1);
+  assert(Buffer.isBuffer(writes[0]));
+  assert.deepEqual(writes[0], expected);
+  assert.equal(writes[0].at(-1), 10);
+  assert.equal(qualifiedHash, createHash("sha256").update(writes[0]).digest("hex"));
+  assert.notEqual(qualifiedHash, createHash("sha256").update(expected.subarray(0, -1)).digest("hex"));
+  const semanticSorted = JSON.stringify({ a: { first: 1, second: 2 }, z: "é" });
+  assert.notEqual(qualifiedHash, createHash("sha256").update(semanticSorted).digest("hex"));
+  const defaults = [];
+  await emitImageReport(report, null, (bytes) => defaults.push(bytes));
+  assert.deepEqual(defaults, writes);
+});
+
+test("actual 64-KiB report-byte cap refuses before qualification and failed qualification emits nothing", async () => {
+  const overhead = Buffer.byteLength(`${JSON.stringify({ payload: "" })}\n`, "utf8");
+  const exact = { payload: "a".repeat(64 * 1024 - overhead) };
+  const writes = [];
+  await emitImageReport(exact, null, (bytes) => writes.push(bytes));
+  assert.equal(writes[0].length, 64 * 1024);
+  let qualifications = 0;
+  for (const oversized of [{ payload: exact.payload + "a" }, { payload: "é".repeat(64 * 1024) }]) {
+    await assert.rejects(() => emitImageReport(oversized, async () => { qualifications += 1; },
+      () => { throw new Error("oversized report emitted"); }), /image_report_bound/);
+  }
+  assert.equal(qualifications, 0);
+  const failedWrites = [];
+  await assert.rejects(() => emitImageReport({ valid: true }, async () => {
+    throw new Error("qualification unavailable");
+  }, (bytes) => failedWrites.push(bytes)), /qualification unavailable/);
+  assert.deepEqual(failedWrites, []);
+});
 const profile = `p639-${"a".repeat(20)}`;
 const state = "/private/tmp/bluey-jobs-linux-p639-abcdef";
 const root = "/private/tmp/bluey-test-runs-phase639/run.1234567890.456.abc";
@@ -100,7 +352,7 @@ const successHostEvidence = {
   helperUdpUnboundDeltaCount: 0,
   literalCodeSigningClaimed: false,
   literalNoHostNetworkClaimed: false,
-  producerSha256: "3c53430e3e937a27b9697264b3b9e5f29ff76f395c7a52546c9e85035a88cf95",
+  producerSha256: "bac1d707b8d077bde9ed6dd787d801550b198fefc908c82e25edb4cae3f6481a",
   socketCount: 3,
   tcpDeltaCount: 1,
   udpDeltaCount: 0,
@@ -319,6 +571,15 @@ test("CLI identity and exact version parsers reject writable binaries and near m
   assertApprovedCli("/usr/bin/git", "/usr/bin/git", { ...privateFile, uid: 0 }, 501);
   assertApprovedCli("/usr/bin/python3", "/Applications/Xcode.app/python3",
     { ...privateFile, uid: 0 }, 501);
+  assertApprovedCli("/usr/bin/tar", "/usr/bin/bsdtar", { ...privateFile, uid: 0 }, 501);
+  for (const canonical of ["/tmp/bsdtar", "/usr/local/bin/tar", "/usr/bin/tar"]) {
+    assert.throws(() => assertApprovedCli("/usr/bin/tar", canonical,
+      { ...privateFile, uid: 0 }, 501), /approved_system_tar_identity/);
+  }
+  assert.throws(() => assertApprovedCli("/usr/bin/tar", "/usr/bin/bsdtar",
+    privateFile, 501), /approved_system_tar_identity/);
+  assert.throws(() => assertApprovedCli("/usr/bin/ditto", "/usr/bin/ditto",
+    { ...privateFile, uid: 0 }, 501), /approved_cli_path/);
   for (const changed of [{ mode: 0o775 }, { symlink: true }, { file: false }, { uid: 777 }]) {
     assert.throws(() => assertApprovedCli("/opt/homebrew/bin/colima", "/real/colima",
       { ...privateFile, ...changed }, 501));
@@ -689,7 +950,7 @@ test("lsof parser preserves every PID/name record including wildcard and bracket
     boundaryAfterSnapshotSha256: "4".repeat(64),
     boundaryBeforeSnapshotSha256: "5".repeat(64),
     executableIdentitySha256: "6".repeat(64),
-    producerSha256: "3c53430e3e937a27b9697264b3b9e5f29ff76f395c7a52546c9e85035a88cf95",
+    producerSha256: "bac1d707b8d077bde9ed6dd787d801550b198fefc908c82e25edb4cae3f6481a",
   }, failureEvidence);
   assert.equal(processEvidence.helperTcpDeltaCount, 1);
   assert.equal(processEvidence.helperUdpDeltaCount, 2);
@@ -843,6 +1104,350 @@ test("lsof parser preserves every PID/name record including wildcard and bracket
   }
 });
 
+test("v2 refusal diagnostics preserve every golden admission outcome and expose no raw owners", () => {
+  const baseline = [2000, 2001, 2002].map((pid, index) => listener(pid, index, "127.0.0.1", 50000 + index));
+  const changed = hostRecord(2001, { helperClass: "python-or-other" });
+  const proof = udpAdmissionProof([stableAmbientRecord, changed]);
+  proof.postProcessesAfter = hostSnapshot(...proof.postProcessesAfter.records.map((record) =>
+    record.pid === "2001" ? { ...record, birthUsec: "987" } : record));
+  const rows = [
+    [listener(42, 300, "127.0.0.1", 51000, true), null],
+    [listener(2000, 301, "127.0.0.1", 51000), "unexpected_new_udp_listener"],
+    [listener(9000, 302, "127.0.0.1", 51000, true), "unexpected_new_udp_owner"],
+    [listener(2000, 303, "127.0.0.1", 51000, true), null],
+    [listener(2001, 304, "127.0.0.1", 51000, true), "udp_process_identity_changed"],
+    [listener(2002, 305, "127.0.0.1", 51000, true), "udp_process_identity_missing"],
+  ];
+  const inputFor = (selected) => ({ tcpBefore: [], tcpAfter: [listener(42, 90, "127.0.0.1", 60022)],
+    udpBefore: baseline, udpAfter: [...baseline, ...selected] });
+  const outcome = (input) => {
+    try { return { value: listenerDeltaPolicy(input, [42, 43], 60022, 42, proof) }; }
+    catch (error) { return { error: error.message }; }
+  };
+  for (const [row, error] of rows) {
+    const input = inputFor([row]);
+    const before = outcome(input);
+    if (error) assert.equal(before.error, error); else assert(before.value);
+    const frozen = JSON.stringify({ input, proof });
+    const evidence = listenerDeltaFailureEvidence(input, [42, 43], 42, proof);
+    assert.equal(evidence.version, 2);
+    assert.equal(Object.values(evidence.udpRefusals).reduce((sum, count) => sum + count, 0), 1);
+    assert.deepEqual(outcome(input), before);
+    assert.equal(JSON.stringify({ input, proof }), frozen);
+  }
+  const input = inputFor(rows.map(([row]) => row));
+  const evidence = listenerDeltaFailureEvidence(input, [42, 43], 42, proof);
+  assert.deepEqual(evidence.udpRefusals, { endpointShapeRefused: 1, ownerRefused: 1,
+    nativeBindingRefused: 1, nativeBindingNotEvaluated: 1, predicatePassed: 2 });
+  assert.equal(outcome(input).error, "unexpected_new_udp_listener");
+  const text = JSON.stringify(evidence);
+  assert(!text.includes("127.0.0.1") && !text.includes('"pid"') && !text.includes('"records"'));
+  const old = listenerDeltaFailureEvidence(input, [42, 43], 42);
+  assert.equal(old.version, 1);
+  assert(!Object.hasOwn(old, "udpRefusals"));
+  const failure = (listenerFailureEvidence) => failureReport({ stage: "listener_observation",
+    primaryFailure: "unexpected_new_udp_listener", interrupted: false, retained: false,
+    cleanupProven: true, retainedDiagnosticsOnly: false, diagnostics: [], listenerFailureEvidence });
+  assert.deepEqual(failure(evidence).listenerFailureEvidence, evidence);
+  assert.deepEqual(failure(old).listenerFailureEvidence, old);
+  for (const invalid of [
+    { ...old, udpRefusals: evidence.udpRefusals }, { ...evidence, version: 3 },
+    { ...evidence, udpRefusals: { ...evidence.udpRefusals, endpointShapeRefused: 2 } },
+    { ...evidence, udpRefusals: { ...evidence.udpRefusals, nativeBindingRefused: -1 } },
+    { ...evidence, udpRefusals: { ...evidence.udpRefusals, raw: "private" } },
+  ]) assert.throws(() => failure(invalid));
+});
+
+test("opt-in preservation finalizes only after normal cleanup and keeps default console report", async () => {
+  const source = await readFile(new URL("./run-nonprod-managed-runner-vm-tests.mjs", import.meta.url), "utf8");
+  const finalize = source.indexOf('await artifactControl("host-qualify"');
+  assert(finalize > source.indexOf('await rm(stateRoot, { recursive: true, force: false })'));
+  assert(finalize > source.indexOf('stage = "source_after_cleanup"'));
+  assert(finalize > source.indexOf("await emitImageReport(fullReport"));
+  assert(source.includes("overallDeadline - ARTIFACT_CLEANUP_RESERVE_MS - POST_EXPORT_RESERVE_MS"));
+  assert(source.includes("imageReportSha256, harnessSha256"));
+  assert(!source.includes("sha256(Buffer.from(canonicalJson(fullReport)))"));
+  assert(source.includes("15 * 60_000"));
+  assert(!source.includes('console.log(JSON.stringify({ event: "artifact'));
+  assert(!source.includes("/dev/fd/"));
+});
+
+test("failed archive finalization requires every actual observation source and cleanup gate", () => {
+  const ready = { pending: true, postChecks: true, cleanupProven: true,
+    cleanupFailure: undefined, sourceUnchanged: true, interrupted: false };
+  assert.equal(failedArchiveFinalizationAllowed(ready), true);
+  for (const patch of [{ pending: false }, { postChecks: false }, { cleanupProven: false },
+    { cleanupFailure: "cleanup_unproven_state_retained" }, { sourceUnchanged: false },
+    { interrupted: true }, { pending: "true" }]) {
+    assert.equal(failedArchiveFinalizationAllowed({ ...ready, ...patch }), false);
+  }
+});
+
+test("failed archive report is closed unqualified and cannot replace the original failure", () => {
+  const input = { stage: "runner_image_workload", primaryFailure: "vm_command_failed",
+    interrupted: false, retained: true, stateRoot: "/private/synthetic", profile: "synthetic",
+    cleanupProven: true, retainedDiagnosticsOnly: true, diagnostics: [] };
+  const reference = { version: 1, state: "incomplete", qualified: false, d2Authority: false,
+    releaseAuthority: false, childName: null, manifestSha256: null, retentionFailure: "transfer_failed" };
+  assert.equal(Object.hasOwn(failureReport(input), "archiveRetention"), false);
+  const report = failureReport({ ...input, archiveRetention: reference });
+  assert.equal(report.primaryFailure, "vm_command_failed");
+  assert.equal(report.code, "vm_command_failed");
+  assert.deepEqual(report.archiveRetention, reference);
+  const retained = { ...reference, state: "retained", retentionFailure: null,
+    childName: "phase639-failed-image-artifacts-" + "a".repeat(24), manifestSha256: "b".repeat(64) };
+  assert.deepEqual(validateFailureArchiveRetention(retained), retained);
+  for (const patch of [{ raw: "private-value" }, { state: "attachments_complete" }, { qualified: true },
+    { d2Authority: true }, { releaseAuthority: true }, { childName: "phase639-image-artifacts-" + "a".repeat(24) },
+    { childName: [retained.childName] }, { manifestSha256: [retained.manifestSha256] },
+    { manifestSha256: null }, { manifestSha256: "0".repeat(64) }, { retentionFailure: "private-value" }]) {
+    assert.throws(() => validateFailureArchiveRetention({ ...retained, ...patch }));
+  }
+});
+
+test("failed archive uses the same bounded stream but only finalizes after outer cleanup and source checks", async () => {
+  const source = await readFile(new URL("./run-nonprod-managed-runner-vm-tests.mjs", import.meta.url), "utf8");
+  const failedExport = source.slice(source.indexOf("async function exportFailedArchive(input)"),
+    source.indexOf("async function hostProcessSnapshot"));
+  assert(failedExport.indexOf("artifactExportDeadline") < failedExport.indexOf('"host-failure-init"'));
+  assert(failedExport.includes('copySelectedArtifact(input, "runner.oci.tar"'));
+  assert(failedExport.includes('check(!workloadCleanupPending'));
+  assert(!failedExport.includes('"host-manifest"') && !failedExport.includes('"host-qualify"'));
+  const finalized = source.indexOf('await artifactControl("host-failure-manifest"');
+  assert(finalized > source.indexOf("try { await cleanup(); }"));
+  assert(finalized > source.indexOf("if (failedArchivePending) failedArchiveSourceAfter = true"));
+  assert(finalized > source.indexOf("failedArchiveFinalizationAllowed({ pending:"));
+  assert(source.includes('stage: deferredImageFailure ? "runner_image_workload" : stage'));
+  assert(source.includes('primaryFailure = codeOf(deferredImageFailure ?? error'));
+  assert(source.indexOf('throw new Error("nonprod_managed_runner_vm_not_qualified");', finalized)
+    < source.indexOf("result.cleanup =", finalized));
+});
+
+function readerObservationFixture() {
+  return { version: 1, qualified: false, candidate: { readerSourceSha256: "a".repeat(64), runtime: {
+    canonicalPath: "/usr/bin/python3.12", version: "3.12.3", platform: "Linux", architecture: "x86_64",
+    uid: 0, mode: 0o755, nlink: 1, size: 12345, sha256: "b".repeat(64), protocolVersion: 1,
+  } }, claims: { image: false, runnerStartup: false, release: false } };
+}
+
+test("reader discovery archive arguments explicitly suppress host metadata", () => {
+  assert.deepEqual(readerArchiveArguments("/private/helper"), ["-cf", "-", "--format=ustar",
+    "--no-mac-metadata", "--no-acls", "--no-xattrs", "-C", "/private/helper", "managed-runner-artifacts.py"]);
+  for (const invalid of [null, "relative", "/private/helper\0suffix"]) {
+    assert.throws(() => readerArchiveArguments(invalid), /reader_archive_directory/);
+  }
+});
+
+function readerTarFixture(source, { name = "managed-runner-artifacts.py", type = "0", prefix = "" } = {}) {
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 100, "ascii");
+  header.write("0000500\0", 100, 8, "ascii");
+  header.write("0000000\0", 108, 8, "ascii");
+  header.write("0000000\0", 116, 8, "ascii");
+  header.write(`${source.length.toString(8).padStart(11, "0")}\0`, 124, 12, "ascii");
+  header.write("00000000000\0", 136, 12, "ascii");
+  header.fill(32, 148, 156);
+  header.write(type, 156, 1, "ascii");
+  header.write("ustar\0", 257, 6, "ascii");
+  header.write("00", 263, 2, "ascii");
+  header.write(prefix, 345, 155, "ascii");
+  header.write(`${header.reduce((sum, byte) => sum + byte, 0).toString(8).padStart(6, "0")}\0 `,
+    148, 8, "ascii");
+  return Buffer.concat([header, source, Buffer.alloc((512 - source.length % 512) % 512), Buffer.alloc(1024)]);
+}
+
+test("reader discovery archive admits only one exact regular ustar payload", () => {
+  const source = Buffer.from("pinned synthetic helper\n");
+  const valid = readerTarFixture(source);
+  assert.equal(validateReaderArchive(valid, source), undefined);
+  // Additional all-zero blocking is harmless; no second member or metadata is admitted.
+  assert.equal(validateReaderArchive(Buffer.concat([valid, Buffer.alloc(512)]), source), undefined);
+  for (const archive of [
+    readerTarFixture(source, { type: "x" }), readerTarFixture(source, { type: "g" }),
+    readerTarFixture(source, { type: "2" }), readerTarFixture(source, { type: "1" }),
+    readerTarFixture(source, { name: "._managed-runner-artifacts.py" }),
+    readerTarFixture(source, { prefix: "nested" }),
+    Buffer.concat([valid.subarray(0, valid.length - 1024), valid]),
+    valid.subarray(0, valid.length - 512), Buffer.from("not tar"), Buffer.alloc(1024 * 1024 + 512),
+  ]) assert.throws(() => validateReaderArchive(archive, source), /reader_archive_/);
+  for (const offset of [0, 124, 148, 257, 263, 512, 512 + source.length, valid.length - 1]) {
+    const changed = Buffer.from(valid);
+    changed[offset] ^= 1;
+    assert.throws(() => validateReaderArchive(changed, source), /reader_archive_/);
+  }
+  assert.throws(() => validateReaderArchive(valid, Buffer.from("different pinned helper")), /reader_archive_payload/);
+});
+
+test("reader stderr evidence is raw bounded closed metadata retained before semantic refusal", async () => {
+  const bytes = Buffer.from([0xff, 0, 0x61, 0x0a]);
+  const terminal = { code: 0, signal: null, stderrBytes: bytes.length,
+    stderrSha256: createHash("sha256").update(bytes).digest("hex") };
+  assert.deepEqual(READER_OBSERVATION_OPERATIONS, ["reader_archive_create", "reader_stage_create",
+    "reader_archive_extract", "reader_source_hash", "reader_install_dir", "reader_install", "reader_discover"]);
+  for (const operation of READER_OBSERVATION_OPERATIONS) {
+    let retained = false;
+    await assert.rejects(() => refuseReaderStderr(operation, terminal, bytes, async (metadata, raw) => {
+      await Promise.resolve();
+      assert(raw.equals(bytes));
+      assert.deepEqual(JSON.parse(metadata), { version: 1, operation, ...terminal,
+        retainedStderrBytes: bytes.length, stderrTruncated: false });
+      retained = true;
+    }), operation === "reader_archive_create" ? /reader_observation_archive_stderr/ : /reader_observation_stderr/);
+    assert.equal(retained, true);
+  }
+  const large = Buffer.alloc(70 * 1024, 0xfe);
+  const tail = boundedDiagnosticTail(Buffer.alloc(0), large);
+  const record = JSON.parse(readerOperationDiagnostic("reader_discover", { code: null, signal: "SIGTERM",
+    stderrBytes: large.length, stderrSha256: createHash("sha256").update(large).digest("hex") }, tail));
+  assert.equal(record.retainedStderrBytes, 64 * 1024);
+  assert.equal(record.stderrTruncated, true);
+  assert.equal(record.signal, "SIGTERM");
+  assert.deepEqual(Object.keys(record).sort(), ["version", "operation", "code", "signal", "stderrBytes",
+    "stderrSha256", "retainedStderrBytes", "stderrTruncated"].sort());
+  assert.equal(JSON.parse(readerOperationDiagnostic("reader_discover", { ...terminal,
+    signal: "not-a-finite-signal-or-an-argv" }, bytes)).signal, "other");
+  assert.throws(() => readerOperationDiagnostic("arbitrary_operation", terminal, bytes), /diagnostic_shape/);
+  assert.throws(() => readerOperationDiagnostic("reader_discover", { ...terminal, stdout: "candidate" }, bytes),
+    /diagnostic_shape/);
+  assert.throws(() => readerOperationDiagnostic("reader_discover", terminal, Buffer.alloc(65537)), /diagnostic_shape/);
+  assert.throws(() => readerOperationDiagnostic("reader_discover", terminal, Buffer.alloc(0)), /diagnostic_shape/);
+  assert.throws(() => readerOperationDiagnostic("reader_discover", { ...terminal,
+    stderrSha256: "0".repeat(64) }, bytes), /diagnostic_shape/);
+});
+
+test("reader stderr retention failure or exhaustion cannot silently become an ordinary refusal", async () => {
+  const bytes = Buffer.from("warning\n");
+  const terminal = { code: 0, signal: null, stderrBytes: bytes.length,
+    stderrSha256: createHash("sha256").update(bytes).digest("hex") };
+  for (const failure of ["disk failure", "reader_observation_diagnostic_limit"]) {
+    await assert.rejects(() => refuseReaderStderr("reader_discover", terminal, bytes,
+      async () => { throw new Error(failure); }), failure === "reader_observation_diagnostic_limit"
+      ? /^Error: reader_observation_diagnostic_limit$/ : /^Error: reader_observation_diagnostic_failed$/);
+  }
+  await assert.rejects(() => refuseReaderStderr("reader_discover", terminal, bytes, null), /diagnostic_failed/);
+  let retained = false;
+  await refuseReaderStderr("reader_discover", { code: 0, signal: null, stderrBytes: 0,
+    stderrSha256: createHash("sha256").digest("hex") }, Buffer.alloc(0), async () => { retained = true; });
+  assert.equal(retained, false);
+});
+
+test("reader extraction stderr stops discovery after retaining evidence without a candidate", async () => {
+  const sourceSha = "a".repeat(64);
+  const operations = [];
+  const evidence = [];
+  await assert.rejects(() => observeGuestReaderRuntime(async (_args, _settings, operation) => {
+    operations.push(operation);
+    if (operation === "reader_archive_extract") {
+      const bytes = Buffer.from("synthetic extraction warning\n");
+      await refuseReaderStderr(operation, { code: 0, signal: null, stderrBytes: bytes.length,
+        stderrSha256: createHash("sha256").update(bytes).digest("hex") }, bytes,
+      async (metadata, raw) => { evidence.push({ metadata, raw }); });
+    }
+    return "";
+  }, Buffer.from("synthetic bounded archive"), sourceSha), /reader_observation_stderr/);
+  assert.deepEqual(operations, ["reader_stage_create", "reader_archive_extract"]);
+  assert.equal(evidence.length, 1);
+  assert.equal(JSON.parse(evidence[0].metadata).operation, "reader_archive_extract");
+  assert(evidence[0].raw.equals(Buffer.from("synthetic extraction warning\n")));
+});
+
+test("reader observation stages only the pinned helper and uses the fixed bootstrap without image work", async () => {
+  const calls = [];
+  const observation = readerObservationFixture();
+  const sourceSha = observation.candidate.readerSourceSha256;
+  const guest = async (args, settings, operation) => {
+    calls.push({ args, settings, operation });
+    if (args[0] === "sha256sum") return `${sourceSha}  ${args[1]}\n`;
+    if (args.includes("guest-discover")) return `${canonicalJson(observation)}\n`;
+    return "";
+  };
+  const result = await observeGuestReaderRuntime(guest, Buffer.from("synthetic bounded tar"), sourceSha);
+  assert.deepEqual(result, observation);
+  assert.equal(calls.length, 6);
+  assert.deepEqual(calls.map((call) => call.operation), READER_OBSERVATION_OPERATIONS.slice(1));
+  assert.deepEqual(calls[1].args.slice(0, 3), ["tar", "-xf", "-"]);
+  assert(Buffer.isBuffer(calls[1].settings.inputBuffer));
+  assert(calls[4].args.includes("500"));
+  assert.equal(calls[5].args[5], "/usr/bin/python3");
+  assert.deepEqual(calls[5].args.slice(6, 9), ["-I", "-S", "-B"]);
+  for (const forbidden of ["docker", "buildx", "guest-probe", "guest-read", "apt-get", "apk"]) {
+    assert(calls.every((call) => !call.args.includes(forbidden)));
+  }
+});
+
+test("missing or malformed reader discovery never falls back or becomes an approval", async () => {
+  const fixture = readerObservationFixture();
+  const digest = fixture.candidate.readerSourceSha256;
+  for (const response of [null, { ...fixture, qualified: true }, { ...fixture, extra: true },
+    { ...fixture, candidate: { ...fixture.candidate, runtime: { ...fixture.candidate.runtime, uid: 501 } } }]) {
+    let observations = 0;
+    const guest = async (args) => {
+      if (args[0] === "sha256sum") return `${digest}  ${args[1]}\n`;
+      if (args.includes("guest-discover")) {
+        observations += 1;
+        if (response === null) throw new Error("fixed bootstrap unavailable");
+        return `${canonicalJson(response)}\n`;
+      }
+      return "";
+    };
+    await assert.rejects(() => observeGuestReaderRuntime(guest, Buffer.from("tar"), digest));
+    assert.equal(observations, 1);
+  }
+  let discovery = false;
+  await assert.rejects(() => observeGuestReaderRuntime(async (args) => {
+    if (args.includes("guest-discover")) discovery = true;
+    return args[0] === "sha256sum" ? `${"f".repeat(64)}  ${args[1]}\n` : "";
+  }, Buffer.from("tar"), digest), /reader_observation_source_changed/);
+  assert.equal(discovery, false);
+});
+
+test("reader candidate terminal record requires full cleanup and denies compatibility or runtime authority", async () => {
+  const value = { sourceCommit: "c".repeat(40), harnessSha256: "d".repeat(64), toolSourcesSha256: "e".repeat(64),
+    observation: readerObservationFixture(), cleanup: { privateInventoriesEmpty: true,
+      ownedVmPidsAbsent: true, socketAbsent: true, stateAbsent: true, usernetSocketsAbsent: true } };
+  const report = readerRuntimeObservationReport(value, "a".repeat(64), "c".repeat(40));
+  assert.equal(report.qualified, false);
+  assert.deepEqual(report.claims, { compatibility: false, image: false, runnerStartup: false, release: false });
+  assert(!Object.hasOwn(report, "approval") && !Object.hasOwn(report, "probe"));
+  for (const key of Object.keys(value.cleanup)) {
+    assert.throws(() => readerRuntimeObservationReport({ ...value,
+      cleanup: { ...value.cleanup, [key]: false } }, "a".repeat(64), "c".repeat(40)), /reader_observation_report/);
+  }
+  assert.throws(() => readerRuntimeObservationReport({ ...value, approval: true }, "a".repeat(64), "c".repeat(40)));
+  assert.throws(() => readerRuntimeObservationReport(value, "f".repeat(64), "c".repeat(40)));
+  assert.throws(() => readerRuntimeObservationReport(value, "a".repeat(64)), /expected_source_commit_required/);
+  assert.throws(() => readerRuntimeObservationReport(value, "a".repeat(64), expectedSource),
+    /reader_observation_source_mismatch/);
+  const source = await readFile(new URL("./run-nonprod-managed-runner-vm-tests.mjs", import.meta.url), "utf8");
+  const terminal = source.indexOf("const observedReport = readerRuntimeObservationReport");
+  assert(terminal > source.indexOf('await rm(stateRoot, { recursive: true, force: false })'));
+  assert(terminal > source.indexOf('stage = "source_after_cleanup"'));
+  assert(source.indexOf('if (mode === "reader") {\n    try') < source.indexOf("const report = reportMode"));
+  const discovery = source.slice(source.indexOf('stage = "reader_runtime_observation"'),
+    source.indexOf('stage = "post_image_listener_observation"'));
+  assert(!discovery.includes("artifactApproval =") && !discovery.includes("runManagedRunnerImageWorkload"));
+  assert(source.includes('check(!interrupted && Date.now() < overallDeadline, "reader_observation_deadline")'));
+});
+
+test("phase exhaustion and TERM retain cleanup authority without allowing delete or final receipts", async () => {
+  const source = await readFile(new URL("./run-nonprod-managed-runner-vm-tests.mjs", import.meta.url), "utf8");
+  const runStart = source.indexOf("async function run(tool, args");
+  const clamp = source.indexOf("const admittedTimeout = commandBudget(timeout)", runStart);
+  assert(clamp < source.indexOf("const child = spawn(CLI[tool]", runStart));
+  const controls = source.indexOf("async function artifactControl");
+  assert(source.indexOf("const admittedTimeout = commandBudget(timeoutMs)", controls)
+    < source.indexOf("const child = spawn(CLI.python", controls));
+  const streams = source.indexOf("async function exportAttachments");
+  assert(source.indexOf("const admittedTimeout = commandBudget(timeoutMs)", streams)
+    < source.indexOf("const writer = spawn(CLI.python", streams));
+  assert(source.includes('check(!workloadCleanupPending, "artifact_workload_cleanup_pending")'));
+  assert(source.includes('budgetPhase = "outerCleanup"'));
+  assert(source.includes("if (active && !cleaning) active.terminate()"));
+  assert(source.includes('catch { cleanupFailure = "cleanup_unproven_state_retained"; }'));
+  assert(source.includes('commandBudget(30_000); // exhaustion cannot start a new retry'));
+  assert(source.includes('commandBudget(1); // complete evidence arriving after the phase deadline is not a pass'));
+});
+
 test("lsof parser rejects malformed, truncated, duplicate, and partially skipped records", () => {
   for (const invalid of [
     "n127.0.0.1:60022\n",
@@ -947,7 +1552,7 @@ test("diagnostics stay stream-separated, bounded, and metadata-only in failure r
   assert.equal(report.listenerFailureEvidence.tcp.vmOwnedCount, 1);
   assert.equal(report.listenerFailureEvidence.udp.unknownPidCount, 1);
   assert.equal(report.hostProcessEvidence.producerSha256,
-    "3c53430e3e937a27b9697264b3b9e5f29ff76f395c7a52546c9e85035a88cf95");
+    "bac1d707b8d077bde9ed6dd787d801550b198fefc908c82e25edb4cae3f6481a");
   assert.equal(JSON.stringify(report.listenerFailureEvidence).includes("127.0.0.1"), false);
   assert.equal(report.retainedState, state);
   const interrupted = failureReport({ stage: "cleanup", interrupted: true, retained: false,
@@ -981,8 +1586,9 @@ test("diagnostics stay stream-separated, bounded, and metadata-only in failure r
 });
 
 test("closed success report validates observed evidence and denies broader claims", () => {
+  const compatibilitySource = "2b85339a403cb5272a56f1b2f0bf8065ca3b19ed";
   const report = reportMode({
-    baseCommit: "2b85339a403cb5272a56f1b2f0bf8065ca3b19ed",
+    baseCommit: compatibilitySource,
     buildx: { status: "available", version: "v0.30.1" },
     claims: { api: false, image: false, productionAuthority: false, runnerStartup: false },
     cleanup: {
@@ -1032,10 +1638,25 @@ test("closed success report validates observed evidence and denies broader claim
     testSha256: "d".repeat(64),
     toolVersions: { colima: "0.10.3", lima: "2.2.1", qemu: "11.1.2" },
     version: 1,
-  });
+  }, compatibilitySource);
   assert.equal(report.claims.runnerStartup, false);
   assert.equal(report.claims.productionAuthority, false);
-  assert(reportMode({ ...report, buildx: { status: "unsupported_known" } }));
+  assert(reportMode({ ...report, buildx: { status: "unsupported_known" } }, compatibilitySource));
+  const imageSource = "32ca96dbfbe151b1ca0294ad945ce58a4276087f";
+  const imageCompatibility = { ...report, baseCommit: imageSource };
+  assert.equal(reportMode(imageCompatibility, imageSource).baseCommit, imageSource);
+  for (const independentlyApproved of [expectedSource, "c".repeat(40)]) {
+    assert.equal(reportMode({ ...report, baseCommit: independentlyApproved }, independentlyApproved).baseCommit,
+      independentlyApproved);
+  }
+  for (const invalidExpected of [undefined, "0".repeat(40), "F".repeat(40), "HEAD", "f".repeat(39),
+    `${compatibilitySource}\n`]) {
+    assert.throws(() => reportMode(report, invalidExpected), /report_source_scope/);
+  }
+  assert.throws(() => reportMode(imageCompatibility), /report_source_scope/);
+  assert.throws(() => reportMode(report, imageSource), /report_identity/);
+  assert.throws(() => reportMode(imageCompatibility, "f".repeat(40)),
+    /report_identity/);
   const outboundReport = reportMode({
     ...report,
     hostProcessEvidence: {
@@ -1051,7 +1672,7 @@ test("closed success report validates observed evidence and denies broader claim
       stableAmbientClientCount: 1,
       usernetClientCount: 3,
     },
-  });
+  }, compatibilitySource);
   assert.equal(outboundReport.listenerEvidence.literalOfficialDependencyPurposeClaimed, false);
   for (const raw of ["192.0.2.20", '"peerAddress"', '"peerPort"', '"pid"', '"fd"']) {
     assert.equal(JSON.stringify(outboundReport).includes(raw), false);
@@ -1073,7 +1694,7 @@ test("closed success report validates observed evidence and denies broader claim
     { observations: { ...report.observations, engineCpuCount: 8 } },
     { buildx: { status: "unknown" } },
     { buildx: { status: "unsupported_known", detail: "unbounded" } },
-  ]) assert.throws(() => reportMode({ ...report, ...changed }));
+  ]) assert.throws(() => reportMode({ ...report, ...changed }, compatibilitySource));
 });
 
 test("listener observation retries only complete snapshot-churn attempts", async () => {

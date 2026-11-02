@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Disposable D0 QEMU compatibility qualification only. It does not build an
-// image, start a Jobs runner, or establish production/runtime authority.
+// Disposable QEMU qualification. The image-smoke mode additionally exercises
+// an actual isolated image; neither mode starts the normal Jobs runner/API.
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -18,6 +18,9 @@ import { basename, dirname, join, resolve } from "node:path";
 import { isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 import { TextDecoder } from "node:util";
+import { ARTIFACT_CAPS, canonicalArtifactJson, copyArtifactStream, guestReaderArguments,
+  guestReaderDiscoveryArguments, validateReaderApproval, validateReaderObservation }
+  from "./managed-runner-artifact-stream.mjs";
 
 const GIB = 1024 ** 3;
 const SELF = fileURLToPath(import.meta.url);
@@ -25,8 +28,21 @@ const TEST = fileURLToPath(new URL("./nonprod-managed-runner-vm.test.mjs", impor
 const HOST_PROCESS_PRODUCER = fileURLToPath(
   new URL("./managed-runner-host-processes.py", import.meta.url),
 );
+const ARTIFACT_HELPER = fileURLToPath(new URL("./managed-runner-artifacts.py", import.meta.url));
+const IMAGE_TOOL_FILES = Object.freeze([
+  "managed-cloud-release-gate.mjs", "managed-cloud-release-gate.test.mjs",
+  "managed-runner-image-workload.mjs", "managed-runner-image-workload.test.mjs",
+  "nonprod-managed-runner-image-inspect.mjs", "nonprod-managed-runner-image-inspect.test.mjs",
+  "managed-runner-artifacts.py", "managed-runner-artifacts.test.py",
+  "managed-runner-artifact-stream.mjs", "managed-runner-artifact-stream.test.mjs",
+]);
+const IMAGE_PROGRESS_PHASES = Object.freeze([
+  "vm_starting", "vm_isolation_checked", "inputs_prepared", "builder_started",
+  "image_build_started", "image_build_finished", "image_inspection_started",
+  "image_inspection_finished",
+]);
 const REPO = resolve(dirname(SELF), "../..");
-const BASE_COMMIT = "2b85339a403cb5272a56f1b2f0bf8065ca3b19ed";
+const SOURCE_COMMIT = /^(?!0{40}$)[a-f0-9]{40}$/;
 const CLI = Object.freeze({
   colima: "/opt/homebrew/bin/colima",
   lima: "/opt/homebrew/bin/limactl",
@@ -34,6 +50,7 @@ const CLI = Object.freeze({
   git: "/usr/bin/git",
   lsof: "/usr/sbin/lsof",
   python: "/usr/bin/python3",
+  tar: "/usr/bin/tar",
 });
 const OWNER_MARKER = ".phase639-owner.json";
 const LAUNCHER_MARKER = ".bluey-test-run-v2";
@@ -42,10 +59,27 @@ const MAX_COMMAND_OUTPUT = 2 * 1024 * 1024;
 const MAX_FAILURE_COMMANDS = 8;
 const MAX_HOST_AGENT_LOG = 256 * 1024;
 const MAX_HOST_PROCESS_OUTPUT = 1024 * 1024;
+// Mandatory outer tail only. Workload cleanup is reserved separately until done;
+// post-export observations share a deadline rather than summing all retry caps.
+export const ARTIFACT_REMAINING_BUDGET_MS = Object.freeze({
+  vmCleanup: 3 * 2 * 30_000 + 90_000 + 60_000 + 120_000, // three inventories, stop/force/delete
+  cleanupGrace: 9 * 5_000,
+  sourceAfter: 35_000,
+  qualification: 35_000,
+  localIoMargin: 120_000,
+  activeTeardown: 5_000,
+});
+export const ARTIFACT_CLEANUP_RESERVE_MS = Object.values(ARTIFACT_REMAINING_BUDGET_MS)
+  .reduce((total, value) => total + value, 0);
+export const ARTIFACT_WORKLOAD_CLEANUP_MS = 60_000 + 120_000 + 2 * 30_000 + 4 * 5_000;
+export const ARTIFACT_WORKLOAD_PENDING_MS = ARTIFACT_WORKLOAD_CLEANUP_MS + 35_000;
+export const ARTIFACT_POST_OBSERVATION_MS = 120_000; // includes current-child termination grace
+export const ARTIFACT_SOURCE_FINAL_MS = 35_000;
+const POST_EXPORT_RESERVE_MS = ARTIFACT_POST_OBSERVATION_MS + ARTIFACT_SOURCE_FINAL_MS;
 const KNOWN_VERSIONS = Object.freeze({ colima: "0.10.3", lima: "2.2.1", qemu: "11.1.2" });
 const KNOWN_LIMA_BINARY = "/opt/homebrew/Cellar/lima/2.2.1/bin/limactl";
 const KNOWN_HOST_PROCESS_PRODUCER_SHA256 =
-  "3c53430e3e937a27b9697264b3b9e5f29ff76f395c7a52546c9e85035a88cf95";
+  "bac1d707b8d077bde9ed6dd787d801550b198fefc908c82e25edb4cae3f6481a";
 const LIMA_PORT_FORWARD_OVERRIDE = Buffer.from([
   "portForwards:",
   "- guestIP: \"0.0.0.0\"",
@@ -81,6 +115,17 @@ function canonicalJson(value) {
       `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+async function imageToolsetSha256() {
+  const entries = [];
+  for (const file of IMAGE_TOOL_FILES) {
+    const bytes = await readFile(join(dirname(SELF), file));
+    check(bytes.length > 0 && bytes.length <= 2 * 1024 * 1024,
+      "image_tool_source_bound");
+    entries.push({ path: file, sha256: sha256(bytes) });
+  }
+  return sha256(Buffer.from(canonicalJson(entries)));
 }
 
 export function parseHostProcessSnapshot(raw) {
@@ -670,18 +715,45 @@ function listenerDeltaSummary(protocol, rows, baselinePids, owned, helperPid) {
   });
 }
 
-export function listenerDeltaFailureEvidence(input, ownedPids, helperPid = null) {
+export function listenerDeltaFailureEvidence(input, ownedPids, helperPid = null, proof = null) {
   const { baselinePids, owned, tcpDelta, udpDelta } = listenerDeltaAnalysis(input, ownedPids);
   check(helperPid === null || (Number.isInteger(helperPid) && helperPid > 1
     && owned.has(helperPid)), "listener_helper_pid_shape");
   return Object.freeze({
-    version: 1,
+    version: proof === null ? 1 : 2,
     literalCodeSigningClaimed: false,
     literalNoHostNetworkClaimed: false,
     literalOfficialDependencyPurposeClaimed: false,
     tcp: listenerDeltaSummary("tcp", tcpDelta, baselinePids, owned, helperPid),
     udp: listenerDeltaSummary("udp", udpDelta, baselinePids, owned, helperPid),
+    ...(proof === null ? {} : { udpRefusals: udpRefusalCounts(udpDelta, baselinePids, owned, helperPid, proof) }),
   });
+}
+
+function udpRefusalCounts(rows, baselinePids, owned, helperPid, proof) {
+  const counts = { endpointShapeRefused: 0, ownerRefused: 0, nativeBindingRefused: 0,
+    nativeBindingNotEvaluated: 0, predicatePassed: 0 };
+  for (const row of rows) {
+    // Diagnostic order only. Admission still executes the unchanged udpClientEvidence.
+    let endpoint = false;
+    try { endpoint = row.connected && !row.unbound && concreteNumericEndpoint(row.address, row.port)
+      && concreteNumericEndpoint(row.peerAddress, row.peerPort); } catch {}
+    if (!endpoint) { counts.endpointShapeRefused += 1; continue; }
+    if (row.pid !== helperPid && (owned.has(row.pid) || row.pid === proof.controllerPid
+      || row.pid === proof.parentPid || !baselinePids.has(row.pid))) {
+      counts.ownerRefused += 1;
+      continue;
+    }
+    try {
+      udpClientEvidence([row], baselinePids, owned, helperPid, proof);
+      counts.predicatePassed += 1;
+    } catch (error) {
+      if (["udp_process_identity_changed", "udp_usernet_identity_changed",
+        "udp_usernet_identity_preexisting"].includes(error.message)) counts.nativeBindingRefused += 1;
+      else counts.nativeBindingNotEvaluated += 1;
+    }
+  }
+  return Object.freeze(counts);
 }
 
 function ipv6Words(address) {
@@ -846,9 +918,13 @@ export function assertVmConfiguration(raw) {
 
 export function assertApprovedCli(path, canonical, metadata, uid) {
   check((typeof path === "string" && path.startsWith("/opt/homebrew/bin/"))
-    || path === "/usr/bin/git" || path === "/usr/sbin/lsof" || path === "/usr/bin/python3",
+    || path === "/usr/bin/git" || path === "/usr/sbin/lsof" || path === "/usr/bin/python3"
+    || path === "/usr/bin/tar",
   "approved_cli_path");
   check(typeof canonical === "string" && canonical.startsWith("/"), "approved_cli_realpath");
+  check(path !== "/usr/bin/tar"
+    || (canonical === "/usr/bin/bsdtar" && metadata?.uid === 0),
+  "approved_system_tar_identity");
   check(metadata?.file && !metadata.symlink && (metadata.uid === 0 || metadata.uid === uid)
     && (metadata.mode & 0o022) === 0 && (metadata.mode & 0o111) !== 0, "approved_cli_identity");
 }
@@ -878,9 +954,10 @@ export function diagnosticRetentionPlan(names) {
 function closedListenerFailureEvidence(value) {
   if (value === null || value === undefined) return null;
   exactKeys(value, ["literalCodeSigningClaimed", "literalNoHostNetworkClaimed",
-    "literalOfficialDependencyPurposeClaimed", "tcp", "udp", "version"],
+    "literalOfficialDependencyPurposeClaimed", "tcp", "udp", "version",
+    ...(value.version === 2 ? ["udpRefusals"] : [])],
     "listener_failure_evidence_shape");
-  check(value.version === 1 && value.literalCodeSigningClaimed === false
+  check([1, 2].includes(value.version) && value.literalCodeSigningClaimed === false
     && value.literalNoHostNetworkClaimed === false
     && value.literalOfficialDependencyPurposeClaimed === false,
     "listener_failure_evidence_shape");
@@ -898,6 +975,14 @@ function closedListenerFailureEvidence(value) {
       && summary.helperConnectedCount <= summary.helperCount
       && summary.helperUnboundCount <= summary.helperCount
       && /^[a-f0-9]{64}$/.test(summary.deltaSha256), "listener_failure_evidence_shape");
+  }
+  if (value.version === 2) {
+    exactKeys(value.udpRefusals, ["endpointShapeRefused", "ownerRefused", "nativeBindingRefused",
+      "nativeBindingNotEvaluated", "predicatePassed"], "listener_failure_evidence_shape");
+    const counts = Object.values(value.udpRefusals);
+    check(counts.every((count) => Number.isInteger(count) && count >= 0 && count <= 1024)
+      && counts.reduce((sum, count) => sum + count, 0) === value.udp.deltaCount,
+    "listener_failure_evidence_shape");
   }
   return value;
 }
@@ -962,9 +1047,31 @@ export function hostProcessEvidence(base, listenerEvidence) {
   }));
 }
 
+export function validateFailureArchiveRetention(value) {
+  exactKeys(value, ["version", "state", "qualified", "d2Authority", "releaseAuthority", "childName",
+    "manifestSha256", "retentionFailure"], "failed_archive_retention_shape");
+  check(value.version === 1 && ["incomplete", "retained"].includes(value.state)
+    && value.qualified === false && value.d2Authority === false && value.releaseAuthority === false
+    && (value.childName === null || (typeof value.childName === "string"
+      && /^phase639-failed-image-artifacts-[a-f0-9]{24}$/.test(value.childName)))
+    && (value.retentionFailure === null || ["transfer_failed", "post_checks_failed", "source_failed",
+      "cleanup_failed", "finalization_failed"].includes(value.retentionFailure)), "failed_archive_retention_shape");
+  if (value.state === "retained") {
+    check(value.childName !== null && typeof value.manifestSha256 === "string"
+      && /^(?!0{64}$)[a-f0-9]{64}$/.test(value.manifestSha256)
+      && value.retentionFailure === null, "failed_archive_retention_shape");
+  } else check(value.manifestSha256 === null, "failed_archive_retention_shape");
+  return { ...value };
+}
+
+export function failedArchiveFinalizationAllowed(value) {
+  return value.pending === true && value.postChecks === true && value.cleanupProven === true
+    && value.cleanupFailure === undefined && value.sourceUnchanged === true && value.interrupted === false;
+}
+
 export function failureReport({ stage, primaryFailure, cleanupFailure, interrupted, retained,
   stateRoot, profile, cleanupProven, retainedDiagnosticsOnly, diagnostics,
-  listenerFailureEvidence = null, hostProcessEvidence: processEvidence = null }) {
+  listenerFailureEvidence = null, hostProcessEvidence: processEvidence = null, archiveRetention = null }) {
   check(Array.isArray(diagnostics) && diagnostics.length <= MAX_FAILURE_COMMANDS * 2,
     "diagnostic_count_bound");
   const closed = diagnostics.map((entry) => {
@@ -1001,17 +1108,21 @@ export function failureReport({ stage, primaryFailure, cleanupFailure, interrupt
     diagnostics: closed,
     hostProcessEvidence: closedProcess,
     listenerFailureEvidence: closedListener,
+    ...(archiveRetention ? { archiveRetention: validateFailureArchiveRetention(archiveRetention) } : {}),
     ...(retained ? { retainedState: stateRoot, profile } : {}),
   };
 }
 
-export function reportMode(value) {
+export function reportMode(value, expectedSourceCommit) {
+  check(typeof expectedSourceCommit === "string" && expectedSourceCommit.length === 40
+    && SOURCE_COMMIT.test(expectedSourceCommit),
+    "report_source_scope");
   exactKeys(value, ["baseCommit", "buildx", "claims", "cleanup", "emulated", "harnessSha256",
     "hostProcessEvidence", "identities", "listenerEvidence", "observations", "qualification",
     "resources", "testSha256", "toolVersions", "version", "portForwardPolicySha256"],
   "report_shape");
   check(value.version === 1 && value.qualification === "isolated_linux_amd64_vm_compatibility_only"
-    && value.emulated === true && value.baseCommit === BASE_COMMIT
+    && value.emulated === true && value.baseCommit === expectedSourceCommit
     && /^[a-f0-9]{64}$/.test(value.harnessSha256)
     && /^[a-f0-9]{64}$/.test(value.testSha256)
     && value.portForwardPolicySha256 === sha256(LIMA_PORT_FORWARD_OVERRIDE), "report_identity");
@@ -1123,13 +1234,275 @@ function singleFlight(operation) {
   return () => pending ??= operation();
 }
 
+export function parseVmMode(argv) {
+  check(Array.isArray(argv) && argv.length === 3 && argv[1] === "--source-commit"
+    && typeof argv[2] === "string" && argv[2].length === 40 && SOURCE_COMMIT.test(argv[2])
+    && ["--preflight-only", "--runner-image-smoke", "--reader-runtime-observation"].includes(argv[0]),
+  "exact_preflight_cli_required");
+  return argv[0] === "--runner-image-smoke" ? "image"
+    : argv[0] === "--reader-runtime-observation" ? "reader" : "compatibility";
+}
+
+export function parseArtifactOptions(argv) {
+  check(Array.isArray(argv) && [3, 9].includes(argv.length), "exact_preflight_cli_required");
+  const mode = parseVmMode(argv.slice(0, 3));
+  const sourceCommit = argv[2];
+  if (argv.length === 3) return { mode, sourceCommit, artifact: null };
+  check(mode === "image" && argv[3] === "--artifact-parent" && argv[5] === "--artifact-filesystem-dev"
+    && argv[7] === "--guest-reader-approval", "exact_preflight_cli_required");
+  check([argv[4], argv[8]].every((path) => typeof path === "string" && path.startsWith("/")
+    && resolve(path) === path && path !== "/") && canonicalUint64(argv[6]), "artifact_option_scope");
+  return { mode, sourceCommit,
+    artifact: { parent: argv[4], filesystemDev: argv[6], approvalPath: argv[8] } };
+}
+
+export function requireExpectedSourceCommit(observed, expectedSourceCommit, code = "base_commit_changed") {
+  check(typeof expectedSourceCommit === "string" && expectedSourceCommit.length === 40
+    && SOURCE_COMMIT.test(expectedSourceCommit),
+    "expected_source_commit_required");
+  check(typeof observed === "string" && observed === expectedSourceCommit, code);
+  return observed;
+}
+
+// Read-only source admission precedes HOME/launcher/VM-state mutation. It is not
+// a second general command launcher and cannot select another executable/argv.
+async function readApprovedGitHead() {
+  const canonical = await realpath(CLI.git);
+  const before = await lstat(canonical);
+  assertApprovedCli(CLI.git, canonical, metadata(before), process.getuid());
+  const child = spawn(CLI.git, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+    "rev-parse", "--verify", "HEAD^{commit}"], {
+    cwd: REPO,
+    env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C", GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_SYSTEM: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_COUNT: "0",
+      GIT_OPTIONAL_LOCKS: "0", GIT_NO_REPLACE_OBJECTS: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let bytes = Buffer.alloc(0), stderrBytes = 0, refused = false, spawnFailed = false;
+  let escalation, terminalLimit;
+  let failTerminal;
+  const terminate = () => {
+    refused = true;
+    child.kill("SIGTERM");
+    escalation ??= setTimeout(() => {
+      child.kill("SIGKILL");
+      terminalLimit ??= setTimeout(() => failTerminal(new Error("source_preflight_cleanup_unproven")), 5000);
+    }, 5000);
+  };
+  const signals = ["SIGHUP", "SIGINT", "SIGTERM"];
+  for (const signal of signals) process.on(signal, terminate);
+  child.stdout.on("data", (chunk) => {
+    if (bytes.length + chunk.length > 1024) terminate();
+    else bytes = Buffer.concat([bytes, chunk]);
+  });
+  child.stderr.on("data", (chunk) => { stderrBytes += chunk.length; if (stderrBytes > 1024) terminate(); });
+  const timer = setTimeout(terminate, 30_000);
+  try {
+    const terminal = await new Promise((resolve, reject) => {
+      failTerminal = reject;
+      child.once("error", () => { spawnFailed = true; });
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+    check(!refused && !spawnFailed && terminal.code === 0 && terminal.signal === null
+      && stderrBytes === 0 && bytes.length === 41 && bytes.every((byte) => byte < 128)
+      && /^[a-f0-9]{40}\n$/.test(bytes.toString("ascii")), "source_preflight_failed");
+    const after = await lstat(canonical);
+    check(await realpath(CLI.git) === canonical && identity(before) === identity(after)
+      && before.uid === after.uid && before.mode === after.mode && before.size === after.size
+      && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs, "source_preflight_tool_changed");
+    check(!refused, "source_preflight_failed");
+    return bytes.toString("ascii").slice(0, -1);
+  } finally {
+    clearTimeout(timer);
+    clearTimeout(escalation);
+    clearTimeout(terminalLimit);
+    for (const signal of signals) process.off(signal, terminate);
+  }
+}
+
+export async function sourceCommitPreflight(expectedSourceCommit, readHead = readApprovedGitHead) {
+  check(typeof expectedSourceCommit === "string" && expectedSourceCommit.length === 40
+    && SOURCE_COMMIT.test(expectedSourceCommit),
+    "expected_source_commit_required");
+  check(typeof readHead === "function", "source_preflight_reader");
+  return requireExpectedSourceCommit(await readHead(), expectedSourceCommit);
+}
+
+export function qualificationDuration(options) {
+  check(options && ["compatibility", "image", "reader"].includes(options.mode)
+    && (options.artifact === null || (options.mode === "image"
+      && typeof options.artifact === "object")), "qualification_mode_duration");
+  return options.artifact ? 60 * 60_000 : 45 * 60_000;
+}
+
+export function artifactExportDeadline(now, overallDeadline) {
+  check(Number.isSafeInteger(now) && now >= 0 && Number.isSafeInteger(overallDeadline)
+    && overallDeadline - now > ARTIFACT_CLEANUP_RESERVE_MS + POST_EXPORT_RESERVE_MS,
+  "artifact_cleanup_reserve");
+  return Math.min(now + 15 * 60_000,
+    overallDeadline - ARTIFACT_CLEANUP_RESERVE_MS - POST_EXPORT_RESERVE_MS);
+}
+
+export function phaseCommandTimeout(maximum, now, overallDeadline, reserveMs, phaseDeadline = null) {
+  check([maximum, now, overallDeadline, reserveMs].every(Number.isSafeInteger)
+    && maximum > 0 && now >= 0 && reserveMs >= 0
+    && (phaseDeadline === null || Number.isSafeInteger(phaseDeadline)), "phase_budget_shape");
+  const available = Math.min(overallDeadline - now - reserveMs,
+    phaseDeadline === null ? Infinity : phaseDeadline - now - 5_000);
+  check(available > 0, "phase_budget_exhausted");
+  return Math.min(maximum, available);
+}
+
+export const READER_OBSERVATION_OPERATIONS = Object.freeze([
+  "reader_archive_create", "reader_stage_create", "reader_archive_extract", "reader_source_hash",
+  "reader_install_dir", "reader_install", "reader_discover",
+]);
+
+export function readerArchiveArguments(directory) {
+  check(typeof directory === "string" && directory.startsWith("/") && !directory.includes("\0"),
+    "reader_archive_directory");
+  return ["-cf", "-", "--format=ustar", "--no-mac-metadata", "--no-acls", "--no-xattrs",
+    "-C", directory, "managed-runner-artifacts.py"];
+}
+
+// This is deliberately a single pinned regular member, not a general tar reader.
+export function validateReaderArchive(archive, source) {
+  check(Buffer.isBuffer(archive) && archive.length >= 1536 && archive.length <= 1024 * 1024
+    && archive.length % 512 === 0 && Buffer.isBuffer(source)
+    && source.length > 0 && source.length <= 128 * 1024, "reader_archive_shape");
+  const header = archive.subarray(0, 512);
+  const field = (start, length) => header.subarray(start, start + length);
+  const octal = (start, length) => {
+    const bytes = field(start, length);
+    const text = bytes.toString("ascii");
+    check(bytes.every((byte) => byte < 128) && /^[0-7]+[\0 ]*$/.test(text), "reader_archive_octal");
+    const value = Number.parseInt(text, 8);
+    check(Number.isSafeInteger(value), "reader_archive_octal");
+    return value;
+  };
+  const name = Buffer.alloc(100);
+  name.write("managed-runner-artifacts.py", "ascii");
+  check(field(0, 100).equals(name) && field(257, 6).equals(Buffer.from("ustar\0"))
+    && field(263, 2).equals(Buffer.from("00"))
+    && [0, 48].includes(header[156]) && field(157, 100).every((byte) => byte === 0)
+    && field(345, 155).every((byte) => byte === 0), "reader_archive_member");
+  const checksum = header.reduce((sum, byte, index) => sum + (index >= 148 && index < 156 ? 32 : byte), 0);
+  check(octal(148, 8) === checksum, "reader_archive_checksum");
+  const size = octal(124, 12);
+  const paddedEnd = 512 + Math.ceil(size / 512) * 512;
+  check(size === source.length && archive.length >= paddedEnd + 1024
+    && archive.subarray(512, 512 + size).equals(source)
+    && archive.subarray(512 + size).every((byte) => byte === 0), "reader_archive_payload");
+}
+
+export function readerOperationDiagnostic(operation, terminal, stderrTail) {
+  check(READER_OBSERVATION_OPERATIONS.includes(operation) && Buffer.isBuffer(stderrTail)
+    && stderrTail.length <= MAX_DIAGNOSTIC, "reader_observation_diagnostic_shape");
+  exactKeys(terminal, ["code", "signal", "stderrBytes", "stderrSha256"], "reader_observation_diagnostic_shape");
+  check((terminal.code === null || (Number.isInteger(terminal.code) && terminal.code >= 0 && terminal.code <= 255))
+    && (terminal.signal === null || typeof terminal.signal === "string")
+    && Number.isSafeInteger(terminal.stderrBytes) && terminal.stderrBytes >= 0
+    && stderrTail.length === Math.min(terminal.stderrBytes, MAX_DIAGNOSTIC)
+    && /^[a-f0-9]{64}$/.test(terminal.stderrSha256)
+    && (terminal.stderrBytes > MAX_DIAGNOSTIC || sha256(stderrTail) === terminal.stderrSha256),
+  "reader_observation_diagnostic_shape");
+  const signal = terminal.signal === null ? null : ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGPIPE",
+    "SIGBUS", "SIGINT", "SIGHUP", "SIGQUIT", "SIGILL", "SIGFPE", "SIGTRAP", "spawn_error"]
+    .includes(terminal.signal) ? terminal.signal : "other";
+  return Buffer.from(`${JSON.stringify({ version: 1, operation, ...terminal, signal,
+    retainedStderrBytes: stderrTail.length, stderrTruncated: terminal.stderrBytes > stderrTail.length })}\n`);
+}
+
+export async function refuseReaderStderr(operation, terminal, stderrTail, retain) {
+  const metadata = readerOperationDiagnostic(operation, terminal, stderrTail);
+  if (terminal.stderrBytes === 0) return;
+  check(typeof retain === "function", "reader_observation_diagnostic_failed");
+  try { await retain(metadata, stderrTail); } catch (error) {
+    throw new Error(error?.message === "reader_observation_diagnostic_limit"
+      ? "reader_observation_diagnostic_limit" : "reader_observation_diagnostic_failed");
+  }
+  throw new Error(operation === "reader_archive_create"
+    ? "reader_observation_archive_stderr" : "reader_observation_stderr");
+}
+
+export async function observeGuestReaderRuntime(guest, archive, readerSourceSha256) {
+  check(typeof guest === "function" && Buffer.isBuffer(archive) && archive.length > 0
+    && archive.length <= 1024 * 1024 && /^[a-f0-9]{64}$/.test(readerSourceSha256),
+  "reader_observation_input");
+  const staging = "/var/tmp/bluey-jobs-reader-observation-p639";
+  const readerDirectory = "/var/tmp/bluey-jobs-artifact-reader-p639";
+  await guest(["mkdir", "-m", "700", staging], { maximum: 1024 }, "reader_stage_create");
+  await guest(["tar", "-xf", "-", "-C", staging], { inputBuffer: archive, maximum: 1024 },
+    "reader_archive_extract");
+  const copied = await guest(["sha256sum", `${staging}/managed-runner-artifacts.py`], { maximum: 1024 },
+    "reader_source_hash");
+  check(copied === `${readerSourceSha256}  ${staging}/managed-runner-artifacts.py\n`,
+    "reader_observation_source_changed");
+  await guest(["/usr/bin/sudo", "-n", "mkdir", "-m", "700", readerDirectory], { maximum: 1024 },
+    "reader_install_dir");
+  await guest(["/usr/bin/sudo", "-n", "install", "-o", "0", "-g", "0", "-m", "500",
+    `${staging}/managed-runner-artifacts.py`, `${readerDirectory}/reader.py`], { maximum: 1024 },
+    "reader_install");
+  const text = await guest(guestReaderDiscoveryArguments(readerSourceSha256),
+    { maximum: 8192, timeout: 30_000 }, "reader_discover");
+  const observed = JSON.parse(text);
+  check(`${canonicalArtifactJson(observed)}\n` === text, "reader_observation_canonical");
+  validateReaderObservation(observed, readerSourceSha256); // observation is never assigned as an approval
+  return observed;
+}
+
+export function readerRuntimeObservationReport(value, sourceSha256, expectedSourceCommit) {
+  exactKeys(value, ["sourceCommit", "harnessSha256", "toolSourcesSha256", "observation", "cleanup"],
+    "reader_observation_report");
+  requireExpectedSourceCommit(value.sourceCommit, expectedSourceCommit, "reader_observation_source_mismatch");
+  check(SOURCE_COMMIT.test(value.sourceCommit)
+    && [value.harnessSha256, value.toolSourcesSha256].every((digest) => /^[a-f0-9]{64}$/.test(digest)),
+  "reader_observation_report");
+  exactKeys(value.cleanup, ["privateInventoriesEmpty", "ownedVmPidsAbsent", "socketAbsent",
+    "stateAbsent", "usernetSocketsAbsent"], "reader_observation_report");
+  check(Object.values(value.cleanup).every((flag) => flag === true), "reader_observation_report");
+  validateReaderObservation(value.observation, sourceSha256);
+  return { event: "managed_runner_vm_reader_runtime_observation_finished", version: 1,
+    qualified: false, ...value,
+    claims: { compatibility: false, image: false, runnerStartup: false, release: false } };
+}
+
+export async function emitImageReport(fullReport, qualify = null,
+  write = (bytes) => process.stdout.write(bytes)) {
+  check((qualify === null || typeof qualify === "function") && typeof write === "function",
+    "image_report_sink");
+  // This exact insertion-ordered UTF-8 record, including its newline, is both
+  // hashed for the private receipt and emitted. No semantic reserialization.
+  const bytes = Buffer.from(`${JSON.stringify(fullReport)}\n`, "utf8");
+  check(bytes.length <= 64 * 1024, "image_report_bound");
+  if (qualify) await qualify(sha256(bytes));
+  write(bytes);
+}
+
+export function imageProgressRecord(phase) {
+  check(IMAGE_PROGRESS_PHASES.includes(phase), "image_progress_phase");
+  return { event: "managed_runner_vm_image_progress", version: 1, phase };
+}
+
 export async function main(argv = process.argv.slice(2)) {
-  check(argv.length === 1 && argv[0] === "--preflight-only", "exact_preflight_cli_required");
+  const options = parseArtifactOptions(argv);
+  const mode = options.mode;
+  const budgeted = options.artifact !== null || mode === "reader";
+  const expectedSourceCommit = options.sourceCommit;
+  let lastImageProgress = -1;
+  const emitImageProgress = (phase) => {
+    const record = imageProgressRecord(phase);
+    const ordinal = IMAGE_PROGRESS_PHASES.indexOf(phase);
+    check(mode === "image" && ordinal === lastImageProgress + 1, "image_progress_order");
+    lastImageProgress = ordinal;
+    console.log(JSON.stringify(record));
+  };
   check(process.platform === "darwin" && process.arch === "arm64", "native_darwin_arm64_required");
   check(process.env.BLUEY_DATABASE_URL === undefined
     && process.env.BLUEY_TEST_POSTGRES_URL === undefined, "database_environment_forbidden");
 
   const uid = process.getuid();
+  await sourceCommitPreflight(expectedSourceCommit);
   const configuredRoot = process.env.BLUEY_TEST_RUN_ROOT;
   check(typeof configuredRoot === "string", "launcher_root_required");
   const rootReal = await realpath(configuredRoot);
@@ -1184,6 +1557,24 @@ export async function main(argv = process.argv.slice(2)) {
   const diagnostics = [];
   let listenerFailureEvidence = null;
   let processEvidence = null;
+  let imageEvidence;
+  let imageToolSourcesSha256;
+  let artifactApproval;
+  let artifactParent;
+  let artifactBinding;
+  let artifactManifest;
+  let failedArchiveBinding;
+  let failedArchivePending;
+  let archiveRetention;
+  let deferredImageFailure;
+  let failedArchivePostChecks = false;
+  let failedArchiveSourceAfter = false;
+  let readerObservation;
+  let readerSourceSha256;
+  let budgetPhase = "prepare";
+  let phaseDeadline = null;
+  let workloadCleanupPending = false;
+  let workloadFailed = false;
   let usernetSocketsAbsent = false;
   let usernetExpected = false;
   let usernetArtifactsAuthority;
@@ -1213,6 +1604,7 @@ export async function main(argv = process.argv.slice(2)) {
     check(producerSha256 === KNOWN_HOST_PROCESS_PRODUCER_SHA256,
       "host_process_producer_source_unknown");
     producerSource = sourceBefore.producer;
+    if (mode === "image" || mode === "reader") imageToolSourcesSha256 = await imageToolsetSha256();
   } catch (error) {
     setupFailure = codeOf(error, "private_state_setup_failed");
   } finally {
@@ -1274,8 +1666,11 @@ export async function main(argv = process.argv.slice(2)) {
     if (limaPolicyEstablished) await revalidateLimaPolicy();
   }
 
-  async function writeDiagnostics(tool, stdoutTail, stderrTail) {
-    if (failureSequence >= MAX_FAILURE_COMMANDS) return;
+  async function writeDiagnostics(tool, stdoutTail, stderrTail, required = false) {
+    if (failureSequence >= MAX_FAILURE_COMMANDS) {
+      check(!required, "reader_observation_diagnostic_limit");
+      return;
+    }
     failureSequence += 1;
     await revalidate();
     for (const [stream, tail] of [["stdout", stdoutTail], ["stderr", stderrTail]]) {
@@ -1288,20 +1683,77 @@ export async function main(argv = process.argv.slice(2)) {
     }
   }
 
+  function commandBudget(maximum) {
+    if (!budgeted) return maximum;
+    check(!interrupted || cleaning, "interrupted");
+    let reserve = ARTIFACT_CLEANUP_RESERVE_MS + POST_EXPORT_RESERVE_MS
+      + (workloadCleanupPending ? ARTIFACT_WORKLOAD_PENDING_MS : 0);
+    if (budgetPhase === "workloadDiagnostic") reserve = ARTIFACT_CLEANUP_RESERVE_MS + ARTIFACT_WORKLOAD_CLEANUP_MS;
+    if (budgetPhase === "workloadCleanup") reserve = ARTIFACT_CLEANUP_RESERVE_MS
+      + (workloadFailed ? 0 : POST_EXPORT_RESERVE_MS);
+    if (budgetPhase === "postObservation") reserve = ARTIFACT_CLEANUP_RESERVE_MS + ARTIFACT_SOURCE_FINAL_MS;
+    if (budgetPhase === "sourceFinal") reserve = ARTIFACT_CLEANUP_RESERVE_MS;
+    if (budgetPhase === "outerCleanup") reserve = 35_000 + 35_000;
+    if (budgetPhase === "sourceAfter") reserve = 35_000 + 120_000;
+    if (budgetPhase === "qualify") reserve = 5_000;
+    return phaseCommandTimeout(maximum, Date.now(), overallDeadline, reserve, phaseDeadline);
+  }
+
+  function workloadPhase(next, { failed = false } = {}) {
+    check(["failure_diagnostic", "cleanup", "cleaned"].includes(next), "workload_budget_phase");
+    if (next === "failure_diagnostic") {
+      workloadFailed = true;
+      budgetPhase = "workloadDiagnostic";
+      phaseDeadline = null;
+    } else if (next === "cleanup") {
+      workloadFailed = failed;
+      budgetPhase = "workloadCleanup";
+      phaseDeadline = Math.min(Date.now() + ARTIFACT_WORKLOAD_CLEANUP_MS,
+        overallDeadline - ARTIFACT_CLEANUP_RESERVE_MS - (failed ? 0 : POST_EXPORT_RESERVE_MS));
+    } else {
+      workloadCleanupPending = false;
+      budgetPhase = "prepare";
+      phaseDeadline = null;
+    }
+  }
+
   async function run(tool, args, {
     timeout = 30_000, maximum = MAX_COMMAND_OUTPUT, allowFailure = false,
-    retainFailureDiagnostics = true,
+    retainFailureDiagnostics = true, inputBuffer, binaryStdout = false, readerOperation = null,
   } = {}) {
     check(own(CLI, tool), "command_tool_not_allowed");
+    check(readerOperation === null || (mode === "reader"
+      && READER_OBSERVATION_OPERATIONS.includes(readerOperation)
+      && tool === (readerOperation === "reader_archive_create" ? "tar" : "colima")
+      && retainFailureDiagnostics), "reader_observation_operation");
+    if (readerOperation !== null) stage = readerOperation;
+    check(inputBuffer === undefined || (["image", "reader"].includes(mode) && Buffer.isBuffer(inputBuffer)
+      && inputBuffer.length > 0 && inputBuffer.length <= 64 * 1024 * 1024),
+    "command_input_buffer_bound");
+    check(!binaryStdout || ((mode === "image" && ["git", "tar"].includes(tool))
+      || (mode === "reader" && tool === "tar")),
+      "command_binary_output_scope");
+    check(Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 64 * 1024 * 1024,
+      "command_output_bound");
     check(!interrupted || cleaning, "interrupted");
     await revalidate();
     const commandPath = await realpath(CLI[tool]);
     assertApprovedCli(CLI[tool], commandPath, metadata(await lstat(commandPath)), uid);
-    const child = spawn(CLI[tool], args, { cwd: REPO, env, stdio: ["ignore", "pipe", "pipe"] });
+    const admittedTimeout = commandBudget(timeout); // after awaited identity checks, before spawning
+    const child = spawn(CLI[tool], args, {
+      cwd: REPO, env, stdio: [inputBuffer === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+    });
+    let inputFailed = false;
+    if (inputBuffer !== undefined) {
+      child.stdin.on("error", () => { inputFailed = true; });
+      child.stdin.end(inputBuffer);
+    }
     let stdout = [];
     let stdoutTail = Buffer.alloc(0);
     let stderr = [];
     let stderrTail = Buffer.alloc(0);
+    let stderrBytes = 0;
+    const stderrHash = readerOperation === null ? null : createHash("sha256");
     let total = 0;
     let timedOut = false;
     let overflow = false;
@@ -1322,11 +1774,13 @@ export async function main(argv = process.argv.slice(2)) {
     });
     child.stderr.on("data", (chunk) => {
       total += chunk.length;
+      stderrBytes += chunk.length;
+      stderrHash?.update(chunk);
       stderrTail = boundedDiagnosticTail(stderrTail, chunk);
       if (total <= maximum) stderr.push(chunk);
       if (total > maximum) { overflow = true; terminate(); }
     });
-    const timer = setTimeout(() => { timedOut = true; terminate(); }, timeout);
+    const timer = setTimeout(() => { timedOut = true; terminate(); }, admittedTimeout);
     const closed = await new Promise((done) => {
       let settled = false;
       const finish = (value) => { if (!settled) { settled = true; done(value); } };
@@ -1337,18 +1791,185 @@ export async function main(argv = process.argv.slice(2)) {
     clearTimeout(escalation);
     active = undefined;
     const failed = timedOut || overflow || closed.code !== 0 || closed.signal !== null;
-    if (failed && retainFailureDiagnostics) await writeDiagnostics(tool, stdoutTail, stderrTail);
+    const readerTerminal = readerOperation === null ? null : {
+      ...closed, stderrBytes, stderrSha256: stderrHash.digest("hex"),
+    };
+    const retainReaderDiagnostic = async (metadata, bytes) => {
+      try { await writeDiagnostics(tool, metadata, bytes, true); } catch (error) {
+        throw new Error(error?.message === "reader_observation_diagnostic_limit"
+          ? "reader_observation_diagnostic_limit" : "reader_observation_diagnostic_failed");
+      }
+    };
+    if ((failed || (readerOperation !== null && inputFailed)) && retainFailureDiagnostics) {
+      if (readerOperation === null) await writeDiagnostics(tool, stdoutTail, stderrTail);
+      else await retainReaderDiagnostic(
+        readerOperationDiagnostic(readerOperation, readerTerminal, stderrTail), stderrTail);
+    }
     if (timedOut) throw new Error("command_timed_out");
     if (overflow) throw new Error("command_output_too_large");
+    check(!inputFailed, "command_input_failed");
     if (!allowFailure) check(closed.code === 0 && closed.signal === null, `command_${tool}_failed`);
+    if (readerOperation !== null && !failed) {
+      // Preserve raw bounded stderr and closed metadata before semantic rejection.
+      // Never retain discovery stdout (candidate data) or the binary host archive.
+      await refuseReaderStderr(readerOperation, readerTerminal, stderrTail, retainReaderDiagnostic);
+    }
     const output = {
       ...closed,
-      stdout: Buffer.concat(stdout).toString("utf8"),
+      stdout: binaryStdout ? Buffer.concat(stdout) : Buffer.concat(stdout).toString("utf8"),
       stderr: Buffer.concat(stderr).toString("utf8"),
     };
     stdout = [];
     stderr = [];
     return output;
+  }
+
+  function artifactRequest(extra = {}) {
+    return { parent: options.artifact.parent, filesystemDev: options.artifact.filesystemDev,
+      excludedRoots: [REPO, rootReal, stateRoot], producerPath: HOST_PROCESS_PRODUCER,
+      producerSha256, ...extra };
+  }
+
+  async function artifactControl(operation, request, timeoutMs = 30_000) {
+    check(options.artifact && canonicalArtifactJson(request).length <= 65536, "artifact_control_scope");
+    check(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= 15 * 60_000,
+      "artifact_control_timeout");
+    check(await imageToolsetSha256() === imageToolSourcesSha256, "image_tool_source_changed");
+    const pythonPath = await realpath(CLI.python);
+    assertApprovedCli(CLI.python, pythonPath, metadata(await lstat(pythonPath)), uid);
+    check(!interrupted, "interrupted");
+    const admittedTimeout = commandBudget(timeoutMs);
+    const child = spawn(CLI.python, ["-I", "-S", "-B", ARTIFACT_HELPER,
+      operation, canonicalArtifactJson(request)], { cwd: REPO, env, stdio: ["ignore", "pipe", "pipe"] });
+    let output = Buffer.alloc(0);
+    let errorOutput = Buffer.alloc(0);
+    let exceeded = false;
+    let escalation;
+    const terminate = () => {
+      child.kill("SIGTERM");
+      escalation ??= setTimeout(() => child.kill("SIGKILL"), 5000);
+    };
+    active = { terminate };
+    const collect = (prior, chunk) => {
+      if (prior.length + chunk.length > 65536) { exceeded = true; terminate(); return prior; }
+      return Buffer.concat([prior, chunk]);
+    };
+    child.stdout.on("data", (chunk) => { output = collect(output, chunk); });
+    child.stderr.on("data", (chunk) => { errorOutput = collect(errorOutput, chunk); });
+    const timer = setTimeout(() => { exceeded = true; terminate(); }, admittedTimeout);
+    try {
+      const terminal = await new Promise((done) => {
+        child.once("error", () => done({ code: null, signal: "spawn_error" }));
+        child.once("close", (code, signal) => done({ code, signal }));
+      });
+      check(!exceeded && !interrupted && terminal.code === 0 && terminal.signal === null
+        && errorOutput.length === 0, "artifact_control_failed");
+      const text = output.toString("ascii");
+      const value = JSON.parse(text);
+      check(output.every((byte) => byte < 128) && `${canonicalArtifactJson(value)}\n` === text,
+        "artifact_control_reply");
+      return value;
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(escalation);
+      active = undefined;
+    }
+  }
+
+  async function exportAttachments(input) {
+    await revalidate();
+    requireExpectedSourceCommit(input.source.sourceCommit, expectedSourceCommit, "artifact_source_mismatch");
+    requireExpectedSourceCommit(input.inspection.expected.sourceCommit, expectedSourceCommit, "artifact_source_mismatch");
+    check(!workloadCleanupPending, "artifact_workload_cleanup_pending");
+    const deadline = artifactExportDeadline(Date.now(), overallDeadline);
+    budgetPhase = "export";
+    phaseDeadline = deadline;
+    artifactBinding = await artifactControl("host-init", artifactRequest({
+      parentIdentity: artifactParent.parentIdentity,
+      source: { ...input.source, harnessSha256, imageToolSourcesSha256 },
+    }), Math.min(30_000, deadline - Date.now()));
+    for (const artifact of Object.keys(ARTIFACT_CAPS)) {
+      await copySelectedArtifact(input, artifact, artifactBinding, deadline, false);
+    }
+    check(Date.now() < deadline, "artifact_export_deadline");
+    artifactManifest = await artifactControl("host-manifest", artifactRequest({ binding: artifactBinding,
+      sha256s: input.sha256s, reader: input.reader, inspection: input.inspection }), deadline - Date.now());
+    check(Date.now() < deadline, "artifact_export_deadline");
+    budgetPhase = "prepare";
+    phaseDeadline = null;
+  }
+
+  async function copySelectedArtifact(input, artifact, binding, deadline, failed) {
+    await revalidate();
+    requireExpectedSourceCommit(input.source.sourceCommit, expectedSourceCommit, "artifact_source_mismatch");
+    check(await imageToolsetSha256() === imageToolSourcesSha256, "image_tool_source_changed");
+    check(deadline > Date.now() && !interrupted, "artifact_cleanup_reserve");
+    for (const tool of ["colima", "python"]) {
+      const path = await realpath(CLI[tool]);
+      assertApprovedCli(CLI[tool], path, metadata(await lstat(path)), uid);
+    }
+    const digest = failed ? input.descriptor.sha256 : input.sha256s[artifact];
+    const request = artifactRequest(failed ? { binding } : { binding, artifact,
+      expected: { reader: input.reader, owner: input.owner, sha256: digest } });
+    const timeoutMs = Math.min(deadline - Date.now(), 15 * 60_000);
+    check(timeoutMs > 0 && !interrupted, "artifact_cleanup_reserve");
+    const admittedTimeout = commandBudget(timeoutMs);
+    const writer = spawn(CLI.python, ["-I", "-S", "-B", ARTIFACT_HELPER,
+      failed ? "host-failure-receive" : "host-receive", canonicalArtifactJson(request)],
+    { cwd: REPO, env, stdio: ["pipe", "pipe", "pipe"] });
+    const reader = spawn(CLI.colima, ["ssh", "--profile", profile, "--",
+      ...guestReaderArguments("guest-read", artifactApproval, {
+        artifact, approval: artifactApproval, reader: input.reader,
+        sha256: digest, owner: input.owner,
+        ...(failed ? { source: input.descriptor.source } : {}),
+      })], { cwd: REPO, env, stdio: ["ignore", "pipe", "pipe"] });
+    const copied = await copyArtifactStream({ reader, writer, artifact, timeoutMs: admittedTimeout,
+      setActive: (value) => { active = value; } });
+    check(copied.sha256 === digest && (!failed || copied.size === input.descriptor.size), "artifact_copy_digest");
+    return copied;
+  }
+
+  async function exportFailedArchive(input) {
+    archiveRetention = { version: 1, state: "incomplete", qualified: false, d2Authority: false,
+      releaseAuthority: false, childName: null, manifestSha256: null, retentionFailure: null };
+    try {
+      await revalidate();
+      requireExpectedSourceCommit(input.source.sourceCommit, expectedSourceCommit, "failed_archive_source_changed");
+      check(!workloadCleanupPending, "artifact_workload_cleanup_pending");
+      const deadline = artifactExportDeadline(Date.now(), overallDeadline);
+      budgetPhase = "export";
+      phaseDeadline = deadline;
+      await assertFailedArchiveTools();
+      requireExpectedSourceCommit((await run("git", ["rev-parse", "HEAD"])).stdout.trim(), expectedSourceCommit,
+        "failed_archive_source_changed");
+      failedArchiveBinding = await artifactControl("host-failure-init", artifactRequest({
+        parentIdentity: artifactParent.parentIdentity,
+        source: { ...input.source, harnessSha256, imageToolSourcesSha256 }, descriptor: input.descriptor,
+      }), Math.min(30_000, deadline - Date.now()));
+      archiveRetention = validateFailureArchiveRetention({ ...archiveRetention,
+        childName: failedArchiveBinding.childName });
+      const received = await copySelectedArtifact(input, "runner.oci.tar", failedArchiveBinding, deadline, true);
+      await assertFailedArchiveTools();
+      requireExpectedSourceCommit((await run("git", ["rev-parse", "HEAD"])).stdout.trim(), expectedSourceCommit,
+        "failed_archive_source_changed");
+      check(Date.now() < deadline, "artifact_export_deadline");
+      failedArchivePending = { received };
+      return false; // bytes staged only, not even a completed unqualified manifest yet
+    } catch {
+      failedArchivePending = undefined;
+      archiveRetention.retentionFailure = "transfer_failed";
+      return false; // original workload failure remains primary; partial bytes remain
+    } finally {
+      budgetPhase = "prepare";
+      phaseDeadline = null;
+    }
+  }
+
+  async function assertFailedArchiveTools() {
+    check(sha256(await readFile(SELF)) === harnessSha256
+      && sha256(await readFile(TEST)) === testSha256
+      && sha256(await readFile(HOST_PROCESS_PRODUCER)) === producerSha256
+      && await imageToolsetSha256() === imageToolSourcesSha256, "failed_archive_source_changed");
   }
 
   async function hostProcessSnapshot(pids) {
@@ -1530,8 +2151,15 @@ export async function main(argv = process.argv.slice(2)) {
     cleanupProven = true;
   });
 
-  overall = setTimeout(stop, 45 * 60_000);
+  const overallDuration = qualificationDuration(options);
+  const overallDeadline = Date.now() + overallDuration;
+  overall = setTimeout(stop, overallDuration);
   try {
+    if (options.artifact) {
+      artifactApproval = JSON.parse((await privateFile(options.artifact.approvalPath, uid, 16384)).toString("utf8"));
+      validateReaderApproval(artifactApproval, sha256(await readFile(ARTIFACT_HELPER)));
+      artifactParent = await artifactControl("host-check", artifactRequest());
+    }
     assertUnixSocketBudget([
       join(env.COLIMA_HOME, profile, "docker.sock"),
       join(env.LIMA_HOME, `colima-${profile}`, "ssh.sock.1234567890123456"),
@@ -1562,7 +2190,7 @@ export async function main(argv = process.argv.slice(2)) {
     );
     stage = "source_snapshot";
     const baseCommit = (await run("git", ["rev-parse", "HEAD"])).stdout.trim();
-    check(baseCommit === BASE_COMMIT, "base_commit_changed");
+    requireExpectedSourceCommit(baseCommit, expectedSourceCommit);
     check(sha256(await readFile(SELF)) === harnessSha256
       && sha256(await readFile(TEST)) === testSha256
       && sha256(await readFile(HOST_PROCESS_PRODUCER)) === producerSha256,
@@ -1577,6 +2205,7 @@ export async function main(argv = process.argv.slice(2)) {
     stage = "vm_start";
     startAttempted = true;
     usernetExpected = true;
+    if (mode === "image") emitImageProgress("vm_starting");
     await run("colima", startArguments(profile), { timeout: 600_000, maximum: 4 * 1024 * 1024 });
     stage = "vm_identity";
     const live = await inventory();
@@ -1607,20 +2236,24 @@ export async function main(argv = process.argv.slice(2)) {
     "engine_architecture_or_resources");
     const managementPort = qemuManagementPort(lima);
 
-    stage = "buildx_observation";
-    const buildxResult = await guest(["docker", "buildx", "version"], { allowFailure: true });
     let buildx;
-    if (buildxResult.code === 0 && buildxResult.signal === null) {
-      const match = /^github\.com\/docker\/buildx\s+(v[0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)/
-        .exec(buildxResult.stdout.trim());
-      check(match && buildxResult.stderr === "", "buildx_version_unknown");
-      buildx = { status: "available", version: match[1] };
+    if (mode === "reader") {
+      buildx = { status: "not_requested" }; // never published as compatibility/image qualification
     } else {
-      const diagnostic = `${buildxResult.stdout}\n${buildxResult.stderr}`;
-      check(buildxResult.code === 1 && buildxResult.signal === null
-        && /(?:is not a docker command|unknown command:?\s+["']?buildx)/i.test(diagnostic),
-      "buildx_failure_ambiguous");
-      buildx = { status: "unsupported_known" };
+      stage = "buildx_observation";
+      const buildxResult = await guest(["docker", "buildx", "version"], { allowFailure: true });
+      if (buildxResult.code === 0 && buildxResult.signal === null) {
+        const match = /^github\.com\/docker\/buildx\s+(v[0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)/
+          .exec(buildxResult.stdout.trim());
+        check(match && buildxResult.stderr === "", "buildx_version_unknown");
+        buildx = { status: "available", version: match[1] };
+      } else {
+        const diagnostic = `${buildxResult.stdout}\n${buildxResult.stderr}`;
+        check(buildxResult.code === 1 && buildxResult.signal === null
+          && /(?:is not a docker command|unknown command:?\s+["']?buildx)/i.test(diagnostic),
+        "buildx_failure_ambiguous");
+        buildx = { status: "unsupported_known" };
+      }
     }
 
     stage = "usernet_identity";
@@ -1643,7 +2276,9 @@ export async function main(argv = process.argv.slice(2)) {
     });
     usernetIdentityAmbiguous = priorUsernetAmbiguity;
     stage = "listener_observation";
-    const captured = await retryListenerObservation(async () => {
+    const observeCurrentListeners = async () => {
+      const captured = await retryListenerObservation(async () => {
+      commandBudget(30_000); // exhaustion cannot start a new retry
       const listenerBefore = await listenerSnapshot();
       const processBeforeListeners = await hostProcessSnapshot(
         listenerSnapshotPids(listenerBefore, [...vmPids]),
@@ -1684,6 +2319,11 @@ export async function main(argv = process.argv.slice(2)) {
       listenerInput,
       [...vmPids],
       usernetHelper.pid,
+      { baselineProcesses: processBaseline, controllerPid: process.pid, parentPid: process.ppid,
+        postProcessesAfter: processAfterListeners, postProcessesBefore: processBeforeListeners,
+        usernetBinding: { artifactIdentitySha256: usernetArtifacts.artifactIdentitySha256,
+          birthIdentitySha256: usernetHelper.birthIdentitySha256,
+          executableIdentitySha256: usernetHelper.executableIdentitySha256, pid: usernetHelper.pid } },
     );
     processEvidence = hostProcessEvidence({
       artifactIdentitySha256: usernetArtifacts.artifactIdentitySha256,
@@ -1713,19 +2353,119 @@ export async function main(argv = process.argv.slice(2)) {
         },
       },
     );
-    listenerFailureEvidence = null;
+      commandBudget(1); // complete evidence arriving after the phase deadline is not a pass
+      listenerFailureEvidence = null;
+      return listenerEvidence;
+    };
+    let listenerEvidence = await observeCurrentListeners();
     stage = "host_agent_log_observation";
     const hostAgentLog = await boundedGeneratedFile(
       join(env.LIMA_HOME, `colima-${profile}`, "ha.stderr.log"), uid, MAX_HOST_AGENT_LOG);
     assertNoAutomaticForwardAttempts(hostAgentLog);
 
+    if (mode === "image") {
+      stage = "runner_image_workload";
+      emitImageProgress("vm_isolation_checked");
+      check(buildx.status === "available" && buildx.version === "v0.34.1",
+        "image_buildx_version_required");
+      check(await imageToolsetSha256() === imageToolSourcesSha256,
+        "image_tool_source_changed");
+      const epoch = (await run("git", ["show", "-s", "--format=%ct", baseCommit])).stdout.trim();
+      check(/^[1-9][0-9]{8,11}$/.test(epoch), "image_source_epoch_invalid");
+      const scratchRoot = join(env.TMPDIR, "image-workload");
+      await revalidate();
+      await mkdir(scratchRoot, { mode: 0o700 });
+      const { runManagedRunnerImageWorkload, validateQualification } = await import("./managed-runner-image-workload.mjs");
+      try {
+        imageEvidence = await runManagedRunnerImageWorkload({
+          guest: async (args, options) => (await guest(args, options)).stdout,
+          host: async (tool, args, options) => {
+            check(["git", "tar"].includes(tool), "image_host_tool_scope");
+            return (await run(tool, args, options)).stdout;
+          },
+          diagnostic: async (combinedBuildLogTail) => {
+            check(typeof combinedBuildLogTail === "string"
+              && Buffer.byteLength(combinedBuildLogTail) <= MAX_DIAGNOSTIC,
+            "image_diagnostic_bound");
+            await writeDiagnostics("colima", Buffer.from(
+              "Bounded private image-workload diagnostic; the source label follows.\n"),
+            Buffer.from(combinedBuildLogTail));
+          },
+          progress: emitImageProgress,
+          scratchRoot,
+          sourceCommit: expectedSourceCommit,
+          buildEpoch: Number(epoch),
+          preservation: options.artifact ? { approval: artifactApproval, exportAttachments, exportFailedArchive,
+            onPhase: workloadPhase,
+            beforeBuild: async () => {
+              workloadCleanupPending = true;
+              commandBudget(30_000);
+              const current = await artifactControl("host-check", artifactRequest());
+              check(canonicalJson(current) === canonicalJson(artifactParent), "artifact_parent_changed");
+              commandBudget(1);
+            } } : null,
+        });
+        validateQualification(imageEvidence, expectedSourceCommit);
+      } catch (error) {
+        if (!failedArchivePending) throw error;
+        deferredImageFailure = error;
+      }
+    } else if (mode === "reader") {
+      stage = "reader_runtime_observation";
+      check(await imageToolsetSha256() === imageToolSourcesSha256, "image_tool_source_changed");
+      const before = await lstat(ARTIFACT_HELPER);
+      check(before.isFile() && !before.isSymbolicLink() && before.uid === uid && before.nlink === 1
+        && (before.mode & 0o022) === 0 && before.size > 0 && before.size <= 128 * 1024,
+      "reader_observation_source_identity");
+      const readerSource = await readFile(ARTIFACT_HELPER);
+      readerSourceSha256 = sha256(readerSource);
+      const archived = await run("tar", readerArchiveArguments(dirname(ARTIFACT_HELPER)),
+        { binaryStdout: true, maximum: 1024 * 1024, readerOperation: "reader_archive_create" });
+      check(archived.stderr === "", "reader_observation_archive_stderr");
+      const after = await lstat(ARTIFACT_HELPER);
+      check(identity(before) === identity(after) && before.size === after.size
+        && before.uid === after.uid && before.mode === after.mode && after.nlink === 1
+        && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs
+        && sha256(await readFile(ARTIFACT_HELPER)) === readerSourceSha256, "reader_observation_source_changed");
+      validateReaderArchive(archived.stdout, readerSource);
+      readerObservation = await observeGuestReaderRuntime(async (args, settings, operation) => {
+        const observed = await guest(args, { ...settings, readerOperation: operation });
+        check(observed.stderr === "", "reader_observation_stderr");
+        return observed.stdout;
+      }, archived.stdout, readerSourceSha256);
+    }
+    if (mode === "image" || mode === "reader") {
+      if (budgeted) {
+        budgetPhase = "postObservation";
+        phaseDeadline = Math.min(Date.now() + ARTIFACT_POST_OBSERVATION_MS,
+          overallDeadline - ARTIFACT_CLEANUP_RESERVE_MS - ARTIFACT_SOURCE_FINAL_MS);
+        commandBudget(1);
+      }
+      stage = "post_image_listener_observation";
+      listenerEvidence = await observeCurrentListeners();
+      stage = "post_image_host_agent_log_observation";
+      assertNoAutomaticForwardAttempts(await boundedGeneratedFile(
+        join(env.LIMA_HOME, `colima-${profile}`, "ha.stderr.log"), uid, MAX_HOST_AGENT_LOG));
+      check(await imageToolsetSha256() === imageToolSourcesSha256,
+        "image_tool_source_changed");
+      commandBudget(1);
+    }
+
     stage = "source_final";
-    check((await run("git", ["rev-parse", "HEAD"])).stdout.trim() === baseCommit,
-      "base_commit_changed");
+    if (budgeted) {
+      budgetPhase = "sourceFinal";
+      phaseDeadline = Math.min(Date.now() + ARTIFACT_SOURCE_FINAL_MS,
+        overallDeadline - ARTIFACT_CLEANUP_RESERVE_MS);
+    }
+    requireExpectedSourceCommit((await run("git", ["rev-parse", "HEAD"])).stdout.trim(), expectedSourceCommit);
     check(sha256(await readFile(SELF)) === harnessSha256
       && sha256(await readFile(TEST)) === testSha256
       && sha256(await readFile(HOST_PROCESS_PRODUCER)) === producerSha256,
     "harness_source_changed");
+    if (deferredImageFailure) {
+      failedArchivePostChecks = true;
+      throw deferredImageFailure;
+    }
     result = {
       baseCommit,
       buildx,
@@ -1757,26 +2497,44 @@ export async function main(argv = process.argv.slice(2)) {
       version: 1,
     };
   } catch (error) {
-    primaryFailure = codeOf(error, "closed_stage_failure");
+    primaryFailure = codeOf(deferredImageFailure ?? error, "closed_stage_failure");
   } finally {
     cleaning = true;
+    if (budgeted) {
+      budgetPhase = "outerCleanup";
+      // Keep the full outer cleanup envelope, including its shared local-I/O
+      // margin. Do not impose a shorter stop/delete phase or reset the clock.
+      phaseDeadline = overallDeadline - 70_000;
+    }
     try { await cleanup(); }
     catch { cleanupFailure = "cleanup_unproven_state_retained"; }
-    if (cleanupProven && !primaryFailure && !cleanupFailure && !interrupted && result) {
+    if (cleanupProven && !cleanupFailure && !interrupted
+        && ((!primaryFailure && result) || (failedArchivePending && failedArchivePostChecks))) {
       stage = "source_after_cleanup";
+      if (budgeted) {
+        cleaning = false;
+        budgetPhase = "sourceAfter";
+        phaseDeadline = Math.min(Date.now() + 35_000, overallDeadline - 155_000);
+      }
       try {
-        check((await run("git", ["rev-parse", "HEAD"])).stdout.trim() === result.baseCommit,
-          "base_commit_changed");
+        requireExpectedSourceCommit((await run("git", ["rev-parse", "HEAD"])).stdout.trim(), expectedSourceCommit);
         check(sha256(await readFile(SELF)) === harnessSha256
           && sha256(await readFile(TEST)) === testSha256
           && sha256(await readFile(HOST_PROCESS_PRODUCER)) === producerSha256,
         "harness_source_changed");
+        if (mode === "image" || mode === "reader") {
+          check(await imageToolsetSha256() === imageToolSourcesSha256,
+            "image_tool_source_changed");
+        }
+        if (failedArchivePending) failedArchiveSourceAfter = true;
       } catch (error) {
-        primaryFailure = codeOf(error, "closed_source_final_failure");
+        primaryFailure ??= codeOf(error, "closed_source_final_failure");
       }
     }
-    clearTimeout(overall);
-    for (const signal of signals) process.off(signal, stop);
+    if (!budgeted) {
+      clearTimeout(overall);
+      for (const signal of signals) process.off(signal, stop);
+    }
     try {
       if (cleanupProven && (primaryFailure || interrupted)) {
         const names = await readdir(stateRoot);
@@ -1813,10 +2571,34 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   if (primaryFailure || cleanupFailure || interrupted || !result || retained) {
+    if (archiveRetention && failedArchiveFinalizationAllowed({ pending: Boolean(failedArchivePending),
+      postChecks: failedArchivePostChecks, cleanupProven, cleanupFailure,
+      sourceUnchanged: failedArchiveSourceAfter, interrupted })) {
+      try {
+        cleaning = false;
+        budgetPhase = "qualify";
+        phaseDeadline = overallDeadline;
+        await assertFailedArchiveTools();
+        const saved = await artifactControl("host-failure-manifest", artifactRequest({
+          binding: failedArchiveBinding, received: failedArchivePending.received,
+          checks: { postObservation: true, sourceUnchanged: true, normalCleanup: true },
+        }));
+        check(saved.name === "failure-retention-manifest.json" && /^(?!0{64}$)[a-f0-9]{64}$/.test(saved.sha256),
+          "failed_archive_manifest_reply");
+        archiveRetention = { ...archiveRetention, state: "retained", manifestSha256: saved.sha256 };
+      } catch { archiveRetention.retentionFailure = "finalization_failed"; }
+    } else if (archiveRetention && archiveRetention.retentionFailure === null) {
+      archiveRetention.retentionFailure = cleanupFailure || !cleanupProven ? "cleanup_failed"
+        : !failedArchivePostChecks ? "post_checks_failed" : "source_failed";
+    }
+    clearTimeout(overall);
+    for (const signal of signals) process.off(signal, stop);
     console.log(JSON.stringify(failureReport({
-      stage, primaryFailure, cleanupFailure, interrupted, retained, stateRoot, profile,
+      stage: deferredImageFailure ? "runner_image_workload" : stage,
+      primaryFailure, cleanupFailure, interrupted, retained, stateRoot, profile,
       cleanupProven, retainedDiagnosticsOnly, diagnostics, listenerFailureEvidence,
       hostProcessEvidence: processEvidence,
+      archiveRetention,
     })));
     throw new Error("nonprod_managed_runner_vm_not_qualified");
   }
@@ -1828,8 +2610,61 @@ export async function main(argv = process.argv.slice(2)) {
     stateAbsent: true,
     usernetSocketsAbsent,
   };
-  const report = reportMode(result);
-  console.log(JSON.stringify({ event: "managed_runner_vm_compatibility_finished", ...report }));
+  if (mode === "reader") {
+    try {
+      check(!interrupted && Date.now() < overallDeadline, "reader_observation_deadline");
+      const observedReport = readerRuntimeObservationReport({ sourceCommit: expectedSourceCommit,
+        harnessSha256, toolSourcesSha256: imageToolSourcesSha256,
+        observation: readerObservation, cleanup: result.cleanup }, readerSourceSha256, expectedSourceCommit);
+      const bytes = Buffer.from(`${JSON.stringify(observedReport)}\n`, "utf8");
+      check(bytes.length <= 64 * 1024, "reader_observation_report_bound");
+      process.stdout.write(bytes);
+    } finally {
+      clearTimeout(overall);
+      for (const signal of signals) process.off(signal, stop);
+    }
+    return;
+  }
+  const report = reportMode(result, expectedSourceCommit);
+  if (mode === "image") {
+    check(imageEvidence?.qualification === "isolated_measured_runner_image_only"
+      && imageEvidence.sourceCommit === expectedSourceCommit
+      && imageEvidence.cleanup?.containerRemoved === true
+      && imageEvidence.cleanup?.builderRemoved === true,
+    "image_workload_report_incomplete");
+    const fullReport = {
+      event: "managed_runner_vm_image_smoke_finished",
+      version: 1,
+      qualification: "isolated_measured_runner_image_only",
+      compatibility: report,
+      image: imageEvidence,
+      imageToolSourcesSha256,
+      claims: { normalRunnerStartup: false, managedAuthority: false,
+        submission: false, production: false },
+    };
+    try {
+      await emitImageReport(fullReport, options.artifact ? async (imageReportSha256) => {
+        cleaning = false;
+        budgetPhase = "qualify";
+        phaseDeadline = overallDeadline;
+        check(artifactBinding && artifactManifest && !interrupted && Date.now() < overallDeadline,
+          "artifact_qualification_unavailable");
+        await artifactControl("host-qualify", artifactRequest({ binding: artifactBinding,
+          manifestSha256: artifactManifest.sha256,
+          qualification: { sourceCommit: expectedSourceCommit,
+            imageReportSha256, harnessSha256,
+            toolSourcesSha256: imageToolSourcesSha256,
+            postListenerChecked: true, sourceUnchanged: true, cleanup: result.cleanup } }));
+      } : null);
+    } finally {
+      if (options.artifact) {
+        clearTimeout(overall);
+        for (const signal of signals) process.off(signal, stop);
+      }
+    }
+  } else {
+    console.log(JSON.stringify({ event: "managed_runner_vm_compatibility_finished", ...report }));
+  }
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === SELF) {
