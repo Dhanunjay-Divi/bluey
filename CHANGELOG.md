@@ -5,6 +5,12 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs: isolate the optional native Browser release SDK from the Web/cloud
+  dependency graph, retain separate strict metadata audit and inventory, and
+  quarantine native packaging/publication pending a reviewed toolchain migration.
+- Jobs native-storage tests: preserve exact inventory-emptiness checks using the
+  strict toolchain's collection assertion form; native behavior is unchanged.
+
 - Jobs tests: qualify a separate disposable Linux/amd64 QEMU guest with bounded
   resources, private state and observed stop/delete proof; no production or
   employer-facing execution is enabled by this compatibility gate.

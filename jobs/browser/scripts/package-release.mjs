@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { lstat, realpath } from "node:fs/promises";
-import { createRequire } from "node:module";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   browserRoot,
@@ -18,8 +17,7 @@ import {
   validateSigningInputs,
   validateSourceRevision,
 } from "./release-package-contract.mjs";
-
-const require = createRequire(import.meta.url);
+import { verifyPackagingToolchain } from "./verify-packaging-toolchain.mjs";
 
 export async function packageBrowserRelease({
   targetName,
@@ -30,7 +28,12 @@ export async function packageBrowserRelease({
   commandRunner = runCommand,
   gitReader = readGitState,
   authorityLoader = loadCompiledAuthority,
+  toolchainVerifier = verifyPackagingToolchain,
 } = {}) {
+  // Native SDK execution is quarantined. This gate precedes source/key reads,
+  // signing authority, cleanup and commands even if metadata auditing is clean.
+  // Only explicit in-process unit fixtures inject a verifier; the CLI never does.
+  const builderCli = await toolchainVerifier();
   const target = requireReleaseTarget(targetName, hostPlatform, hostArchitecture);
   const candidateBrowserRoot = await requirePreparedSourceRoot(preparedSourceRoot);
   await validatePreparedPackagingTree(candidateBrowserRoot);
@@ -66,7 +69,6 @@ export async function packageBrowserRelease({
       signingMaterial,
       authority,
     });
-    const builderCli = join(dirname(require.resolve("electron-builder/package.json")), "cli.js");
     commandRunner(
       process.execPath,
       [

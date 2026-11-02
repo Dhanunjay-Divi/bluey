@@ -62,11 +62,7 @@ fn writes_replaces_inventories_and_removes_with_retained_handles() {
     subject
         .remove_entry("profiles")
         .expect("remove subject subtree");
-    assert!(subject
-        .inventory()
-        .expect("empty inventory")
-        .entries
-        .is_empty());
+    assert_eq!(subject.inventory().expect("empty inventory").entries, []);
 }
 
 #[test]
@@ -195,11 +191,10 @@ fn move_rejects_unsafe_entries_and_a_destination_inside_the_source() {
         StorageErrorCode::UnsafeEntry
     );
     assert_eq!(fs::read(&outside).expect("outside sentinel"), b"sentinel");
-    assert!(destination
-        .inventory()
-        .expect("safe destination")
-        .entries
-        .is_empty());
+    assert_eq!(
+        destination.inventory().expect("safe destination").entries,
+        []
+    );
     assert_eq!(
         root.move_entry_noreplace(
             &["source".to_owned()],

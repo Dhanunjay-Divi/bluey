@@ -6,11 +6,15 @@ on:
       - ".github/workflows/jobs-browser-release.yml"
       - "jobs/browser/electron-builder.yml"
       - "jobs/browser/package.json"
+      - "jobs/browser/packaging/package.json"
+      - "jobs/browser/packaging/package-lock.json"
       - "jobs/browser/scripts/package-release.mjs"
+      - "jobs/browser/scripts/verify-packaging-toolchain.mjs"
       - "jobs/browser/scripts/release-package-contract.mjs"
       - "jobs/browser/src/release-authority.ts"
       - "jobs/scripts/browser-release-ci-gate.mjs"
       - "jobs/scripts/browser-release-ci-gate.test.mjs"
+      - "jobs/scripts/check-provenance-licenses.mjs"
   workflow_dispatch:
     inputs:
       operation:
@@ -154,8 +158,36 @@ jobs:
           node jobs/scripts/browser-release-ci-gate.mjs workflow
           --file .github/workflows/jobs-browser-release.yml
 
+  # Optional native tooling is quarantined from the Web/cloud Jobs dependency graph.
+  # Metadata audit never qualifies an installed SDK or unquarantines publication.
+  release-sdk-audit:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation != 'contract' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the trusted isolated native SDK
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Select Node.js for the isolated native SDK audit
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Validate provenance, audit metadata, and refuse native publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          node jobs/scripts/check-provenance-licenses.mjs
+          node jobs/browser/scripts/verify-packaging-toolchain.mjs
+          echo 'Bluey Browser native publication is quarantined; metadata audit is not installed-graph or physical packaging qualification.' >&2
+          exit 1
+
   prepare-candidate:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate' && github.ref_name == github.event.repository.default_branch
+    needs: release-sdk-audit
     name: Prepare candidate ${{ matrix.target }} without credentials
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -757,6 +789,7 @@ jobs:
 
   authorize-stored-candidate:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'authorize' && github.ref_name == github.event.repository.default_branch
+    needs: release-sdk-audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -829,6 +862,7 @@ jobs:
 
   promote-stored-authorization:
     if: github.event_name == 'workflow_dispatch' && inputs.operation == 'promote' && github.ref_name == github.event.repository.default_branch
+    needs: release-sdk-audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

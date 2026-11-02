@@ -781,6 +781,111 @@ test("the checked-in workflow preserves offline threshold and no-rebuild boundar
   );
 });
 
+test("native release effects remain quarantined even after a clean metadata-only SDK audit", async () => {
+  const source = await readFile(WORKFLOW_PATH, "utf8");
+  assert.equal(validateWorkflowContract(source), true);
+  assert.equal(
+    source.match(/^          node jobs\/browser\/scripts\/verify-packaging-toolchain\.mjs$/gm)?.length,
+    1,
+  );
+  const auditJob = source.match(
+    /^  release-sdk-audit:\n[\s\S]*?(?=^  prepare-candidate:)/m,
+  )?.[0];
+  assert.ok(auditJob);
+  const provenance = "          node jobs/scripts/check-provenance-licenses.mjs";
+  const metadataAudit = "          node jobs/browser/scripts/verify-packaging-toolchain.mjs";
+  const terminalRefusal = "          echo 'Bluey Browser native publication is quarantined; " +
+    "metadata audit is not installed-graph or physical packaging qualification.' >&2";
+  assert.ok(auditJob.indexOf(provenance) < auditJob.indexOf(metadataAudit));
+  assert.ok(auditJob.indexOf(metadataAudit) < auditJob.indexOf(terminalRefusal));
+  assert.ok(auditJob.endsWith("          exit 1\n\n"));
+  const cases = [
+    ["omitted audit", source.replace(auditJob, "")],
+    ["omitted provenance", source.replace(`${provenance}\n`, "")],
+    ["provenance after audit", source.replace(
+      `${provenance}\n${metadataAudit}`, `${metadataAudit}\n${provenance}`,
+    )],
+    ["weaker threshold argument", source.replace(
+      metadataAudit, `${metadataAudit} --audit-level=high`,
+    )],
+    ["registry override argument", source.replace(
+      metadataAudit, `${metadataAudit} --registry=https://registry.example.invalid/`,
+    )],
+    ["scripts enabled argument", source.replace(
+      metadataAudit, `${metadataAudit} --ignore-scripts=false`,
+    )],
+    ["SDK metadata audit omitted", source.replace(`${metadataAudit}\n`, "")],
+    ["clean metadata permits publication", source.replace(
+      metadataAudit, "          echo '{\"metadataAuditPassed\":true,\"nativePublicationAllowed\":true}'",
+    )],
+    ["audit failure swallowed", source.replace(
+      metadataAudit, `${metadataAudit} || true`,
+    )],
+    ["terminal deny omitted", source.replace("          exit 1\n", "")],
+    ["terminal deny succeeds", source.replace("          exit 1\n", "          exit 0\n")],
+    ["terminal refusal omitted", source.replace(`${terminalRefusal}\n`, "")],
+    ["terminal refusal bypassed", source.replace(
+      terminalRefusal, "          if false; then\n" + terminalRefusal,
+    )],
+    ["audit step conditional", source.replace(
+      "      - name: Validate provenance, audit metadata, and refuse native publication\n",
+      "      - name: Validate provenance, audit metadata, and refuse native publication\n        if: false\n",
+    )],
+    ["audit error ignored", source.replace(
+      "  release-sdk-audit:\n", "  release-sdk-audit:\n    continue-on-error: true\n",
+    )],
+    ["audit candidate-only", source.replace(
+      "inputs.operation != 'contract'", "inputs.operation == 'candidate'",
+    )],
+    ["audit untrusted source", source.replace(
+      "      - name: Check out the trusted isolated native SDK\n",
+      "      - name: Check out the trusted isolated native SDK\n" +
+        "        env:\n          SOURCE: ${{ inputs.source_commit }}\n",
+    )],
+    ["contract installs SDK", source.replace(
+      "run: npm ci --ignore-scripts --prefix jobs\n",
+      "run: npm ci --ignore-scripts --prefix jobs/browser/packaging\n",
+    )],
+    ["trusted SDK installed", source.replace(
+      "          npm ci --prefix trusted-release-tools/jobs\n",
+      "          npm ci --prefix trusted-release-tools/jobs\n" +
+        "          npm ci --ignore-scripts --prefix trusted-release-tools/jobs/browser/packaging\n",
+    )],
+    ["candidate SDK installed", source.replace(
+      "          npm ci --prefix candidate-source/jobs\n",
+      "          npm ci --prefix candidate-source/jobs\n" +
+        "          npm ci --ignore-scripts --prefix candidate-source/jobs/browser/packaging\n",
+    )],
+    ["installed SDK executed", source.replace(
+      "          npm ci --prefix trusted-release-tools/jobs\n",
+      "          node trusted-release-tools/jobs/browser/packaging/node_modules/electron-builder/cli.js\n" +
+        "          npm ci --prefix trusted-release-tools/jobs\n",
+    )],
+    ["new unguarded effect", `${source}\n  publish-native:\n` +
+      "    runs-on: ubuntu-latest\n    steps:\n      - run: echo publication\n"],
+  ];
+  for (const name of [
+    "prepare-candidate", "candidate-targets", "assemble-candidate",
+    "authorize-stored-candidate", "promote-stored-authorization",
+  ]) {
+    const block = source.match(new RegExp(
+      `^  ${name}:\\n[\\s\\S]*?(?=^  [a-z]|$(?![\\s\\S]))`, "m",
+    ))?.[0];
+    assert.ok(block);
+    cases.push(
+      [`${name} omitted dependency`, source.replace(block, block.replace(/^    needs:.*\n/m, ""))],
+      [`${name} skipped dependency bypass`, source.replace(
+        block, block.replace(/^    if: /m, "    if: always() && "),
+      )],
+      [`${name} changed dependency`, source.replace(block, block.replace(/^    needs:.*$/m, "    needs: contract"))],
+    );
+  }
+  for (const [name, mutated] of cases) {
+    assert.notEqual(mutated, source, name);
+    assert.throws(() => validateWorkflowContract(mutated), /SDK|build-free/, name);
+  }
+});
+
 test("promotion authority input materializes only exact canonical bytes", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "bluey-browser-promotion-input-"));
   t.after(async () => rm(root, { recursive: true, force: true }));

@@ -1891,6 +1891,105 @@ export async function materializePromotionAuthorityInput(input, outputDirectory)
   });
 }
 
+// Metadata is not installed-graph qualification. This exact prerequisite must
+// refuse publication even after a clean audit; enablement needs separate review.
+const RELEASE_SDK_AUDIT_JOB = `  release-sdk-audit:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation != 'contract' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the trusted isolated native SDK
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: \${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Select Node.js for the isolated native SDK audit
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Validate provenance, audit metadata, and refuse native publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          node jobs/scripts/check-provenance-licenses.mjs
+          node jobs/browser/scripts/verify-packaging-toolchain.mjs
+          echo 'Bluey Browser native publication is quarantined; metadata audit is not installed-graph or physical packaging qualification.' >&2
+          exit 1`;
+
+function validateReleaseSdkPrerequisite(workflowSource) {
+  const jobsSource = workflowSource.split(/^jobs:\n/m);
+  const expectedJobs = [
+    "contract", "release-sdk-audit", "prepare-candidate", "candidate-targets",
+    "assemble-candidate", "authorize-stored-candidate", "promote-stored-authorization",
+  ];
+  const headers = jobsSource.length === 2
+    ? [...jobsSource[1].matchAll(/^  ([a-z][a-z0-9-]*):\n/gm)] : [];
+  const directRows = jobsSource[1]?.match(/^  (?!#)\S.*$/gm) ?? [];
+  if (
+    directRows.length !== expectedJobs.length ||
+    headers.map((match) => match[1]).join("\n") !== expectedJobs.join("\n")
+  ) {
+    throw new BrowserReleaseGateError(
+      "Every native release effect requires the approved SDK audit job graph",
+    );
+  }
+  const jobs = new Map(headers.map((match, index) => [
+    match[1], jobsSource[1].slice(match.index, headers[index + 1]?.index).trimEnd(),
+  ]));
+  if (jobs.get("release-sdk-audit") !== RELEASE_SDK_AUDIT_JOB) {
+    throw new BrowserReleaseGateError(
+      "The native SDK quarantine requires trusted provenance, strict metadata audit, and unconditional terminal refusal",
+    );
+  }
+  for (const name of expectedJobs.slice(2)) {
+    if (
+      /\b(?:npm|npx)\b[^\n]*(?:browser\/packaging|electron-builder)|\bnode_modules[\\/]/.test(jobs.get(name))
+    ) {
+      throw new BrowserReleaseGateError(
+        "Native SDK installation or installed graph execution is outside the quarantined workflow",
+      );
+    }
+  }
+  const dependencies = new Map([
+    ["prepare-candidate", "release-sdk-audit"],
+    ["candidate-targets", "prepare-candidate"],
+    ["assemble-candidate", "candidate-targets"],
+    ["authorize-stored-candidate", "release-sdk-audit"],
+    ["promote-stored-authorization", "release-sdk-audit"],
+  ]);
+  for (const [name, dependency] of dependencies) {
+    const job = jobs.get(name);
+    const operation = name === "authorize-stored-candidate" ? "authorize"
+      : name === "promote-stored-authorization" ? "promote" : "candidate";
+    const expectedCondition = "    if: github.event_name == 'workflow_dispatch' && " +
+      `inputs.operation == '${operation}' && github.ref_name == github.event.repository.default_branch`;
+    const conditions = job.match(/^    if:.*$/gm) ?? [];
+    const needs = job.match(/^    needs:.*$/gm) ?? [];
+    if (
+      conditions.length !== 1 || conditions[0] !== expectedCondition ||
+      needs.length !== 1 || needs[0] !== `    needs: ${dependency}`
+    ) {
+      throw new BrowserReleaseGateError(
+        "Native release effects must require SDK audit success through the approved job needs and conditions",
+      );
+    }
+  }
+  if (/\b(?:always|failure|cancelled)\s*\(|^\s*continue-on-error:/m.test(workflowSource)) {
+    throw new BrowserReleaseGateError("Native SDK audit failure must never be bypassed");
+  }
+  const contractJob = jobs.get("contract");
+  if (
+    (contractJob.match(/^    if:.*$/gm) ?? []).join("\n") !==
+      "    if: github.event_name == 'pull_request' || inputs.operation == 'contract'" ||
+    /^    needs:/m.test(contractJob) ||
+    /browser\/packaging|\bnpm\s+(?:run\s+[^\n]*\bbuild|exec|install)|\belectron-builder\b/.test(contractJob)
+  ) {
+    throw new BrowserReleaseGateError("PR contract checks must remain build-free without native SDK installation");
+  }
+}
+
 export function validateWorkflowContract(workflowSource) {
   if (
     typeof workflowSource !== "string" ||
@@ -1900,6 +1999,7 @@ export function validateWorkflowContract(workflowSource) {
   ) {
     throw new BrowserReleaseGateError("Invalid Browser release workflow");
   }
+  validateReleaseSdkPrerequisite(workflowSource);
   const dispatchInputsBlock = workflowSource.match(
     /^  workflow_dispatch:\n    inputs:\n([\s\S]*?)(?=^[^\s])/m,
   )?.[1];
@@ -2088,9 +2188,9 @@ export function validateWorkflowContract(workflowSource) {
   const trustedValidatorCheckouts = workflowSource.match(
     /ref:\s+\$\{\{ github\.workflow_sha \}\}/g,
   )?.length ?? 0;
-  if (trustedValidatorCheckouts !== 4) {
+  if (trustedValidatorCheckouts !== 5) {
     throw new BrowserReleaseGateError(
-      "Packaging, assembly, authorization, and promotion require trusted workflow tooling",
+      "SDK audit, packaging, assembly, authorization, and promotion require trusted workflow tooling",
     );
   }
   const candidateJob = workflowSource.match(
@@ -2141,7 +2241,7 @@ export function validateWorkflowContract(workflowSource) {
     }
   }
   const contractJob = workflowSource.match(
-    /^  contract:\n([\s\S]*?)(?=^  prepare-candidate:)/m,
+    /^  contract:\n([\s\S]*?)(?=^  release-sdk-audit:)/m,
   )?.[1];
   if (!contractJob || contractJob.includes("${{ secrets.")) {
     throw new BrowserReleaseGateError(
