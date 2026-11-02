@@ -5,6 +5,12 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs resume import: recognize combined awards/certification headings, exclude
+  award narrative, and preserve separate employment intervals without adding
+  gap tenure or leaking dates into titles; preserve first-range education records.
+- Jobs portal: refresh checked-in assets from a hash-verified deterministic
+  build after hosted CI detected stale assets; the freshness gate is unchanged.
+
 - Jobs: isolate the optional native Browser release SDK from the Web/cloud
   dependency graph, retain separate strict metadata audit and inventory, and
   quarantine native packaging/publication pending a reviewed toolchain migration.

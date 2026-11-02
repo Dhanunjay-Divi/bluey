@@ -758,6 +758,107 @@ Cloud: AWS (EKS, EC2, Lambda), Kubernetes`,
     expect(result.skills).toEqual(["AWS (EKS, EC2, Lambda)", "Kubernetes"]);
   });
 
+  it("keeps credentials from combined awards and certification headings without importing awards", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "synthetic-credentials.pdf",
+      text: `Avery Sample
+AWARDS AND CERTIFICATION
+• Cloud Platform Practitioner
+• Data Systems Credential
+• Project Delivery Certificate
+• Security Foundations Certificate; Community Service Award
+• Award: Community Service
+• Scholarship: Future Leaders
+• Innovation Prize for volunteer mentoring`,
+    });
+
+    expect(result.certifications).toEqual([
+      "Cloud Platform Practitioner",
+      "Data Systems Credential",
+      "Project Delivery Certificate",
+      "Security Foundations Certificate",
+    ]);
+  });
+
+  it("preserves separate noncontiguous employment periods without leaking dates into the title", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "synthetic-returning-role.docx",
+      text: `Avery Sample
+EXPERIENCE
+Orion Systems
+Platform Engineer Jun 2021 - Sep 2021 && Jun 2022 - Present
+• Built reliable internal tools.`,
+    });
+
+    expect(result.employment).toEqual([
+      expect.objectContaining({
+        company: "Orion Systems",
+        title: "Platform Engineer",
+        start_date: "2021-06",
+        end_date: "2021-09",
+        current: false,
+        highlights: [],
+      }),
+      expect.objectContaining({
+        company: "Orion Systems",
+        title: "Platform Engineer",
+        start_date: "2022-06",
+        end_date: "",
+        current: true,
+        highlights: ["Built reliable internal tools."],
+      }),
+    ]);
+  });
+
+  it("keeps education date parsing on its first extracted range", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "synthetic-education-ranges.pdf",
+      text: `Avery Sample
+EDUCATION
+State University
+Bachelor of Science in Engineering Sep 2018 - Jun 2022 && Sep 2023 - Jun 2025`,
+    });
+
+    expect(result.education).toEqual([
+      expect.objectContaining({
+        school: "State University",
+        degree: "Bachelor of Science in Engineering",
+        start_date: "2018-09",
+        end_date: "2022-06",
+      }),
+    ]);
+  });
+
+  it("shares a post-date employer header across separate employment periods without duplicating highlights", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "synthetic-returning-role-company-below.docx",
+      text: `Avery Sample
+EXPERIENCE
+Platform Engineer Jun 2021 - Sep 2021 && Jun 2022 - Present
+Orion Systems
+• Built reliable internal tools.`,
+    });
+
+    expect(result.employment).toEqual([
+      expect.objectContaining({
+        company: "Orion Systems",
+        title: "Platform Engineer",
+        start_date: "2021-06",
+        end_date: "2021-09",
+        current: false,
+        highlights: [],
+      }),
+      expect.objectContaining({
+        company: "Orion Systems",
+        title: "Platform Engineer",
+        start_date: "2022-06",
+        end_date: "",
+        current: true,
+        highlights: ["Built reliable internal tools."],
+      }),
+    ]);
+  });
+
   it("flags incomplete extracted facts before replacing a Career Profile", () => {
     expect(resumeReviewWarnings({
       ...emptyProfile(),
