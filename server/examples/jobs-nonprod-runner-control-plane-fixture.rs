@@ -1,5 +1,7 @@
 //! Private debug-only synthetic runner protocol fixture; not browser, VM, or employer evidence.
-//! Bootstrap uses existing lifecycle APIs. Post-queue is a database-enforced read-only handoff.
+//! Historical bootstrap uses existing lifecycle APIs. Measured startup imports only
+//! external qualified evidence and issues unconsumed grants; it never preclaims.
+//! Post-queue is a database-enforced read-only handoff.
 #![forbid(unsafe_code)]
 
 #[cfg(not(debug_assertions))]
@@ -18,10 +20,16 @@ mod unix {
     use std::io::{Read, Write};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     type Checked<T> = Result<T, &'static str>;
     const MARKER: &str = ".bluey-test-run-v2";
+    const MEASURED_REQUEST: &str = "runner-measured-startup-request.json";
+    const MEASURED_RESULT: &str = "runner-measured-startup-result.json";
+    const MEASURED_JOURNAL: &str = "runner-measured-d1-controller-journal.jsonl";
+    const MEASURED_STDOUT: &str = "runner-measured-d1-controller-final-stdout.json";
+    const MEASURED_TERMINAL: &str = "runner-measured-d1-external-terminal.json";
+    const MEASURED_ARTIFACT_DIRECTORY: &str = "runner-measured-artifacts";
     const BOOTSTRAP_REQUEST: &str = "runner-control-plane-bootstrap-request.json";
     const BOOTSTRAP_RESULT: &str = "runner-control-plane-bootstrap-result.json";
     const POST_QUEUE_REQUEST: &str = "runner-control-plane-post-queue-request.json";
@@ -117,6 +125,24 @@ mod unix {
             "mixed_fixture_file_families",
         )?;
         Ok(auto_present)
+    }
+
+    fn select_measured_family(legacy_present: bool, measured_present: bool) -> Checked<bool> {
+        require(
+            !(legacy_present && measured_present),
+            "mixed_measured_fixture_families",
+        )?;
+        Ok(measured_present)
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MeasuredStartupFiles {
+        request: fixture::MeasuredRunnerStartupRequest,
+        artifact_directory: PathBuf,
+        // Parent admission is separate from all artifact/report bytes. No defaults
+        // or report-derived expected values may silently authorize a new closure.
+        expected_d1: fixture::MeasuredRunnerD1Expected,
     }
 
     struct RootGuard {
@@ -484,6 +510,256 @@ mod unix {
         root.revalidate()
     }
 
+    fn same_startup_metadata(before: &Metadata, after: &Metadata) -> bool {
+        same_file(before, after)
+            && before.len() == after.len()
+            && before.uid() == after.uid()
+            && before.mode() == after.mode()
+            && before.nlink() == after.nlink()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+
+    fn read_startup_attachment(
+        path: &Path,
+        uid: u32,
+        cap: u64,
+        retain: bool,
+        deadline: Instant,
+        observed: &mut Vec<(PathBuf, Metadata)>,
+    ) -> Checked<(Vec<u8>, String, u64)> {
+        require(Instant::now() < deadline, "measured_input_deadline")?;
+        let before = private_metadata(path, uid, false)?;
+        require(
+            before.len() > 0 && before.len() <= cap,
+            "measured_input_bound",
+        )?;
+        // Fixed Unix ABI constants; unsupported Unix targets refuse, never follow.
+        let nofollow = if cfg!(target_os = "linux") {
+            0x20000
+        } else if cfg!(target_os = "macos") {
+            0x100
+        } else {
+            return Err("measured_nofollow_unavailable");
+        };
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nofollow)
+            .open(path)
+            .map_err(|_| "measured_input_open")?;
+        require(
+            same_startup_metadata(
+                &before,
+                &file.metadata().map_err(|_| "measured_input_metadata")?,
+            ),
+            "measured_input_changed",
+        )?;
+        let mut digest = Sha256::new();
+        let mut bytes = Vec::new();
+        let mut size = 0_u64;
+        let mut buffer = [0_u8; 65_536];
+        loop {
+            require(Instant::now() < deadline, "measured_input_deadline")?;
+            let count = file.read(&mut buffer).map_err(|_| "measured_input_read")?;
+            if count == 0 {
+                break;
+            }
+            size = size
+                .checked_add(count as u64)
+                .filter(|size| *size <= cap)
+                .ok_or("measured_input_bound")?;
+            digest.update(&buffer[..count]);
+            if retain {
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+        }
+        require(
+            size == before.len()
+                && same_startup_metadata(
+                    &before,
+                    &file.metadata().map_err(|_| "measured_input_metadata")?,
+                )
+                && same_startup_metadata(&before, &private_metadata(path, uid, false)?),
+            "measured_input_changed",
+        )?;
+        observed.push((path.into(), before));
+        Ok((bytes, hex::encode(digest.finalize()), size))
+    }
+
+    fn revalidate_startup_inputs(files: &[(PathBuf, Metadata)], uid: u32) -> Checked<()> {
+        for (path, before) in files {
+            require(
+                same_startup_metadata(before, &private_metadata(path, uid, before.is_dir())?),
+                "measured_input_changed",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn require_measured_artifact_path(root: &Path, selected: &Path) -> Checked<()> {
+        require(
+            root.is_absolute()
+                && selected.as_os_str() == root.join(MEASURED_ARTIFACT_DIRECTORY).as_os_str(),
+            "measured_artifact_scope",
+        )
+    }
+
+    fn run_measured_startup(root: &RootGuard) -> Checked<()> {
+        require(
+            absent(&root.path.join(MEASURED_RESULT))?,
+            "measured_result_already_exists",
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut observed = Vec::new();
+        let request_bytes = read_startup_attachment(
+            &root.path.join(MEASURED_REQUEST),
+            root.uid,
+            20 * 1024 * 1024,
+            true,
+            deadline,
+            &mut observed,
+        )?
+        .0;
+        let input: MeasuredStartupFiles =
+            serde_json::from_slice(&request_bytes).map_err(|_| "measured_request_schema")?;
+        input
+            .expected_d1
+            .validate()
+            .map_err(|_| "measured_expected_d1_invalid")?;
+        require_measured_artifact_path(&root.path, &input.artifact_directory)?;
+        let artifact_directory = root.path.join(MEASURED_ARTIFACT_DIRECTORY);
+        root.revalidate()?;
+        let directory = private_metadata(&artifact_directory, root.uid, true)?;
+        require(
+            fs::canonicalize(&artifact_directory).ok().as_ref() == Some(&artifact_directory),
+            "measured_artifact_directory",
+        )?;
+        observed.push((artifact_directory.clone(), directory));
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&artifact_directory).map_err(|_| "measured_artifact_directory")? {
+            require(names.len() < 7, "measured_artifact_file_set")?;
+            names.push(
+                entry
+                    .map_err(|_| "measured_artifact_directory")?
+                    .file_name(),
+            );
+        }
+        names.sort();
+        let mut expected: Vec<_> = [
+            "runner.oci.tar",
+            "inventory.json",
+            "measurement.json",
+            "report.json",
+            "export-started.json",
+            "export-manifest.json",
+            "qualification.json",
+        ]
+        .map(std::ffi::OsString::from)
+        .to_vec();
+        expected.sort();
+        require(names == expected, "measured_artifact_file_set")?;
+        let mut attachment = |name: &str, cap: u64, retain| {
+            root.revalidate()?;
+            revalidate_startup_inputs(&observed, root.uid)?;
+            let result = read_startup_attachment(
+                &artifact_directory.join(name),
+                root.uid,
+                cap,
+                retain,
+                deadline,
+                &mut observed,
+            )?;
+            revalidate_startup_inputs(&observed, root.uid)?;
+            root.revalidate()?;
+            Ok::<_, &'static str>(result)
+        };
+        let (_, archive_sha256, archive_size) =
+            attachment("runner.oci.tar", 4 * 1024_u64.pow(3), false)?;
+        let export_started = attachment("export-started.json", 65_536, true)?.0;
+        let export_manifest = attachment("export-manifest.json", 65_536, true)?.0;
+        let qualification = attachment("qualification.json", 65_536, true)?.0;
+        let inventory = attachment("inventory.json", 32 * 1024_u64.pow(2), true)?.0;
+        let measurement = attachment("measurement.json", 128 * 1024, true)?.0;
+        let inspection = attachment("report.json", 16 * 1024, true)?.0;
+        let controller_journal = read_startup_attachment(
+            &root.path.join(MEASURED_JOURNAL),
+            root.uid,
+            4 * 1024 * 1024,
+            true,
+            deadline,
+            &mut observed,
+        )?
+        .0;
+        let controller_final_stdout = read_startup_attachment(
+            &root.path.join(MEASURED_STDOUT),
+            root.uid,
+            65_536,
+            true,
+            deadline,
+            &mut observed,
+        )?
+        .0;
+        let external_terminal = read_startup_attachment(
+            &root.path.join(MEASURED_TERMINAL),
+            root.uid,
+            4096,
+            true,
+            deadline,
+            &mut observed,
+        )?
+        .0;
+        let d1 = fixture::validate_measured_runner_d1(
+            &fixture::MeasuredRunnerD1Readback {
+                export_started,
+                export_manifest,
+                qualification,
+                inventory,
+                measurement,
+                inspection,
+                controller_journal,
+                controller_final_stdout,
+                external_terminal,
+                archive_sha256,
+                archive_size,
+            },
+            &input.expected_d1,
+            &input.request.process_runtime.runner_build_id,
+        )
+        .map_err(|_| "measured_d1_handoff_invalid")?;
+        let raw = required("BLUEY_TEST_POSTGRES_URL")?;
+        let (config, port) = database_config(&raw)?;
+        let mut client = config
+            .connect(postgres::NoTls)
+            .map_err(|_| "postgres_connect")?;
+        validate_database(&mut client, root, port)?;
+        let version: i32 = client
+            .query_one("SELECT current_setting('server_version_num')::integer", &[])
+            .map_err(|_| "measured_postgres_version")?
+            .get(0);
+        require(
+            (170_000..180_000).contains(&version),
+            "measured_postgres17_required",
+        )?;
+        revalidate_startup_inputs(&observed, root.uid)?;
+        root.revalidate()?;
+        let pool_url = format!("{raw}&connect_timeout=5&options=-c%20statement_timeout%3D5000%20-c%20lock_timeout%3D5000");
+        let pool = db::open_postgres_pool(&pool_url).map_err(|_| "postgres_pool")?;
+        // Pool establishment can block after the earlier input checks. Bind the
+        // same guarded root and current local file/directory identities again
+        // immediately before the issuer receives only already-validated bytes.
+        root.revalidate()?;
+        revalidate_startup_inputs(&observed, root.uid)?;
+        // No migrations, synthetic signer, preclaim, seeded native key or attestation.
+        let result = fixture::issue_measured_runner_startup(&pool, &input.request, &d1)
+            .map_err(|_| "measured_issuer_refused_partial_state_must_be_inspected")?;
+        revalidate_startup_inputs(&observed, root.uid)?;
+        root.revalidate()?;
+        validate_database(&mut client, root, port)?;
+        write_private(root, MEASURED_RESULT, &result)
+    }
+
     fn run() -> Checked<()> {
         require(std::env::args_os().len() == 1, "arguments_forbidden")?;
         require(
@@ -513,6 +789,22 @@ mod unix {
         let mut checkpoint_present = [false; 6];
         for (index, name) in CHECKPOINT_FILES.into_iter().enumerate() {
             checkpoint_present[index] = !absent(&root.path.join(name))?;
+        }
+        let mut measured_present = false;
+        for name in [
+            MEASURED_REQUEST,
+            MEASURED_RESULT,
+            MEASURED_JOURNAL,
+            MEASURED_STDOUT,
+            MEASURED_TERMINAL,
+        ] {
+            measured_present |= !absent(&root.path.join(name))?;
+        }
+        if select_measured_family(
+            review_present || auto_present || checkpoint_present.contains(&true),
+            measured_present,
+        )? {
+            return run_measured_startup(&root);
         }
         let checkpoint_stage = select_checkpoint_stage(checkpoint_present)?;
         let auto = select_auto_family(review_present, auto_present)?;
@@ -734,6 +1026,174 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn measured_startup_files_require_separate_closed_expected_d1_admission() {
+            use serde_json::json;
+            // Deserialization-only synthetic data; no signed trust or execution proof.
+            let envelope =
+                json!({"canonicalBase64url":"unit-only","signatureSetBase64url":"unit-only"});
+            let mut input = json!({
+                "artifact_directory":"/private/tmp/unit/runner-measured-artifacts",
+                "request":{"version":1,"operation":"issue_measured_runner_startup",
+                    "worker_id":"unit-worker","issuance_ref":"unit-issuance",
+                    "provider_resource_id":"unit-volume","resource_fingerprint":"a".repeat(64),
+                    "authorization_ref":"unit-authority","ttl_ms":60_000,
+                    "process_runtime":{"runnerImageSha256":"a".repeat(64),"runnerBuildId":"runner-unit",
+                        "platform":"linux","architecture":"x86_64","automationBundleSha256":"b".repeat(64),
+                        "playwrightVersion":"1.61.1","chromiumRevision":"1228","chromiumExecutableSha256":"c".repeat(64)},
+                    "startup_evidence_base64url":"unit-only","release_test_evidence_base64url":"unit-only",
+                    "trust_policy":envelope,"release":{"envelope":envelope,"verificationEvidenceBase64url":"unit-only",
+                        "inventoryAttachments":{"jobs-api":"unit-only","jobs-portal":"unit-only","jobs-runner":"unit-only","jobs-workflows":"unit-only"}},
+                    "cohort":{"envelope":envelope,"accountIds":[]},"activation":{"envelope":envelope,"evidence":{
+                        "canaryBase64url":"unit-only","cleanupBase64url":"unit-only","failureConverterBase64url":"unit-only",
+                        "portalReadbackBase64url":"unit-only","runnerFleetBase64url":"unit-only","storageBase64url":"unit-only",
+                        "taskQueueBase64url":"unit-only","temporalNamespaceBase64url":"unit-only"}}},
+                "expected_d1":{"version":1,"source_commit":"1".repeat(40),"source_branch":"feat/unit",
+                    "source_file_count":1,"source_manifest_sha256":"a".repeat(64),"source_archive_sha256":"b".repeat(64),
+                    "controller_source_sha256":"c".repeat(64),"harness_sha256":"d".repeat(64),"vm_test_sha256":"e".repeat(64),
+                    "artifact_helper_sha256":"f".repeat(64),"inspector_sha256":"1".repeat(64),
+                    "image_tool_sources_sha256":"2".repeat(64),"inspection_tool_sources_sha256":"3".repeat(64)}
+            });
+            let parsed: MeasuredStartupFiles = serde_json::from_value(input.clone()).unwrap();
+            parsed.expected_d1.validate().unwrap();
+            // This nested object is the existing public attestation wire type,
+            // not the private fixture's snake_case request envelope.
+            let mut wrong_wire_case = input.clone();
+            wrong_wire_case["request"]["process_runtime"]["automation_bundle_sha256"] =
+                wrong_wire_case["request"]["process_runtime"]["automationBundleSha256"].clone();
+            assert!(serde_json::from_value::<MeasuredStartupFiles>(wrong_wire_case).is_err());
+            let mut missing = input.clone();
+            missing.as_object_mut().unwrap().remove("expected_d1");
+            let error = serde_json::from_value::<MeasuredStartupFiles>(missing)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("expected_d1"));
+            let mut unknown = input.clone();
+            unknown["expected_d1"]["qualified"] = json!(true);
+            assert!(serde_json::from_value::<MeasuredStartupFiles>(unknown).is_err());
+            let mut report = input.clone();
+            report["report"] = report["expected_d1"].clone();
+            assert!(serde_json::from_value::<MeasuredStartupFiles>(report).is_err());
+            input["expected_d1"]["source_commit"] = json!("0".repeat(40));
+            let parsed: MeasuredStartupFiles = serde_json::from_value(input).unwrap();
+            assert!(parsed.expected_d1.validate().is_err());
+        }
+
+        #[test]
+        fn measured_startup_file_family_never_mixes_with_preclaimed_bootstrap() {
+            assert_eq!(select_measured_family(false, false), Ok(false));
+            assert_eq!(select_measured_family(true, false), Ok(false));
+            assert_eq!(select_measured_family(false, true), Ok(true));
+            assert_eq!(
+                select_measured_family(true, true),
+                Err("mixed_measured_fixture_families")
+            );
+            assert_eq!(MEASURED_REQUEST, "runner-measured-startup-request.json");
+            assert!(
+                !REVIEW_FILES.contains(&MEASURED_REQUEST)
+                    && !AUTO_FILES.contains(&MEASURED_REQUEST)
+                    && !CHECKPOINT_FILES.contains(&MEASURED_REQUEST)
+            );
+        }
+
+        #[test]
+        fn measured_artifact_path_accepts_only_the_fixed_guarded_root_child() {
+            let root = Path::new("/private/tmp/bluey-test-runs-unit/run.1.2.unit");
+            let expected = root.join(MEASURED_ARTIFACT_DIRECTORY);
+            assert_eq!(require_measured_artifact_path(root, &expected), Ok(()));
+            for selected in [
+                PathBuf::from("/private/tmp/same-uid-outside/runner-measured-artifacts"),
+                root.to_path_buf(),
+                root.join("different-artifacts"),
+                expected.join("nested"),
+                root.join("../runner-measured-artifacts"),
+                root.join("./runner-measured-artifacts"),
+                PathBuf::from("runner-measured-artifacts"),
+            ] {
+                assert_eq!(
+                    require_measured_artifact_path(root, &selected),
+                    Err("measured_artifact_scope")
+                );
+            }
+            assert_eq!(
+                require_measured_artifact_path(Path::new("relative"), &expected),
+                Err("measured_artifact_scope")
+            );
+        }
+
+        #[test]
+        fn measured_input_readback_streams_bounds_and_rejects_symlinks_changes_and_expired_budget()
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            struct OwnedUnitRoot(PathBuf);
+            impl Drop for OwnedUnitRoot {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let root = OwnedUnitRoot(std::env::temp_dir().join(format!(
+                "bluey-phase641-input-unit-{}",
+                uuid::Uuid::new_v4()
+            )));
+            fs::create_dir(&root.0).unwrap();
+            fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.0.join("unit-only.bin");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"unit-only synthetic bytes").unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let uid = fs::symlink_metadata(&path).unwrap().uid();
+            let mut observed = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (bytes, digest, size) =
+                read_startup_attachment(&path, uid, 1024, false, deadline, &mut observed).unwrap();
+            assert!(bytes.is_empty());
+            assert_eq!(size, 25);
+            assert_eq!(
+                digest,
+                hex::encode(Sha256::digest(b"unit-only synthetic bytes"))
+            );
+            revalidate_startup_inputs(&observed, uid).unwrap();
+            let retained =
+                read_startup_attachment(&path, uid, 1024, true, deadline, &mut observed).unwrap();
+            assert_eq!(retained.0, b"unit-only synthetic bytes");
+            assert!(read_startup_attachment(&path, uid, 1, true, deadline, &mut observed).is_err());
+            assert!(read_startup_attachment(
+                &path,
+                uid,
+                1024,
+                true,
+                Instant::now() - Duration::from_secs(1),
+                &mut observed
+            )
+            .is_err());
+            let link = root.0.join("unit-only-link");
+            symlink(&path, &link).unwrap();
+            assert!(
+                read_startup_attachment(&link, uid, 1024, true, deadline, &mut observed).is_err()
+            );
+            fs::write(&path, b"changed unit-only bytes").unwrap();
+            assert!(revalidate_startup_inputs(&observed, uid).is_err());
+            let artifacts = root.0.join(MEASURED_ARTIFACT_DIRECTORY);
+            require_measured_artifact_path(&root.0, &artifacts).unwrap();
+            fs::create_dir(&artifacts).unwrap();
+            fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+            let original_directory = private_metadata(&artifacts, uid, true).unwrap();
+            let directory_observation = vec![(artifacts.clone(), original_directory)];
+            revalidate_startup_inputs(&directory_observation, uid).unwrap();
+            fs::rename(&artifacts, root.0.join("unit-original-artifacts")).unwrap();
+            fs::create_dir(&artifacts).unwrap();
+            fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(revalidate_startup_inputs(&directory_observation, uid).is_err());
+            fs::remove_dir_all(&root.0).unwrap();
+            assert!(!root.0.exists());
+        }
 
         #[test]
         fn auto_file_family_is_separate_and_mixed_families_fail_closed() {

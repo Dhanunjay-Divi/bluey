@@ -5,6 +5,21 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs nonproduction tests: select measured-startup D1 source/tool evidence with
+  a separate closed parent-admitted expectation tuple rather than stale embedded
+  pins or report-derived expectations. Corrected full1948-test/strict-Clippy
+  source gates passed; measured runner startup remains unqualified.
+
+- Jobs nonproduction tests: retain redacted operation/status/body-digest evidence
+  for failed saved-account reads and preserve natural canonical cleanup for
+  admitted negative controller results. Saved-account default9/human8 tests and
+  cleanup passed; this is not measured runner or production runtime proof.
+
+- Jobs tests: add a guarded non-production measured-runner startup issuer that
+  imports complete externally signed evidence and creates three unconsumed
+  grants without preclaiming or fabricating runtime identity/readiness. Actual
+  image prerequisites and startup qualification remain pending.
+
 - Jobs docs: define isolated read-only provider-exposure evidence and correct
   fixed spend-truth retention versus configurable admission-window semantics.
 - Jobs tests: add a private read-only provider-exposure/stored-receipt prototype

@@ -1,6 +1,1469 @@
-// Debug/integration-feature-only protocol fixtures. Synthetic runtime/storage evidence is not
-// a measurement, deployment, browser execution, Temporal acceptance, or employer submission.
+// Debug/integration-feature-only fixtures. The measured issuer requires external
+// qualified artifacts and signed authority; it never executes or preclaims a runner.
+// Historical synthetic bootstrap evidence below is not startup or deployment proof.
 use super::*;
+
+/// A separate, externally authorized startup issuer. No account, job, volume key,
+/// claimed instance or successful runtime observation is accepted as input.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasuredRunnerStartupRequest {
+    pub version: u8,
+    pub operation: String,
+    pub worker_id: String,
+    pub issuance_ref: String,
+    pub provider_resource_id: String,
+    pub resource_fingerprint: String,
+    pub authorization_ref: String,
+    pub ttl_ms: i64,
+    pub process_runtime: RunnerProcessRuntimeAttestation,
+    pub startup_evidence_base64url: String,
+    pub release_test_evidence_base64url: String,
+    pub trust_policy: ManagedCloudAuthorityEnvelope,
+    pub release: ManagedCloudReleaseImportRequest,
+    pub cohort: ManagedCloudCohortImportRequest,
+    pub activation: ManagedCloudActivationImportRequest,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasuredRunnerStartupResult {
+    pub version: u8,
+    pub operation: &'static str,
+    pub worker_id: String,
+    pub scope: ManagedCloudScope,
+    pub managed_runtime_grant: ManagedCloudRuntimeGrant,
+    pub volume_admission_grant: RunnerVolumeAdmissionGrant,
+    pub volume_admission_token: String,
+    pub process_runtime_grant: RunnerProcessRuntimeGrant,
+    pub process_runtime_token: String,
+    pub d1_export_manifest_sha256: String,
+    pub d1_qualification_sha256: String,
+    pub d1_controller_journal_sha256: String,
+    pub grants_issued: u8,
+    pub grants_consumed: u8,
+    pub runtime_observed: bool,
+    pub customer_admission_proven: bool,
+    pub release_authority: bool,
+}
+
+struct MeasuredRunnerAuthority {
+    manifest_sha256: String,
+    activation_sha256: String,
+    runtime_identity_sha256: String,
+    expires_at_ms: i64,
+}
+
+/// Bytes read from the exact retained D1 handoff, not a caller success flag.
+/// The CLI streams the archive separately; its bounded digest/size are supplied here.
+pub struct MeasuredRunnerD1Readback {
+    pub export_started: Vec<u8>,
+    pub export_manifest: Vec<u8>,
+    pub qualification: Vec<u8>,
+    pub inventory: Vec<u8>,
+    pub measurement: Vec<u8>,
+    pub inspection: Vec<u8>,
+    pub controller_journal: Vec<u8>,
+    pub controller_final_stdout: Vec<u8>,
+    pub external_terminal: Vec<u8>,
+    pub archive_sha256: String,
+    pub archive_size: u64,
+}
+
+/// Independently reviewed parent admission, never constructed from D1 report fields.
+/// These expected bytes select one source/tool closure; they do not certify execution.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasuredRunnerD1Expected {
+    pub version: u8,
+    pub source_commit: String,
+    pub source_branch: String,
+    pub source_file_count: u64,
+    pub source_manifest_sha256: String,
+    pub source_archive_sha256: String,
+    pub controller_source_sha256: String,
+    pub harness_sha256: String,
+    pub vm_test_sha256: String,
+    pub artifact_helper_sha256: String,
+    pub inspector_sha256: String,
+    pub image_tool_sources_sha256: String,
+    pub inspection_tool_sources_sha256: String,
+}
+
+impl MeasuredRunnerD1Expected {
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.version == 1
+                && self.source_commit.len() == 40
+                && self.source_commit != "0".repeat(40)
+                && self
+                    .source_commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                && (1..=100_000).contains(&self.source_file_count)
+                && !self.source_branch.is_empty()
+                && self.source_branch.len() <= 255
+                && self.source_branch.split('/').all(|part| part
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                    && !part.contains("..")
+                    && !part.ends_with('.')
+                    && !part.ends_with(".lock")
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))),
+            "measured_d1_expected_source"
+        );
+        for digest in [
+            &self.source_manifest_sha256,
+            &self.source_archive_sha256,
+            &self.controller_source_sha256,
+            &self.harness_sha256,
+            &self.vm_test_sha256,
+            &self.artifact_helper_sha256,
+            &self.inspector_sha256,
+            &self.image_tool_sources_sha256,
+            &self.inspection_tool_sources_sha256,
+        ] {
+            anyhow::ensure!(
+                managed_cloud_hex64(digest) && digest != &"0".repeat(64),
+                "measured_d1_expected_digest"
+            );
+        }
+        Ok(())
+    }
+}
+
+pub struct MeasuredRunnerD1Binding {
+    source_commit: String,
+    inventory_sha256: String,
+    measurement_sha256: String,
+    measurement: ManagedCloudRuntimeMeasurementAuthority,
+    process_runtime: RunnerProcessRuntimeAttestation,
+    export_manifest_sha256: String,
+    export_started_sha256: String,
+    qualification_sha256: String,
+    controller_journal_sha256: String,
+    controller_final_stdout_sha256: String,
+    external_terminal_sha256: String,
+}
+
+fn d1_keys(value: &Value, keys: &[&str]) -> Result<()> {
+    let object = value.as_object().context("measured D1 object missing")?;
+    anyhow::ensure!(
+        object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key)),
+        "measured_d1_closed_shape"
+    );
+    Ok(())
+}
+
+fn d1_json(bytes: &[u8], maximum: usize, newline: bool) -> Result<Value> {
+    anyhow::ensure!(
+        !bytes.is_empty() && bytes.len() <= maximum && bytes.is_ascii(),
+        "measured_d1_bytes"
+    );
+    let value: Value = serde_json::from_slice(bytes)?;
+    let mut canonical = managed_cloud_canonical_json(&value)?;
+    if !newline {
+        let _ = canonical.pop();
+    }
+    anyhow::ensure!(canonical == bytes, "measured_d1_canonical");
+    Ok(value)
+}
+
+fn d1_text(value: &Value) -> Result<&str> {
+    value.as_str().context("measured D1 string missing")
+}
+
+fn d1_digest(value: &Value) -> Result<&str> {
+    let digest = d1_text(value)?;
+    anyhow::ensure!(
+        managed_cloud_hex64(digest) && digest != "0".repeat(64),
+        "measured_d1_digest"
+    );
+    Ok(digest)
+}
+
+fn validate_startup_release_test_evidence(value: &Value, source_commit: &str) -> Result<()> {
+    // Preserve the normal release-v3 test-evidence-v2 meaning. These are imported
+    // signed metadata bindings, not an assertion that this issuer ran remote CI.
+    d1_keys(
+        value,
+        &[
+            "version",
+            "audience",
+            "sourceCommit",
+            "repository",
+            "repositoryId",
+            "defaultBranch",
+            "releaseContractSelfTestSha256",
+            "ciRuns",
+        ],
+    )?;
+    let repository = d1_text(&value["repository"])?;
+    let repository_parts: Vec<_> = repository.split('/').collect();
+    let branch = d1_text(&value["defaultBranch"])?;
+    anyhow::ensure!(
+        value["version"] == 2
+            && value["audience"] == "bluey-jobs-managed-cloud-test-evidence-v2"
+            && value["sourceCommit"] == source_commit
+            && repository_parts.len() == 2
+            && repository_parts.iter().all(|part| !part.is_empty()
+                && part.len() <= 100
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)))
+            && value["repositoryId"]
+                .as_i64()
+                .is_some_and(|number| managed_cloud_safe_integer(number, true))
+            && !branch.is_empty()
+            && branch.len() <= 255
+            && branch.trim() == branch
+            && branch.is_ascii()
+            && !branch
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b' '),
+        "measured_startup_release_test_evidence"
+    );
+    d1_digest(&value["releaseContractSelfTestSha256"])?;
+    let runs = value["ciRuns"]
+        .as_array()
+        .context("measured startup CI metadata missing")?;
+    anyhow::ensure!(runs.len() == 2, "measured_startup_release_test_evidence");
+    for (run, (check_id, workflow)) in runs.iter().zip([
+        ("jobs-ci", ".github/workflows/jobs-ci.yml"),
+        (
+            "observability-policy",
+            ".github/workflows/observability-policy.yml",
+        ),
+    ]) {
+        d1_keys(
+            run,
+            &[
+                "checkId",
+                "conclusion",
+                "event",
+                "headBranch",
+                "headSha",
+                "repositoryId",
+                "runAttempt",
+                "runId",
+                "workflowPath",
+            ],
+        )?;
+        anyhow::ensure!(
+            run["checkId"] == check_id
+                && run["workflowPath"] == workflow
+                && run["conclusion"] == "success"
+                && run["event"] == "push"
+                && run["headBranch"] == branch
+                && run["headSha"] == source_commit
+                && run["repositoryId"] == value["repositoryId"]
+                && ["runId", "runAttempt"].iter().all(|key| run[key]
+                    .as_i64()
+                    .is_some_and(|number| managed_cloud_safe_integer(number, true))),
+            "measured_startup_release_test_evidence"
+        );
+    }
+    anyhow::ensure!(
+        runs[0]["runId"] != runs[1]["runId"],
+        "measured_startup_release_test_evidence"
+    );
+    Ok(())
+}
+
+fn validate_measured_d1_controller(
+    input: &MeasuredRunnerD1Readback,
+    expected: &MeasuredRunnerD1Expected,
+    manifest: &Value,
+    qualification: &Value,
+) -> Result<()> {
+    anyhow::ensure!(
+        !input.controller_journal.is_empty()
+            && input.controller_journal.len() <= 4 * 1024 * 1024
+            && input.controller_journal.ends_with(b"\n")
+            && input.controller_final_stdout.len() <= 65_536
+            && !input.controller_final_stdout.is_empty()
+            && input.external_terminal.len() <= 4096,
+        "measured_d1_controller_bounds"
+    );
+    let terminal: Value = serde_json::from_slice(&input.external_terminal)?;
+    d1_keys(
+        &terminal,
+        &[
+            "version",
+            "controllerSourceSha256",
+            "controllerFinalStdoutSha256",
+            "controllerJournalSha256",
+            "code",
+            "signal",
+        ],
+    )?;
+    anyhow::ensure!(
+        input.external_terminal.len() <= 4096
+            && terminal["version"] == 1
+            && terminal["controllerSourceSha256"] == expected.controller_source_sha256
+            && terminal["controllerFinalStdoutSha256"]
+                == managed_cloud_sha256(&input.controller_final_stdout)
+            && terminal["controllerJournalSha256"]
+                == managed_cloud_sha256(&input.controller_journal)
+            && terminal["code"] == 0
+            && terminal["signal"].is_null(),
+        "measured_d1_external_terminal"
+    );
+    anyhow::ensure!(
+        input.controller_final_stdout.ends_with(b"\n")
+            && input
+                .controller_final_stdout
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                == 1,
+        "measured_d1_final_stdout_line"
+    );
+    let stdout: Value = serde_json::from_slice(&input.controller_final_stdout)?;
+    d1_keys(
+        &stdout,
+        &[
+            "event",
+            "success",
+            "journal",
+            "journalSha256",
+            "terminal",
+            "states",
+            "parentAbsent",
+        ],
+    )?;
+    anyhow::ensure!(
+        stdout["event"] == "phase639_image_controller_finished"
+            && stdout["success"] == true
+            && stdout["journalSha256"] == terminal["controllerJournalSha256"]
+            && stdout["terminal"] == json!({"code":0,"signal":null})
+            && stdout["parentAbsent"] == true,
+        "measured_d1_controller_terminal"
+    );
+    let journal = std::str::from_utf8(&input.controller_journal)?;
+    let lines: Vec<_> = journal.lines().collect();
+    anyhow::ensure!(
+        lines.len() <= 512
+            && lines
+                .iter()
+                .all(|line| !line.is_empty() && line.len() <= 128 * 1024),
+        "measured_d1_journal_bounds"
+    );
+    let records: Vec<Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line))
+        .collect::<std::result::Result<_, _>>()?;
+    let one = |event: &str| -> Result<&Value> {
+        let mut matches = records.iter().filter(|record| record["event"] == event);
+        let value = matches
+            .next()
+            .context("measured D1 journal stage missing")?;
+        anyhow::ensure!(matches.next().is_none(), "measured_d1_duplicate_stage");
+        Ok(value)
+    };
+    let allowed = [
+        "source_before",
+        "dispatch",
+        "owned_vm_state_observed",
+        "image_progress",
+        "command_terminal",
+        "managed_runner_vm_image_smoke_finished",
+        "residue",
+        "source_after",
+        "retained_artifact_proof",
+        "source_after_artifacts",
+        "controller_finished",
+    ];
+    anyhow::ensure!(
+        records
+            .iter()
+            .all(|record| allowed.iter().any(|name| record["event"] == *name))
+            && records
+                .first()
+                .is_some_and(|record| record["event"] == "source_before")
+            && records
+                .last()
+                .is_some_and(|record| record["event"] == "controller_finished")
+            && one("controller_finished")?["success"] == true,
+        "measured_d1_journal_sequence"
+    );
+    // Exact success record emitted by the independently admitted controller.
+    // A successful outer wrapper cannot override a failed or authority-widened
+    // controller record inside its hash-bound journal.
+    let finished = one("controller_finished")?;
+    d1_keys(
+        finished,
+        &[
+            "event",
+            "time",
+            "success",
+            "d1Qualified",
+            "qualified",
+            "d2Authority",
+            "releaseAuthority",
+            "actualTerminal",
+            "failure",
+            "originalFailure",
+            "failedArchiveRetained",
+            "elapsedMs",
+        ],
+    )?;
+    anyhow::ensure!(
+        finished["success"] == true
+            && finished["d1Qualified"] == true
+            && finished["qualified"] == false
+            && finished["d2Authority"] == false
+            && finished["releaseAuthority"] == false
+            && finished["actualTerminal"] == json!({"code":0,"signal":null})
+            && finished["failure"].is_null()
+            && finished["originalFailure"].is_null()
+            && finished["failedArchiveRetained"] == false
+            && finished["elapsedMs"]
+                .as_u64()
+                .is_some_and(|elapsed| elapsed <= 9_007_199_254_740_991)
+            && finished["time"]
+                .as_str()
+                .is_some_and(|time| time.len() == 24
+                    && chrono::DateTime::parse_from_rfc3339(time)
+                        .is_ok_and(
+                            |parsed| parsed.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string() == time
+                        )),
+        "measured_d1_controller_finished"
+    );
+    let before = one("source_before")?;
+    for event in ["source_after", "source_after_artifacts"] {
+        let after = one(event)?;
+        for key in ["head", "branch", "files", "manifest", "rawStatus"] {
+            anyhow::ensure!(after[key] == before[key], "measured_d1_source_changed");
+        }
+    }
+    anyhow::ensure!(
+        before["head"] == manifest["source"]["sourceCommit"]
+            && before["head"] == expected.source_commit
+            && before["branch"] == expected.source_branch
+            && before["files"] == expected.source_file_count
+            && before["manifest"] == expected.source_manifest_sha256
+            && before["selfSha256"] == expected.controller_source_sha256,
+        "measured_d1_controller_source"
+    );
+    let progress: Vec<_> = records
+        .iter()
+        .filter(|record| record["event"] == "image_progress")
+        .map(|record| record["phase"].as_str())
+        .collect();
+    anyhow::ensure!(
+        progress
+            == [
+                Some("vm_starting"),
+                Some("vm_isolation_checked"),
+                Some("inputs_prepared"),
+                Some("builder_started"),
+                Some("image_build_started"),
+                Some("image_build_finished"),
+                Some("image_inspection_started"),
+                Some("image_inspection_finished")
+            ],
+        "measured_d1_progress"
+    );
+    let command = one("command_terminal")?;
+    anyhow::ensure!(
+        command["code"] == 0
+            && command["signal"].is_null()
+            && command["overflow"] == false
+            && command["observerFailure"].is_null(),
+        "measured_d1_launcher_terminal"
+    );
+    let residue = one("residue")?;
+    let states = residue["states"]
+        .as_array()
+        .context("measured D1 state proof missing")?;
+    anyhow::ensure!(
+        states.len() == 1
+            && states[0]["absent"] == true
+            && residue["parentEmpty"] == true
+            && residue["parentAbsent"] == true
+            && residue["preexistingStateCount"] == 0
+            && stdout["states"] == residue["states"],
+        "measured_d1_cleanup"
+    );
+    let retained = one("retained_artifact_proof")?;
+    anyhow::ensure!(
+        retained["manifestSha256"] == managed_cloud_sha256(&input.export_manifest)
+            && retained["qualificationSha256"] == managed_cloud_sha256(&input.qualification)
+            && retained["sourceCommit"] == before["head"]
+            && retained["d2Authority"] == false
+            && retained["releaseAuthority"] == false,
+        "measured_d1_retained_proof"
+    );
+    let retained_files = retained["files"]
+        .as_array()
+        .context("measured D1 retained files missing")?;
+    let manifest_files = manifest["files"]
+        .as_array()
+        .context("measured D1 manifest files missing")?;
+    anyhow::ensure!(
+        retained_files.len() == 4 && manifest_files.len() == 4,
+        "measured_d1_retained_proof"
+    );
+    for (retained_file, saved) in retained_files.iter().zip(manifest_files) {
+        d1_keys(retained_file, &["name", "size", "sha256", "identity"])?;
+        d1_keys(&retained_file["identity"], &["dev", "ino"])?;
+        anyhow::ensure!(
+            ["name", "size", "sha256"]
+                .iter()
+                .all(|key| retained_file[key] == saved[key])
+                && ["dev", "ino"]
+                    .iter()
+                    .all(|key| retained_file["identity"][key] == saved["identity"][key]),
+            "measured_d1_retained_file_changed"
+        );
+    }
+    let report = one("managed_runner_vm_image_smoke_finished")?;
+    anyhow::ensure!(
+        report["version"] == 1
+            && report["qualification"] == "isolated_measured_runner_image_only"
+            && report["claims"]
+                == json!({"normalRunnerStartup":false,"managedAuthority":false,"submission":false,"production":false})
+            && report["compatibility"]["baseCommit"] == before["head"]
+            && report["compatibility"]["harnessSha256"] == expected.harness_sha256
+            && report["compatibility"]["testSha256"] == expected.vm_test_sha256
+            && report["compatibility"]["cleanup"] == qualification["proof"]["cleanup"]
+            && report["imageToolSourcesSha256"] == expected.image_tool_sources_sha256
+            && report["image"]["sourceCommit"] == before["head"]
+            && report["image"]["sourceArchiveSha256"] == manifest["source"]["sourceArchiveSha256"]
+            && report["image"]["toolSourcesSha256"] == manifest["source"]["toolSourcesSha256"]
+            && report["image"]["inspection"] == manifest["inspection"]
+            && report["image"]["cleanup"] == json!({"builderRemoved":true,"containerRemoved":true}),
+        "measured_d1_final_report"
+    );
+    // The pinned controller adds only its second `time` property when journaling
+    // this report. Remove that exact prefix field without sorting/reserializing
+    // the report: qualification hashes the original emitted bytes plus newline.
+    let ordinal = records
+        .iter()
+        .position(|record| record["event"] == "managed_runner_vm_image_smoke_finished")
+        .context("measured D1 report missing")?;
+    let event = "{\"event\":\"managed_runner_vm_image_smoke_finished\"";
+    let prefix = format!(
+        "{event},\"time\":{}",
+        serde_json::to_string(&report["time"])?
+    );
+    let suffix = lines[ordinal]
+        .strip_prefix(&prefix)
+        .context("measured D1 report encoding changed")?;
+    anyhow::ensure!(suffix.starts_with(','), "measured_d1_report_encoding");
+    let original = format!("{event}{suffix}\n");
+    anyhow::ensure!(
+        qualification["proof"]["imageReportSha256"] == managed_cloud_sha256(original.as_bytes()),
+        "measured_d1_emitted_report_changed"
+    );
+    Ok(())
+}
+
+/// Revalidates retained metadata/content. This never grants D2, fleet or release authority.
+pub fn validate_measured_runner_d1(
+    input: &MeasuredRunnerD1Readback,
+    admission: &MeasuredRunnerD1Expected,
+    declared_runner_build_id: &str,
+) -> Result<MeasuredRunnerD1Binding> {
+    admission.validate()?;
+    anyhow::ensure!(
+        runner_build_id_is_canonical(declared_runner_build_id),
+        "measured_d1_deployment_build_token"
+    );
+    let manifest = d1_json(&input.export_manifest, 65_536, false)?;
+    let qualification = d1_json(&input.qualification, 65_536, false)?;
+    let started = d1_json(&input.export_started, 65_536, false)?;
+    let inspection = d1_json(&input.inspection, 16_384, true)?;
+    let measurement: ManagedCloudRuntimeMeasurementAuthority =
+        managed_cloud_parse_canonical(&input.measurement)?;
+    d1_keys(
+        &manifest,
+        &[
+            "version",
+            "state",
+            "qualified",
+            "d2Authority",
+            "releaseAuthority",
+            "binding",
+            "source",
+            "reader",
+            "files",
+            "inspection",
+        ],
+    )?;
+    d1_keys(
+        &started,
+        &[
+            "version",
+            "state",
+            "qualified",
+            "d2Authority",
+            "releaseAuthority",
+            "binding",
+            "source",
+            "artifacts",
+        ],
+    )?;
+    d1_keys(
+        &qualification,
+        &[
+            "version",
+            "state",
+            "qualification",
+            "d2Authority",
+            "releaseAuthority",
+            "externalTerminalZeroRequired",
+            "exportManifestSha256",
+            "proof",
+        ],
+    )?;
+    let manifest_sha256 = managed_cloud_sha256(&input.export_manifest);
+    let qualification_sha256 = managed_cloud_sha256(&input.qualification);
+    anyhow::ensure!(
+        manifest["version"] == 1
+            && manifest["state"] == "attachments_complete"
+            && manifest["qualified"] == false
+            && started["version"] == 1
+            && started["state"] == "incomplete"
+            && started["qualified"] == false
+            && qualification["version"] == 1
+            && qualification["state"] == "d1_qualified"
+            && qualification["qualification"] == "isolated_measured_runner_image_only"
+            && qualification["externalTerminalZeroRequired"] == true
+            && qualification["exportManifestSha256"] == manifest_sha256
+            && [&manifest, &started, &qualification]
+                .iter()
+                .all(|item| item["d2Authority"] == false && item["releaseAuthority"] == false)
+            && started["binding"] == manifest["binding"]
+            && started["source"] == manifest["source"]
+            && manifest["inspection"] == inspection,
+        "measured_d1_receipt_binding"
+    );
+    let source = &manifest["source"];
+    d1_keys(
+        &manifest["binding"],
+        &[
+            "parentIdentity",
+            "childIdentity",
+            "childName",
+            "hostRuntime",
+        ],
+    )?;
+    d1_keys(
+        &manifest["reader"],
+        &["runtime", "readerSourceSha256", "continuity"],
+    )?;
+    d1_keys(
+        source,
+        &[
+            "sourceCommit",
+            "sourceArchiveSha256",
+            "toolSourcesSha256",
+            "harnessSha256",
+            "imageToolSourcesSha256",
+        ],
+    )?;
+    let commit = d1_text(&source["sourceCommit"])?;
+    anyhow::ensure!(
+        commit.len() == 40
+            && commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "measured_d1_source"
+    );
+    for key in [
+        "sourceArchiveSha256",
+        "toolSourcesSha256",
+        "harnessSha256",
+        "imageToolSourcesSha256",
+    ] {
+        d1_digest(&source[key])?;
+    }
+    anyhow::ensure!(
+        commit == admission.source_commit
+            && source["sourceArchiveSha256"] == admission.source_archive_sha256
+            && source["harnessSha256"] == admission.harness_sha256
+            && source["imageToolSourcesSha256"] == admission.image_tool_sources_sha256
+            && source["toolSourcesSha256"] == admission.inspection_tool_sources_sha256
+            && manifest["reader"]["readerSourceSha256"] == admission.artifact_helper_sha256,
+        "measured_d1_expected_closure"
+    );
+    let proof = &qualification["proof"];
+    d1_keys(
+        proof,
+        &[
+            "sourceCommit",
+            "imageReportSha256",
+            "harnessSha256",
+            "toolSourcesSha256",
+            "postListenerChecked",
+            "sourceUnchanged",
+            "cleanup",
+        ],
+    )?;
+    let cleanup_keys = [
+        "privateInventoriesEmpty",
+        "ownedVmPidsAbsent",
+        "socketAbsent",
+        "stateAbsent",
+        "usernetSocketsAbsent",
+    ];
+    d1_keys(&proof["cleanup"], &cleanup_keys)?;
+    anyhow::ensure!(
+        proof["sourceCommit"] == source["sourceCommit"]
+            && proof["harnessSha256"] == source["harnessSha256"]
+            && proof["toolSourcesSha256"] == source["imageToolSourcesSha256"]
+            && proof["postListenerChecked"] == true
+            && proof["sourceUnchanged"] == true
+            && cleanup_keys.iter().all(|key| proof["cleanup"][key] == true),
+        "measured_d1_qualification"
+    );
+    let names = [
+        "runner.oci.tar",
+        "inventory.json",
+        "measurement.json",
+        "report.json",
+    ];
+    let sizes = [
+        input.archive_size,
+        input.inventory.len() as u64,
+        input.measurement.len() as u64,
+        input.inspection.len() as u64,
+    ];
+    let hashes = [
+        input.archive_sha256.clone(),
+        managed_cloud_sha256(&input.inventory),
+        managed_cloud_sha256(&input.measurement),
+        managed_cloud_sha256(&input.inspection),
+    ];
+    let caps = [
+        4 * 1024_u64.pow(3),
+        32 * 1024_u64.pow(2),
+        128 * 1024,
+        16 * 1024,
+    ];
+    let files = manifest["files"]
+        .as_array()
+        .context("measured D1 files missing")?;
+    anyhow::ensure!(
+        files.len() == 4 && started["artifacts"] == json!(names),
+        "measured_d1_file_set"
+    );
+    for (index, file) in files.iter().enumerate() {
+        d1_keys(file, &["name", "size", "sha256", "identity"])?;
+        anyhow::ensure!(
+            file["name"] == names[index]
+                && file["size"].as_u64() == Some(sizes[index])
+                && sizes[index] > 0
+                && sizes[index] <= caps[index]
+                && d1_digest(&file["sha256"])? == hashes[index],
+            "measured_d1_attachment_changed"
+        );
+        // Original identities remain historical receipt bindings. A guest copy is
+        // content-equivalent, not inode-equivalent; the CLI binds its current FDs.
+        d1_keys(
+            &file["identity"],
+            &[
+                "dev", "ino", "uid", "mode", "nlink", "size", "mtimeNs", "ctimeNs",
+            ],
+        )?;
+        anyhow::ensure!(
+            file["identity"]["size"] == file["size"] && file["identity"]["nlink"] == 1,
+            "measured_d1_original_identity"
+        );
+    }
+    d1_keys(
+        &inspection,
+        &[
+            "version",
+            "expected",
+            "oci",
+            "runtime",
+            "native",
+            "browser",
+            "claims",
+            "inspectorSha256",
+        ],
+    )?;
+    let expected = &inspection["expected"];
+    d1_keys(
+        expected,
+        &[
+            "version",
+            "sourceCommit",
+            "buildId",
+            "configSchemaSha256",
+            "migrationSetSha256",
+            "protocolSetSha256",
+        ],
+    )?;
+    d1_keys(
+        &inspection["oci"],
+        &["manifestSha256", "imageConfigSha256", "inventorySha256"],
+    )?;
+    d1_keys(
+        &inspection["runtime"],
+        &[
+            "runtimeMeasurementSha256",
+            "runtimeIdentitySha256",
+            "automationBundleSha256",
+        ],
+    )?;
+    d1_digest(&inspection["inspectorSha256"])?;
+    anyhow::ensure!(
+        inspection["inspectorSha256"] == admission.inspector_sha256,
+        "measured_d1_expected_inspector"
+    );
+    for (object, keys) in [
+        (
+            &inspection["oci"],
+            &["manifestSha256", "imageConfigSha256", "inventorySha256"][..],
+        ),
+        (
+            &inspection["runtime"],
+            &[
+                "runtimeMeasurementSha256",
+                "runtimeIdentitySha256",
+                "automationBundleSha256",
+            ][..],
+        ),
+        (
+            expected,
+            &[
+                "configSchemaSha256",
+                "migrationSetSha256",
+                "protocolSetSha256",
+            ][..],
+        ),
+    ] {
+        for key in keys {
+            d1_digest(&object[key])?;
+        }
+    }
+    let runtime_identity =
+        managed_cloud_runtime_identity_sha256(&hashes[2], "jobs-runner", "managed_runner")?;
+    anyhow::ensure!(
+        inspection["version"] == 1
+            && expected["version"] == 1
+            && expected["sourceCommit"] == commit
+            && expected["buildId"] == format!("nonprod-p639-{}", &commit[..12])
+            && measurement.source_commit == commit
+            && measurement.component_id == "jobs-runner"
+            && measurement.roles == ["managed_runner"]
+            && expected["buildId"] == measurement.build_id
+            && expected["configSchemaSha256"] == measurement.config_schema_sha256
+            && expected["migrationSetSha256"] == measurement.migration_set_sha256
+            && expected["protocolSetSha256"] == measurement.protocol_set_sha256
+            && inspection["oci"]["inventorySha256"] == hashes[1]
+            && inspection["runtime"]["runtimeMeasurementSha256"] == hashes[2]
+            && inspection["runtime"]["runtimeIdentitySha256"] == runtime_identity
+            && inspection["oci"]["manifestSha256"] != inspection["oci"]["imageConfigSha256"]
+            && inspection["native"]
+                == json!({"writeReadback":true,"inventory":true,"removed":true})
+            && inspection["claims"]
+                == json!({"actualImageInspection":true,"nativeAddon":true,"browserOnly":true,
+            "normalRunnerStartup":false,"managedAuthority":false,"submission":false,"production":false}),
+        "measured_d1_inspection_binding"
+    );
+    let automation_entries: Vec<_> = measurement
+        .measured_files
+        .iter()
+        .filter(|item| item.path.starts_with("app/automation/"))
+        .map(|item| json!({"path":item.path,"sha256":item.sha256}))
+        .collect();
+    anyhow::ensure!(
+        [
+            "app/automation/package.json",
+            "app/automation/dist/index.js"
+        ]
+        .iter()
+        .all(|path| automation_entries.iter().any(|item| item["path"] == *path)),
+        "measured_d1_automation_missing"
+    );
+    let bundle_sha256 = managed_cloud_digest(
+        &json!({"audience":"bluey-jobs-managed-runner-automation-bundle-v1",
+        "entries":automation_entries,"version":1}),
+    )?;
+    anyhow::ensure!(
+        inspection["runtime"]["automationBundleSha256"] == bundle_sha256,
+        "measured_d1_automation_changed"
+    );
+    let browser = &inspection["browser"];
+    d1_keys(
+        browser,
+        &[
+            "playwrightVersion",
+            "chromiumVersion",
+            "chromiumRevision",
+            "executablePath",
+            "executableSha256",
+            "titleReadback",
+            "requestsAborted",
+            "launchProfile",
+        ],
+    )?;
+    let executable_path = d1_text(&browser["executablePath"])?;
+    let relative_executable = executable_path
+        .strip_prefix('/')
+        .context("measured D1 executable path")?;
+    for (key, minimum, maximum) in [("playwrightVersion", 3, 3), ("chromiumVersion", 2, 4)] {
+        let parts: Vec<_> = d1_text(&browser[key])?.split('.').collect();
+        anyhow::ensure!(
+            (minimum..=maximum).contains(&parts.len())
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+            "measured_d1_browser_version"
+        );
+    }
+    let revision = d1_text(&browser["chromiumRevision"])?;
+    anyhow::ensure!(
+        managed_cloud_runner_headless_shell_path(relative_executable)
+            && !revision.starts_with('0')
+            && (1..=10).contains(&revision.len())
+            && relative_executable.split('/').nth(1)
+                == Some(
+                    format!(
+                        "chromium_headless_shell-{}",
+                        d1_text(&browser["chromiumRevision"])?
+                    )
+                    .as_str()
+                )
+            && measurement
+                .measured_files
+                .iter()
+                .filter(|item| managed_cloud_runner_headless_shell_path(&item.path))
+                .count()
+                == 1
+            && measurement
+                .measured_files
+                .iter()
+                .any(|item| item.path == relative_executable
+                    && browser["executableSha256"] == item.sha256)
+            && browser["titleReadback"] == true
+            && browser["requestsAborted"].as_u64().is_some()
+            && browser["launchProfile"] == "production_default_options_synthetic_only",
+        "measured_d1_browser_binding"
+    );
+    let process_runtime = RunnerProcessRuntimeAttestation {
+        runner_image_sha256: d1_digest(&inspection["oci"]["manifestSha256"])?.into(),
+        // This is a declared deployment token, not D1's differently shaped buildId.
+        runner_build_id: declared_runner_build_id.into(),
+        platform: "linux".into(),
+        architecture: "x86_64".into(),
+        automation_bundle_sha256: bundle_sha256,
+        playwright_version: d1_text(&browser["playwrightVersion"])?.into(),
+        chromium_revision: d1_text(&browser["chromiumRevision"])?.into(),
+        chromium_executable_sha256: d1_digest(&browser["executableSha256"])?.into(),
+    };
+    validate_runner_process_runtime(&process_runtime)?;
+    validate_measured_d1_controller(input, admission, &manifest, &qualification)?;
+    Ok(MeasuredRunnerD1Binding {
+        source_commit: commit.into(),
+        inventory_sha256: hashes[1].clone(),
+        measurement_sha256: hashes[2].clone(),
+        measurement,
+        process_runtime,
+        export_manifest_sha256: manifest_sha256,
+        export_started_sha256: managed_cloud_sha256(&input.export_started),
+        qualification_sha256,
+        controller_journal_sha256: managed_cloud_sha256(&input.controller_journal),
+        controller_final_stdout_sha256: managed_cloud_sha256(&input.controller_final_stdout),
+        external_terminal_sha256: managed_cloud_sha256(&input.external_terminal),
+    })
+}
+
+fn validate_startup_evidence_binding(
+    encoded: &str,
+    d1: &MeasuredRunnerD1Binding,
+    release_test_evidence_sha256: &str,
+) -> Result<String> {
+    let bytes = managed_cloud_decode_base64url(encoded)?;
+    let evidence = d1_json(&bytes, 128 * 1024, true)?;
+    let expected = json!({"version":1,
+        "audience":"bluey-jobs-phase641-nonproduction-startup-only-evidence-v1",
+        "sourceCommit":d1.source_commit,"releaseTestEvidenceSha256":release_test_evidence_sha256,
+        "d1ExportStartedSha256":d1.export_started_sha256,"d1ExportManifestSha256":d1.export_manifest_sha256,
+        "d1QualificationSha256":d1.qualification_sha256,"d1ControllerJournalSha256":d1.controller_journal_sha256,
+        "d1ControllerFinalStdoutSha256":d1.controller_final_stdout_sha256,"d1ExternalTerminalSha256":d1.external_terminal_sha256});
+    anyhow::ensure!(evidence == expected, "measured_startup_evidence_aggregate");
+    Ok(managed_cloud_sha256(&bytes))
+}
+
+fn validate_measured_startup_header(
+    request: &MeasuredRunnerStartupRequest,
+    d1: &MeasuredRunnerD1Binding,
+) -> Result<()> {
+    anyhow::ensure!(
+        request.version == 1
+            && request.operation == "issue_measured_runner_startup"
+            && managed_cloud_route_id(&request.worker_id)
+            && managed_cloud_route_id(&request.issuance_ref)
+            && managed_cloud_route_id(&request.authorization_ref)
+            && request.provider_resource_id.starts_with("phase641-owned-")
+            && bounded_id(&request.provider_resource_id, 20, 128)
+            && managed_cloud_hex64(&request.resource_fingerprint)
+            && request.resource_fingerprint != "0".repeat(64)
+            && (5_000..=900_000).contains(&request.ttl_ms),
+        "measured_startup_request"
+    );
+    validate_runner_process_runtime(&request.process_runtime)?;
+    anyhow::ensure!(
+        request.process_runtime == d1.process_runtime,
+        "measured_startup_process_binding"
+    );
+    Ok(())
+}
+
+fn validate_measured_startup_authority(
+    request: &MeasuredRunnerStartupRequest,
+    d1: &MeasuredRunnerD1Binding,
+    anchor: &ManagedCloudRootTrustAnchor,
+    now_ms: i64,
+) -> Result<MeasuredRunnerAuthority> {
+    validate_measured_startup_header(request, d1)?;
+    let (policy_bytes, policy_signature_bytes) =
+        managed_cloud_decode_envelope(&request.trust_policy)?;
+    let policy: ManagedCloudTrustPolicyAuthority = managed_cloud_parse_canonical(&policy_bytes)?;
+    let policy_signature: ManagedCloudSignatureSetAuthority =
+        managed_cloud_parse_canonical(&policy_signature_bytes)?;
+    validate_managed_cloud_root_anchor(anchor)?;
+    validate_managed_cloud_trust_policy(&policy)?;
+    anyhow::ensure!(
+        policy.predecessor_policy_sha256.is_none(),
+        "measured_startup_initial_policy"
+    );
+    verify_managed_cloud_bootstrap_union_signature_set(
+        &policy_bytes,
+        &policy_signature,
+        anchor,
+        &policy,
+        now_ms,
+    )?;
+
+    let (release_bytes, release_signature_bytes) =
+        managed_cloud_decode_envelope(&request.release.envelope)?;
+    let release: ManagedCloudReleaseAuthority = managed_cloud_parse_canonical(&release_bytes)?;
+    let release_signature: ManagedCloudSignatureSetAuthority =
+        managed_cloud_parse_canonical(&release_signature_bytes)?;
+    validate_managed_cloud_release(&release)?;
+    anyhow::ensure!(
+        release.version == 3
+            && release.source_commit == d1.source_commit
+            && release.manifest_generation == 1
+            && release.release_sequence == 1,
+        "measured_startup_release_version_source"
+    );
+    verify_managed_cloud_signature_set(
+        &release_bytes,
+        &release_signature,
+        &policy,
+        "release",
+        &release.audience,
+        release.published_at_ms,
+        now_ms,
+    )?;
+    let verification_bytes =
+        managed_cloud_decode_base64url(&request.release.verification_evidence_base64url)?;
+    let verification: ManagedCloudVerificationEvidenceAuthority =
+        managed_cloud_parse_canonical(&verification_bytes)?;
+    validate_managed_cloud_verification_evidence(&verification, &verification_bytes, &release)?;
+    let test_evidence_bytes =
+        managed_cloud_decode_base64url(&request.release_test_evidence_base64url)?;
+    let test_evidence = d1_json(&test_evidence_bytes, 128 * 1024, true)?;
+    validate_startup_release_test_evidence(&test_evidence, &release.source_commit)?;
+    anyhow::ensure!(
+        managed_cloud_sha256(&test_evidence_bytes) == verification.test_evidence_sha256,
+        "measured_startup_release_test_evidence_changed"
+    );
+    let startup_evidence_sha256 = validate_startup_evidence_binding(
+        &request.startup_evidence_base64url,
+        d1,
+        &verification.test_evidence_sha256,
+    )?;
+    let failure_converter_sha256 = validate_managed_cloud_content_inventories(
+        &request.release.inventory_attachments,
+        &release,
+        &verification,
+    )?;
+    let runner = release
+        .components
+        .iter()
+        .find(|item| item.component_id == "jobs-runner")
+        .context("measured startup runner component missing")?;
+    let measured_runner = verification
+        .components
+        .iter()
+        .find(|item| item.component_id == "jobs-runner")
+        .context("measured startup runner verification missing")?;
+    let inventory_bytes =
+        managed_cloud_decode_content_inventory(&request.release.inventory_attachments.jobs_runner)?;
+    anyhow::ensure!(
+        runner.artifact_sha256 == d1.process_runtime.runner_image_sha256
+            && runner.build_id == d1.measurement.build_id
+            && managed_cloud_sha256(&inventory_bytes) == d1.inventory_sha256
+            && measured_runner.runtime_measurement.as_ref() == Some(&d1.measurement)
+            && measured_runner.runtime_measurement_sha256.as_deref()
+                == Some(d1.measurement_sha256.as_str()),
+        "measured_startup_d1_release_binding"
+    );
+
+    let (cohort_bytes, cohort_signature_bytes) =
+        managed_cloud_decode_envelope(&request.cohort.envelope)?;
+    let cohort: ManagedCloudCohortAuthority = managed_cloud_parse_canonical(&cohort_bytes)?;
+    let cohort_signature: ManagedCloudSignatureSetAuthority =
+        managed_cloud_parse_canonical(&cohort_signature_bytes)?;
+    validate_managed_cloud_cohort(&cohort)?;
+    anyhow::ensure!(
+        cohort.scope == fixture_scope()
+            && cohort.trust_generation == policy.trust_generation
+            && request.cohort.account_ids.is_empty()
+            && cohort.account_id_sha256s.is_empty()
+            && cohort.cohort_generation == 1
+            && cohort.not_before_ms >= policy.valid_from_ms
+            && cohort.expires_at_ms <= policy.expires_at_ms
+            && cohort.approval_ref
+                == format!("phase641-startup-evidence-{startup_evidence_sha256}"),
+        "measured_startup_cohort_scope"
+    );
+    verify_managed_cloud_signature_set(
+        &cohort_bytes,
+        &cohort_signature,
+        &policy,
+        "general_promotion",
+        MANAGED_CLOUD_COHORT_AUDIENCE,
+        cohort.issued_at_ms,
+        now_ms,
+    )?;
+
+    let (activation_bytes, activation_signature_bytes) =
+        managed_cloud_decode_envelope(&request.activation.envelope)?;
+    let activation: ManagedCloudActivationAuthority =
+        managed_cloud_parse_canonical(&activation_bytes)?;
+    let activation_signature: ManagedCloudSignatureSetAuthority =
+        managed_cloud_parse_canonical(&activation_signature_bytes)?;
+    validate_managed_cloud_activation(&activation)?;
+    let expires_at_ms = now_ms
+        .checked_add(request.ttl_ms)
+        .context("measured startup expiry overflow")?;
+    anyhow::ensure!(
+        activation.scope == fixture_scope()
+            && activation.version == 3
+            && activation.activation_generation == 1
+            && activation.channel_sequence == 1
+            && activation.expected_head_revision == 0
+            && activation.expected_transition_sha256.is_none()
+            && activation.predecessor_activation_sha256.is_none()
+            && activation.recovery_acceptances.is_empty()
+            && activation.manifest_sha256 == managed_cloud_sha256(&release_bytes)
+            && activation.cohort_sha256 == managed_cloud_sha256(&cohort_bytes)
+            && activation.trust_generation == policy.trust_generation
+            && activation.not_before_ms <= now_ms
+            && cohort.not_before_ms <= now_ms
+            && activation.not_before_ms >= cohort.not_before_ms
+            && activation.not_before_ms >= policy.valid_from_ms
+            && activation.expires_at_ms <= cohort.expires_at_ms
+            && activation.expires_at_ms <= policy.expires_at_ms
+            && expires_at_ms <= activation.expires_at_ms
+            && expires_at_ms <= cohort.expires_at_ms
+            && expires_at_ms <= policy.expires_at_ms
+            && activation.issued_at_ms >= release.published_at_ms
+            && activation.issued_at_ms >= cohort.issued_at_ms,
+        "measured_startup_activation_scope_time"
+    );
+    verify_managed_cloud_signature_set(
+        &activation_bytes,
+        &activation_signature,
+        &policy,
+        "general_promotion",
+        &activation.audience,
+        activation.issued_at_ms,
+        now_ms,
+    )?;
+    let signature_ids: BTreeSet<_> = [
+        &policy_signature,
+        &release_signature,
+        &cohort_signature,
+        &activation_signature,
+    ]
+    .into_iter()
+    .map(|signature| signature.signature_set_id.as_str())
+    .collect();
+    anyhow::ensure!(
+        signature_ids.len() == 4,
+        "measured_startup_signature_set_identity_conflict"
+    );
+    let dependencies = ManagedCloudActivationDependencies {
+        trust_generation: policy.trust_generation,
+        manifest_signature_set_sha256: managed_cloud_sha256(&release_signature_bytes),
+        cohort_signature_set_sha256: managed_cloud_sha256(&cohort_signature_bytes),
+        feature_authority_sha256: release.feature_authority_sha256.clone(),
+        feature_authority: release.feature_authority,
+        failure_converter_sha256,
+        portal_artifact_sha256: release
+            .components
+            .iter()
+            .find(|item| item.component_id == "jobs-portal")
+            .context("measured startup portal component missing")?
+            .artifact_sha256
+            .clone(),
+        manifest_published_at_ms: release.published_at_ms,
+        cohort_issued_at_ms: cohort.issued_at_ms,
+        cohort_not_before_ms: cohort.not_before_ms,
+        cohort_expires_at_ms: cohort.expires_at_ms,
+        canonical_manifest_base64url: request.release.envelope.canonical_base64url.clone(),
+    };
+    validate_managed_cloud_activation_dependencies(&activation, &dependencies)?;
+    let evidence = parse_managed_cloud_activation_evidence(&request.activation.evidence)?;
+    let validated_evidence = validate_managed_cloud_activation_evidence(
+        &evidence,
+        &activation,
+        &dependencies.portal_artifact_sha256,
+        &dependencies.failure_converter_sha256,
+        now_ms,
+    )?;
+    validate_managed_cloud_activation_evidence_bindings(&activation, &validated_evidence)?;
+    Ok(MeasuredRunnerAuthority {
+        manifest_sha256: managed_cloud_sha256(&release_bytes),
+        activation_sha256: managed_cloud_sha256(&activation_bytes),
+        runtime_identity_sha256: managed_cloud_runtime_identity_sha256(
+            &d1.measurement_sha256,
+            "jobs-runner",
+            "managed_runner",
+        )?,
+        expires_at_ms,
+    })
+}
+
+const STARTUP_ZERO_TABLES: &[&str] = &[
+    "jobs_managed_cloud_runtime_instances",
+    "jobs_managed_cloud_runtime_heartbeats",
+    "jobs_managed_cloud_original_source_verifier_runtime_instances",
+    "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+    "jobs_runner_volumes",
+    "jobs_runner_volume_keys",
+    "jobs_runner_volume_authority_uses",
+    "jobs_runner_process_runtime_bindings",
+    "jobs_runner_volume_storage_attestations",
+    "jobs_runner_legacy_inventory_authorities",
+    "jobs_runner_volume_residencies",
+    "jobs_runner_account_subjects",
+    "jobs_runner_purge_requests",
+    "jobs_runner_purge_tombstones",
+    "jobs_runner_volume_destructions",
+    "jobs_runner_process_runtime_grant_revocations",
+    "jobs_applications",
+    "jobs_browser_sessions",
+    "jobs_attempt_reservations",
+    "jobs_execution_leases",
+    "jobs_workflow_commands",
+    "jobs_managed_cloud_workflow_bindings",
+    "jobs_managed_cloud_request_start_authorities",
+    "jobs_managed_cloud_irreversible_effect_receipts",
+];
+
+fn require_startup_zero_state(pool: &DbPool) -> Result<()> {
+    let mut connection = pool.get_pg()?;
+    let mut tx = connection
+        .build_transaction()
+        .read_only(true)
+        .isolation_level(postgres::IsolationLevel::RepeatableRead)
+        .start()?;
+    for table in STARTUP_ZERO_TABLES {
+        let count: i64 = tx
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])?
+            .get(0);
+        anyhow::ensure!(count == 0, "measured_startup_state_not_empty");
+    }
+    let fleet = tx.query_one(
+        "SELECT enrollment_generation,purge_generation,tombstone_generation,destruction_generation,
+                storage_attestation_generation,legacy_inventory_generation,cutover_state,
+                legacy_reconciliation_generation,legacy_inventory_state,storage_attestation_count,
+                unresolved_legacy_volume_count
+           FROM jobs_runner_volume_fleet_state WHERE singleton_id=1",
+        &[],
+    )?;
+    anyhow::ensure!(
+        (0_usize..6).all(|index| fleet.get::<_, i64>(index) == 0)
+            && fleet.get::<_, String>(6) == "pre_cutover"
+            && fleet.get::<_, i64>(7) == 0
+            && fleet.get::<_, String>(8) == "unknown"
+            && fleet.get::<_, i64>(9) == 0
+            && fleet.get::<_, i64>(10) == 0,
+        "measured_startup_fleet_not_fresh"
+    );
+    tx.commit()?;
+    Ok(())
+}
+
+fn require_startup_initial_registry(pool: &DbPool) -> Result<()> {
+    let mut connection = pool.get_pg()?;
+    for table in [
+        "jobs_managed_cloud_trust_policies",
+        "jobs_managed_cloud_manifests",
+        "jobs_managed_cloud_cohorts",
+        "jobs_managed_cloud_activations",
+        "jobs_managed_cloud_heads",
+        "jobs_managed_cloud_revocations",
+        "jobs_managed_cloud_runtime_grants",
+        "jobs_managed_cloud_original_source_verifier_runtime_grants",
+        "jobs_runner_volume_admission_grants",
+        "jobs_runner_process_runtime_grants",
+    ] {
+        let count: i64 = connection
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])?
+            .get(0);
+        anyhow::ensure!(count == 0, "measured_startup_registry_not_fresh");
+    }
+    Ok(())
+}
+
+fn issue_startup_grants(
+    pool: &DbPool,
+    request: &MeasuredRunnerStartupRequest,
+    authority: &MeasuredRunnerAuthority,
+    now_ms: i64,
+    d1: &MeasuredRunnerD1Binding,
+) -> Result<MeasuredRunnerStartupResult> {
+    let ttl_ms = authority
+        .expires_at_ms
+        .checked_sub(now_ms)
+        .filter(|ttl| (5_000..=900_000).contains(ttl))
+        .context("measured startup grant window expired")?;
+    let created_by = "phase641-private-startup-issuer";
+    let managed = issue_managed_cloud_runtime_grant(
+        pool,
+        &NewManagedCloudRuntimeGrant {
+            issuance_ref: request.issuance_ref.clone(),
+            scope: fixture_scope(),
+            activation_sha256: authority.activation_sha256.clone(),
+            manifest_sha256: authority.manifest_sha256.clone(),
+            component_id: "jobs-runner".into(),
+            role: "managed_runner".into(),
+            expected_worker_id: request.worker_id.clone(),
+            authorization_ref: request.authorization_ref.clone(),
+            created_by: created_by.into(),
+            ttl_ms,
+        },
+    )?;
+    anyhow::ensure!(
+        !managed.replayed
+            && managed.grant_token.is_some()
+            && managed.expected_runtime_identity_sha256 == authority.runtime_identity_sha256
+            && managed.artifact_sha256 == request.process_runtime.runner_image_sha256,
+        "measured_startup_managed_grant"
+    );
+    let volume_token = random_token();
+    let volume = create_runner_volume_admission_grant(
+        pool,
+        &NewRunnerVolumeAdmissionGrant {
+            grant_id: format!("p641-volume-{}", uuid::Uuid::new_v4().simple()),
+            token: volume_token.clone(),
+            expected_worker_id: request.worker_id.clone(),
+            provider: "nonprod-owned-volume".into(),
+            provider_resource_id: request.provider_resource_id.clone(),
+            resource_fingerprint: request.resource_fingerprint.clone(),
+            authorization_ref: request.authorization_ref.clone(),
+            created_by: created_by.into(),
+            expires_at_ms: authority.expires_at_ms,
+            created_at_ms: now_ms,
+        },
+    )?;
+    let process_token = random_token();
+    let process = create_runner_process_runtime_grant(
+        pool,
+        &NewRunnerProcessRuntimeGrant {
+            grant_id: format!("p641-process-{}", uuid::Uuid::new_v4().simple()),
+            token: process_token.clone(),
+            expected_worker_id: request.worker_id.clone(),
+            runtime: request.process_runtime.clone(),
+            authorization_ref: request.authorization_ref.clone(),
+            created_by: created_by.into(),
+            expires_at_ms: authority.expires_at_ms,
+            created_at_ms: now_ms,
+        },
+    )?;
+    anyhow::ensure!(
+        volume.consumed_volume_id.is_none()
+            && volume.consumed_at_ms.is_none()
+            && volume.disposition == RunnerVolumeWriteDisposition::Applied
+            && process.disposition == RunnerVolumeWriteDisposition::Applied,
+        "measured_startup_grants_not_fresh"
+    );
+    Ok(MeasuredRunnerStartupResult {
+        version: 1,
+        operation: "issue_measured_runner_startup",
+        worker_id: request.worker_id.clone(),
+        scope: fixture_scope(),
+        managed_runtime_grant: managed,
+        volume_admission_grant: volume,
+        volume_admission_token: volume_token,
+        process_runtime_grant: process,
+        process_runtime_token: process_token,
+        d1_export_manifest_sha256: d1.export_manifest_sha256.clone(),
+        d1_qualification_sha256: d1.qualification_sha256.clone(),
+        d1_controller_journal_sha256: d1.controller_journal_sha256.clone(),
+        grants_issued: 3,
+        grants_consumed: 0,
+        runtime_observed: false,
+        customer_admission_proven: false,
+        release_authority: false,
+    })
+}
+
+/// Imports commit independently. Any later storage/clock failure retains partial
+/// private state; a retry is refused by the initial-registry guard, not rolled back.
+pub fn issue_measured_runner_startup(
+    pool: &DbPool,
+    request: &MeasuredRunnerStartupRequest,
+    d1: &MeasuredRunnerD1Binding,
+) -> Result<MeasuredRunnerStartupResult> {
+    anyhow::ensure!(
+        matches!(pool, DbPool::Postgres(_)),
+        "measured startup requires private PostgreSQL"
+    );
+    require_startup_zero_state(pool)?;
+    require_startup_initial_registry(pool)?;
+    let anchor = managed_cloud_root_anchor_from_environment()?;
+    let authority = validate_measured_startup_authority(request, d1, &anchor, clock(pool)?)?;
+    let actor = "phase641-private-startup-issuer";
+    import_managed_cloud_trust_policy(pool, &request.trust_policy, actor)?;
+    let release = import_managed_cloud_release(pool, &request.release, actor)?;
+    import_managed_cloud_cohort(pool, &request.cohort, actor)?;
+    let activation = import_managed_cloud_activation(pool, &request.activation, actor)?;
+    anyhow::ensure!(
+        release.authority_sha256 == authority.manifest_sha256
+            && activation.authority_sha256 == authority.activation_sha256,
+        "measured_startup_import_binding"
+    );
+    apply_managed_cloud_activation(
+        pool,
+        &ApplyManagedCloudActivationRequest {
+            activation_sha256: authority.activation_sha256.clone(),
+            expected_head_revision: 0,
+            expected_transition_sha256: None,
+        },
+        actor,
+    )?;
+    require_startup_zero_state(pool)?;
+    let result = issue_startup_grants(pool, request, &authority, clock(pool)?, d1)?;
+    require_startup_zero_state(pool)?;
+    let counts = pool.get_pg()?.query_one(
+        "SELECT (SELECT count(*) FROM jobs_managed_cloud_runtime_grants),
+                (SELECT count(*) FROM jobs_runner_volume_admission_grants),
+                (SELECT count(*) FROM jobs_runner_process_runtime_grants)",
+        &[],
+    )?;
+    anyhow::ensure!(
+        (0_usize..3).all(|index| counts.get::<_, i64>(index) == 1),
+        "measured_startup_three_grants"
+    );
+    Ok(result)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FixtureMode {
@@ -1934,6 +3397,768 @@ pub fn inspect_checkpoint_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // All of this factory's records/signatures are UNIT METADATA ONLY. They do
+    // not represent a VM, real CI, native storage, a runner startup or fleet proof.
+    fn unit_startup_request_json() -> Value {
+        let envelope =
+            json!({"canonicalBase64url":"unit-only", "signatureSetBase64url":"unit-only"});
+        json!({"version":1,"operation":"issue_measured_runner_startup",
+            "worker_id":"phase641-unit-worker-00000001","issuance_ref":"phase641-unit-issuance",
+            "provider_resource_id":"phase641-owned-unit-volume","resource_fingerprint":"a".repeat(64),
+            "authorization_ref":"phase641-unit-only-authority","ttl_ms":60_000,
+            "process_runtime":runtime_model("phase641-unit-only"),"startup_evidence_base64url":"unit-only",
+            "release_test_evidence_base64url":"unit-only","trust_policy":envelope,
+            "release":{"envelope":envelope,"verificationEvidenceBase64url":"unit-only","inventoryAttachments":{
+                "jobs-api":"unit-only","jobs-portal":"unit-only","jobs-runner":"unit-only","jobs-workflows":"unit-only"}},
+            "cohort":{"envelope":envelope,"accountIds":[]},"activation":{"envelope":envelope,"evidence":{
+                "canaryBase64url":"unit-only","cleanupBase64url":"unit-only","failureConverterBase64url":"unit-only",
+                "portalReadbackBase64url":"unit-only","runnerFleetBase64url":"unit-only","storageBase64url":"unit-only",
+                "taskQueueBase64url":"unit-only","temporalNamespaceBase64url":"unit-only"}}})
+    }
+
+    fn unit_startup_request() -> MeasuredRunnerStartupRequest {
+        serde_json::from_value(unit_startup_request_json()).unwrap()
+    }
+
+    fn unit_d1_expected() -> MeasuredRunnerD1Expected {
+        // Planned C admission pins, not actual D1 execution evidence. The inspection
+        // aggregate is a unit-only value because these fixtures contain no tool bytes.
+        serde_json::from_value(json!({
+            "version":1,
+            "source_commit":"14d56e770670291ab12798888c45c851d34efe42",
+            "source_branch":"feat/phase-646-jobs-current-source-runner-qualification",
+            "source_file_count":846,
+            "source_manifest_sha256":"a93f795803c6b224879f5f92ee385000db16449c8afd8c7d66147e3a6b305ec1",
+            "source_archive_sha256":"5366d56177945607b2754915bb1000b9d10f27df1ddb2715d2cd74da09385a60",
+            "controller_source_sha256":"9472b523a6888410bf958cf90a38ebca7113d522e8b245a5dd54aab8084fa221",
+            "harness_sha256":"5f3d8831212afa9e72ac7d5d574d58ab465431a53a7636b92e888e626f73a846",
+            "vm_test_sha256":"3331113d5a99f8278cd2ccccfe0e5a4afa136af634547ae89084184f9b95c82b",
+            "artifact_helper_sha256":"f76951933fc950d788fc624f80a8ee48290907f3fac9657e7fd5c5e2ee0d238c",
+            "inspector_sha256":"27532f5b47305fd363c8168bb4078bffd165365d243aa26a498177e0f5ea87b6",
+            "image_tool_sources_sha256":"17ce99c0238a28f8e8ec19ea08c3ad05121a68b25c1a068155da20f9aff8b985",
+            "inspection_tool_sources_sha256":"5".repeat(64)
+        })).unwrap()
+    }
+
+    fn unit_d1_metadata() -> MeasuredRunnerD1Readback {
+        unit_d1_metadata_for(&unit_d1_expected())
+    }
+
+    fn unit_d1_metadata_for(admission: &MeasuredRunnerD1Expected) -> MeasuredRunnerD1Readback {
+        let commit = &admission.source_commit;
+        let measurement = json!({"version":1,"audience":MANAGED_CLOUD_RUNTIME_MEASUREMENT_AUDIENCE,
+            "buildId":format!("nonprod-p639-{}",&commit[..12]),"componentId":"jobs-runner",
+            "configSchemaSha256":"c".repeat(64),"migrationSetSha256":"e".repeat(64),"protocolSetSha256":"f".repeat(64),
+            "roles":["managed_runner"],"sourceCommit":commit,"measuredFiles":[
+                {"path":"app/automation/dist/index.js","sha256":"a".repeat(64)},
+                {"path":"app/automation/package.json","sha256":"b".repeat(64)},
+                {"path":"ms-playwright/chromium_headless_shell-1228/linux64/chrome-headless-shell","sha256":"d".repeat(64)}]});
+        let measurement_bytes = managed_cloud_canonical_json(&measurement).unwrap();
+        let measurement_sha = managed_cloud_sha256(&measurement_bytes);
+        let bundle = managed_cloud_digest(
+            &json!({"audience":"bluey-jobs-managed-runner-automation-bundle-v1",
+            "version":1,"entries":measurement["measuredFiles"].as_array().unwrap()[..2].to_vec()}),
+        )
+        .unwrap();
+        let inventory =
+            managed_cloud_canonical_json(&json!({"unitOnly":"not-a-release-inventory"})).unwrap();
+        let inspection = json!({"version":1,"expected":{"version":1,"sourceCommit":commit,
+            "buildId":measurement["buildId"],"configSchemaSha256":measurement["configSchemaSha256"],
+            "migrationSetSha256":measurement["migrationSetSha256"],"protocolSetSha256":measurement["protocolSetSha256"]},
+            "oci":{"manifestSha256":"1".repeat(64),"imageConfigSha256":"2".repeat(64),"inventorySha256":managed_cloud_sha256(&inventory)},
+            "runtime":{"runtimeMeasurementSha256":measurement_sha,"automationBundleSha256":bundle,
+                "runtimeIdentitySha256":managed_cloud_runtime_identity_sha256(&measurement_sha,"jobs-runner","managed_runner").unwrap()},
+            "native":{"writeReadback":true,"inventory":true,"removed":true},"browser":{"playwrightVersion":"1.61.1",
+                "chromiumVersion":"130.0.0","chromiumRevision":"1228",
+                "executablePath":"/ms-playwright/chromium_headless_shell-1228/linux64/chrome-headless-shell",
+                "executableSha256":"d".repeat(64),"titleReadback":true,"requestsAborted":0,
+                "launchProfile":"production_default_options_synthetic_only"},"inspectorSha256":admission.inspector_sha256,
+            "claims":{"actualImageInspection":true,"nativeAddon":true,"browserOnly":true,
+                "normalRunnerStartup":false,"managedAuthority":false,"submission":false,"production":false}});
+        let inspection_bytes = managed_cloud_canonical_json(&inspection).unwrap();
+        let source = json!({"sourceCommit":commit,"sourceArchiveSha256":admission.source_archive_sha256,
+            "toolSourcesSha256":admission.inspection_tool_sources_sha256,
+            "harnessSha256":admission.harness_sha256,"imageToolSourcesSha256":admission.image_tool_sources_sha256});
+        let binding = json!({"parentIdentity":{"dev":"1","ino":"1"},"childIdentity":{"dev":"1","ino":"2"},
+            "childName":"phase639-image-artifacts-000000000000000000000001","hostRuntime":{"unitOnly":true}});
+        let names = [
+            "runner.oci.tar",
+            "inventory.json",
+            "measurement.json",
+            "report.json",
+        ];
+        let hashes = [
+            managed_cloud_sha256(b"unit archive"),
+            managed_cloud_sha256(&inventory),
+            measurement_sha,
+            managed_cloud_sha256(&inspection_bytes),
+        ];
+        let sizes = [
+            12,
+            inventory.len(),
+            measurement_bytes.len(),
+            inspection_bytes.len(),
+        ];
+        let files: Vec<_> = names.iter().enumerate().map(|(index,name)| json!({"name":name,"size":sizes[index],
+            "sha256":hashes[index],"identity":{"dev":"1","ino":(index+1).to_string(),"uid":501,"mode":384,
+                "nlink":1,"size":sizes[index],"mtimeNs":"1","ctimeNs":"1"}})).collect();
+        let retained_files: Vec<_> = files.iter().map(|file|json!({"name":file["name"],"size":file["size"],
+            "sha256":file["sha256"],"identity":{"dev":file["identity"]["dev"],"ino":file["identity"]["ino"]}})).collect();
+        let manifest = json!({"version":1,"state":"attachments_complete","qualified":false,"d2Authority":false,"releaseAuthority":false,
+            "binding":binding,"source":source,"reader":{"runtime":{"unitOnly":true},"readerSourceSha256":admission.artifact_helper_sha256,
+                "continuity":{"unitOnly":true}},"files":files,"inspection":inspection});
+        let started = json!({"version":1,"state":"incomplete","qualified":false,"d2Authority":false,"releaseAuthority":false,
+            "binding":binding,"source":source,"artifacts":names});
+        let record = |value: &Value| {
+            let mut bytes = managed_cloud_canonical_json(value).unwrap();
+            let _ = bytes.pop();
+            bytes
+        };
+        let manifest_bytes = record(&manifest);
+        let cleanup = json!({"privateInventoriesEmpty":true,"ownedVmPidsAbsent":true,"socketAbsent":true,"stateAbsent":true,"usernetSocketsAbsent":true});
+        let compatibility = json!({"baseCommit":commit,"cleanup":cleanup,
+            "harnessSha256":admission.harness_sha256,"testSha256":admission.vm_test_sha256});
+        let image = json!({"sourceCommit":commit,"sourceArchiveSha256":source["sourceArchiveSha256"],
+            "toolSourcesSha256":source["toolSourcesSha256"],"inspection":inspection,"cleanup":{"builderRemoved":true,"containerRemoved":true}});
+        let claims = json!({"normalRunnerStartup":false,"managedAuthority":false,"submission":false,"production":false});
+        let raw_report = format!("{{\"event\":\"managed_runner_vm_image_smoke_finished\",\"version\":1,\"qualification\":\"isolated_measured_runner_image_only\",\"compatibility\":{compatibility},\"image\":{image},\"imageToolSourcesSha256\":{},\"claims\":{claims}}}\n",source["imageToolSourcesSha256"]);
+        let qualification = json!({"version":1,"state":"d1_qualified","qualification":"isolated_measured_runner_image_only",
+            "d2Authority":false,"releaseAuthority":false,"externalTerminalZeroRequired":true,
+            "exportManifestSha256":managed_cloud_sha256(&manifest_bytes),"proof":{"sourceCommit":commit,
+                "imageReportSha256":managed_cloud_sha256(raw_report.as_bytes()),"harnessSha256":source["harnessSha256"],
+                "toolSourcesSha256":source["imageToolSourcesSha256"],"postListenerChecked":true,"sourceUnchanged":true,"cleanup":cleanup}});
+        let qualification_bytes = record(&qualification);
+        let snapshot = json!({"head":commit,"branch":admission.source_branch,
+            "files":admission.source_file_count,"manifest":admission.source_manifest_sha256,
+            "rawStatus":"8".repeat(64),"selfSha256":admission.controller_source_sha256});
+        let state = json!({"unitOnly":true,"absent":true});
+        let mut records = Vec::new();
+        for event in ["source_before", "dispatch", "owned_vm_state_observed"] {
+            let mut value = if event == "source_before" {
+                snapshot.clone()
+            } else {
+                json!({})
+            };
+            value["event"] = json!(event);
+            records.push(format!("{value}\n"));
+        }
+        for phase in [
+            "vm_starting",
+            "vm_isolation_checked",
+            "inputs_prepared",
+            "builder_started",
+            "image_build_started",
+            "image_build_finished",
+            "image_inspection_started",
+            "image_inspection_finished",
+        ] {
+            records.push(format!(
+                "{}\n",
+                json!({"event":"image_progress","phase":phase})
+            ));
+        }
+        records.push(format!("{}\n",json!({"event":"command_terminal","code":0,"signal":null,"overflow":false,"observerFailure":null})));
+        records.push(raw_report.replacen(
+            "\"version\":1",
+            "\"time\":\"unit-only\",\"version\":1",
+            1,
+        ));
+        records.push(format!("{}\n",json!({"event":"residue","states":[state],"parentEmpty":true,"parentAbsent":true,"preexistingStateCount":0})));
+        let mut after = snapshot.clone();
+        after["event"] = json!("source_after");
+        records.push(format!("{after}\n"));
+        records.push(format!("{}\n",json!({"event":"retained_artifact_proof","manifestSha256":managed_cloud_sha256(&manifest_bytes),
+            "qualificationSha256":managed_cloud_sha256(&qualification_bytes),"sourceCommit":commit,"d2Authority":false,"releaseAuthority":false,"files":retained_files})));
+        after["event"] = json!("source_after_artifacts");
+        records.push(format!("{after}\n"));
+        records.push(format!(
+            "{}\n",
+            json!({"event":"controller_finished","time":"2026-11-02T00:00:00.000Z",
+                "success":true,"d1Qualified":true,"qualified":false,"d2Authority":false,
+                "releaseAuthority":false,"actualTerminal":{"code":0,"signal":null},
+                "failure":null,"originalFailure":null,"failedArchiveRetained":false,"elapsedMs":1})
+        ));
+        let journal = records.concat().into_bytes();
+        let stdout = format!("{}\n",json!({"event":"phase639_image_controller_finished","success":true,"journal":"unit-only.jsonl",
+            "journalSha256":managed_cloud_sha256(&journal),"terminal":{"code":0,"signal":null},"states":[state],"parentAbsent":true})).into_bytes();
+        let external = format!("{}\n",json!({"version":1,"controllerSourceSha256":admission.controller_source_sha256,
+            "controllerFinalStdoutSha256":managed_cloud_sha256(&stdout),"controllerJournalSha256":managed_cloud_sha256(&journal),"code":0,"signal":null})).into_bytes();
+        MeasuredRunnerD1Readback {
+            export_started: record(&started),
+            export_manifest: manifest_bytes,
+            qualification: qualification_bytes,
+            inventory,
+            measurement: measurement_bytes,
+            inspection: inspection_bytes,
+            controller_journal: journal,
+            controller_final_stdout: stdout,
+            external_terminal: external,
+            archive_sha256: hashes[0].clone(),
+            archive_size: 12,
+        }
+    }
+
+    #[test]
+    fn measured_startup_unit_metadata_readback_binds_all_files_and_external_terminal() {
+        let metadata = unit_d1_metadata();
+        let binding =
+            validate_measured_runner_d1(&metadata, &unit_d1_expected(), "runner-641.0").unwrap();
+        assert_eq!(binding.source_commit, unit_d1_expected().source_commit);
+        assert_eq!(binding.process_runtime.runner_build_id, "runner-641.0");
+        assert_ne!(
+            binding.process_runtime.runner_build_id,
+            binding.measurement.build_id
+        );
+        assert_eq!(
+            binding.process_runtime.automation_bundle_sha256.as_str(),
+            d1_json(&metadata.inspection, 16_384, true).unwrap()["runtime"]
+                ["automationBundleSha256"]
+                .as_str()
+                .unwrap()
+        );
+        for index in 0..9 {
+            let mut changed = unit_d1_metadata();
+            let bytes = match index {
+                0 => &mut changed.export_started,
+                1 => &mut changed.export_manifest,
+                2 => &mut changed.qualification,
+                3 => &mut changed.inventory,
+                4 => &mut changed.measurement,
+                5 => &mut changed.inspection,
+                6 => &mut changed.controller_journal,
+                7 => &mut changed.controller_final_stdout,
+                _ => &mut changed.external_terminal,
+            };
+            bytes[0] ^= 1;
+            assert!(
+                validate_measured_runner_d1(&changed, &unit_d1_expected(), "runner-641.0").is_err()
+            );
+        }
+        let mut changed = unit_d1_metadata();
+        changed.archive_sha256 = "0".repeat(64);
+        assert!(
+            validate_measured_runner_d1(&changed, &unit_d1_expected(), "runner-641.0").is_err()
+        );
+        let mut changed = unit_d1_metadata();
+        changed.archive_size += 1;
+        assert!(
+            validate_measured_runner_d1(&changed, &unit_d1_expected(), "runner-641.0").is_err()
+        );
+        assert!(validate_measured_runner_d1(
+            &unit_d1_metadata(),
+            &unit_d1_expected(),
+            "nonprod-p639-not-a-deployment-token"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn measured_startup_expected_d1_schema_and_canonical_bounds_are_closed() {
+        let valid = serde_json::to_value(unit_d1_expected()).unwrap();
+        let parse = |value: Value| -> Result<()> {
+            serde_json::from_value::<MeasuredRunnerD1Expected>(value)?.validate()
+        };
+        parse(valid.clone()).unwrap();
+        for key in valid.as_object().unwrap().keys() {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(parse(missing).is_err(), "missing {key}");
+            let mut null = valid.clone();
+            null[key] = Value::Null;
+            assert!(parse(null).is_err(), "null {key}");
+        }
+        let mut extra = valid.clone();
+        extra["qualified"] = json!(true);
+        assert!(parse(extra).is_err());
+        for (key, value) in [
+            ("version", json!(0)),
+            ("source_file_count", json!(0)),
+            ("source_file_count", json!(100_001)),
+            ("source_file_count", json!(846.5)),
+            ("source_commit", json!("0".repeat(40))),
+            ("source_commit", json!("A".repeat(40))),
+            ("source_commit", json!("a".repeat(39))),
+            ("source_branch", json!("")),
+            ("source_branch", json!("a".repeat(256))),
+            ("source_branch", json!("feat//branch")),
+            ("source_branch", json!("feat/../branch")),
+            ("source_branch", json!("feat/branch.lock")),
+            ("source_branch", json!("feat/branch\n")),
+        ] {
+            let mut changed = valid.clone();
+            changed[key] = value;
+            assert!(parse(changed).is_err(), "malformed {key}");
+        }
+        for key in valid
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.ends_with("_sha256"))
+        {
+            for value in ["0".repeat(64), "A".repeat(64), "a".repeat(63)] {
+                let mut changed = valid.clone();
+                changed[key] = json!(value);
+                assert!(parse(changed).is_err(), "malformed {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn measured_startup_expected_d1_rejects_each_mismatch_and_coherent_self_rewrite() {
+        let expected = unit_d1_expected();
+        let original = serde_json::to_value(&expected).unwrap();
+        for key in original
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| key.as_str() != "version")
+        {
+            let mut rewritten = original.clone();
+            rewritten[key] = match key.as_str() {
+                "source_commit" => json!("2".repeat(40)),
+                "source_branch" => json!("feat/different-reviewed-closure"),
+                "source_file_count" => json!(expected.source_file_count + 1),
+                _ => json!("2".repeat(64)),
+            };
+            let changed: MeasuredRunnerD1Expected = serde_json::from_value(rewritten).unwrap();
+            changed.validate().unwrap();
+            assert!(
+                validate_measured_runner_d1(&unit_d1_metadata(), &changed, "runner-641.0").is_err(),
+                "expected mismatch {key}"
+            );
+            // Every dependent hash and journal/report field is regenerated coherently.
+            // Self-consistency still cannot replace the independent expected tuple.
+            let coherent = unit_d1_metadata_for(&changed);
+            validate_measured_runner_d1(&coherent, &changed, "runner-641.0").unwrap();
+            assert!(
+                validate_measured_runner_d1(&coherent, &expected, "runner-641.0").is_err(),
+                "coherent rewrite {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn measured_startup_expected_d1_synthetic_old_shaped_hybrid_cannot_cross_replay() {
+        let current = unit_d1_expected();
+        // Intentionally synthetic hybrid: only these old-shaped source/controller
+        // fields differ. The remaining closure is current unit metadata, not a
+        // representation or validation of any actual historical D1 execution.
+        let mut old = current.clone();
+        old.source_commit = "32ca96dbfbe151b1ca0294ad945ce58a4276087f".into();
+        old.source_branch = "feat/phase-639-jobs-managed-runtime-startup".into();
+        old.source_file_count = 786;
+        old.source_manifest_sha256 =
+            "1421c5adf6f6135818380d2aa48697a01cf008dd23ea53fdf4d060c929562e36".into();
+        old.controller_source_sha256 =
+            "0ff5260db4e56f63dbf9a456b1cc1b708919dc1f795d90216c1242155b905b4c".into();
+        let current_metadata = unit_d1_metadata_for(&current);
+        let old_metadata = unit_d1_metadata_for(&old);
+        validate_measured_runner_d1(&current_metadata, &current, "runner-641.0").unwrap();
+        validate_measured_runner_d1(&old_metadata, &old, "runner-641.0").unwrap();
+        assert!(validate_measured_runner_d1(&current_metadata, &old, "runner-641.0").is_err());
+        assert!(validate_measured_runner_d1(&old_metadata, &current, "runner-641.0").is_err());
+    }
+
+    fn unit_rebind_controller_journal(metadata: &mut MeasuredRunnerD1Readback, records: &[Value]) {
+        metadata.controller_journal = records
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>()
+            .into_bytes();
+        let mut stdout: Value = serde_json::from_slice(&metadata.controller_final_stdout).unwrap();
+        stdout["journalSha256"] = json!(managed_cloud_sha256(&metadata.controller_journal));
+        metadata.controller_final_stdout = format!("{stdout}\n").into_bytes();
+        let mut terminal: Value = serde_json::from_slice(&metadata.external_terminal).unwrap();
+        terminal["controllerJournalSha256"] = stdout["journalSha256"].clone();
+        terminal["controllerFinalStdoutSha256"] =
+            json!(managed_cloud_sha256(&metadata.controller_final_stdout));
+        metadata.external_terminal = format!("{terminal}\n").into_bytes();
+    }
+
+    #[test]
+    fn measured_startup_expected_d1_journal_self_and_finished_claims_are_exact() {
+        let expected = unit_d1_expected();
+        for case in 0..24 {
+            let mut metadata = unit_d1_metadata();
+            let manifest = d1_json(&metadata.export_manifest, 65_536, false).unwrap();
+            let qualification = d1_json(&metadata.qualification, 65_536, false).unwrap();
+            let mut records: Vec<Value> = std::str::from_utf8(&metadata.controller_journal)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let event = if matches!(case, 0 | 18) {
+                "source_before"
+            } else {
+                "controller_finished"
+            };
+            let row = records
+                .iter_mut()
+                .find(|row| row["event"] == event)
+                .unwrap();
+            match case {
+                0 => row["selfSha256"] = json!("2".repeat(64)),
+                1 => row["d1Qualified"] = json!(false),
+                2 => row["qualified"] = json!(true),
+                3 => row["d2Authority"] = json!(true),
+                4 => row["releaseAuthority"] = json!(true),
+                5 => row["actualTerminal"]["code"] = json!(1),
+                6 => row["actualTerminal"]["signal"] = json!("SIGTERM"),
+                7 => {
+                    row.as_object_mut().unwrap().remove("actualTerminal");
+                }
+                8 => row["actualTerminal"]["extra"] = json!(true),
+                9 => row["failure"] = json!("image_qualification_not_proven"),
+                10 => row["originalFailure"] = json!("original_image_failure"),
+                11 => row["failedArchiveRetained"] = json!(true),
+                12 => row["elapsedMs"] = json!(-1),
+                13 => row["elapsedMs"] = json!(1.5),
+                14 => row["time"] = json!("unit-only"),
+                15 => {
+                    row.as_object_mut().unwrap().remove("failure");
+                }
+                16 => row["extra"] = json!(true),
+                17 => {
+                    row.as_object_mut().unwrap().remove("d1Qualified");
+                }
+                18 => {
+                    row.as_object_mut().unwrap().remove("selfSha256");
+                }
+                19 => row["success"] = json!(false),
+                20 => row["actualTerminal"] = Value::Null,
+                21 => {
+                    row["actualTerminal"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("signal");
+                }
+                22 => {
+                    row.as_object_mut().unwrap().remove("originalFailure");
+                }
+                _ => row["elapsedMs"] = json!(9_007_199_254_740_992_u64),
+            }
+            // Recompute the journal/stdout/terminal chain. A valid outer digest
+            // must not mask different controller bytes or failed inner claims.
+            unit_rebind_controller_journal(&mut metadata, &records);
+            let error =
+                validate_measured_d1_controller(&metadata, &expected, &manifest, &qualification)
+                    .unwrap_err();
+            let code = match case {
+                0 | 18 => "measured_d1_controller_source",
+                7 | 15 | 16 | 17 | 22 => "measured_d1_closed_shape",
+                19 => "measured_d1_journal_sequence",
+                _ => "measured_d1_controller_finished",
+            };
+            assert_eq!(error.to_string(), code, "case {case}");
+        }
+    }
+
+    #[test]
+    fn measured_startup_expected_d1_preserves_terminal_cleanup_and_stage_denials() {
+        let expected = unit_d1_expected();
+        for case in 0..6 {
+            let mut metadata = unit_d1_metadata();
+            let manifest = d1_json(&metadata.export_manifest, 65_536, false).unwrap();
+            let qualification = d1_json(&metadata.qualification, 65_536, false).unwrap();
+            let mut records: Vec<Value> = std::str::from_utf8(&metadata.controller_journal)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let event = [
+                "command_terminal",
+                "residue",
+                "controller_finished",
+                "source_after",
+                "dispatch",
+                "image_progress",
+            ][case];
+            let row = records
+                .iter_mut()
+                .find(|row| row["event"] == event)
+                .unwrap();
+            match case {
+                0 => row["code"] = json!(1),
+                1 => row["states"][0]["absent"] = json!(false),
+                2 => row["success"] = json!(false),
+                3 => row["manifest"] = json!("2".repeat(64)),
+                4 => row["event"] = json!("unknown_stage"),
+                _ => row["phase"] = json!("image_inspection_finished"),
+            }
+            // Rebind terminal hashes so the existing semantic guards, not merely
+            // an outdated journal digest, must refuse the changed record family.
+            unit_rebind_controller_journal(&mut metadata, &records);
+            assert!(validate_measured_d1_controller(
+                &metadata,
+                &expected,
+                &manifest,
+                &qualification
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn measured_startup_request_rejects_missing_packages_and_preclaimed_authority_fields() {
+        let request = unit_startup_request();
+        assert_eq!(request.operation, "issue_measured_runner_startup");
+        for key in [
+            "trust_policy",
+            "release",
+            "cohort",
+            "activation",
+            "startup_evidence_base64url",
+            "release_test_evidence_base64url",
+        ] {
+            let mut value = unit_startup_request_json();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<MeasuredRunnerStartupRequest>(value).is_err());
+        }
+        for key in [
+            "volume_seed",
+            "volume_id",
+            "claimed_instance",
+            "account_id",
+            "runtime_observed",
+            "environment",
+        ] {
+            let mut value = unit_startup_request_json();
+            value[key] = json!("forbidden");
+            assert!(serde_json::from_value::<MeasuredRunnerStartupRequest>(value).is_err());
+        }
+        let binding =
+            validate_measured_runner_d1(&unit_d1_metadata(), &unit_d1_expected(), "runner-641.0")
+                .unwrap();
+        let pool = super::super::tests::test_pool();
+        assert!(issue_measured_runner_startup(&pool, &request, &binding).is_err()); // actual CLI requires guarded PG
+        let count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM jobs_runner_volume_admission_grants",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn measured_startup_release_test_evidence_keeps_normal_v2_exact_tip_meaning() {
+        let commit = "1".repeat(40);
+        let value = json!({"version":2,"audience":"bluey-jobs-managed-cloud-test-evidence-v2","sourceCommit":commit,
+            "repository":"unit-only/metadata","repositoryId":1,"defaultBranch":"main",
+            "releaseContractSelfTestSha256":"a".repeat(64),"ciRuns":[
+                {"checkId":"jobs-ci","workflowPath":".github/workflows/jobs-ci.yml","conclusion":"success",
+                    "event":"push","headBranch":"main","headSha":commit,"repositoryId":1,"runAttempt":1,"runId":1},
+                {"checkId":"observability-policy","workflowPath":".github/workflows/observability-policy.yml","conclusion":"success",
+                    "event":"push","headBranch":"main","headSha":commit,"repositoryId":1,"runAttempt":1,"runId":2}]});
+        validate_startup_release_test_evidence(&value, &commit).unwrap(); // unit metadata, not executed CI
+        for index in 0..6 {
+            let mut changed = value.clone();
+            match index {
+                0 => changed["sourceCommit"] = json!("2".repeat(40)),
+                1 => changed["ciRuns"][0]["headSha"] = json!("2".repeat(40)),
+                2 => changed["ciRuns"][0]["event"] = json!("pull_request"),
+                3 => changed["ciRuns"][1]["runId"] = json!(1),
+                4 => changed["ciRuns"][0]["conclusion"] = json!("failure"),
+                _ => changed["d1_success"] = json!(true),
+            }
+            assert!(validate_startup_release_test_evidence(&changed, &commit).is_err());
+        }
+    }
+
+    #[test]
+    fn measured_startup_aggregate_binds_each_real_input_without_replacing_release_test_evidence() {
+        use base64::Engine as _;
+        let d1 =
+            validate_measured_runner_d1(&unit_d1_metadata(), &unit_d1_expected(), "runner-641.0")
+                .unwrap();
+        let normal_test_digest = "a".repeat(64);
+        let aggregate = json!({"version":1,"audience":"bluey-jobs-phase641-nonproduction-startup-only-evidence-v1",
+            "sourceCommit":d1.source_commit,"releaseTestEvidenceSha256":normal_test_digest,
+            "d1ExportStartedSha256":d1.export_started_sha256,"d1ExportManifestSha256":d1.export_manifest_sha256,
+            "d1QualificationSha256":d1.qualification_sha256,"d1ControllerJournalSha256":d1.controller_journal_sha256,
+            "d1ControllerFinalStdoutSha256":d1.controller_final_stdout_sha256,"d1ExternalTerminalSha256":d1.external_terminal_sha256});
+        let encode = |value: &Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(managed_cloud_canonical_json(value).unwrap())
+        };
+        let digest =
+            validate_startup_evidence_binding(&encode(&aggregate), &d1, &normal_test_digest)
+                .unwrap();
+        assert!(managed_cloud_token(
+            &format!("phase641-startup-evidence-{digest}"),
+            1024
+        ));
+        for key in aggregate.as_object().unwrap().keys() {
+            let mut changed = aggregate.clone();
+            changed.as_object_mut().unwrap().remove(key);
+            assert!(
+                validate_startup_evidence_binding(&encode(&changed), &d1, &normal_test_digest)
+                    .is_err()
+            );
+        }
+        for key in [
+            "releaseTestEvidenceSha256",
+            "d1ExternalTerminalSha256",
+            "d1ControllerFinalStdoutSha256",
+            "audience",
+        ] {
+            let mut changed = aggregate.clone();
+            changed[key] = json!("wrong");
+            assert!(
+                validate_startup_evidence_binding(&encode(&changed), &d1, &normal_test_digest)
+                    .is_err()
+            );
+        }
+        let mut changed = aggregate;
+        changed["caller_success"] = json!(true);
+        assert!(
+            validate_startup_evidence_binding(&encode(&changed), &d1, &normal_test_digest).is_err()
+        );
+    }
+
+    #[test]
+    fn measured_startup_header_rejects_scope_tokens_bounds_and_mixed_process_measurements() {
+        let d1 =
+            validate_measured_runner_d1(&unit_d1_metadata(), &unit_d1_expected(), "runner-641.0")
+                .unwrap();
+        let fresh = || {
+            let mut request = unit_startup_request();
+            request.process_runtime = d1.process_runtime.clone();
+            request
+        };
+        validate_measured_startup_header(&fresh(), &d1).unwrap();
+        for authorization in [false, true] {
+            for valid in ["a".repeat(20), "a".repeat(128)] {
+                let mut request = fresh();
+                if authorization {
+                    request.authorization_ref = valid;
+                } else {
+                    request.issuance_ref = valid;
+                }
+                validate_measured_startup_header(&request, &d1).unwrap();
+            }
+            for invalid in [
+                "a".repeat(19),
+                "a".repeat(129),
+                format!("{}:", "a".repeat(19)),
+                format!("{}.", "a".repeat(19)),
+            ] {
+                let mut request = fresh();
+                if authorization {
+                    request.authorization_ref = invalid;
+                } else {
+                    request.issuance_ref = invalid;
+                }
+                assert!(validate_measured_startup_header(&request, &d1).is_err());
+            }
+        }
+        for index in 0..10 {
+            let mut request = fresh();
+            match index {
+                0 => request.version = 2,
+                1 => request.operation = "bootstrap".into(),
+                2 => request.worker_id = "owner".into(),
+                3 => request.issuance_ref = "invalid space".into(),
+                4 => request.provider_resource_id = "production-volume".into(),
+                5 => request.resource_fingerprint = "0".repeat(64),
+                6 => request.ttl_ms = 4_999,
+                7 => request.ttl_ms = 900_001,
+                8 => request.process_runtime.runner_image_sha256 = "f".repeat(64),
+                _ => request.process_runtime.automation_bundle_sha256 = "e".repeat(64),
+            }
+            assert!(validate_measured_startup_header(&request, &d1).is_err());
+        }
+    }
+
+    #[test]
+    fn measured_startup_unit_only_grant_helper_issues_three_without_new_claims_or_enrollment() {
+        // Existing synthetic signed head is used ONLY here, with zero preclaims.
+        // This is a grant-state unit test, never runtime/CI/storage/fleet proof.
+        let pool = super::super::tests::test_pool();
+        let now: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT CAST((julianday('now')-2440587.5)*86400000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (activation, manifest) =
+            managed_cloud_release_authority_tests::install_valid_original_source_managed_head(
+                &pool,
+                3,
+                now,
+                300_000,
+                24 * 60 * 60_000,
+                fixture_scope(),
+                "phase641-unit-only",
+            );
+        let (identity,artifact):(String,String)=pool.get().unwrap().query_row(
+            "SELECT identity.runtime_identity_sha256,component.artifact_sha256
+               FROM jobs_managed_cloud_manifest_runtime_identities identity
+               JOIN jobs_managed_cloud_manifest_components component
+                 ON component.manifest_sha256=identity.manifest_sha256 AND component.component_id=identity.component_id
+              WHERE identity.manifest_sha256=?1 AND identity.component_id='jobs-runner' AND identity.role='managed_runner'",
+            params![manifest],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let authority = MeasuredRunnerAuthority {
+            manifest_sha256: manifest,
+            activation_sha256: activation,
+            runtime_identity_sha256: identity,
+            expires_at_ms: now + 60_000,
+        };
+        let mut d1 =
+            validate_measured_runner_d1(&unit_d1_metadata(), &unit_d1_expected(), "runner-641.0")
+                .unwrap();
+        d1.process_runtime.runner_image_sha256 = artifact; // unit head artifact, not an executed OCI image
+        let mut request = unit_startup_request();
+        request.process_runtime = d1.process_runtime.clone();
+        let counts = || {
+            let conn = pool.get().unwrap();
+            [
+                "jobs_managed_cloud_runtime_grants",
+                "jobs_runner_volume_admission_grants",
+                "jobs_runner_process_runtime_grants",
+                "jobs_managed_cloud_runtime_instances",
+                "jobs_runner_volumes",
+                "jobs_runner_process_runtime_bindings",
+                "jobs_runner_volume_storage_attestations",
+                "jobs_applications",
+                "jobs_runner_volume_residencies",
+                "jobs_managed_cloud_irreversible_effect_receipts",
+            ]
+            .map(|table| {
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+        };
+        let before = counts();
+        assert_eq!(before, [0; 10]);
+        let issued = issue_startup_grants(&pool, &request, &authority, now, &d1).unwrap();
+        let after = counts();
+        assert_eq!(&after[..3], &[before[0] + 1, before[1] + 1, before[2] + 1]);
+        assert_eq!(&after[3..], &before[3..]);
+        assert_eq!((issued.grants_issued, issued.grants_consumed), (3, 0));
+        assert!(
+            !issued.runtime_observed
+                && !issued.customer_admission_proven
+                && !issued.release_authority
+        );
+        assert!(issued.volume_admission_grant.consumed_volume_id.is_none());
+        assert!(issue_startup_grants(&pool, &request, &authority, now, &d1).is_err());
+        assert_eq!(counts(), after);
+        assert!(
+            issue_startup_grants(&pool, &request, &authority, authority.expires_at_ms, &d1)
+                .is_err()
+        );
+        assert_eq!(counts(), after);
+    }
 
     fn checkpoint_application() -> JobApplication {
         JobApplication {

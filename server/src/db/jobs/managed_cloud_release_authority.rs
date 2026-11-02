@@ -20736,7 +20736,7 @@ pub(crate) mod managed_cloud_release_authority_tests {
         })
     }
 
-    fn install_valid_original_source_managed_head(
+    pub(crate) fn install_valid_original_source_managed_head(
         pool: &DbPool,
         version: i64,
         now_ms: i64,

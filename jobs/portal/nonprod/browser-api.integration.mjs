@@ -13,6 +13,9 @@ import { extname, join, normalize, relative, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { chromium } from "playwright";
+import {
+  getNonprodJson as getJson, redactedChildLiveness,
+} from "../../scripts/nonprod-http-read.mjs";
 import { startNonprodObjectStore } from "../../scripts/nonprod-object-store.mjs";
 
 const HUMAN_HOLD = process.argv.length === 3 && process.argv[2] === "--human-hold";
@@ -289,21 +292,6 @@ function get(url, token) {
     request.on("error", (error) => finish(reject, error)); request.end();
   });
 }
-function getJson(url, token) {
-  return new Promise((resolveRequest, reject) => {
-    let settled = false;
-    const finish = (callback, value) => { if (!settled) { settled = true; clearTimeout(timer); callback(value); } };
-    const request = httpRequest(url, { headers: { authorization: `Bearer ${token}` } }, (response) => {
-      let body = ""; response.on("data", (chunk) => { body += chunk; if (body.length > 1024 * 1024) { request.destroy(); finish(reject, new Error("workspace_body_limit")); } });
-      response.on("end", () => {
-        if (response.statusCode !== 200) return finish(reject, new Error("workspace_status"));
-        try { finish(resolveRequest, JSON.parse(body)); } catch { finish(reject, new Error("workspace_json")); }
-      });
-    });
-    const timer = setTimeout(() => { request.destroy(); finish(reject, new Error("http_timeout")); }, OPERATION_MS);
-    request.on("error", (error) => finish(reject, error)); request.end();
-  });
-}
 function putJson(url, token, body) {
   return new Promise((resolveRequest, reject) => {
     const encoded = JSON.stringify(body); let settled = false;
@@ -526,9 +514,11 @@ async function humanHoldQualification({ context, page, portalPort, jobsPort, acc
   assert(humanResult.hold_ms <= HUMAN_HOLD_MS, "human_hold_timeout");
   humanResult.operator_release_received = true; passHumanCase("operator_release_received");
 
-  const accountBefore = await getJson(`http://127.0.0.1:${accountPort}/account/me`, token);
+  const accountBefore = await getJson(`http://127.0.0.1:${accountPort}/account/me`, token,
+    "account_before");
   humanResult.account_status_before = 200;
-  const workspaceBefore = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token);
+  const workspaceBefore = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token,
+    "workspace_before");
   const pgBefore = await humanPgSnapshot(psql, database, childHome, accountId);
   assert.equal(workspaceBefore.applications.length, 1, "human_exactly_one_application");
   const application = workspaceBefore.applications[0];
@@ -541,7 +531,8 @@ async function humanHoldQualification({ context, page, portalPort, jobsPort, acc
   assert.equal(pgBefore.application_rows, 1, "human_pg_application_row");
   assert.equal(pgBefore.prepared_rows, 1, "human_pg_prepared_row");
   assert.equal(pgBefore.submitted_rows, 0, "human_pg_submitted_row");
-  const resumeBefore = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-versions/${encodeURIComponent(application.resume_version_id)}`, token);
+  const resumeBefore = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-versions/${encodeURIComponent(application.resume_version_id)}`, token,
+    "resume_before");
   assert.equal(pgBefore.application.account_id, accountId, "human_pg_application_account");
   assert.equal(pgBefore.application.id, application.id, "human_pg_application_id");
   assert.equal(pgBefore.application.job_id, fixtureResult.job_id, "human_pg_application_job");
@@ -576,11 +567,14 @@ async function humanHoldQualification({ context, page, portalPort, jobsPort, acc
   assert.equal(await page.locator(".application-row").count(), 1, "human_reload_single_application");
   await page.locator(".application-row").click();
   await page.getByRole("heading", { name: "Application kit" }).waitFor({ timeout: OPERATION_MS });
-  const accountAfter = await getJson(`http://127.0.0.1:${accountPort}/account/me`, token);
+  const accountAfter = await getJson(`http://127.0.0.1:${accountPort}/account/me`, token,
+    "account_after");
   humanResult.account_status_after = 200;
-  const workspaceAfter = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token);
+  const workspaceAfter = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, token,
+    "workspace_after");
   const pgAfter = await humanPgSnapshot(psql, database, childHome, accountId);
-  const resumeAfter = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-versions/${encodeURIComponent(application.resume_version_id)}`, token);
+  const resumeAfter = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/resume-versions/${encodeURIComponent(application.resume_version_id)}`, token,
+    "resume_after");
   assert.deepEqual(accountAfter, accountBefore, "human_account_reload_stable");
   assert.deepEqual(workspaceAfter.profile, workspaceBefore.profile, "human_profile_reload_stable");
   assert.deepEqual(workspaceAfter.applications, workspaceBefore.applications,
@@ -602,7 +596,8 @@ async function humanHoldQualification({ context, page, portalPort, jobsPort, acc
 
   humanResult.unauthenticated_status = await get(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`);
   assert.equal(humanResult.unauthenticated_status, 401, "human_unauthenticated_exact_denial");
-  const isolatedWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`, isolatedToken);
+  const isolatedWorkspace = await getJson(`http://127.0.0.1:${jobsPort}/api/jobs/workspace`,
+    isolatedToken, "isolated_workspace");
   humanResult.isolated_application_rows = isolatedWorkspace.applications.length;
   assert.equal(humanResult.isolated_application_rows, 0, "human_isolated_application_rows");
   assert.notDeepEqual(isolatedWorkspace.profile, workspaceAfter.profile, "human_profile_isolation");
@@ -1054,6 +1049,10 @@ try {
   await main();
 } catch (error) {
   const brokenStage = stage;
+  if (error?.httpReadDiagnostic) {
+    process.stdout.write(`${JSON.stringify({ event: "human_http_read_refused",
+      ...error.httpReadDiagnostic, child_liveness: redactedChildLiveness(children) })}\n`);
+  }
   const assertionLabel = error?.code === "ERR_ASSERTION" && typeof error.message === "string"
     ? error.message.split("\n", 1)[0] : "";
   const candidate = /^[a-z0-9_]{1,120}$/.test(assertionLabel)
