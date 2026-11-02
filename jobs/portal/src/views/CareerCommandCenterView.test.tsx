@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import { previewWorkspace } from "../data/preview";
+import { commandCenterSummary } from "../lib/command-center";
 import type { JobsWorkspace } from "../types";
 import { CareerCommandCenterView } from "./CareerCommandCenterView";
 
@@ -42,6 +43,17 @@ describe("career command center", () => {
     expect(html).toContain("3 of 5 required checks ready");
     expect(html).toContain("Application inbox (optional)");
     expect(html).toContain("Freshness does not establish eligibility.");
+    expect(html).not.toMatch(/onClick|<button/i);
+  });
+
+  it("uses the first data-derived next action as the primary overview link", () => {
+    const previewSearch = "?preview=1&scenario=final-review";
+    const action = commandCenterSummary(previewWorkspace, now, previewSearch).next_actions[0];
+    const html = renderCommandCenter(previewWorkspace, previewSearch);
+
+    if (!action) throw new Error("expected a data-derived command-center action");
+    expect(html).toContain(`href="${action.href.replace("&", "&amp;")}"`);
+    expect(html).toContain(action.title);
     expect(html).not.toMatch(/onClick|<button/i);
   });
 

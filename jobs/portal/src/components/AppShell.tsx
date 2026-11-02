@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Link, NavLink } from "react-router-dom";
+import { Link, NavLink, useLocation } from "react-router-dom";
 import {
   Bell,
   BriefcaseBusiness,
@@ -52,6 +52,7 @@ const mobileNavItems = [
 ];
 
 export function AppShell({ children, account, workspace, onRefresh, preview, previewSearch }: Props) {
+  const location = useLocation();
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     const saved = localStorage.getItem("bluey_jobs_theme");
     if (saved === "light" || saved === "dark") return saved;
@@ -62,6 +63,7 @@ export function AppShell({ children, account, workspace, onRefresh, preview, pre
   const profileButtonRef = useRef<HTMLButtonElement>(null);
   const openInterventions = workspace.interventions.filter((item) => item.status === "open").length;
   const destination = (path: string) => `${path}${previewSearch}`;
+  const currentSection = desktopNavItems.find((item) => item.to === location.pathname)?.label || "Your job search";
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -94,13 +96,7 @@ export function AppShell({ children, account, workspace, onRefresh, preview, pre
           <img className="brand-wordmark" src={blueyWordmark} alt="" />
           <b>jobs</b>
         </Link>
-        <nav className="desktop-nav" aria-label="Jobs navigation">
-          {desktopNavItems.map(({ to, label, icon: Icon }) => (
-            <NavLink key={to} to={destination(to)} className={({ isActive }) => (isActive ? "active" : "")}>
-              <Icon size={16} />{label}
-            </NavLink>
-          ))}
-        </nav>
+        <p className="workspace-context"><span>Bluey Jobs</span>{currentSection}</p>
         <div className="header-actions">
           {preview && <span className="preview-pill">Preview</span>}
           <div className="balance-chip" title="Shared Bluey balance">
@@ -127,7 +123,6 @@ export function AppShell({ children, account, workspace, onRefresh, preview, pre
               ref={profileButtonRef}
               className="profile-button"
               aria-expanded={profileOpen}
-              aria-haspopup="menu"
               aria-label="Open account menu"
               onClick={() => setProfileOpen((open) => !open)}
             >
@@ -135,25 +130,43 @@ export function AppShell({ children, account, workspace, onRefresh, preview, pre
               <ChevronDown size={14} />
             </button>
             {profileOpen && (
-              <div className="profile-menu" role="menu">
+              <div className="profile-menu">
                 <div className="profile-summary">
                   <CircleUserRound size={20} />
                   <div><strong>{workspace.profile.full_name}</strong><span>{account?.email || workspace.profile.email}</span></div>
                 </div>
-                <Link to={destination("/settings")} role="menuitem" onClick={() => setProfileOpen(false)}><Settings size={16} />Jobs settings</Link>
-                <a href="/account" role="menuitem"><WalletCards size={16} />Bluey account</a>
-                <button role="menuitem" onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}>
+                <Link to={destination("/settings")} onClick={() => setProfileOpen(false)}><Settings size={16} />Jobs settings</Link>
+                <a href="/account"><WalletCards size={16} />Bluey account</a>
+                <button onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}>
                   {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
                   Use {theme === "dark" ? "light" : "dark"} theme
                 </button>
-                <button role="menuitem" onClick={signOutOfBluey}><LogOut size={16} />Sign out</button>
+                <button onClick={signOutOfBluey}><LogOut size={16} />Sign out</button>
               </div>
             )}
           </div>
         </div>
       </header>
 
-      <main id="jobs-main" tabIndex={-1} className="app-main">{children}</main>
+      <div className="workspace-frame">
+        <aside className="workspace-sidebar" aria-label="Jobs workspace">
+          <Link className="workspace-brand" to={destination("/overview")} aria-label="Bluey Jobs overview">
+            <img className="brand-icon" src={blueyIcon} alt="" />
+            <span><strong>Bluey</strong><small>Jobs workspace</small></span>
+          </Link>
+          <nav className="workspace-nav" aria-label="Jobs navigation">
+            {desktopNavItems.map(({ to, label, icon: Icon }) => (
+              <NavLink key={to} to={destination(to)} className={({ isActive }) => (isActive ? "active" : "")}>
+                <Icon aria-hidden="true" size={18} /><span>{label}</span>
+              </NavLink>
+            ))}
+          </nav>
+          <p className="workspace-sidebar-note">
+            Review-first by default. Jobs stay tied to the exact resume and answers used.
+          </p>
+        </aside>
+        <main id="jobs-main" tabIndex={-1} className="app-main">{children}</main>
+      </div>
 
       <nav className="mobile-nav" aria-label="Jobs navigation">
         {mobileNavItems.map(({ to, label, icon: Icon }) => (

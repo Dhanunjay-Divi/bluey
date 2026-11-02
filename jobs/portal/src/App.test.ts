@@ -97,11 +97,19 @@ describe("Jobs portal home route", () => {
         },
       ),
     ));
-    const desktopNavigation = markup.match(/<nav class="desktop-nav"[\s\S]*?<\/nav>/)?.[0] || "";
+    const desktopNavigation = markup.match(/<nav class="workspace-nav"[\s\S]*?<\/nav>/)?.[0] || "";
     const mobileNavigation = markup.match(/<nav class="mobile-nav"[\s\S]*?<\/nav>/)?.[0] || "";
 
     expect(desktopNavigation).toContain('href="/overview?preview=1"');
     expect(desktopNavigation).toContain('href="/settings?preview=1"');
+    expect(markup).toContain('class="workspace-sidebar"');
+    expect(markup).toContain('aria-expanded="false"');
+    expect(markup).toContain('aria-label="Open account menu"');
+    expect(markup).toContain('class="preview-pill"');
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+    expect(css).not.toMatch(/[^{}]*\.preview-pill[^{}]*\{\s*display:\s*none\s*;/);
+    expect(markup).not.toContain('aria-haspopup="menu"');
+    expect(markup).not.toContain('role="menuitem"');
     expect(mobileNavigation).toContain('href="/overview?preview=1"');
     expect(mobileNavigation).not.toContain('href="/settings?preview=1"');
     expect(mobileNavigation.match(/ href=/g)).toHaveLength(5);

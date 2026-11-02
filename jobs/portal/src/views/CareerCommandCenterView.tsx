@@ -45,6 +45,7 @@ export function CareerCommandCenterView({
   const firstName = workspace.profile.full_name.trim().split(/\s+/)[0] || "there";
   const packetLimit = workspace.entitlement.monthly_packet_limit;
   const packetRemaining = Math.max(0, packetLimit - workspace.entitlement.used_packets);
+  const primaryAction = summary.next_actions[0];
   const freshMatchesLabel = summary.today_matches_loaded_scope
     ? "Fresh in loaded matches"
     : "Fresh in 24 hours";
@@ -62,10 +63,17 @@ export function CareerCommandCenterView({
             One truthful view of discovery, preparation, review, execution, and outcomes.
           </span>
         </div>
-        <Link className="button primary" to={commandCenterHref("/matches", previewSearch)}>
-          <SearchCheck size={16} />
-          {summary.today_matches_loaded_scope ? "Review loaded matches" : "Review fresh matches"}
-        </Link>
+        {primaryAction ? (
+          <Link className="button primary" to={primaryAction.href}>
+            <Sparkles size={16} />
+            {primaryAction.title}
+          </Link>
+        ) : (
+          <Link className="button primary" to={commandCenterHref("/matches", previewSearch)}>
+            <SearchCheck size={16} />
+            {summary.today_matches_loaded_scope ? "Review loaded matches" : "Review fresh matches"}
+          </Link>
+        )}
       </section>
 
       <section className="career-command-metrics" aria-label="Career operations summary">

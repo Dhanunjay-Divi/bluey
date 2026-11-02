@@ -5,6 +5,10 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs workspace: introduce labelled desktop navigation, a compact contextual
+  header, clearer Overview next action and more readable theme/navigation copy.
+  Browser and regression qualification are in progress; no execution is enabled.
+
 - Jobs resume import: recognize combined awards/certification headings, exclude
   award narrative, and preserve separate employment intervals without adding
   gap tenure or leaking dates into titles; preserve first-range education records.
