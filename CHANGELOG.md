@@ -5,9 +5,14 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs public entry: prepare the existing landing content as build-time HTML
+  and load the workspace separately, with guarded storage/theme and recoverable
+  application loading. Local tests/builds and script-blocked browser checks
+  passed; no deployment or access change.
+
 - Jobs workspace: introduce labelled desktop navigation, a compact contextual
   header, clearer Overview next action and more readable theme/navigation copy.
-  Browser and regression qualification are in progress; no execution is enabled.
+  Local regression and targeted browser checks passed; no execution is enabled.
 
 - Jobs resume import: recognize combined awards/certification headings, exclude
   award narrative, and preserve separate employment intervals without adding

@@ -47,6 +47,14 @@ import {
   canonicalTaxonomyDescriptor,
   checkJobsTaxonomyResponse,
 } from "./lib/canonical-taxonomy";
+import {
+  accessToken as storedAccessToken,
+  loginUrl as storedLoginUrl,
+  tokenStores,
+} from "./auth";
+
+export const accessToken = storedAccessToken;
+export const loginUrl = storedLoginUrl;
 
 const ACCESS_TOKEN_KEY = "bluey_access_token";
 const REFRESH_TOKEN_KEY = "bluey_refresh_token";
@@ -183,19 +191,7 @@ export interface InterviewPrepCompletionResponse {
   };
 }
 
-function storageOrder(): Storage[] {
-  return localStorage.getItem(AUTH_PERSISTENCE_KEY) === "session"
-    ? [sessionStorage, localStorage]
-    : [localStorage, sessionStorage];
-}
-
-export function accessToken(): string {
-  for (const store of storageOrder()) {
-    const token = store.getItem(ACCESS_TOKEN_KEY);
-    if (token) return token;
-  }
-  return "";
-}
+const storageOrder = tokenStores;
 
 function refreshToken(): string {
   for (const store of storageOrder()) {
@@ -1000,8 +996,4 @@ export function signOutOfBluey(): void {
     }).catch(() => undefined);
   }
   window.location.href = "/";
-}
-
-export function loginUrl(): string {
-  return `/login?next=${encodeURIComponent("/jobs")}`;
 }

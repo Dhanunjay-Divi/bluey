@@ -8,7 +8,7 @@ import {
   Search,
   Sparkles,
 } from "lucide-react";
-import { loginUrl } from "../api";
+import { loginUrl } from "../auth";
 import { runnerLandingCopy } from "../lib/runner-access";
 import blueyIcon from "../../../../web/assets/bluey-logo.svg";
 import blueyWordmark from "../../../../web/assets/bluey-wordmark.svg";
