@@ -1303,6 +1303,39 @@ export function validateManagedCloudRuntimeMeasurement(
   return measurement;
 }
 
+/** Derive only from the exact validated runner inventory/embedded measurement.
+ * This is a managed-runner digest domain, not the desktop app.asar domain.
+ * Derivation does not itself attest that caller-provided archive bytes ran.
+ */
+export function deriveManagedRunnerAutomationBundleSha256(
+  measurement,
+  measurementSha256,
+  runtimeIdentities,
+  context,
+) {
+  if (context?.componentId !== "jobs-runner"
+    || JSON.stringify(context.roles) !== '["managed_runner"]') {
+    fail("Automation bundle evidence requires the exact managed runner role");
+  }
+  validateContentInventoryDocument(context.inventory, "jobs-runner");
+  validateManagedCloudRuntimeMeasurement(
+    measurement, measurementSha256, runtimeIdentities, context,
+  );
+  const entries = measurement.measuredFiles
+    .filter((entry) => entry.path.startsWith("app/automation/"))
+    .map(({ path, sha256 }) => ({ path, sha256 }));
+  if (entries.length < 2
+    || !entries.some((entry) => entry.path === "app/automation/package.json")
+    || !entries.some((entry) => entry.path === "app/automation/dist/index.js")) {
+    fail("Managed runner automation bundle is incomplete");
+  }
+  return sha256(canonicalJsonBytes({
+    audience: "bluey-jobs-managed-runner-automation-bundle-v1",
+    entries,
+    version: 1,
+  }));
+}
+
 function validateContentInventoryDocument(inventory, componentId) {
   requireExactKeys(
     inventory,

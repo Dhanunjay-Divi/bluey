@@ -5,6 +5,22 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Jobs tests: qualify a separate disposable Linux/amd64 QEMU guest with bounded
+  resources, private state and observed stop/delete proof; no production or
+  employer-facing execution is enabled by this compatibility gate.
+- Jobs tests: parse macOS socket-tool process/file/name records and unbound UDP
+  endpoints explicitly; retain strict owned-loopback-only management admission.
+- Jobs tests: install and revalidate a private all-interface Lima forwarding
+  denial before boot; do not rely on Colima's narrower `none` rule alone.
+- Jobs: derive a separate canonical automation-bundle digest from the validated
+  runner inventory and check measured bundle/claimed image at normal startup;
+  actual-image qualification remains pending.
+- Jobs tests: bind private usernet SSH management to kernel-observed process
+  identity and retained socket artifacts; keep identity drift sticky through
+  shutdown and retain state rather than deleting ambiguous VM data.
+- Jobs tests: distinguish native-attributed connected UDP clients from host
+  service listeners; retry only bounded socket-frame churn after independent
+  helper identity proof, retaining strict drift and unknown-ownership denials.
 - Jobs tests: add a bounded, headed synthetic saved-account session with exact
   PostgreSQL/API reload checks, separate reports and cancellation cleanup;
   preserve the original automated journey and disable all external effects.

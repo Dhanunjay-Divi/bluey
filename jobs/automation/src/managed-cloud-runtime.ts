@@ -60,6 +60,7 @@ export interface ManagedCloudRuntimeConfig {
   configSchemaSha256: string;
   migrationSetSha256: string;
   protocolSetSha256: string;
+  automationBundleSha256?: string;
   measurementOptions: Readonly<ManagedCloudRuntimeMeasurementOptions>;
   scope: ManagedCloudScope;
   heartbeatIntervalMs: number;
@@ -96,6 +97,7 @@ export interface ManagedCloudRuntimeMeasurementIdentity {
   protocolSetSha256: string;
   runtimeIdentitySha256: string;
   runtimeMeasurementSha256: string;
+  automationBundleSha256?: string;
 }
 
 export interface ManagedCloudRuntimeMeasurementOptions {
@@ -187,6 +189,9 @@ export function managedCloudRuntimeConfig(
     configSchemaSha256: measurement.configSchemaSha256,
     migrationSetSha256: measurement.migrationSetSha256,
     protocolSetSha256: measurement.protocolSetSha256,
+    ...(measurement.automationBundleSha256 === undefined ? {} : {
+      automationBundleSha256: measurement.automationBundleSha256,
+    }),
     measurementOptions: Object.freeze({ ...measurementOptions }),
     scope,
     heartbeatIntervalMs: heartbeatSeconds * 1_000,
@@ -206,7 +211,8 @@ export function assertManagedCloudRuntimeMeasurement(
     || measured.componentId !== config.componentId
     || measured.configSchemaSha256 !== config.configSchemaSha256
     || measured.migrationSetSha256 !== config.migrationSetSha256
-    || measured.protocolSetSha256 !== config.protocolSetSha256) {
+    || measured.protocolSetSha256 !== config.protocolSetSha256
+    || measured.automationBundleSha256 !== config.automationBundleSha256) {
     throw new Error("Managed-cloud runtime measurement changed after startup");
   }
 }
@@ -277,6 +283,28 @@ export function measureManagedCloudRuntimeIdentity(
     .update("\0")
     .update(expectedRole, "utf8")
     .digest("hex");
+  // Derive only after the same complete current-file-set and byte verification above.
+  // This domain is intentionally separate from desktop packaging and runtime identity.
+  let automationBundleSha256: string | undefined;
+  if (measurement.componentId === "jobs-runner") {
+    if (expectedRole !== "managed_runner"
+      || measurement.roles.length !== 1
+      || measurement.roles[0] !== "managed_runner") {
+      throw new Error("Managed runner automation bundle role is invalid");
+    }
+    const entries = measurement.measuredFiles
+      .filter((entry) => entry.path.startsWith("app/automation/"))
+      .map(({ path, sha256 }) => ({ path, sha256 }));
+    if (!entries.some((entry) => entry.path === "app/automation/package.json")
+      || !entries.some((entry) => entry.path === "app/automation/dist/index.js")) {
+      throw new Error("Managed runner automation bundle is incomplete");
+    }
+    automationBundleSha256 = createHash("sha256").update(canonicalJsonBytes({
+      audience: "bluey-jobs-managed-runner-automation-bundle-v1",
+      entries,
+      version: 1,
+    })).digest("hex");
+  }
   return {
     componentId: measurement.componentId,
     configSchemaSha256: measurement.configSchemaSha256,
@@ -284,6 +312,7 @@ export function measureManagedCloudRuntimeIdentity(
     protocolSetSha256: measurement.protocolSetSha256,
     runtimeIdentitySha256,
     runtimeMeasurementSha256,
+    ...(automationBundleSha256 === undefined ? {} : { automationBundleSha256 }),
   };
 }
 

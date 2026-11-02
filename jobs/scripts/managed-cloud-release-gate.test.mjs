@@ -39,6 +39,7 @@ import {
   deriveManagedCloudRequiredRuntimePaths,
   deriveRequiredRuntimeRoles,
   deriveManagedCloudRuntimeIdentitySha256,
+  deriveManagedRunnerAutomationBundleSha256,
   deriveManagedCloudTaskQueueSha256,
   inspectOciImageArchive,
   inspectManagedCloudArtifactPublicationReadback,
@@ -5933,4 +5934,128 @@ test("release workflow statically proves build-once and protected authorization"
     () => validateManagedCloudWorkflowContract(latePath),
     /default-branch-only and pin Node 22\.23\.2/,
   );
+});
+
+function runnerAutomationBundleEvidenceFixture() {
+  const contract = MANAGED_CLOUD_RUNTIME_CONTRACTS["jobs-runner"];
+  const paths = [
+    "app/automation/dist/index.js",
+    "app/automation/package.json",
+    "app/runner/dist/native/bluey_jobs_runner_native_storage.node",
+    "app/runner/dist/server.js",
+    "ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell",
+    "usr/local/bin/node",
+  ];
+  const measurement = {
+    audience: MANAGED_CLOUD_AUDIENCES.runtimeMeasurement,
+    buildId: "runner-639.0",
+    componentId: "jobs-runner",
+    configSchemaSha256: "a".repeat(64),
+    measuredFiles: paths.map((path, index) => ({ path, sha256: String(index + 1).repeat(64) })),
+    migrationSetSha256: "b".repeat(64),
+    protocolSetSha256: "c".repeat(64),
+    roles: ["managed_runner"],
+    sourceCommit: SOURCE_COMMIT,
+    version: 1,
+  };
+  const inventory = {
+    artifactKind: "oci_image",
+    artifactSha256: "d".repeat(64),
+    audience: MANAGED_CLOUD_AUDIENCES.contentInventory,
+    componentId: "jobs-runner",
+    entries: measurement.measuredFiles.map((entry) => ({
+      ...entry, type: "file", sizeBytes: 1,
+      mode: entry.path.includes("native/") || entry.path.includes("ms-playwright/")
+        || entry.path === "usr/local/bin/node" ? "0555" : "0444",
+    })),
+    runtime: {
+      cmd: [...contract.cmd], entrypoint: [...contract.entrypoint],
+      environment: [...contract.requiredEnvironment].sort(),
+      exposedPorts: [...contract.exposedPorts], user: contract.runtimeUser,
+      workingDirectory: contract.workingDirectory,
+    },
+    version: 1,
+  };
+  inventory.entries.unshift({ path: "app/.bluey/managed-cloud-runtime-measurement.json",
+    type: "file", mode: "0444", sizeBytes: 1, sha256: "f".repeat(64) });
+  const context = {
+    buildId: measurement.buildId, componentId: measurement.componentId,
+    configSchemaSha256: measurement.configSchemaSha256, inventory,
+    migrationSetSha256: measurement.migrationSetSha256,
+    protocolSetSha256: measurement.protocolSetSha256,
+    roles: measurement.roles, sourceCommit: measurement.sourceCommit,
+  };
+  return refreshRunnerAutomationBundleEvidence({ measurement, context });
+}
+
+function refreshRunnerAutomationBundleEvidence(fixture) {
+  const bytes = canonicalJsonBytes(fixture.measurement);
+  fixture.measurementSha256 = sha256(bytes);
+  const embedded = fixture.context.inventory.entries.find(
+    (entry) => entry.path === "app/.bluey/managed-cloud-runtime-measurement.json",
+  );
+  embedded.sha256 = fixture.measurementSha256;
+  embedded.sizeBytes = bytes.length;
+  fixture.runtimeIdentities = [{ role: "managed_runner", runtimeIdentitySha256:
+    deriveManagedCloudRuntimeIdentitySha256(fixture.measurementSha256, "jobs-runner", "managed_runner") }];
+  return fixture;
+}
+
+function runnerAutomationBundleDigest(fixture) {
+  return deriveManagedRunnerAutomationBundleSha256(fixture.measurement,
+    fixture.measurementSha256, fixture.runtimeIdentities, fixture.context);
+}
+
+test("managed runner automation bundle uses a separate canonical v1 golden domain", () => {
+  assert.equal(runnerAutomationBundleDigest(runnerAutomationBundleEvidenceFixture()),
+    "167ed27a469d0d4a888d9c16f7ad3df3a6885dd0653defed72a755ed22b1b189");
+});
+
+test("runner bundle digest changes only for validated automation subtree bytes", () => {
+  for (const [path, changed] of [["app/automation/dist/index.js", true],
+    ["app/runner/dist/server.js", false]]) {
+    const fixture = runnerAutomationBundleEvidenceFixture();
+    fixture.measurement.measuredFiles.find((entry) => entry.path === path).sha256 = "9".repeat(64);
+    fixture.context.inventory.entries.find((entry) => entry.path === path).sha256 = "9".repeat(64);
+    refreshRunnerAutomationBundleEvidence(fixture);
+    assert.equal(runnerAutomationBundleDigest(fixture)
+      !== "167ed27a469d0d4a888d9c16f7ad3df3a6885dd0653defed72a755ed22b1b189", changed);
+  }
+});
+
+test("runner bundle derivation requires exact component, role and embedded measurement", () => {
+  for (const mutate of [
+    (f) => { f.context.componentId = "jobs-workflows"; },
+    (f) => { f.context.roles = ["managed_runner", "workflow_worker"]; },
+    (f) => { f.measurement.measuredFiles[0].sha256 = "9".repeat(64); },
+    (f) => { f.runtimeIdentities[0].runtimeIdentitySha256 = "9".repeat(64); },
+    (f) => { f.context.inventory.entries[0].sha256 = "9".repeat(64); },
+  ]) {
+    const fixture = runnerAutomationBundleEvidenceFixture(); mutate(fixture);
+    assert.throws(() => runnerAutomationBundleDigest(fixture));
+  }
+});
+
+test("runner bundle cannot omit its package or executable module", () => {
+  for (const path of ["app/automation/package.json", "app/automation/dist/index.js"]) {
+    const fixture = runnerAutomationBundleEvidenceFixture();
+    fixture.measurement.measuredFiles = fixture.measurement.measuredFiles.filter((entry) => entry.path !== path);
+    fixture.context.inventory.entries = fixture.context.inventory.entries.filter((entry) => entry.path !== path);
+    refreshRunnerAutomationBundleEvidence(fixture);
+    assert.throws(() => runnerAutomationBundleDigest(fixture), /bundle is incomplete/);
+  }
+});
+
+test("runner bundle rejects duplicate, unsorted, escaping or unmeasured inventory entries", () => {
+  for (const mutate of [
+    (f) => { f.context.inventory.entries.push({ ...f.context.inventory.entries[1] }); },
+    (f) => { f.context.inventory.entries.reverse(); },
+    (f) => { f.context.inventory.entries[1].path = "app/automation/../escape.js"; },
+    (f) => { f.context.inventory.entries[1].extra = true; },
+    (f) => { f.context.inventory.entries.splice(1, 0, { path: "app/automation/dist/extra.js",
+      type: "file", mode: "0444", sizeBytes: 1, sha256: "9".repeat(64) }); },
+  ]) {
+    const fixture = runnerAutomationBundleEvidenceFixture(); mutate(fixture);
+    assert.throws(() => runnerAutomationBundleDigest(fixture));
+  }
 });
