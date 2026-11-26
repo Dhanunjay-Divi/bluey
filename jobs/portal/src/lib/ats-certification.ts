@@ -160,6 +160,7 @@ export function portalEligibilityDecision(
 ): PortalEligibilityDecision {
   const decision = decodeEligibilityDecision(value) ?? fallbackEligibility(fallbackCanPrepare);
   const summary = decodeAtsCertificationSummary(decision.ats_certification);
+  const candidateOnly = requiresCandidateSubmission(decision);
   const currentActive = Boolean(decision.capability === "certified"
     && summary
     && summary.status === "active"
@@ -175,6 +176,7 @@ export function portalEligibilityDecision(
       // The server still carries a local-runner field for parked native clients.
       // Never surface that authority through the web-only launch experience.
       can_queue_local: false,
+      can_queue_cloud: decision.can_queue_cloud && !candidateOnly,
       ats_certification: summary,
     };
   }
@@ -182,6 +184,7 @@ export function portalEligibilityDecision(
   if (!currentActive || !summary) return reviewOnlyDecision(decision, summary);
 
   const canQueueCloud = decision.can_queue_cloud
+    && !candidateOnly
     && summary.certified_runner_kinds.includes("cloud");
   return {
     ...decision,
@@ -193,6 +196,14 @@ export function portalEligibilityDecision(
     can_queue_cloud: canQueueCloud,
     ats_certification: summary,
   };
+}
+
+export function requiresCandidateSubmission(
+  eligibility: Pick<JobEligibilityDecision, "review_reasons"> | undefined,
+): boolean {
+  return eligibility?.review_reasons.some(
+    (reason) => reason.code === "c2c_submission_requires_candidate",
+  ) ?? false;
 }
 
 export function atsCertificationPresentation(

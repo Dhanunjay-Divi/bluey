@@ -8,7 +8,7 @@ import type {
   RunnerAvailability,
   SubmissionMode,
 } from "../types";
-import { portalEligibilityDecision } from "./ats-certification";
+import { portalEligibilityDecision, requiresCandidateSubmission } from "./ats-certification";
 import { workspaceJobById } from "./workspace-jobs";
 
 export function cloudAutomationEligibleApplications(workspace: Pick<
@@ -63,12 +63,17 @@ export function isCloudAutomationEligibleApplication(
     nowMs,
   );
   if (!eligibility.can_queue_cloud) return false;
-  if (eligibility.capability !== "certified" || !currentEligibility) return true;
+  const current = currentEligibility
+    ? portalEligibilityDecision(currentEligibility, false, nowMs)
+    : undefined;
+  // A candidate-only restriction removes runner authority, even when the
+  // current posting lacks a runner certificate or the frozen grant is legacy.
+  if (requiresCandidateSubmission(current)) return false;
+  if (eligibility.capability !== "certified" || !current) return true;
 
   // The receipt remains the frozen decision. A current full match can veto a
   // withdrawn ATS certificate, but cannot grant authority or replace pacing
   // and other application-specific checks with its aggregate queue decision.
-  const current = portalEligibilityDecision(currentEligibility, false, nowMs);
   const certification = current.ats_certification;
   return !certification || current.evaluated_at_ms < eligibility.evaluated_at_ms
     || (current.capability === "certified" && certification.status === "active"

@@ -46,7 +46,11 @@ import { relativeTime, titleCase } from "../lib/format";
 import { ConfirmDialog, Dialog } from "../components/Dialog";
 import { AtsCertificationSummaryCard } from "../components/AtsCertificationSummary";
 import { InterviewPrepDialog, type InterviewPrepTarget } from "../components/InterviewPrepDialog";
-import { atsCertificationPresentation, portalEligibilityDecision } from "../lib/ats-certification";
+import {
+  atsCertificationPresentation,
+  portalEligibilityDecision,
+  requiresCandidateSubmission,
+} from "../lib/ats-certification";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
 import { applicationIssueReasons, applicationIssues, applicationOutcomes, eventActionLabel, latestApplicationOutcome } from "../lib/candidate-events";
 import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
@@ -95,12 +99,6 @@ interface Props {
 type ApplicationHandoff =
   | { kind: "candidate_only" }
   | { kind: "reviewed_packet"; onCommit: Props["onCommit"] };
-
-function requiresCandidateSubmission(eligibility: JobEligibilityDecision | undefined): boolean {
-  return eligibility?.review_reasons.some(
-    (reason) => reason.code === "c2c_submission_requires_candidate",
-  ) ?? false;
-}
 
 export async function resolveVerifiedApplicationHandoff(
   application: JobApplication,

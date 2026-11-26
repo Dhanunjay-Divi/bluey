@@ -20,6 +20,7 @@ import {
   isFinalSubmissionReview,
   workspaceNeedsCloudAutomationRefresh,
 } from "./application-flow";
+import { portalEligibilityDecision } from "./ats-certification";
 
 const runners = (available: boolean): RunnerAvailability => ({
   local: {
@@ -253,6 +254,92 @@ describe("application workflow boundaries", () => {
       ...automationWorkspace([frozen]),
       matches: [aggregateDenied],
     }, frozen)).toBe(true);
+  });
+
+  it("vetoes portal queueing and requested Auto-submit for a server C2C requirement", () => {
+    const frozen = {
+      ...application("queued"),
+      receipt: { eligibility: job(true).eligibility },
+    };
+    const currentC2c = job(true);
+    currentC2c.eligibility = {
+      ...currentC2c.eligibility!,
+      // These legacy positive fields must not override the server's current
+      // candidate-only handoff decision.
+      review_reasons: [{
+        code: "c2c_submission_requires_candidate",
+        message: "The candidate must submit this C2C application directly.",
+      }],
+      ats_certification: undefined,
+    };
+    const currentC2cWithCertification = {
+      ...currentC2c,
+      eligibility: {
+        ...currentC2c.eligibility,
+        ats_certification: activeCertification(),
+      },
+    };
+
+    const workspace = { ...automationWorkspace([frozen]), matches: [currentC2c] };
+    expect(cloudAutomationEligibleApplications(workspace)).toEqual([]);
+    expect(isCloudAutomationEligibleApplication(workspace, frozen)).toBe(false);
+    expect(effectiveSubmissionMode(
+      currentC2cWithCertification,
+      "auto_submit",
+      runners(true),
+      true,
+    )).toBe("review_first");
+    expect(portalEligibilityDecision(currentC2cWithCertification.eligibility)).toMatchObject({
+      can_prepare: true,
+      can_auto_submit: false,
+      can_queue_cloud: false,
+      can_queue_local: false,
+    });
+  });
+
+  it("keeps a frozen candidate-only C2C receipt blocked when a later W2 match is positive", () => {
+    const candidateOnly = job(true);
+    candidateOnly.eligibility = {
+      ...candidateOnly.eligibility!,
+      review_reasons: [{
+        code: "c2c_submission_requires_candidate",
+        message: "The candidate must submit this C2C application directly.",
+      }],
+    };
+    const frozen = {
+      ...application("queued"),
+      receipt: { eligibility: candidateOnly.eligibility },
+    };
+
+    expect(isCloudAutomationEligibleApplication({
+      ...automationWorkspace([frozen]),
+      matches: [evaluatedAt(job(true), NOW_MS + 1)],
+    }, frozen)).toBe(false);
+  });
+
+  it("vetoes queued legacy beta authority when the current server decision requires C2C handoff", () => {
+    const legacyBeta = job(false);
+    legacyBeta.eligibility = {
+      ...legacyBeta.eligibility!,
+      can_queue_cloud: true,
+    };
+    const frozen = {
+      ...application("queued"),
+      receipt: { eligibility: legacyBeta.eligibility },
+    };
+    const currentC2c = job(true);
+    currentC2c.eligibility = {
+      ...currentC2c.eligibility!,
+      review_reasons: [{
+        code: "c2c_submission_requires_candidate",
+        message: "The candidate must submit this C2C application directly.",
+      }],
+    };
+
+    expect(isCloudAutomationEligibleApplication({
+      ...automationWorkspace([frozen]),
+      matches: [currentC2c],
+    }, frozen)).toBe(false);
   });
 
   it("downgrades Auto-submit unless both the job and a runner are authorized", () => {

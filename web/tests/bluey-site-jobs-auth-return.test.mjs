@@ -106,6 +106,7 @@ function authContext({ search = "", path = "/login", pendingDevice = false } = {
       pendingSignupEmail: values.accountEmail.value,
       accountAuthMode: "signup",
       accountAuthEpoch: 0,
+      jobsPasswordLoginAttempt: null,
       signupModeRevision: 0,
       signupStartInFlight: false,
       signupConfirmInFlight: false,
@@ -125,6 +126,7 @@ function authContext({ search = "", path = "/login", pendingDevice = false } = {
 
 async function runAuth(sourceBody, name, options) {
   const { context, calls } = authContext(options);
+  if (name === "accountAuth") context.accountAuthMode = "login";
   const argument = name === "accountAuth" ? "'login'" : "";
   vm.runInNewContext(`${targetSource}; ${navigationSource}; ${sourceBody}; promise = ${name}(${argument})`, context);
   await context.promise;
@@ -137,6 +139,68 @@ test("actual copied password login returns to Jobs without loading Account", asy
   assert.equal(calls.accountLoads, 0);
   assert.equal(calls.replaces, 0);
   assert.equal(calls.tokens, 1);
+});
+
+function passwordLoginHarness() {
+  const { context, calls } = authContext({ search: "?next=%2Fjobs" });
+  context.accountAuthMode = "login";
+  const requests = [];
+  context.apiJson = (...args) => new Promise((resolve, reject) => { requests.push({ args, resolve, reject }); });
+  vm.runInNewContext(`${targetSource}; ${navigationSource}; ${passwordLoginSource}`, context);
+  return { context, calls, requests };
+}
+
+test("stale Jobs password success cannot replace the signup view or a newer session", async () => {
+  for (const change of [
+    context => { context.accountAuthMode = "signup"; context.signupModeRevision++; },
+    context => { context.accountAuthEpoch++; },
+    context => { context.location.search = ""; },
+  ]) {
+    const { context, calls, requests } = passwordLoginHarness();
+    const first = context.accountAuth("login");
+    assert.equal(requests.length, 1);
+    change(context);
+    requests[0].resolve({ access_token: "obsolete-synthetic-access" });
+    await first;
+    assert.equal(calls.tokens, 0);
+    assert.deepEqual(calls.assigned, []);
+    assert.equal(calls.accountLoads, 0);
+  }
+});
+
+test("a Jobs password request from a previous view cannot clear or duplicate a new attempt", async () => {
+  const { context, calls, requests } = passwordLoginHarness();
+  const old = context.accountAuth("login");
+  const firstDuplicate = context.accountAuth("login");
+  assert.equal(requests.length, 1);
+  context.signupModeRevision += 2; // Login -> signup -> login during the old request.
+  const fresh = context.accountAuth("login");
+  assert.equal(requests.length, 2);
+  requests[0].reject(new Error("obsolete login error"));
+  await old;
+  const secondDuplicate = context.accountAuth("login");
+  assert.equal(requests.length, 2);
+  requests[1].resolve({ access_token: "fresh-synthetic-access" });
+  await Promise.all([fresh, firstDuplicate, secondDuplicate]);
+  assert.deepEqual(requests.map(request => request.args[0]), ["/auth/login", "/auth/login"]);
+  assert.equal(calls.tokens, 1);
+  assert.deepEqual(calls.assigned, ["/jobs/"]);
+});
+
+test("the current Jobs password error is shown and the candidate can explicitly retry", async () => {
+  const { context, calls, requests } = passwordLoginHarness();
+  const first = context.accountAuth("login");
+  requests[0].reject(new Error("invalid credentials"));
+  await assert.rejects(first, /invalid credentials/);
+  assert.equal(requests.length, 1);
+  assert.equal(calls.tokens, 0);
+  assert.deepEqual(calls.assigned, []);
+  const retry = context.accountAuth("login");
+  assert.equal(requests.length, 2);
+  requests[1].resolve({ access_token: "fresh-synthetic-access" });
+  await retry;
+  assert.equal(calls.tokens, 1);
+  assert.deepEqual(calls.assigned, ["/jobs/"]);
 });
 
 test("password login through the real QA gateway does not send another session's credentials", async t => {
@@ -179,6 +243,7 @@ test("password login through the real QA gateway does not send another session's
   assert.deepEqual(upstream, []);
 
   const { context, calls, values } = authContext({ search: "?next=%2Fjobs" });
+  context.accountAuthMode = "login";
   values.accountEmail.value = email;
   values.accountPassword.value = password;
   const attempts = [];
@@ -204,6 +269,7 @@ test("password login through the real QA gateway does not send another session's
 
 test("password 401 never refreshes or replays, but authenticated account reads still can", async () => {
   const { context, calls } = authContext({ search: "?next=%2Fjobs" });
+  context.accountAuthMode = "login";
   const requests = [];
   let token = "dummy.old.signature", refreshes = 0;
   Object.assign(context, { Headers, accountToken: () => token,
@@ -214,7 +280,7 @@ test("password 401 never refreshes or replays, but authenticated account reads s
         ? { status: 200, ok: true, json: async () => ({ ok: true }) }
         : { status: 401, ok: false, json: async () => ({ error: "invalid credentials" }) };
     } });
-  vm.runInNewContext(`${passwordLoginSource}; ${apiResponseSource}; ${apiSource}`, context);
+  vm.runInNewContext(`${targetSource}; ${passwordLoginSource}; ${apiResponseSource}; ${apiSource}`, context);
   await assert.rejects(context.accountAuth("login"), /invalid credentials/);
   assert.equal(calls.tokens, 0);
   assert.equal(refreshes, 0);
@@ -225,6 +291,54 @@ test("password 401 never refreshes or replays, but authenticated account reads s
     { path: "/account/me", auth: "Bearer dummy.old.signature", credentials: undefined },
     { path: "/account/me", auth: "Bearer dummy.new.signature", credentials: undefined },
   ]);
+});
+
+test("public signup OTP writes omit other sessions and never refresh or replay", async () => {
+  for (const path of ["/auth/signup/start", "/auth/signup/confirm"]) {
+    const requests = [];
+    let refreshes = 0;
+    const context = {
+      Headers,
+      accountToken: () => "dummy.old.signature",
+      refreshAccountToken: async () => { refreshes++; return "dummy.new.signature"; },
+      fetch: async (requestPath, options) => {
+        const cookie = options.headers.get("cookie") ?? (options.credentials !== "omit" ? "qa=stale" : null);
+        const authorization = options.headers.get("authorization");
+        requests.push({ path: requestPath, authorization, cookie, credentials: options.credentials });
+        // Match the synthetic signup gateway's refusal of ambient session credentials.
+        if (options.method === "POST" && (cookie || authorization)) {
+          return { status: 400, ok: false, json: async () => ({ error: "Request refused" }) };
+        }
+        return { status: 401, ok: false, json: async () => ({ error: "current signup error" }) };
+      },
+    };
+    vm.runInNewContext(`${apiResponseSource}; ${apiSource}`, context);
+    await assert.rejects(context.apiJson(path, {
+      method: "POST",
+      credentials: "include",
+      headers: { Authorization: "Bearer dummy.explicit.signature", Cookie: "qa=explicit" },
+      body: "{}",
+    }), /current signup error/);
+    assert.deepEqual(requests, [{ path, authorization: null, cookie: null, credentials: "omit" }]);
+    assert.equal(refreshes, 0);
+  }
+});
+
+test("an authenticated trial conversion remains outside the public signup write boundary", async () => {
+  const path = "/auth/trial/convert/start";
+  const context = {
+    Headers,
+    accountToken: () => "dummy.trial.signature",
+    refreshAccountToken: () => assert.fail("unexpected refresh"),
+    fetch: async (requestPath, options) => {
+      assert.equal(requestPath, path);
+      assert.equal(options.headers.get("authorization"), "Bearer dummy.trial.signature");
+      assert.equal(options.credentials, undefined);
+      return { status: 200, ok: true, json: async () => ({ ok: true }) };
+    },
+  };
+  vm.runInNewContext(`${apiResponseSource}; ${apiSource}`, context);
+  assert.deepEqual(await context.apiJson(path, { method: "POST" }), { ok: true });
 });
 
 test("actual copied OTP signup returns to Jobs without loading Account", async () => {

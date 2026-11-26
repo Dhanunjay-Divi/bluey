@@ -90,6 +90,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let signupStartInFlight = false;
     let signupConfirmInFlight = false;
     let signupModeRevision = 0;
+    let jobsPasswordLoginAttempt = null;
     let trialTurnstileWidgetId = null;
     let trialTurnstileToken = '';
     let pendingTrialButton = null;
@@ -802,12 +803,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     async function apiJsonResponse(path, options = {}, hasRetriedAuth = false) {
       const { skipAuthRefresh, ...fetchOptions } = options;
-      const passwordLogin = path === '/auth/login' && fetchOptions.method === 'POST';
+      const publicIdentityWrite = fetchOptions.method === 'POST'
+        && (path === '/auth/login' || path === '/auth/signup/start' || path === '/auth/signup/confirm');
       const headers = new Headers(options.headers || {});
       headers.set('Content-Type', 'application/json');
-      if (passwordLogin) {
-        // The password request must not carry or refresh a different browser session.
+      if (publicIdentityWrite) {
+        // These requests establish identity; they must not carry or refresh another session.
         headers.delete('Authorization');
+        headers.delete('Cookie');
         fetchOptions.credentials = 'omit';
       } else {
         const token = accountToken();
@@ -820,7 +823,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       } catch {
         body = null;
       }
-      if (response.status === 401 && !passwordLogin && !hasRetriedAuth && !skipAuthRefresh) {
+      if (response.status === 401 && !publicIdentityWrite && !hasRetriedAuth && !skipAuthRefresh) {
         const refreshed = await refreshAccountToken();
         if (refreshed) {
           return apiJsonResponse(path, options, true);
@@ -1623,6 +1626,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function accountAuth(mode) {
+      const jobsLogin = mode === 'login' && currentPath === '/login'
+        && jobsReturnTarget() === '/jobs/' && !pendingDeviceCode();
+      const currentJobsLogin = (view) => view !== null && accountAuthMode === 'login'
+        && view.revision === signupModeRevision && view.epoch === accountAuthEpoch
+        && jobsReturnTarget() === '/jobs/' && !pendingDeviceCode();
+      if (jobsLogin && (accountAuthMode !== 'login' || currentJobsLogin(jobsPasswordLoginAttempt))) return;
       const email = document.getElementById('accountEmail').value.trim();
       const password = document.getElementById('accountPassword').value;
       const remember = document.getElementById('rememberMe')?.checked !== false;
@@ -1631,15 +1640,28 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       if (mode === 'signup' && !requireSignupTerms()) return;
+      // A departed form must not install a session or overwrite newer UI feedback.
+      // Retiring that form also lets a new view sign in without waiting for it.
+      const attempt = jobsLogin ? { revision: signupModeRevision, epoch: accountAuthEpoch } : null;
+      if (attempt) jobsPasswordLoginAttempt = attempt;
+      let auth;
       accountMessage(mode === 'signup' ? 'Creating account...' : 'Signing in...', true);
-      const auth = await apiJson(`/auth/${mode === 'signup' ? 'signup' : 'login'}`, {
-        method: 'POST',
-        body: JSON.stringify({
-          email,
-          password,
-          ...(mode === 'signup' ? { terms_accepted: true } : {}),
-        }),
-      });
+      try {
+        auth = await apiJson(`/auth/${mode === 'signup' ? 'signup' : 'login'}`, {
+          method: 'POST',
+          body: JSON.stringify({
+            email,
+            password,
+            ...(mode === 'signup' ? { terms_accepted: true } : {}),
+          }),
+        });
+      } catch (error) {
+        if (!attempt || currentJobsLogin(attempt)) throw error;
+        return;
+      } finally {
+        if (attempt && jobsPasswordLoginAttempt === attempt) jobsPasswordLoginAttempt = null;
+      }
+      if (attempt && !currentJobsLogin(attempt)) return;
       setAccountToken(auth, remember);
       if (currentPath === '/login' && !pendingDeviceCode()) {
         if (navigateToJobsAfterAuth()) return;
