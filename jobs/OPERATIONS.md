@@ -127,6 +127,12 @@ rollout order is:
    `bluey-server` and `bluey-jobs-api` validate cleanup configuration before starting any background
    worker if the exact flag is later enabled. Verify the disabled authenticated cleanup route is
    404 and the generic unauthenticated boundary remains 401.
+   For the subsequent cleanup-only canary, use a separate private gateway process with
+   `BLUEY_JOBS_WORKFLOW_GATEWAY_MODE=cleanup_only`. The mode requires cleanup enabled and matching
+   Temporal namespaces, rejects managed-cloud runtime registration on that process, and does not
+   mount either workflow command route. Both command routes return authenticated 404 and
+   unauthenticated 401. An unset mode retains the existing combined gateway for established
+   deployments. Gateway mode does not enable the API cleanup worker or authorize a cleanup.
 3. Resolve and approve the one production Temporal namespace and protocol-v1 cutover timestamp.
    Configure `BLUEY_JOBS_WORKFLOW_NAMESPACE` to equal `TEMPORAL_NAMESPACE`. The cleanup query is
    fixed to `WorkflowType = "applicationWorkflow"`; the cutoff is bound cutover authority and is

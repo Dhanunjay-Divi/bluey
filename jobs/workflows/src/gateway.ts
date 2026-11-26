@@ -47,6 +47,11 @@ export async function runGateway(): Promise<void> {
     process.env.BLUEY_JOBS_WORKFLOW_NAMESPACE,
     namespace,
   );
+  const mode = workflowGatewayMode(
+    process.env.BLUEY_JOBS_WORKFLOW_GATEWAY_MODE,
+    cleanupNamespace,
+    runtimeConfig !== undefined,
+  );
   const taskQueue = process.env.BLUEY_JOBS_TASK_QUEUE || "bluey-jobs-applications";
   const controller = new AbortController();
   const stop = (): void => controller.abort();
@@ -74,13 +79,15 @@ export async function runGateway(): Promise<void> {
     },
   });
   let runtimeReady = runtimeConfig === undefined;
-  const service = createGatewayService({
-    client: client.workflow,
-    taskQueue,
-    ...(runtimeConfig
-      ? { runtimeIdentity: () => runtimeReady ? runtimeInstance : undefined }
-      : {}),
-  });
+  const service = mode === "combined"
+    ? createGatewayService({
+        client: client.workflow,
+        taskQueue,
+        ...(runtimeConfig
+          ? { runtimeIdentity: () => runtimeReady ? runtimeInstance : undefined }
+          : {}),
+      })
+    : undefined;
   const cleanupService = cleanupNamespace
     ? createWorkflowCleanupService({
       client: createTemporalCleanupClient(client.workflow),
@@ -151,7 +158,7 @@ export interface GatewayCleanupExecutor {
 
 export function createGatewayRequestHandler(
   token: string,
-  service: GatewayCommandExecutor,
+  service: GatewayCommandExecutor | undefined,
   cleanupService?: GatewayCleanupExecutor,
   ready: () => boolean = () => true,
 ): RequestListener {
@@ -164,9 +171,10 @@ export function createGatewayRequestHandler(
       return json(response, 401, gatewayError("rejected", "invalid_request"));
     }
     const cleanupRoute = request.url === WORKFLOW_CLEANUP_PATH && cleanupService !== undefined;
-    const commandRoute = request.url === WORKFLOW_COMMAND_PATH;
     const commandReconciliationRoute = request.url === WORKFLOW_COMMAND_RECONCILIATION_PATH;
-    if (!cleanupRoute && !commandRoute && !commandReconciliationRoute) {
+    const command = request.url === WORKFLOW_COMMAND_PATH || commandReconciliationRoute
+      ? service : undefined;
+    if (!cleanupRoute && !command) {
       return json(response, 404, gatewayError("rejected", "invalid_request"));
     }
     if (!ready() && cleanupRoute) {
@@ -202,11 +210,14 @@ export function createGatewayRequestHandler(
       }
       return json(response, result.status, result.body);
     }
+    if (!command) {
+      return json(response, 404, gatewayError("rejected", "invalid_request"));
+    }
     let result: GatewayServiceResult;
     try {
       result = commandReconciliationRoute
-        ? await service.reconcile(parsed)
-        : await service.execute(parsed);
+        ? await command.reconcile(parsed)
+        : await command.execute(parsed);
     } catch {
       result = {
         status: 503,
@@ -248,6 +259,21 @@ export function workflowCleanupStartupNamespace(
   return cleanupNamespace;
 }
 
+export function workflowGatewayMode(
+  value: string | undefined,
+  cleanupNamespace: string | undefined,
+  managedRuntimeConfigured: boolean,
+): "combined" | "cleanup_only" {
+  if (value === undefined || value === "combined") return "combined";
+  if (value !== "cleanup_only") {
+    throw new Error("BLUEY_JOBS_WORKFLOW_GATEWAY_MODE must be combined or cleanup_only");
+  }
+  if (cleanupNamespace === undefined || managedRuntimeConfigured) {
+    throw new Error("cleanup_only requires enabled cleanup and no managed runtime configuration");
+  }
+  return value;
+}
+
 export function workflowGatewayToken(value: string | undefined): string {
   const token = value?.trim() ?? "";
   const length = Buffer.byteLength(token, "utf8");
@@ -261,7 +287,7 @@ export function workflowGatewayToken(value: string | undefined): string {
 
 export function createGatewayHttpServer(
   token: string,
-  service: GatewayCommandExecutor,
+  service: GatewayCommandExecutor | undefined,
   cleanupService?: GatewayCleanupExecutor,
   ready?: () => boolean,
 ): Server {

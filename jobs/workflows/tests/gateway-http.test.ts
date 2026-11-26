@@ -5,6 +5,7 @@ import {
   workflowCleanupEnabled,
   workflowCleanupNamespace,
   workflowCleanupStartupNamespace,
+  workflowGatewayMode,
   workflowGatewayToken,
   type GatewayCleanupExecutor,
 } from "../src/gateway.js";
@@ -32,7 +33,9 @@ async function bindGatewayFixture(gateway: Server): Promise<string> {
     });
   });
   const address = gateway.address();
-  if (!address || typeof address === "string") throw new Error("Test gateway did not bind");
+  if (!address || typeof address === "string" || address.address !== "127.0.0.1") {
+    throw new Error("Test gateway did not bind to IPv4 loopback");
+  }
   return `http://127.0.0.1:${address.port}`;
 }
 
@@ -109,6 +112,24 @@ describe("workflow gateway HTTP boundary", () => {
       .toThrow("Temporal namespace");
     expect(() => workflowCleanupStartupNamespace("true", "other", "temporal-prod"))
       .toThrow("must equal");
+  });
+
+  it("accepts only an exact cleanup-only gateway mode with isolated prerequisites", () => {
+    expect(workflowGatewayMode(undefined, undefined, false)).toBe("combined");
+    expect(workflowGatewayMode("combined", undefined, true)).toBe("combined");
+    expect(workflowGatewayMode("cleanup_only", "bluey-jobs", false)).toBe("cleanup_only");
+
+    for (const value of ["", "cleanup-only", "CLEANUP_ONLY", " cleanup_only", "cleanup_only "]) {
+      expect(() => workflowGatewayMode(value, "bluey-jobs", false)).toThrow(
+        "BLUEY_JOBS_WORKFLOW_GATEWAY_MODE",
+      );
+    }
+    expect(() => workflowGatewayMode("cleanup_only", undefined, false)).toThrow(
+      "cleanup_only requires",
+    );
+    expect(() => workflowGatewayMode("cleanup_only", "bluey-jobs", true)).toThrow(
+      "cleanup_only requires",
+    );
   });
 
   it("keeps health isolated from command authentication", async () => {
@@ -264,6 +285,61 @@ describe("workflow gateway HTTP boundary", () => {
 
     expect(response.status).toBe(503);
     expect(executeCleanup).not.toHaveBeenCalled();
+  });
+
+  it("mounts only cleanup in cleanup-only mode over authenticated loopback HTTP", async () => {
+    await replaceCleanupOnlyServer({ executeCleanup } as GatewayCleanupExecutor);
+    const cleanupRequest = {
+      schemaVersion: 3,
+      operation: "legacy_inventory_page",
+      cleanupRequestId: `wfclean-v3-${"a".repeat(32)}`,
+    };
+    executeCleanup.mockResolvedValueOnce({
+      status: 202,
+      body: { ...cleanupRequest, outcome: "page" },
+    });
+
+    const unauthenticated = await fixtureFetch(`${origin}/workflow-commands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(unauthenticated.status).toBe(401);
+
+    for (const [path, body] of [
+      ["/workflow-commands", "{"],
+      ["/workflow-command-reconciliations", JSON.stringify({ unexpected: true })],
+    ]) {
+      const response = await gatewayRequest(path, body);
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({
+        schemaVersion: 2,
+        outcome: "rejected",
+        reason: "invalid_request",
+      });
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+
+    const cleanup = await gatewayRequest("/workflow-cleanup", JSON.stringify(cleanupRequest));
+    expect(cleanup.status).toBe(202);
+    expect(executeCleanup).toHaveBeenCalledWith(cleanupRequest);
+  });
+
+  it("keeps cleanup-only execution unavailable until readiness is true", async () => {
+    await replaceCleanupOnlyServer({ executeCleanup } as GatewayCleanupExecutor, () => false);
+
+    const response = await gatewayRequest("/workflow-cleanup", "{}");
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      schemaVersion: 3,
+      outcome: "rejected",
+      reason: "temporal_unavailable",
+    });
+    expect(executeCleanup).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
   });
 
   it("does not expose unfinished cleanup to unauthenticated requests", async () => {
@@ -511,5 +587,17 @@ async function replaceServer(
     cleanupService,
     ready,
   );
+  origin = await bindGatewayFixture(server);
+}
+
+async function replaceCleanupOnlyServer(
+  cleanupService: GatewayCleanupExecutor,
+  ready?: () => boolean,
+): Promise<void> {
+  server.closeAllConnections();
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+  server = createGatewayHttpServer(TOKEN, undefined, cleanupService, ready);
   origin = await bindGatewayFixture(server);
 }
