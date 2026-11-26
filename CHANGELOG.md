@@ -5,6 +5,10 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Run the Jobs Darwin native-storage CI lane on the supported macOS 15 ARM64
+  image and verify the runner architecture before building.
+- Give the isolated Chromium redirect fixtures an inline favicon so unrelated
+  icon fetches do not interfere with their strict network assertions.
 ### Added
 
 - Added an opt-in original-source check for saved Jobs feed listings. It

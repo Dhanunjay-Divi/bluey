@@ -12,6 +12,9 @@ const JOB = "https://boards.greenhouse.io/acme/jobs/1234567";
 const CHROMIUM = chromium.executablePath();
 const EMAIL = "synthetic@example.test";
 const DOCUMENT = Buffer.from("Synthetic redirect sentinel document; no personal data.");
+// Chromium must not introduce a separate favicon request into the network census.
+const INLINE_ICON = '<link rel="icon" type="image/gif" href="data:image/gif;base64,'
+  + 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">';
 
 describe("real Chromium exact-submit redirect boundary", () => {
   it.each([301, 302, 303, 307, 308])(
@@ -40,7 +43,12 @@ describe("real Chromium exact-submit redirect boundary", () => {
           request.on("error", () => undefined);
           request.on("end", () => {
             record.document = Buffer.concat(chunks).includes(DOCUMENT);
-            response.writeHead(200).end("synthetic");
+            if (record.path === "/capture") {
+              response.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+                .end(`<!doctype html><head>${INLINE_ICON}</head><body>Synthetic capture control</body>`);
+            } else {
+              response.writeHead(200).end("synthetic");
+            }
           });
         });
         await new Promise<void>((resolve, reject) => {
@@ -74,7 +82,8 @@ describe("real Chromium exact-submit redirect boundary", () => {
           if (request.url() === JOB && request.method() === "GET") {
             return route.fulfill({
               status: 200, contentType: "text/html",
-              body: `<!doctype html><form id="application_form" action="${JOB}" method="post"
+              body: `<!doctype html><head>${INLINE_ICON}</head>
+                <form id="application_form" action="${JOB}" method="post"
                 enctype="multipart/form-data" data-greenhouse-job-id="1234567">
                 <input type="hidden" name="job_id" value="1234567">
                 <label for="email">Email</label><input id="email" name="email" type="email">

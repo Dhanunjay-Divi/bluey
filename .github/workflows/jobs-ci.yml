@@ -222,7 +222,7 @@ jobs:
 
   native-runner-storage-darwin:
     name: Native runner storage (Darwin)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
 
     steps:
@@ -248,6 +248,11 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: jobs/package-lock.json
+
+      - name: Verify Darwin ARM64 runner
+        run: |
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
 
       - name: Build Darwin runner JavaScript
         run: |
