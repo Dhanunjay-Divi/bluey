@@ -5,6 +5,7 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+- Check Career Track ownership before importing a candidate-supplied job link.
 - Add a cleanup-only Jobs gateway mode that leaves workflow commands unmounted.
 - Run the Jobs Darwin native-storage CI lane on the supported macOS 15 ARM64
   image and verify the runner architecture before building.

@@ -1383,15 +1383,35 @@ fn current_match_representation(
 pub async fn save_match(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-    Json(mut input): Json<UserJobInput>,
+    Json(input): Json<UserJobInput>,
 ) -> Result<Json<JobPosting>, ApiError> {
+    save_match_using(&state.pool, &account, input, |url| async move {
+        jobs_import::import_supported_job(&url).await
+    })
+    .await
+}
+
+async fn save_match_using<F, Fut>(
+    pool: &crate::db::DbPool,
+    account: &crate::db::accounts::Account,
+    mut input: UserJobInput,
+    import: F,
+) -> Result<Json<JobPosting>, ApiError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<Option<jobs_import::ImportedJob>, jobs_import::JobImportError>,
+    >,
+{
     // Track ownership is a server-side authority check. Trim once so the
     // persisted match and its discovery source cannot disagree about a track.
     input.track_id = input.track_id.trim().to_string();
     let imported = if input.canonical_url.trim().is_empty() {
         None
     } else {
-        jobs_import::import_supported_job(input.canonical_url.trim())
+        // Reject an invalid account/track binding before spending a provider read.
+        validate_match_track(pool, &account.id, &input.track_id)?;
+        import(input.canonical_url.trim().to_string())
             .await
             .map_err(job_import_error)?
     };
@@ -1403,7 +1423,8 @@ pub async fn save_match(
     let verified_import = imported.is_some();
     let posting = posting_from_user_input(input, imported);
     validate_posting(&posting)?;
-    validate_match_track(&state.pool, &account.id, &posting.track_id)?;
+    // The track can change while the provider request is in flight.
+    validate_match_track(pool, &account.id, &posting.track_id)?;
     let discovery_source = if verified_import {
         let source = jobs::discovery_source_input_from_verified_import(
             &posting.source,
@@ -1413,21 +1434,21 @@ pub async fn save_match(
         )
         .map_err(discovery_source_validation_error)?;
         if let Some(source) = source.as_ref() {
-            jobs::validate_discovery_source_input(&state.pool, &account.id, source)
+            jobs::validate_discovery_source_input(pool, &account.id, source)
                 .map_err(discovery_source_validation_error)?;
         }
         source
     } else {
         None
     };
-    let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
-    let preferences = jobs::get_preferences(&state.pool, &account.id).map_err(internal)?;
+    let profile = jobs::get_profile(pool, &account.id, &account.email).map_err(internal)?;
+    let preferences = jobs::get_preferences(pool, &account.id).map_err(internal)?;
     // The verified posting and its automatic board are one transaction. A
     // source conflict/failure rolls the posting back, and a posting failure
     // rolls the source back, so no invisible unscheduled state is created.
     let saved = match discovery_source.as_ref() {
         Some(source) => jobs::save_verified_import_posting_with_source(
-            &state.pool,
+            pool,
             &account.id,
             &posting,
             source,
@@ -1435,7 +1456,7 @@ pub async fn save_match(
             &preferences,
         )
         .map_err(discovery_source_validation_error)?,
-        None => jobs::upsert_posting(&state.pool, &account.id, &posting, &profile, &preferences)
+        None => jobs::upsert_posting(pool, &account.id, &posting, &profile, &preferences)
             .map_err(internal)?,
     };
     Ok(Json(saved))
@@ -12919,6 +12940,99 @@ mod tests {
         .unwrap();
         drop(conn);
         pool
+    }
+
+    #[tokio::test]
+    async fn save_match_checks_track_before_provider_read_and_again_before_storage() {
+        const URL: &str = "https://boards.greenhouse.io/fixture/jobs/123";
+        let pool = discovery_enrollment_test_pool();
+        let account = crate::db::accounts::Account::fetch_by_id(&pool, "acct-one")
+            .unwrap()
+            .unwrap();
+        jobs::upsert_track(&pool, "acct-two", &test_track("foreign-track")).unwrap();
+        jobs::upsert_track(&pool, &account.id, &test_track("valid-track")).unwrap();
+        jobs::upsert_track(&pool, &account.id, &test_track("removed-track")).unwrap();
+
+        let input = |track: &str| -> UserJobInput {
+            serde_json::from_value(json!({"track_id": track, "canonical_url": URL})).unwrap()
+        };
+        let posting = || jobs_import::ImportedJob {
+            source: "greenhouse_import".to_string(),
+            external_id: "123".to_string(),
+            company: "Fixture Systems".to_string(),
+            title: "Software Engineer".to_string(),
+            location: "Austin, TX".to_string(),
+            workplace: "hybrid".to_string(),
+            canonical_url: URL.to_string(),
+            description: "Build reliable systems.".to_string(),
+            compensation: String::new(),
+            employment_type: "full_time".to_string(),
+            posted_at_ms: None,
+            verified_at_ms: chrono::Utc::now().timestamp_millis(),
+            evidence_hash: "a".repeat(64),
+        };
+        let unchanged = || {
+            for id in [&account.id[..], "acct-two"] {
+                assert!(jobs::list_postings(&pool, id).unwrap().is_empty());
+                assert!(jobs::list_discovery_sources(&pool, id).unwrap().is_empty());
+            }
+        };
+        let expected = (
+            StatusCode::BAD_REQUEST,
+            "Career Track was not found.".to_string(),
+        );
+        let calls = &AtomicUsize::new(0);
+        let foreign = save_match_using(
+            &pool,
+            &account,
+            input(" foreign-track "),
+            |url| async move {
+                assert_eq!(url, URL);
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(posting()))
+            },
+        )
+        .await;
+        assert_eq!(foreign.unwrap_err(), expected);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        unchanged();
+
+        let pool_ref = &pool;
+        let account_id = account.id.as_str();
+        let removed = save_match_using(&pool, &account, input("removed-track"), |url| async move {
+            assert_eq!(url, URL);
+            calls.fetch_add(1, Ordering::SeqCst);
+            assert!(jobs::delete_track(pool_ref, account_id, "removed-track").unwrap());
+            Ok(Some(posting()))
+        })
+        .await;
+        assert_eq!(removed.unwrap_err(), expected);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        unchanged();
+
+        let Json(saved) =
+            save_match_using(&pool, &account, input(" valid-track "), |url| async move {
+                assert_eq!(url, URL);
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(posting()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(saved.track_id, "valid-track");
+        assert_eq!(saved.source, "greenhouse_import");
+        assert_eq!(
+            jobs::list_postings(&pool, &account.id).unwrap()[0].id,
+            saved.id
+        );
+        let sources = jobs::list_discovery_sources(&pool, &account.id).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].track_id, "valid-track");
+        assert_eq!(sources[0].source_key, "fixture");
+        assert!(jobs::list_postings(&pool, "acct-two").unwrap().is_empty());
+        assert!(jobs::list_discovery_sources(&pool, "acct-two")
+            .unwrap()
+            .is_empty());
     }
 
     fn seed_router_smartrecruiters_summary(
