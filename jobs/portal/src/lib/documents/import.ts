@@ -30,25 +30,31 @@ export async function importResume(file: File): Promise<ImportedResume> {
       import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
     ]);
     pdfjs.GlobalWorkerOptions.workerSrc = worker.default;
-    const pdf = await pdfjs.getDocument({ data: buffer }).promise;
-    if (pdf.numPages > MAX_RESUME_PDF_PAGES) {
-      throw new Error(`That PDF has ${pdf.numPages} pages. Bluey supports resumes up to ${MAX_RESUME_PDF_PAGES} pages.`);
-    }
-    const pages: string[] = [];
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-      const page = await pdf.getPage(pageNumber);
-      const content = await page.getTextContent();
-      pages.push(pdfTextItemsToText(content.items as PdfTextItem[]));
-      if (pages.reduce((total, pageText) => total + pageText.length, 0) > MAX_RESUME_TEXT_CHARACTERS) {
-        throw new Error("That resume contains too much text. Choose a shorter resume and try again.");
+    // Bluey extracts text only and never instantiates PDF.js viewer, annotation, or scripting layers.
+    const loadingTask = pdfjs.getDocument({ data: buffer });
+    try {
+      const pdf = await loadingTask.promise;
+      if (pdf.numPages > MAX_RESUME_PDF_PAGES) {
+        throw new Error(`That PDF has ${pdf.numPages} pages. Bluey supports resumes up to ${MAX_RESUME_PDF_PAGES} pages.`);
       }
+      const pages: string[] = [];
+      for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+        const page = await pdf.getPage(pageNumber);
+        const content = await page.getTextContent();
+        pages.push(pdfTextItemsToText(content.items as PdfTextItem[]));
+        if (pages.reduce((total, pageText) => total + pageText.length, 0) > MAX_RESUME_TEXT_CHARACTERS) {
+          throw new Error("That resume contains too much text. Choose a shorter resume and try again.");
+        }
+      }
+      return {
+        name: file.name,
+        text: validateExtractedResumeText(pages.join("\n\n"), "PDF"),
+        file_type: "pdf",
+        page_count: pdf.numPages,
+      };
+    } finally {
+      await loadingTask.destroy();
     }
-    return {
-      name: file.name,
-      text: validateExtractedResumeText(pages.join("\n\n"), "PDF"),
-      file_type: "pdf",
-      page_count: pdf.numPages,
-    };
   }
   if (extension === "docx") {
     const { default: mammoth } = await import("mammoth");

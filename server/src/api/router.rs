@@ -189,7 +189,7 @@ fn validate_managed_direct_request(
     Ok(answer_rules)
 }
 
-fn is_internal_disclosure_request(text: &str) -> bool {
+pub(super) fn is_internal_disclosure_request(text: &str) -> bool {
     // `user` is an untrusted API field even when it resembles Bluey's internal
     // Question/Context envelope. Scan the entire value so a caller cannot hide
     // a disclosure request in a later paragraph or forged context section.
@@ -716,8 +716,8 @@ fn reserve_llm_usage(
     account: &Account,
     request_id: &str,
     estimated_customer_cents: i64,
-    estimated_upstream_cents: i64,
     reason: &'static str,
+    scope: CompletionScope,
 ) -> Result<ReservedUsage, Box<(StatusCode, Json<ApiError>)>> {
     let created_at_ms = managed_usage_now_ms();
     let ttl_ms = llm_usage_reservation_ttl()
@@ -732,7 +732,7 @@ fn reserve_llm_usage(
             kind: "llm",
             reason,
             estimated_customer_cents,
-            estimated_upstream_cents,
+            estimated_upstream_cents: 0, // Separate durable provider-attempt admission owns this.
             upstream_spend_guard: state.config.upstream_spend_guard,
             created_at_ms,
             expires_at_ms,
@@ -749,7 +749,7 @@ fn reserve_llm_usage(
             Ok(reservation)
         }
         Err(usage_reservations::UsageReservationError::InsufficientBalance) => {
-            let _ = idempotency::mark_failed(&state.pool, &account.id, request_id);
+            scope.finish_before_dispatch_failure(&state.pool, &account.id, request_id);
             let balance_cents = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
             Err(Box::new((
                 StatusCode::PAYMENT_REQUIRED,
@@ -920,6 +920,7 @@ fn fail_stream_llm_usage(
     release_llm_usage(pool, account_id, request_id, reason);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn settle_llm_usage_with_retry(
     pool: &crate::db::DbPool,
     account_id: &str,
@@ -928,10 +929,11 @@ async fn settle_llm_usage_with_retry(
     elapsed_ms: i64,
     reason: &'static str,
     events: &[usage_reservations::SettlementUsageEvent],
+    encode: &(impl Fn(&SettledUsage) -> Result<String, serde_json::Error> + Sync),
 ) -> Result<SettledUsage, usage_reservations::UsageReservationError> {
     let mut last_error = None;
     for attempt in 1..=LLM_SETTLEMENT_RETRY_ATTEMPTS {
-        match usage_reservations::settle_with_events(
+        match usage_reservations::settle_with_events_and_completion(
             pool,
             account_id,
             request_id,
@@ -940,6 +942,7 @@ async fn settle_llm_usage_with_retry(
             reason,
             managed_usage_now_ms(),
             events,
+            encode,
         ) {
             Ok(settled) => return Ok(settled),
             Err(error @ usage_reservations::UsageReservationError::Db(_))

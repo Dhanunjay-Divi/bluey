@@ -46,7 +46,26 @@ describe("job source intelligence", () => {
     expect(assessJobSourceTrust({
       applicationUrl: "https://careers.acmehealth.com/jobs/1",
       company: "Acme Health",
-    })).toMatchObject({ level: "high", flags: [] });
+    })).toMatchObject({ level: "medium", flags: ["unverified_company_domain"], requiresOriginalRevalidation: true });
+  });
+
+  it.each([
+    ["https://careers.acmehealth.example/jobs/1", "Acme Health", "unverified_company_domain"],
+    ["https://careers.acmehealth.example/jobs/1", "", "unverified_company_domain"],
+    ["https://other.example/jobs/1", "Acme Health", "company_domain_mismatch"],
+  ])("does not score unverified company URLs as high trust: %s", (applicationUrl, company, flag) => {
+    expect(assessJobSourceTrust({ applicationUrl, company })).toMatchObject({
+      level: "medium", score: 85, flags: [flag], requiresOriginalRevalidation: true,
+    });
+  });
+
+  it("refuses URLs with embedded credentials even for known ATS hosts", () => {
+    expect(assessJobSourceTrust({
+      applicationUrl: "https://synthetic:fixture@jobs.lever.co/acme/role-1", company: "Acme Health",
+    })).toEqual({
+      score: 30, level: "low", flags: ["invalid_application_url"], hostname: "jobs.lever.co",
+      requiresOriginalRevalidation: true,
+    });
   });
 
   it("creates deterministic fingerprints and ignores descriptions without enough evidence", () => {

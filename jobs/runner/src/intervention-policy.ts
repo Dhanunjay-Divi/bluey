@@ -1,3 +1,8 @@
+import {
+  parseManagedCloudReleaseMemo,
+  type ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+
 const CONTENT_NEUTRAL_RESUME_ACTIONS = new Set([
   "approve_submission",
   "approve_email_otp",
@@ -6,11 +11,16 @@ const CONTENT_NEUTRAL_RESUME_ACTIONS = new Set([
 ]);
 
 export interface RunResolution {
+  accountId: string;
+  applicationId: string;
+  applicationIdentityId: string;
+  runId: string;
   requestId: string;
   profileScope: string;
   action?: string;
   field?: string;
   answer?: string;
+  managedCloudRelease?: ManagedCloudReleaseMemoAuthority;
 }
 
 export type RunnerInterventionDecision =
@@ -24,22 +34,55 @@ export class RunnerInterventionPolicyError extends Error {
   }
 }
 
-export function parseRunnerInterventionResolution(value: unknown): RunResolution {
+export function parseRunnerInterventionResolution(
+  value: unknown,
+  managedRuntimeConfigured = false,
+): RunResolution {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new RunnerInterventionPolicyError("A run resolution is required");
   }
   const record = value as Record<string, unknown>;
   for (const key of Object.keys(record)) {
-    if (!["requestId", "profileScope", "action", "field", "answer"].includes(key)) {
+    if (![
+      "accountId",
+      "applicationId",
+      "applicationIdentityId",
+      "runId",
+      "requestId",
+      "profileScope",
+      "action",
+      "field",
+      "answer",
+      ...(managedRuntimeConfigured ? ["managedCloudRelease"] : []),
+    ].includes(key)) {
       throw new RunnerInterventionPolicyError("The run resolution contains unsupported data");
     }
   }
+  let managedCloudRelease: ManagedCloudReleaseMemoAuthority | undefined;
+  if (managedRuntimeConfigured) {
+    try {
+      managedCloudRelease = parseManagedCloudReleaseMemo(record.managedCloudRelease);
+    } catch {
+      throw new RunnerInterventionPolicyError(
+        "The managed-cloud release authority is invalid",
+      );
+    }
+  }
   return {
+    accountId: requiredText(record.accountId, "account ID", 160),
+    applicationId: requiredText(record.applicationId, "application ID", 160),
+    applicationIdentityId: requiredText(
+      record.applicationIdentityId,
+      "application identity ID",
+      160,
+    ),
+    runId: requiredText(record.runId, "run ID", 160),
     requestId: requiredText(record.requestId, "request ID", 240),
     profileScope: requiredText(record.profileScope, "profile scope", 40),
     ...optionalProperty(record, "action", 64),
     ...optionalProperty(record, "field", 1_000),
     ...optionalProperty(record, "answer", 10_000),
+    ...(managedCloudRelease ? { managedCloudRelease } : {}),
   };
 }
 

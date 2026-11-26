@@ -96,11 +96,14 @@ export interface DiscoveryWorkerRuntimeOptions {
 
 export type DiscoveryPollOutcome = "completed" | "failed" | "idle" | "replayed";
 
+type PendingReport = { leaseAuthoritySha256: string; state?: DiscoveryLoopState };
+
 interface CachedCompleteReport {
   kind: "complete";
   replayKey: string;
   scheduledForMs: number;
   jobs: DiscoveredJobInput[];
+  pending?: PendingReport;
 }
 
 interface CachedFailureReport {
@@ -108,6 +111,7 @@ interface CachedFailureReport {
   replayKey: string;
   scheduledForMs: number;
   errorCode: DiscoveryRuntimeFailureCode;
+  pending?: PendingReport;
 }
 
 type CachedReport = CachedCompleteReport | CachedFailureReport;
@@ -142,6 +146,8 @@ export class DiscoveryWorkerRuntime {
   private readonly sourceCache = new Map<string, SourceCacheEntry>();
   private curatedSnapshot?: CuratedSnapshot;
   private readonly stopController = new AbortController();
+  private lastPollCompletedAtMs = 0;
+  private lastPollFailedAtMs = 0;
   private stopping = false;
 
   constructor(options: DiscoveryWorkerRuntimeOptions) {
@@ -178,7 +184,9 @@ export class DiscoveryWorkerRuntime {
       while (!this.stopping) {
         try {
           await this.pollOnce();
+          this.lastPollCompletedAtMs = Date.now();
         } catch (error) {
+          this.lastPollFailedAtMs = Date.now();
           this.logger.log({
             event: "discovery_poll_failed",
             error_code: safePollErrorCode(error),
@@ -199,17 +207,43 @@ export class DiscoveryWorkerRuntime {
     this.stopController.abort();
   }
 
+  managedCloudReady(nowMs: number = Date.now()): boolean {
+    const maximumAgeMs = Math.max(15_000, this.pollIntervalMs * 3);
+    return this.lastPollCompletedAtMs > this.lastPollFailedAtMs
+      && nowMs - this.lastPollCompletedAtMs <= maximumAgeMs;
+  }
+
   async pollOnce(): Promise<DiscoveryPollOutcome> {
     const lease = await this.api.lease();
     if (!lease) return "idle";
 
-    const cached = this.cachedSource(lease.source.id);
+    let cached = this.cachedSource(lease.source.id);
+    if (cached?.report?.pending
+      && (cached.report.replayKey !== lease.replay_key
+        || cached.report.scheduledForMs !== lease.scheduled_for_ms
+        || cached.report.pending.leaseAuthoritySha256 !== leaseAuthoritySha256(lease))) {
+      // Never resurrect a pending intent after observing different authority.
+      cached = { state: cached.state };
+      this.rememberSource(lease.source.id, cached);
+    }
     if (cached?.report?.replayKey === lease.replay_key) {
       if (cached.report.scheduledForMs !== lease.scheduled_for_ms) {
         return this.reportDirectFailure(lease, "replay_mismatch", cached.state);
       }
-      await this.replayCachedReport(lease, cached.report);
-      this.rememberSource(lease.source.id, cached);
+      try {
+        await this.replayCachedReport(lease, cached.report);
+      } catch (error) {
+        if (cached.report.pending && !ambiguousReportError(error)) {
+          this.rememberSource(lease.source.id, { state: cached.state });
+        }
+        throw error;
+      }
+      if (cached.report.pending) {
+        const { pending, ...report } = cached.report;
+        this.rememberSource(lease.source.id, { state: pending.state, report });
+      } else {
+        this.rememberSource(lease.source.id, cached);
+      }
       return "replayed";
     }
 
@@ -257,35 +291,10 @@ export class DiscoveryWorkerRuntime {
     }
     if (result.state.health.state !== "healthy") {
       const errorCode = resultFailureCode(result);
-      const input = failureInput(lease, errorCode);
-      await this.api.fail(lease.source.id, input);
-      this.rememberSource(lease.source.id, {
-        state: result.state,
-        report: {
-          kind: "fail",
-          replayKey: lease.replay_key,
-          scheduledForMs: lease.scheduled_for_ms,
-          errorCode,
-        },
-      });
-      this.logReport(lease.source.id, "failed", false, undefined, errorCode);
-      return "failed";
+      return this.reportDirectFailure(lease, errorCode, result.state);
     }
 
-    const jobs = completedJobs(result);
-    const input = completionInput(lease, jobs);
-    await this.api.complete(lease.source.id, input);
-    this.rememberSource(lease.source.id, {
-      state: result.state,
-      report: {
-        kind: "complete",
-        replayKey: lease.replay_key,
-        scheduledForMs: lease.scheduled_for_ms,
-        jobs,
-      },
-    });
-    this.logReport(lease.source.id, "complete", false, jobs.length);
-    return "completed";
+    return this.reportCompletion(lease, completedJobs(result), result.state);
   }
 
   private async pollCuratedSource(
@@ -295,27 +304,17 @@ export class DiscoveryWorkerRuntime {
     if (!validCuratedSource(lease.source)) {
       return this.reportDirectFailure(lease, "invalid_config", state);
     }
+    let jobs: DiscoveredJobInput[];
     try {
-      const leads = await this.curatedLeads();
-      const jobs = curatedJobs(leads, lease.scheduled_for_ms);
-      await this.api.complete(lease.source.id, completionInput(lease, jobs));
-      this.rememberSource(lease.source.id, {
-        state,
-        report: {
-          kind: "complete",
-          replayKey: lease.replay_key,
-          scheduledForMs: lease.scheduled_for_ms,
-          jobs,
-        },
-      });
-      this.logReport(lease.source.id, "complete", false, jobs.length);
-      return "completed";
+      jobs = curatedJobs(await this.curatedLeads(), lease.scheduled_for_ms);
     } catch (error) {
       const errorCode: DiscoveryRuntimeFailureCode = error instanceof CuratedFeedError
         ? curatedFailureCode(error)
         : "provider_error";
       return this.reportDirectFailure(lease, errorCode, state);
     }
+    // A lost API acknowledgement is not evidence of a provider failure.
+    return this.reportCompletion(lease, jobs, state);
   }
 
   private async curatedLeads(): Promise<CuratedFeedLead[]> {
@@ -340,13 +339,27 @@ export class DiscoveryWorkerRuntime {
   }
 
   private async replayCachedReport(lease: DiscoverySourceLease, report: CachedReport): Promise<void> {
+    await this.sendReport(lease, report);
+    this.logTerminalReport(lease.source.id, report, true);
+  }
+
+  private async sendReport(lease: DiscoverySourceLease, report: CachedReport): Promise<void> {
     if (report.kind === "complete") {
       await this.api.complete(lease.source.id, completionInput(lease, report.jobs));
-      this.logReport(lease.source.id, "complete", true, report.jobs.length);
-      return;
+    } else {
+      await this.api.fail(lease.source.id, failureInput(lease, report.errorCode));
     }
-    await this.api.fail(lease.source.id, failureInput(lease, report.errorCode));
-    this.logReport(lease.source.id, "failed", true, undefined, report.errorCode);
+  }
+
+  private async reportCompletion(
+    lease: DiscoverySourceLease,
+    jobs: DiscoveredJobInput[],
+    state?: DiscoveryLoopState,
+  ): Promise<"completed"> {
+    await this.reportTerminal(lease, {
+      kind: "complete", replayKey: lease.replay_key, scheduledForMs: lease.scheduled_for_ms, jobs,
+    }, state);
+    return "completed";
   }
 
   private async reportDirectFailure(
@@ -354,18 +367,45 @@ export class DiscoveryWorkerRuntime {
     errorCode: DiscoveryRuntimeFailureCode,
     state?: DiscoveryLoopState,
   ): Promise<"failed"> {
-    await this.api.fail(lease.source.id, failureInput(lease, errorCode));
+    await this.reportTerminal(lease, {
+      kind: "fail",
+      replayKey: lease.replay_key,
+      scheduledForMs: lease.scheduled_for_ms,
+      errorCode,
+    }, state);
+    return "failed";
+  }
+
+  private async reportTerminal(
+    lease: DiscoverySourceLease,
+    report: CachedReport,
+    state?: DiscoveryLoopState,
+  ): Promise<void> {
+    try {
+      await this.sendReport(lease, report);
+    } catch (error) {
+      if (ambiguousReportError(error)) {
+        this.rememberSource(lease.source.id, {
+          // Preserve the prior loop state until the result is acknowledged.
+          state: this.sourceCache.get(lease.source.id)?.state,
+          report: { ...report, pending: { leaseAuthoritySha256: leaseAuthoritySha256(lease), state } },
+        });
+      }
+      throw error;
+    }
     this.rememberSource(lease.source.id, {
       state,
-      report: {
-        kind: "fail",
-        replayKey: lease.replay_key,
-        scheduledForMs: lease.scheduled_for_ms,
-        errorCode,
-      },
+      report,
     });
-    this.logReport(lease.source.id, "failed", false, undefined, errorCode);
-    return "failed";
+    this.logTerminalReport(lease.source.id, report, false);
+  }
+
+  private logTerminalReport(sourceId: string, report: CachedReport, replayed: boolean): void {
+    if (report.kind === "complete") {
+      this.logReport(sourceId, "complete", replayed, report.jobs.length);
+    } else {
+      this.logReport(sourceId, "failed", replayed, undefined, report.errorCode);
+    }
   }
 
   private logReport(
@@ -463,6 +503,25 @@ function failureInput(
     scheduled_for_ms: lease.scheduled_for_ms,
     error_code: reportFailureCode(errorCode),
   };
+}
+
+function leaseAuthoritySha256(lease: DiscoverySourceLease): string {
+  // A re-lease rotates the token and expiry. Bind the source semantics, and
+  // use the newly issued token when submitting the retained report.
+  const source = lease.source;
+  return createHash("sha256")
+    .update(JSON.stringify([
+      source.id, source.account_id, source.track_id, source.provider,
+      source.source_key, source.config, source.run_interval_ms, source.status,
+      source.health, source.consecutive_failures, source.last_success_at_ms,
+      source.last_failure_at_ms, source.last_error_code,
+    ]), "utf8")
+    .digest("hex");
+}
+
+function ambiguousReportError(error: unknown): boolean {
+  return error instanceof DiscoveryApiError
+    && (error.code === "api_timeout" || error.code === "api_unavailable");
 }
 
 function completedJobs(

@@ -815,9 +815,36 @@ enum JobsRateClass {
     Evidence,
 }
 
+const SELECTED_LEAD_VERIFICATION_ROUTE: &str = "/api/jobs/matches/:job_id/verify-original";
+const SMARTRECRUITERS_REQUIREMENTS_LOAD_ROUTE: &str = "/api/jobs/matches/:job_id/load-requirements";
+
+pub(crate) fn jobs_match_provider_action_path(path: &str) -> Option<&'static str> {
+    let (job_id, action) = path.strip_prefix("/api/jobs/matches/")?.split_once('/')?;
+    if job_id.is_empty() {
+        return None;
+    }
+    match action {
+        "verify-original" => Some(SELECTED_LEAD_VERIFICATION_ROUTE),
+        "load-requirements" => Some(SMARTRECRUITERS_REQUIREMENTS_LOAD_ROUTE),
+        _ => None,
+    }
+}
+
+fn jobs_rate_limit_telemetry_path<'a>(method: &Method, path: &'a str) -> &'a str {
+    if method == Method::POST {
+        if let Some(template) = jobs_match_provider_action_path(path) {
+            return template;
+        }
+    }
+    path
+}
+
 fn jobs_rate_class(method: &Method, path: &str) -> JobsRateClass {
     if method == Method::GET {
         return JobsRateClass::Read;
+    }
+    if method == Method::POST && jobs_match_provider_action_path(path).is_some() {
+        return JobsRateClass::Expensive;
     }
     if path.contains("/evidence") {
         return JobsRateClass::Evidence;
@@ -872,7 +899,7 @@ pub async fn limit_jobs_api(
                 client = %client,
                 rate_class = ?rate_class,
                 method = %req.method(),
-                path = %req.uri().path(),
+                path = %jobs_rate_limit_telemetry_path(req.method(), req.uri().path()),
                 retry_after_secs = retry,
                 "Bluey Jobs request rate limited"
             );
@@ -1033,6 +1060,60 @@ mod tests {
             jobs_rate_class(&Method::POST, "/api/jobs/applications/id/evidence"),
             JobsRateClass::Evidence
         );
+    }
+
+    #[test]
+    fn selected_lead_verification_uses_the_expensive_jobs_bucket() {
+        let selected_lead_path =
+            "/api/jobs/matches/4cfb8a51-8257-4e36-9e90-52fdf65fd908/verify-original";
+        assert_eq!(
+            jobs_rate_class(&Method::POST, selected_lead_path),
+            JobsRateClass::Expensive
+        );
+        assert_eq!(
+            jobs_rate_class(
+                &Method::POST,
+                "/api/jobs/matches/runs-fixture/verify-original"
+            ),
+            JobsRateClass::Expensive
+        );
+        let put_rate_class = jobs_rate_class(&Method::PUT, selected_lead_path);
+        assert_eq!(put_rate_class, JobsRateClass::Write);
+        assert_eq!(
+            jobs_rate_class(&Method::POST, "/api/jobs/matches/id/verify-original/extra"),
+            JobsRateClass::Write
+        );
+        assert_eq!(
+            jobs_rate_limit_telemetry_path(&Method::POST, selected_lead_path),
+            SELECTED_LEAD_VERIFICATION_ROUTE
+        );
+        assert_eq!(
+            jobs_rate_limit_telemetry_path(&Method::PUT, selected_lead_path),
+            selected_lead_path
+        );
+    }
+
+    #[test]
+    fn smartrecruiters_requirements_use_expensive_bucket_and_redacted_path() {
+        let path = "/api/jobs/matches/private-match/load-requirements";
+        assert_eq!(
+            jobs_rate_class(&Method::POST, path),
+            JobsRateClass::Expensive
+        );
+        assert_eq!(
+            jobs_rate_limit_telemetry_path(&Method::POST, path),
+            SMARTRECRUITERS_REQUIREMENTS_LOAD_ROUTE
+        );
+        assert_eq!(jobs_rate_class(&Method::GET, path), JobsRateClass::Read);
+        for invalid in [
+            "/api/jobs/matches//load-requirements",
+            "/api/jobs/matches/private-match/load-requirements/extra",
+        ] {
+            assert_eq!(
+                jobs_rate_class(&Method::POST, invalid),
+                JobsRateClass::Write
+            );
+        }
     }
 
     #[tokio::test]

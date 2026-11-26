@@ -1,5 +1,26 @@
 import { createHash, randomBytes } from "node:crypto";
+import {
+  assertFinalSubmitProof,
+  type AtsCertifiedReceiptAuthority,
+  type FinalSubmitProof,
+} from "@bluey/jobs-automation";
 import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
+import {
+  managedCloudGatewayMatchesRuntime,
+  managedCloudReleaseMemo,
+  managedCloudReleaseMemoBytes,
+  parseManagedCloudGatewayAuthority,
+  parseManagedCloudReleaseMemo,
+  type ManagedCloudGatewayAuthority,
+  type ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+import type {
+  ManagedCloudRuntimeInstance,
+} from "@bluey/jobs-automation/managed-cloud-runtime-client";
+import type {
+  RunnerExecutionLeaseClaimProofInput,
+  RunnerVolumeAuthorityProof,
+} from "./runner-volume-client.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -8,6 +29,8 @@ const MAX_OWNER_BYTES = 128;
 const MAX_WORKER_SIGNING_KEY_BYTES = 4_096;
 const MAX_LEASE_TOKEN_BYTES = 256;
 const PROCESS_OWNER_ID = `runner-${process.pid}-${randomBytes(8).toString("hex")}`;
+const WORKFLOW_COMMAND_REQUEST_ID =
+  /^wfreq-v2-[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export type ExecutionLeaseFinishOutcome =
   | "released"
@@ -30,12 +53,62 @@ export interface ExecutionLeaseClaim {
   applicationId: string;
   runId: string;
   browserProfileId: string;
+  workflowRequestId?: string;
+  managedCloudRelease?: ManagedCloudReleaseMemoAuthority;
+}
+
+export interface ExecutionLeaseRunnerVolume {
+  volumeId: string;
+  enrollmentEpoch: number;
+  processInstanceId: string;
+  keyFingerprint: string;
+  runtimeGrantId: string;
+  runtimeSha256: string;
+  createExecutionLeaseClaimProof(
+    input: RunnerExecutionLeaseClaimProofInput,
+  ): RunnerVolumeAuthorityProof;
+}
+
+export type ReconciledCheckpointPhase =
+  | "prepared"
+  | "needs_input"
+  | "provider_review"
+  | "final_submit_started"
+  | "final_submit_activated"
+  | "side_effect_unknown";
+
+export interface ExecutionLeaseCheckpointReconciliation {
+  accountId: string;
+  applicationId: string;
+  runId: string;
+  ownerId: string;
+  fence: number;
+  leaseToken?: string;
+  checkpointVersion: 1 | 2;
+  checkpointPhase: ReconciledCheckpointPhase;
+}
+
+export interface ExecutionLeaseSubmittedFinishReplay {
+  accountId: string;
+  applicationId: string;
+  runId: string;
+  leaseToken: string;
+  fence: number;
+}
+
+export interface ExecutionLeaseCheckpointMetadata {
+  leaseToken: string;
+  fence: number;
+  expiresAtMs: number;
+  ownerId: string;
 }
 
 export interface ExecutionLeaseClientOptions {
   origin: string;
   workerSigningKey: string;
   ownerId: string;
+  runnerVolume: ExecutionLeaseRunnerVolume;
+  managedCloudRuntime?: ManagedCloudRuntimeInstance;
   requestTimeoutMs?: number;
   heartbeatIntervalMs?: number;
   maxResponseBytes?: number;
@@ -44,7 +117,14 @@ export interface ExecutionLeaseClientOptions {
 
 export class ExecutionLeaseError extends Error {
   constructor(
-    readonly operation: "claim" | "heartbeat" | "irreversible" | "finish" | "configuration",
+    readonly operation:
+      | "claim"
+      | "heartbeat"
+      | "authorize_managed_effect"
+      | "irreversible"
+      | "finish"
+      | "recovery"
+      | "configuration",
     readonly code: ExecutionLeaseErrorCode,
     readonly status?: number,
   ) {
@@ -57,25 +137,35 @@ interface LeaseGrant {
   leaseToken: string;
   fence: number;
   expiresAtMs: number;
+  purgeSubject: string;
 }
 
 interface LeaseOperations {
   heartbeat(): Promise<void>;
-  irreversible(): Promise<void>;
+  authorizeManagedEffect?: (
+    requestId: string,
+    managedCloudRelease: ManagedCloudReleaseMemoAuthority,
+  ) => Promise<void>;
+  irreversible(
+    proof: FinalSubmitProof,
+  ): Promise<AtsCertifiedReceiptAuthority | undefined>;
   finish(outcome: ExecutionLeaseFinishOutcome): Promise<void>;
 }
 
 export class ActiveExecutionLease {
   readonly #operations: LeaseOperations;
   readonly #heartbeatIntervalMs: number;
+  readonly #leaseToken: string;
   #heartbeatTimer?: ReturnType<typeof setTimeout>;
   #heartbeatInFlight?: Promise<void>;
   #heartbeatStopped = false;
   #heartbeatFailure?: ExecutionLeaseError;
   #finishOutcome?: ExecutionLeaseFinishOutcome;
   #finishPromise?: Promise<void>;
+  #managedAuthorizationPending?: string;
   #finalSubmitAttempted = false;
   #finalSubmitAuthorized = false;
+  #atsCertifiedReceiptAuthority?: AtsCertifiedReceiptAuthority;
   #activationOutcome?: "activated" | "activation_uncertain";
 
   constructor(
@@ -84,9 +174,12 @@ export class ActiveExecutionLease {
     readonly fence: number = 1,
     readonly expiresAtMs: number = Date.now() + heartbeatIntervalMs,
     readonly ownerId: string = "runner-unknown",
+    leaseToken: string = "",
+    readonly purgeSubject: string = "",
   ) {
     this.#operations = operations;
     this.#heartbeatIntervalMs = heartbeatIntervalMs;
+    this.#leaseToken = leaseToken;
     this.scheduleHeartbeat();
   }
 
@@ -96,6 +189,12 @@ export class ActiveExecutionLease {
 
   get finalSubmitAuthorized(): boolean {
     return this.#finalSubmitAuthorized;
+  }
+
+  get atsCertifiedReceiptAuthority(): AtsCertifiedReceiptAuthority | undefined {
+    return this.#atsCertifiedReceiptAuthority
+      ? structuredClone(this.#atsCertifiedReceiptAuthority)
+      : undefined;
   }
 
   get finalSubmitActivationOutcome(): "activated" | "activation_uncertain" | undefined {
@@ -110,13 +209,55 @@ export class ActiveExecutionLease {
     return !this.#heartbeatStopped;
   }
 
-  async beforeFinalSubmit(): Promise<void> {
-    if (this.#finishPromise || this.#finalSubmitAttempted) {
+  checkpointMetadata(): ExecutionLeaseCheckpointMetadata {
+    return {
+      leaseToken: this.#leaseToken,
+      fence: this.fence,
+      expiresAtMs: this.expiresAtMs,
+      ownerId: this.ownerId,
+    };
+  }
+
+  async authorizeManagedEffect(
+    requestId: string,
+    managedCloudRelease: ManagedCloudReleaseMemoAuthority,
+  ): Promise<void> {
+    if (this.#finishPromise
+      || this.#heartbeatStopped
+      || this.#finalSubmitAttempted
+      || !this.#operations.authorizeManagedEffect) {
+      throw new ExecutionLeaseError("authorize_managed_effect", "invalid_state");
+    }
+    let authorizationKey: string;
+    try {
+      authorizationKey = `${requestId}\0${managedReleaseSha256(managedCloudRelease)}`;
+    } catch {
+      throw new ExecutionLeaseError("authorize_managed_effect", "invalid_state");
+    }
+    if (this.#managedAuthorizationPending
+      && this.#managedAuthorizationPending !== authorizationKey) {
+      throw new ExecutionLeaseError("authorize_managed_effect", "invalid_state");
+    }
+    // Poison effect I/O before the request. Only an exact successful retry can clear uncertainty.
+    this.#managedAuthorizationPending = authorizationKey;
+    await this.#operations.authorizeManagedEffect(requestId, managedCloudRelease);
+    this.#managedAuthorizationPending = undefined;
+  }
+
+  async beforeFinalSubmit(proof: FinalSubmitProof): Promise<void> {
+    if (this.#finishPromise
+      || this.#finalSubmitAttempted
+      || this.#managedAuthorizationPending) {
+      throw new ExecutionLeaseError("irreversible", "invalid_state");
+    }
+    try {
+      assertFinalSubmitProof(proof);
+    } catch {
       throw new ExecutionLeaseError("irreversible", "invalid_state");
     }
     // Set this before I/O: a lost success response must permanently consume the local attempt.
     this.#finalSubmitAttempted = true;
-    await this.#operations.irreversible();
+    this.#atsCertifiedReceiptAuthority = await this.#operations.irreversible(proof);
     this.#finalSubmitAuthorized = true;
   }
 
@@ -177,11 +318,17 @@ export class ExecutionLeaseClient {
   readonly #heartbeatIntervalMs: number;
   readonly #maxResponseBytes: number;
   readonly #fetch: typeof globalThis.fetch;
+  readonly #runnerVolume: ExecutionLeaseRunnerVolume;
+  readonly #managedCloudRuntime?: ManagedCloudRuntimeInstance;
 
   constructor(options: ExecutionLeaseClientOptions) {
     this.#origin = normalizedOrigin(options.origin);
     this.#workerSigningKey = boundedSigningKey(options.workerSigningKey);
     this.#ownerId = boundedOwnerId(options.ownerId);
+    this.#runnerVolume = boundedRunnerVolume(options.runnerVolume);
+    this.#managedCloudRuntime = options.managedCloudRuntime === undefined
+      ? undefined
+      : boundedManagedCloudRuntime(options.managedCloudRuntime);
     this.#requestTimeoutMs = boundedInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 100, 60_000);
     this.#heartbeatIntervalMs = boundedInteger(
       options.heartbeatIntervalMs,
@@ -202,17 +349,42 @@ export class ExecutionLeaseClient {
   }
 
   async claim(input: ExecutionLeaseClaim): Promise<ActiveExecutionLease> {
+    const managed = managedClaimAuthority(input, this.#managedCloudRuntime);
     const common = {
       account_id: input.accountId,
       application_id: input.applicationId,
+    };
+    const claimBinding = {
+      accountId: input.accountId,
+      applicationId: input.applicationId,
+      runId: input.runId,
+      browserProfileId: input.browserProfileId,
+      ownerId: this.#ownerId,
+      ...(managed
+        ? {
+          workflowRequestId: managed.workflowRequestId,
+          managedCloudRelease: managed.managedCloudRelease,
+          managedCloudReleaseSha256: managed.managedCloudReleaseSha256,
+          managedCloudRuntimeInstanceId: managed.runtime.runtimeInstanceId,
+          managedCloudRuntimeInstanceEpoch: managed.runtime.instanceEpoch,
+        }
+        : {}),
     };
     const payload = await this.request("claim", "/api/jobs/internal/execution-leases/claim", {
       ...common,
       run_id: input.runId,
       browser_profile_id: input.browserProfileId,
       owner_id: this.#ownerId,
+      ...(managed ? managedClaimBody(managed) : {}),
+      volume_id: this.#runnerVolume.volumeId,
+      enrollment_epoch: this.#runnerVolume.enrollmentEpoch,
+      process_instance_id: this.#runnerVolume.processInstanceId,
+      runtime_grant_id: this.#runnerVolume.runtimeGrantId,
+      runtime_sha256: this.#runnerVolume.runtimeSha256,
+      volume_proof: this.#runnerVolume.createExecutionLeaseClaimProof(claimBinding),
     });
-    const grant = parseGrant(payload, input.runId);
+    const grant = parseGrant(payload, input.runId, this.#runnerVolume, managed);
+    let latestManagedEffect = managed;
     const runPath = encodeURIComponent(input.runId);
     const operations: LeaseOperations = {
       heartbeat: async () => {
@@ -223,14 +395,62 @@ export class ExecutionLeaseClient {
         });
         parseLeaseRecord("heartbeat", response, input.runId, grant.fence, ["prepared", "click_started"]);
       },
-      irreversible: async () => {
-        const response = await this.request("irreversible", `/api/jobs/internal/execution-leases/${runPath}/irreversible`, {
-          ...common,
-          lease_token: grant.leaseToken,
-          fence: grant.fence,
-          action: "submit",
-        });
-        parseLeaseRecord("irreversible", response, input.runId, grant.fence, ["click_started"]);
+      ...(managed
+        ? {
+          authorizeManagedEffect: async (
+            requestId: string,
+            managedCloudRelease: ManagedCloudReleaseMemoAuthority,
+          ) => {
+            const effect = managedEffectAuthority(
+              requestId,
+              managedCloudRelease,
+              managed,
+            );
+            const response = await this.request(
+              "authorize_managed_effect",
+              `/api/jobs/internal/execution-leases/${runPath}/authorize-managed-effect`,
+              {
+                ...common,
+                lease_token: grant.leaseToken,
+                fence: grant.fence,
+                ...managedClaimBody(effect),
+              },
+            );
+            parseManagedLeaseRecord(
+              "authorize_managed_effect",
+              response,
+              input.runId,
+              grant.fence,
+              ["prepared"],
+              effect,
+            );
+            latestManagedEffect = effect;
+          },
+        }
+        : {}),
+      irreversible: async (proof) => {
+        const irreversibleAuthority = latestManagedEffect;
+        const response = await this.request(
+          "irreversible",
+          `/api/jobs/internal/execution-leases/${runPath}/irreversible`,
+          {
+            ...common,
+            lease_token: grant.leaseToken,
+            fence: grant.fence,
+            action: "submit",
+            final_submit_proof: proof,
+            ...(irreversibleAuthority
+              ? managedClaimBody(irreversibleAuthority)
+              : {}),
+          },
+        );
+        return parseIrreversibleLeaseRecord(
+          response,
+          input,
+          grant.fence,
+          proof,
+          irreversibleAuthority,
+        );
       },
       finish: async (outcome) => {
         await this.request("finish", `/api/jobs/internal/execution-leases/${runPath}/finish`, {
@@ -247,11 +467,58 @@ export class ExecutionLeaseClient {
       grant.fence,
       grant.expiresAtMs,
       this.#ownerId,
+      grant.leaseToken,
+      grant.purgeSubject,
+    );
+  }
+
+  async reconcileCheckpoint(input: ExecutionLeaseCheckpointReconciliation): Promise<void> {
+    const runPath = encodeURIComponent(input.runId);
+    const response = await this.request(
+      "recovery",
+      `/api/jobs/internal/execution-leases/${runPath}/reconcile-checkpoint`,
+      {
+        account_id: input.accountId,
+        application_id: input.applicationId,
+        owner_id: input.ownerId,
+        fence: input.fence,
+        lease_token: input.leaseToken,
+        checkpoint_version: input.checkpointVersion,
+        checkpoint_phase: input.checkpointPhase,
+      },
+    );
+    parseLeaseRecord(
+      "recovery",
+      response,
+      input.runId,
+      input.fence,
+      ["released", "side_effect_unknown", "submitted"],
+    );
+  }
+
+  async replaySubmittedFinish(input: ExecutionLeaseSubmittedFinishReplay): Promise<void> {
+    const runPath = encodeURIComponent(input.runId);
+    await this.request(
+      "finish",
+      `/api/jobs/internal/execution-leases/${runPath}/finish`,
+      {
+        account_id: input.accountId,
+        application_id: input.applicationId,
+        lease_token: input.leaseToken,
+        fence: input.fence,
+        outcome: "submitted",
+      },
     );
   }
 
   private async request(
-    operation: "claim" | "heartbeat" | "irreversible" | "finish",
+    operation:
+      | "claim"
+      | "heartbeat"
+      | "authorize_managed_effect"
+      | "irreversible"
+      | "finish"
+      | "recovery",
     path: string,
     body: Record<string, unknown>,
   ): Promise<unknown> {
@@ -291,6 +558,11 @@ export class ExecutionLeaseClient {
           : "request_failed";
         throw new ExecutionLeaseError(operation, code, response.status);
       }
+      // A submitted finish can promote a staged receipt, so only accept the
+      // exact no-content response from the API's finish handler.
+      if (operation === "finish" && body.outcome === "submitted" && response.status !== 204) {
+        throw new ExecutionLeaseError(operation, "invalid_response", response.status);
+      }
       if (!responseText) return undefined;
       try {
         return JSON.parse(responseText) as unknown;
@@ -312,12 +584,16 @@ export class ExecutionLeaseClient {
 }
 
 export function createExecutionLeaseClientFromEnv(
+  runnerVolume: ExecutionLeaseRunnerVolume,
   env: NodeJS.ProcessEnv = process.env,
+  managedCloudRuntime?: ManagedCloudRuntimeInstance,
 ): ExecutionLeaseClient {
   return new ExecutionLeaseClient({
     origin: env.BLUEY_JOBS_API_ORIGIN ?? "",
     workerSigningKey: env.BLUEY_JOBS_WORKER_SIGNING_KEY ?? "",
     ownerId: runnerOwnerId(env.BLUEY_JOBS_RUNNER_ID),
+    runnerVolume,
+    managedCloudRuntime,
   });
 }
 
@@ -364,6 +640,135 @@ function boundedOwnerId(value: string): string {
   return `runner-${createHash("sha256").update(value).digest("hex").slice(0, 48)}`;
 }
 
+function boundedRunnerVolume(value: ExecutionLeaseRunnerVolume): ExecutionLeaseRunnerVolume {
+  if (!value || !isCanonicalBase64Url(value.volumeId, 32)
+    || !Number.isSafeInteger(value.enrollmentEpoch)
+    || value.enrollmentEpoch <= 0
+    || !isCanonicalBase64Url(value.processInstanceId, 32)
+    || !/^[0-9a-f]{64}$/.test(value.keyFingerprint)
+    || !/^[A-Za-z0-9._:+-]{1,128}$/.test(value.runtimeGrantId)
+    || !/^[0-9a-f]{64}$/.test(value.runtimeSha256)
+    || typeof value.createExecutionLeaseClaimProof !== "function") {
+    throw new ExecutionLeaseError("configuration", "configuration");
+  }
+  return Object.freeze({ ...value });
+}
+
+interface ManagedClaimAuthority {
+  readonly workflowRequestId: string;
+  readonly managedCloudRelease: ManagedCloudReleaseMemoAuthority;
+  readonly managedCloudReleaseSha256: string;
+  readonly runtime: ManagedCloudRuntimeInstance;
+}
+
+function boundedManagedCloudRuntime(
+  value: ManagedCloudRuntimeInstance,
+): ManagedCloudRuntimeInstance {
+  if (!value
+    || value.role !== "managed_runner"
+    || !/^[A-Za-z0-9_-]{20,128}$/.test(value.runtimeInstanceId)
+    || !/^[A-Za-z0-9_-]{20,128}$/.test(value.workerId)
+    || !positiveSafeInteger(value.instanceEpoch)
+    || !positiveSafeInteger(value.headRevision)
+    || !positiveSafeInteger(value.activationExpiresAtMs)
+    || !value.scope
+    || (value.scope.environment !== "staging" && value.scope.environment !== "production")
+    || (value.scope.channel !== "shadow"
+      && value.scope.channel !== "canary"
+      && value.scope.channel !== "general")
+    || !/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(value.scope.region)
+    || ![
+      value.transitionSha256,
+      value.activationSha256,
+      value.manifestSha256,
+      value.taskQueueSha256,
+      value.failureConverterSha256,
+    ].every(validSha256)) {
+    throw new ExecutionLeaseError("configuration", "configuration");
+  }
+  return Object.freeze(structuredClone(value));
+}
+
+function managedClaimAuthority(
+  input: ExecutionLeaseClaim,
+  runtime: ManagedCloudRuntimeInstance | undefined,
+): ManagedClaimAuthority | undefined {
+  const workflowRequestId = input.workflowRequestId;
+  const release = input.managedCloudRelease;
+  const hasRequestId = workflowRequestId !== undefined;
+  const hasRelease = release !== undefined;
+  if (!runtime && !hasRequestId && !hasRelease) return undefined;
+  if (!runtime || workflowRequestId === undefined || release === undefined
+    || !WORKFLOW_COMMAND_REQUEST_ID.test(workflowRequestId)) {
+    throw new ExecutionLeaseError("claim", "invalid_state");
+  }
+  let managedCloudRelease: ManagedCloudReleaseMemoAuthority;
+  try {
+    managedCloudRelease = parseManagedCloudReleaseMemo(release);
+  } catch {
+    throw new ExecutionLeaseError("claim", "invalid_state");
+  }
+  return Object.freeze({
+    workflowRequestId,
+    managedCloudRelease,
+    managedCloudReleaseSha256: managedReleaseSha256(managedCloudRelease),
+    runtime,
+  });
+}
+
+function managedEffectAuthority(
+  requestId: string,
+  value: ManagedCloudReleaseMemoAuthority,
+  claimed: ManagedClaimAuthority,
+): ManagedClaimAuthority {
+  if (!WORKFLOW_COMMAND_REQUEST_ID.test(requestId)) {
+    throw new ExecutionLeaseError("authorize_managed_effect", "invalid_state");
+  }
+  let managedCloudRelease: ManagedCloudReleaseMemoAuthority;
+  try {
+    managedCloudRelease = parseManagedCloudReleaseMemo(value);
+  } catch {
+    throw new ExecutionLeaseError("authorize_managed_effect", "invalid_state");
+  }
+  if (!sameManagedRelease(managedCloudRelease, claimed.managedCloudRelease)) {
+    throw new ExecutionLeaseError("authorize_managed_effect", "invalid_state");
+  }
+  return Object.freeze({
+    workflowRequestId: requestId,
+    managedCloudRelease,
+    managedCloudReleaseSha256: managedReleaseSha256(managedCloudRelease),
+    runtime: claimed.runtime,
+  });
+}
+
+function managedClaimBody(
+  authority: ManagedClaimAuthority,
+): Record<string, unknown> {
+  return {
+    workflow_request_id: authority.workflowRequestId,
+    managed_cloud_release: authority.managedCloudRelease,
+    managed_cloud_release_sha256: authority.managedCloudReleaseSha256,
+    managed_cloud_runtime_instance_id: authority.runtime.runtimeInstanceId,
+    managed_cloud_runtime_instance_epoch: authority.runtime.instanceEpoch,
+  };
+}
+
+function managedReleaseSha256(value: ManagedCloudReleaseMemoAuthority): string {
+  return createHash("sha256")
+    .update(managedCloudReleaseMemoBytes(value))
+    .digest("hex");
+}
+
+function sameManagedRelease(
+  left: ManagedCloudReleaseMemoAuthority,
+  right: ManagedCloudReleaseMemoAuthority,
+): boolean {
+  const leftBytes = managedCloudReleaseMemoBytes(left);
+  const rightBytes = managedCloudReleaseMemoBytes(right);
+  return leftBytes.length === rightBytes.length
+    && leftBytes.every((byte, index) => byte === rightBytes[index]);
+}
+
 function boundedInteger(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
   const candidate = value ?? fallback;
   if (!Number.isInteger(candidate) || candidate < minimum || candidate > maximum) {
@@ -372,7 +777,12 @@ function boundedInteger(value: number | undefined, fallback: number, minimum: nu
   return candidate;
 }
 
-function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
+function parseGrant(
+  value: unknown,
+  expectedRunId: string,
+  expectedVolume: ExecutionLeaseRunnerVolume,
+  managed: ManagedClaimAuthority | undefined,
+): LeaseGrant {
   if (!value || typeof value !== "object") {
     throw new ExecutionLeaseError("claim", "invalid_response");
   }
@@ -380,7 +790,23 @@ function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
   const leaseToken = record.lease_token;
   const fence = record.fence;
   const expiresAtMs = record.lease_expires_at_ms;
-  if (record.run_id !== expectedRunId
+  const purgeSubject = record.purge_subject;
+  if (!hasExactKeys(record, [
+    "enrollment_epoch",
+    "fence",
+    "lease_expires_at_ms",
+    "lease_token",
+    "phase",
+    "process_instance_id",
+    "purge_subject",
+    "runtime_grant_id",
+    "runtime_sha256",
+    "run_id",
+    "volume_id",
+    "volume_key_fingerprint",
+    ...(managed ? ["managedCloud", ...MANAGED_RESPONSE_CORRELATION_KEYS] : []),
+  ])
+    || record.run_id !== expectedRunId
     || record.phase !== "prepared"
     || typeof leaseToken !== "string"
     || !leaseToken
@@ -390,14 +816,43 @@ function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
     || fence <= 0
     || typeof expiresAtMs !== "number"
     || !Number.isSafeInteger(expiresAtMs)
-    || expiresAtMs <= Date.now()) {
+    || expiresAtMs <= Date.now()
+    || typeof purgeSubject !== "string"
+    || !isCanonicalBase64Url(purgeSubject, 32)
+    || record.volume_id !== expectedVolume.volumeId
+    || record.enrollment_epoch !== expectedVolume.enrollmentEpoch
+    || record.process_instance_id !== expectedVolume.processInstanceId
+    || record.runtime_grant_id !== expectedVolume.runtimeGrantId
+    || record.runtime_sha256 !== expectedVolume.runtimeSha256
+    || record.volume_key_fingerprint !== expectedVolume.keyFingerprint
+    || (managed && !managedResponseCorrelationMatches(record, managed))) {
     throw new ExecutionLeaseError("claim", "invalid_response");
   }
-  return { leaseToken, fence, expiresAtMs };
+  if (managed) {
+    parseManagedCloudAuthority("claim", record.managedCloud, managed);
+  }
+  return { leaseToken, fence, expiresAtMs, purgeSubject };
+}
+
+function isCanonicalBase64Url(value: string, expectedBytes: number): boolean {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  const decoded = Buffer.from(value, "base64url");
+  return decoded.length === expectedBytes && decoded.toString("base64url") === value;
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort((left, right) => left.localeCompare(right));
+  const wanted = [...expected].sort((left, right) => left.localeCompare(right));
+  return actual.length === wanted.length
+    && actual.every((key, index) => key === wanted[index]);
 }
 
 function parseLeaseRecord(
-  operation: "heartbeat" | "irreversible",
+  operation:
+    | "heartbeat"
+    | "authorize_managed_effect"
+    | "irreversible"
+    | "recovery",
   value: unknown,
   expectedRunId: string,
   expectedFence: number,
@@ -415,10 +870,240 @@ function parseLeaseRecord(
   }
 }
 
+function parseManagedLeaseRecord(
+  operation: "authorize_managed_effect" | "irreversible",
+  value: unknown,
+  expectedRunId: string,
+  expectedFence: number,
+  expectedPhases: readonly string[],
+  managed: ManagedClaimAuthority,
+  additionalKeys: readonly string[] = [],
+): ManagedCloudGatewayAuthority {
+  parseLeaseRecord(
+    operation,
+    value,
+    expectedRunId,
+    expectedFence,
+    expectedPhases,
+  );
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionLeaseError(operation, "invalid_response");
+  }
+  const record = value as Record<string, unknown>;
+  if (!hasExactKeys(record, [
+    ...EXECUTION_LEASE_RECORD_KEYS,
+    ...additionalKeys,
+    "managedCloud",
+    ...MANAGED_RESPONSE_CORRELATION_KEYS,
+  ])
+    || !managedResponseCorrelationMatches(record, managed)) {
+    throw new ExecutionLeaseError(operation, "invalid_response");
+  }
+  return parseManagedCloudAuthority(operation, record.managedCloud, managed);
+}
+
+function managedResponseCorrelationMatches(
+  record: Record<string, unknown>,
+  managed: ManagedClaimAuthority,
+): boolean {
+  return record.managedCloudWorkflowRequestId === managed.workflowRequestId
+    && record.managedCloudRuntimeInstanceId === managed.runtime.runtimeInstanceId
+    && record.managedCloudRuntimeInstanceEpoch === managed.runtime.instanceEpoch
+    && record.managedCloudWorkerId === managed.runtime.workerId;
+}
+
+function parseManagedCloudAuthority(
+  operation: "claim" | "authorize_managed_effect" | "irreversible",
+  value: unknown,
+  managed: ManagedClaimAuthority,
+): ManagedCloudGatewayAuthority {
+  try {
+    const authority = parseManagedCloudGatewayAuthority(value);
+    if (!sameManagedRelease(
+      managedCloudReleaseMemo(authority),
+      managed.managedCloudRelease,
+    )
+      || !managedCloudGatewayMatchesRuntime(
+        authority,
+        managed.runtime,
+        "managed_runner",
+      )
+      || authority.authorization.currentActivationExpiresAtMs <= Date.now()) {
+      throw new Error("managed-cloud authority mismatch");
+    }
+    return authority;
+  } catch {
+    throw new ExecutionLeaseError(operation, "invalid_response");
+  }
+}
+
+const EXECUTION_LEASE_RECORD_KEYS = [
+  "fence",
+  "lease_expires_at_ms",
+  "phase",
+  "run_id",
+] as const;
+
+const MANAGED_RESPONSE_CORRELATION_KEYS = [
+  "managedCloudRuntimeInstanceEpoch",
+  "managedCloudRuntimeInstanceId",
+  "managedCloudWorkerId",
+  "managedCloudWorkflowRequestId",
+] as const;
+
+const ATS_CERTIFIED_RECEIPT_AUTHORITY_KEYS = [
+  "accountId",
+  "activationGeneration",
+  "activationSha256",
+  "adapter",
+  "adapterBundleSha256",
+  "adapterVersion",
+  "applicationAttemptId",
+  "applicationId",
+  "bindingConsumedAtMs",
+  "bindingFence",
+  "bindingSha256",
+  "canaryReservationSha256",
+  "layoutObservationSha256",
+  "layoutSetSha256",
+  "manifestSha256",
+  "meteringReservationSha256",
+  "phaseBRequestId",
+  "provider",
+  "rolloutChannel",
+  "runId",
+  "runnerKind",
+  "runnerTargetSha256",
+  "schemaVersion",
+  "observedSurfaceSha256",
+  "targetKeySha256",
+] as const;
+
+function parseIrreversibleLeaseRecord(
+  value: unknown,
+  input: ExecutionLeaseClaim,
+  expectedFence: number,
+  proof: FinalSubmitProof,
+  managed: ManagedClaimAuthority | undefined,
+): AtsCertifiedReceiptAuthority | undefined {
+  if (managed) {
+    parseManagedLeaseRecord(
+      "irreversible",
+      value,
+      input.runId,
+      expectedFence,
+      ["click_started"],
+      managed,
+      proof.schemaVersion === 4 ? ["atsCertifiedReceiptAuthority"] : [],
+    );
+  } else {
+    parseLeaseRecord(
+      "irreversible",
+      value,
+      input.runId,
+      expectedFence,
+      ["click_started"],
+    );
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionLeaseError("irreversible", "invalid_response");
+  }
+  const record = value as Record<string, unknown>;
+  if (proof.schemaVersion === 3) {
+    if (!managed && !hasExactKeys(record, EXECUTION_LEASE_RECORD_KEYS)) {
+      throw new ExecutionLeaseError("irreversible", "invalid_response");
+    }
+    return undefined;
+  }
+  if (!managed && !hasExactKeys(record, [
+    ...EXECUTION_LEASE_RECORD_KEYS,
+    "atsCertifiedReceiptAuthority",
+  ])) {
+    throw new ExecutionLeaseError("irreversible", "invalid_response");
+  }
+  return parseAtsCertifiedReceiptAuthority(
+    record.atsCertifiedReceiptAuthority,
+    input,
+    proof,
+  );
+}
+
+function parseAtsCertifiedReceiptAuthority(
+  value: unknown,
+  input: ExecutionLeaseClaim,
+  proof: Extract<FinalSubmitProof, { schemaVersion: 4 }>,
+): AtsCertifiedReceiptAuthority {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionLeaseError("irreversible", "invalid_response");
+  }
+  const authority = value as Record<string, unknown>;
+  const certification = proof.certification;
+  if (!hasExactKeys(authority, ATS_CERTIFIED_RECEIPT_AUTHORITY_KEYS)
+    || authority.schemaVersion !== 1
+    || authority.accountId !== input.accountId
+    || authority.applicationId !== input.applicationId
+    || authority.runId !== input.runId
+    || authority.provider !== certification.provider
+    || authority.adapter !== proof.adapter
+    || authority.adapterVersion !== proof.adapterVersion
+    || authority.manifestSha256 !== certification.manifestSha256
+    || authority.activationSha256 !== certification.activationSha256
+    || authority.activationGeneration !== certification.activationGeneration
+    || authority.targetKeySha256 !== certification.targetKeySha256
+    || authority.layoutSetSha256 !== certification.layoutSetSha256
+    || authority.observedSurfaceSha256
+      !== proof.observedSurface.surfaceSha256
+    || authority.adapterBundleSha256 !== certification.adapterBundleSha256
+    || authority.runnerKind !== "cloud"
+    || typeof authority.runnerTargetSha256 !== "string"
+    || !certification.runnerTargetSha256s.includes(authority.runnerTargetSha256)
+    || !positiveSafeInteger(authority.bindingFence)
+    || !positiveSafeInteger(authority.bindingConsumedAtMs)
+    || (authority.bindingConsumedAtMs as number) > certification.expiresAtMs
+    || ![
+      authority.applicationAttemptId,
+      authority.phaseBRequestId,
+    ].every(validAuthorityId)
+    || ![
+      authority.bindingSha256,
+      authority.canaryReservationSha256,
+      authority.layoutObservationSha256,
+      authority.meteringReservationSha256,
+      authority.observedSurfaceSha256,
+    ].every(validSha256)
+    || (authority.rolloutChannel !== "canary"
+      && authority.rolloutChannel !== "general")) {
+    throw new ExecutionLeaseError("irreversible", "invalid_response");
+  }
+  return structuredClone(authority) as unknown as AtsCertifiedReceiptAuthority;
+}
+
+function validAuthorityId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 1
+    && value.length <= 240
+    && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
 async function discardBounded(
   response: Response,
   maximumBytes: number,
-  operation: "claim" | "heartbeat" | "irreversible" | "finish",
+  operation:
+    | "claim"
+    | "heartbeat"
+    | "authorize_managed_effect"
+    | "irreversible"
+    | "finish"
+    | "recovery",
 ): Promise<void> {
   await readBounded(response, maximumBytes, operation);
 }
@@ -426,7 +1111,13 @@ async function discardBounded(
 async function readBounded(
   response: Response,
   maximumBytes: number,
-  operation: "claim" | "heartbeat" | "irreversible" | "finish",
+  operation:
+    | "claim"
+    | "heartbeat"
+    | "authorize_managed_effect"
+    | "irreversible"
+    | "finish"
+    | "recovery",
 ): Promise<string> {
   const declaredLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {

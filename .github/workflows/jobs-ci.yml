@@ -23,11 +23,24 @@ jobs:
   jobs-ci:
     name: Jobs CI and privacy gate
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      PLAYWRIGHT_BROWSERS_PATH: "0"
 
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact Jobs checkout
+        env:
+          EXPECTED_JOBS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_JOBS_SHA"
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -41,23 +54,62 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
 
-      - name: Ensure Rust formatter is available
-        run: rustup component add rustfmt
+      - name: Ensure Rust quality tools are available
+        run: rustup component add rustfmt clippy
 
       - name: Self-test Jobs CI guards
         run: node jobs/scripts/ci-guards-self-test.mjs
 
+      - name: Self-test isolated test launcher
+        run: bash scripts/run-bluey-tests.sh --self-test
+
       - name: Reject committed private data and secrets
-        run: node jobs/scripts/privacy-gate.mjs
+        run: |
+          bash scripts/run-bluey-tests.sh -- node --test jobs/scripts/privacy-gate.test.mjs
+          node jobs/scripts/privacy-gate.mjs
 
       - name: Check Jobs SQLite/Postgres schema parity
         run: node jobs/scripts/check-jobs-schema-parity.mjs
 
+      - name: Test read-only Jobs projections
+        run: >-
+          bash scripts/run-bluey-tests.sh -- node --test
+          jobs/scripts/jobs-mcp-read-sqlite.test.mjs
+          jobs/scripts/check-jobs-submission-drain.test.mjs
+
       - name: Check provenance and license inventory
         run: node jobs/scripts/check-provenance-licenses.mjs
 
+      - name: Test isolated Jobs QA bindings and C2C handoff controls
+        run: bash scripts/run-bluey-tests.sh -- npm run test:local-qa --prefix jobs
+
+      - name: Test isolated Linux PostgreSQL shutdown protocol
+        run: bash scripts/run-bluey-tests.sh -- python3 -I -S -B jobs/scripts/test-local-qa-linux-postmaster-pidfd.py
+
       - name: Install Jobs dependencies from lockfile
         run: npm ci --prefix jobs --no-audit --no-fund
+
+      - name: Reject known Jobs dependency vulnerabilities
+        run: npm audit --prefix jobs --audit-level=moderate
+
+      - name: Validate the Browser release workflow contract independently
+        run: |
+          node --test jobs/scripts/browser-release-ci-gate.test.mjs
+          node jobs/scripts/browser-release-ci-gate.mjs workflow \
+            --file .github/workflows/jobs-browser-release.yml
+
+      - name: Validate the managed-cloud release authority independently
+        run: |
+          node --test jobs/scripts/managed-cloud-release-gate.test.mjs
+          node --test jobs/scripts/check-managed-cloud-observability-policy.test.mjs
+          node --test jobs/scripts/check-managed-cloud-authorization-origin.test.mjs
+          python3 -I -S -B jobs/scripts/test-stage-managed-cloud-authorization-archive.py
+          bash jobs/scripts/test-intake-managed-cloud-authorized.sh
+          node jobs/scripts/managed-cloud-release-gate.mjs workflow \
+            --file .github/workflows/jobs-managed-cloud-release.yml
+
+      - name: Install locked Chromium for Jobs tests
+        run: node jobs/node_modules/playwright/cli.js install --with-deps --no-shell chromium
 
       - name: Run all Jobs tests
         run: npm test --prefix jobs
@@ -68,14 +120,152 @@ jobs:
       - name: Build all Jobs workspaces
         run: npm run build --prefix jobs
 
+      - name: Check business messaging simulator containment
+        run: node jobs/scripts/check-business-messaging-simulator-containment.mjs
+
+      - name: Verify the checked-in Jobs portal bundle is current
+        run: |
+          bundle_status="$(git --no-optional-locks status --porcelain=v1 --untracked-files=all --ignored=matching -- web/jobs)" || exit 1
+          if [ -n "$bundle_status" ]; then
+            printf '%s\n' 'The regenerated Jobs portal bundle differs from the checkout.' "$bundle_status" >&2
+            exit 1
+          fi
+
+      - name: Test Jobs signup handoff and browser account deletion
+        run: node --test web/tests/bluey-site-jobs-auth-return.test.mjs web/assets/bluey-account-delete.test.cjs
+
+      - name: Build and verify the immutable Jobs signup pair
+        run: |
+          bash scripts/run-bluey-tests.sh -- bash -euo pipefail -c '
+            node --test jobs/scripts/build-jobs-static-auth-pair.test.mjs
+            pair="${TMPDIR:?}/jobs-static-auth-pair"
+            node jobs/scripts/build-jobs-static-auth-pair.mjs --out "$pair"
+            node jobs/scripts/build-jobs-static-auth-pair.mjs --verify "$pair"
+            printf "Jobs static auth pair checked at checkout %s\n" "$(git rev-parse HEAD)"
+          '
+
+      - name: Check native runner storage formatting
+        run: cargo fmt --manifest-path jobs/runner/native-storage/Cargo.toml --all -- --check
+
+      - name: Lint native runner storage
+        run: >-
+          cargo clippy --manifest-path jobs/runner/native-storage/Cargo.toml
+          --all-targets --locked -- -D warnings
+
+      - name: Test native runner storage
+        run: >-
+          cargo test --manifest-path jobs/runner/native-storage/Cargo.toml
+          --all-targets --locked
+
+      - name: Build native runner storage release artifact
+        run: >-
+          cargo build --manifest-path jobs/runner/native-storage/Cargo.toml
+          --release --locked
+
+      - name: Build and smoke the managed runner image
+        env:
+          BLUEY_JOBS_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test -n "$BLUEY_JOBS_SOURCE_COMMIT"
+          docker build \
+            --build-arg BLUEY_JOBS_BUILD_ID=jobs-runner-ci \
+            --build-arg BLUEY_JOBS_CONFIG_SCHEMA_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg BLUEY_JOBS_MIGRATION_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg BLUEY_JOBS_PROTOCOL_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$BLUEY_JOBS_SOURCE_COMMIT" \
+            --tag bluey-jobs-runner-ci --file jobs/runner/Dockerfile jobs
+          docker run --rm \
+            --entrypoint /usr/local/bin/node \
+            --env BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT=/var/lib/bluey-jobs-runner/native-smoke \
+            --volume "$GITHUB_WORKSPACE/jobs/scripts/native-runner-addon-smoke.mjs:/app/scripts/native-runner-addon-smoke.mjs:ro" \
+            bluey-jobs-runner-ci /app/scripts/native-runner-addon-smoke.mjs
+
+      - name: Reclaim ephemeral runner space before server Rust tests
+        run: |
+          df -h /
+          docker system prune --all --force
+          cargo clean --manifest-path jobs/runner/native-storage/Cargo.toml
+          rm -rf jobs/node_modules
+          df -h /
+
       - name: Check server Rust formatting
         run: cargo fmt --manifest-path server/Cargo.toml -- --check
 
-      - name: Check the Jobs API server target
-        run: cargo check --manifest-path server/Cargo.toml --bin bluey-jobs-api
+      - name: Run isolated server Jobs and ATS storage regressions
+        run: |
+          bash scripts/run-bluey-tests.sh -- bash -euc '
+            cargo check --manifest-path server/Cargo.toml --locked --bin bluey-jobs-api
+            cargo test --manifest-path server/Cargo.toml --locked --lib db::postgres_migration_tests
+            cargo test --manifest-path server/Cargo.toml --locked --lib db::sqlite_migration_replay_tests
+            cargo test --manifest-path server/Cargo.toml --locked --lib jobs
+            # Compile the owned receipt fixture with its observation assertion as well.
+            # Postgres execution still requires the separate owned-run custody gate.
+            cargo test --manifest-path server/Cargo.toml --locked --no-default-features \
+              --features jobs-mcp-read,integration-test-support,jobs-submission-observation --lib jobs_mcp
+            cargo test --manifest-path server/Cargo.toml --locked --no-default-features \
+              --features jobs-mcp-read,integration-test-support,jobs-submission-observation --lib submission_observation
+            cargo test --manifest-path server/Cargo.toml --locked --lib ats_storage_migration_tests
+            cargo test --manifest-path server/Cargo.toml --locked --test ats_storage_invariants
+            cargo clippy --manifest-path server/Cargo.toml --locked \
+              --lib --test ats_storage_invariants --test ats_storage_postgres -- -D warnings
+            cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features \
+              --features integration-test-support --test integration_e2e -- -D warnings
+            cargo test --manifest-path server/Cargo.toml --locked --no-default-features \
+              --features integration-test-support --test integration_e2e
+            cargo check --manifest-path server/Cargo.toml --locked --no-default-features \
+              --features integration-test-support --example jobs-nonprod-browser-fixture
+            cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features \
+              --features business-messaging-simulator-test-support --test business_messaging_simulator -- -D warnings
+            cargo test --manifest-path server/Cargo.toml --locked --no-default-features \
+              --features business-messaging-simulator-test-support --test business_messaging_simulator
+          '
 
-      - name: Run server Jobs unit tests
-        run: cargo test --manifest-path server/Cargo.toml --lib jobs
+  native-runner-storage-darwin:
+    name: Native runner storage (Darwin)
+    runs-on: macos-14
+    timeout-minutes: 20
 
-      - name: Run server Jobs integration tests
-        run: cargo test --manifest-path server/Cargo.toml --test integration_e2e jobs_
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact Jobs checkout
+        env:
+          EXPECTED_JOBS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_JOBS_SHA"
+
+      - name: Install Rust quality toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: jobs/package-lock.json
+
+      - name: Build Darwin runner JavaScript
+        run: |
+          npm ci --prefix jobs --no-audit --no-fund
+          npm run build --prefix jobs --workspace @bluey/jobs-automation
+          npm run build --prefix jobs --workspace @bluey/jobs-runner
+
+      - name: Verify Darwin native runner storage
+        run: |
+          cargo fmt --manifest-path jobs/runner/native-storage/Cargo.toml --all -- --check
+          cargo clippy --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked
+          cargo build --manifest-path jobs/runner/native-storage/Cargo.toml --release --locked
+          mkdir -p jobs/runner/dist/native
+          install -m 0555 \
+            jobs/runner/native-storage/target/release/libbluey_jobs_runner_native_storage.dylib \
+            jobs/runner/dist/native/bluey_jobs_runner_native_storage.node
+          SMOKE_ROOT="$GITHUB_WORKSPACE/jobs/runner/native-storage/target/native-addon-smoke"
+          mkdir -m 0700 "$SMOKE_ROOT"
+          BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT="$SMOKE_ROOT" \
+            node jobs/scripts/native-runner-addon-smoke.mjs

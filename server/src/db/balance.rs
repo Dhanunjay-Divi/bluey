@@ -58,6 +58,38 @@ pub(crate) fn insert_balance_ledger_sqlite_tx(
     Ok(())
 }
 
+pub(crate) fn insert_balance_ledger_sqlite_tx_at_ms(
+    tx: &SqliteTransaction<'_>,
+    entry: BalanceLedgerEntry<'_>,
+    created_at_ms: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO balance_ledger_entries
+            (id, account_id, event_type, amount_cents, balance_cents_before,
+             balance_cents_after, reason, provider, processor_payment_id,
+             source_id, idempotency_key, request_id, metadata_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 datetime(?14 / 1000, 'unixepoch'))",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            entry.account_id,
+            entry.event_type,
+            entry.amount_cents,
+            entry.balance_cents_before,
+            entry.balance_cents_after,
+            entry.reason,
+            entry.provider,
+            entry.processor_payment_id,
+            entry.source_id,
+            entry.idempotency_key,
+            entry.request_id,
+            entry.metadata_json.unwrap_or("{}"),
+            created_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn insert_balance_ledger_pg_tx(
     tx: &mut PgTransaction<'_>,
     entry: BalanceLedgerEntry<'_>,
@@ -82,6 +114,38 @@ pub(crate) fn insert_balance_ledger_pg_tx(
             &entry.idempotency_key,
             &entry.request_id,
             &entry.metadata_json.unwrap_or("{}"),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn insert_balance_ledger_pg_tx_at_ms(
+    tx: &mut PgTransaction<'_>,
+    entry: BalanceLedgerEntry<'_>,
+    created_at_ms: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO balance_ledger_entries
+            (id, account_id, event_type, amount_cents, balance_cents_before,
+             balance_cents_after, reason, provider, processor_payment_id,
+             source_id, idempotency_key, request_id, metadata_json, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                 to_timestamp(($14::bigint)::double precision / 1000.0))",
+        &[
+            &uuid::Uuid::new_v4().to_string(),
+            &entry.account_id,
+            &entry.event_type,
+            &entry.amount_cents,
+            &entry.balance_cents_before,
+            &entry.balance_cents_after,
+            &entry.reason,
+            &entry.provider,
+            &entry.processor_payment_id,
+            &entry.source_id,
+            &entry.idempotency_key,
+            &entry.request_id,
+            &entry.metadata_json.unwrap_or("{}"),
+            &created_at_ms,
         ],
     )?;
     Ok(())

@@ -134,6 +134,38 @@ export interface CareerTrackPolicy {
   employment_types: string[];
   engagement_types: string[];
   work_authorizations: string[];
+  authority?: CareerTrackPolicyAuthority;
+}
+
+export interface CareerTrackPolicyAuthority {
+  taxonomy_version: string;
+  taxonomy_sha256: string;
+  taxonomy_activation_epoch: number;
+  canonicalizer_schema_version: number;
+  canonicalizer_sha256: string;
+  account_input_generation: number;
+  account_input_transition_sha256: string;
+  account_input_semantic_sha256: string;
+  track_input_generation: number;
+  track_input_transition_sha256: string;
+  track_semantic_sha256: string;
+  canonical_role_id: string;
+  canonical_role_family_id: string;
+  canonical_location_ids: string[];
+  source_resume_asset_id: string;
+  source_resume_sha256: string;
+  applicationIdentityId: string;
+  application_identity_sha256: string;
+  job_preferences_sha256: string;
+  policy_revision_id: string;
+  policy_revision_no: number;
+  canonical_policy_sha256: string;
+  policy_head_generation: number;
+  policy_head_transition_sha256: string;
+  policy_review_receipt_id: string;
+  policy_review_receipt_sha256: string;
+  review_state: string;
+  review_reason_codes: string[];
 }
 
 export interface CareerTrack {
@@ -179,7 +211,7 @@ export interface JobPosting {
   matched_reasons: string[];
   missing_requirements: string[];
   posted_at_ms?: number;
-  last_verified_at_ms?: number;
+  last_verified_at_ms?: number | null;
   availability_status: "active" | "expired" | "unknown" | string;
   status: string;
   created_at_ms: number;
@@ -205,6 +237,33 @@ export interface EligibilityReason {
 
 export type SubmissionCapability = "certified" | "beta_review" | "handoff" | "unknown_review" | "blocked";
 
+export type AtsCertificationStatus =
+  | "active"
+  | "review_only"
+  | "expired"
+  | "suspended"
+  | "revoked"
+  | "drifted";
+
+export type AtsCertifiedRunnerKind = "local" | "cloud";
+
+/**
+ * Bounded, display-safe certification state authored by the server. The
+ * portal treats this wire object as untrusted until the strict AC25 decoder
+ * accepts every field and rejects every unknown field.
+ */
+export interface AtsCertificationSummary {
+  provider_label: string;
+  adapter_version: string | null;
+  certified_runner_kinds: AtsCertifiedRunnerKind[];
+  status: AtsCertificationStatus;
+  last_verified_at_ms: number | null;
+  expires_at_ms: number | null;
+  reason: string;
+  next_action: string;
+  canary_available: boolean;
+}
+
 export interface JobEligibilityDecision {
   capability: SubmissionCapability;
   can_prepare: boolean;
@@ -215,6 +274,8 @@ export interface JobEligibilityDecision {
   review_reasons: EligibilityReason[];
   passed_checks: string[];
   evaluated_at_ms: number;
+  /** Parsed before display; `unknown` prevents compile-time trust in API JSON. */
+  ats_certification?: unknown;
 }
 
 export interface ResumeVersion {
@@ -304,6 +365,18 @@ export interface AnswerMemory {
   use_count: number;
 }
 
+export interface CompanyAnswerMemoryScope {
+  job_id: string;
+  scope_id: string;
+  company: string;
+  domain: string;
+}
+
+export interface AnswerMemorySaveInput extends AnswerMemory {
+  company_job_id?: string;
+  expected_company_scope?: string;
+}
+
 export type CandidateEventType = "match_feedback" | "application_issue" | "application_outcome";
 
 export interface CandidateEvent {
@@ -330,14 +403,23 @@ export interface CandidateEventInput {
 
 export interface InterventionResolutionResult {
   intervention: Intervention;
-  answer_memory?: AnswerMemory;
-  application?: JobApplication;
+  answer_memory?: AnswerMemory | null;
+  application?: JobApplication | null;
+  workflow_command?: WorkflowCommandAdmission;
 }
 
 export interface ApplicationEvidence {
   id: string;
   application_id: string;
-  kind: "resume" | "cover_letter" | "attachment" | "submission_confirmation" | "status_email" | "interview_event" | string;
+  kind:
+    | "resume"
+    | "cover_letter"
+    | "attachment"
+    | "application_receipt"
+    | "submission_confirmation"
+    | "status_email"
+    | "interview_event"
+    | string;
   label: string;
   provider: string;
   file_name: string;
@@ -415,6 +497,77 @@ export interface MailboxMessage {
   classification: string;
 }
 
+export type CommunicationActionKind = "reply" | "calendar";
+
+export type CommunicationActionProvider =
+  | "gmail"
+  | "outlook_email"
+  | "google_calendar"
+  | "outlook_calendar";
+
+export type CommunicationActionStatus =
+  | "awaiting_approval"
+  | "approved"
+  | "dispatching"
+  | "sent"
+  | "calendar_created"
+  | "needs_input"
+  | "failed"
+  | "side_effect_unknown"
+  | "cancelled";
+
+export interface CommunicationActionSummary {
+  id: string;
+  application_id: string;
+  connection_id: string;
+  source_message_id: string | null;
+  kind: CommunicationActionKind;
+  provider: CommunicationActionProvider;
+  payload_sha256: string;
+  action_revision: number;
+  status: CommunicationActionStatus;
+  execution_available: boolean;
+  execution_unavailable_reason: string;
+  approved_at_ms: number | null;
+  dispatched_at_ms: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface CommunicationSourceContext {
+  sender: string;
+  reply_target: string;
+  subject: string;
+  received_at_ms: number;
+}
+
+export interface CommunicationActionDetail extends CommunicationActionSummary {
+  connection_account_label: string;
+  source_context: CommunicationSourceContext | null;
+  /** Parsed and fail-closed by the portal before any review control is shown. */
+  payload: unknown;
+}
+
+export interface CommunicationReplyPayload {
+  kind: "reply";
+  to: string;
+  subject: string;
+  body_text: string;
+}
+
+export interface CommunicationCalendarPayload {
+  kind: "calendar";
+  title: string;
+  starts_at_ms: number;
+  ends_at_ms: number;
+  time_zone: string;
+  attendees: string[];
+}
+
+export type ReviewedCommunicationPayload =
+  | CommunicationReplyPayload
+  | CommunicationCalendarPayload;
+
 export type DiscoverySourceHealth = "healthy" | "degraded" | "paused" | "waiting";
 
 export interface DiscoverySource {
@@ -457,7 +610,44 @@ export interface JobsEntitlement {
   additional_inbox_cents: number;
 }
 
-export type RunnerAvailabilityStatus = "available" | "invited_beta" | "upgrade_required";
+export type RunnerAvailabilityStatus = "available" | "limited_beta" | "upgrade_required";
+
+export type LocalBrowserReleaseChannel = "internal" | "beta" | "stable";
+export type LocalBrowserReleasePlatform = "macos" | "windows";
+export type LocalBrowserReleaseArchitecture = "arm64" | "x64";
+export type LocalBrowserReleasePackageKind = "dmg" | "zip" | "exe";
+
+export interface LocalBrowserReleaseArtifact {
+  platform: LocalBrowserReleasePlatform;
+  architecture: LocalBrowserReleaseArchitecture;
+  package_kind: LocalBrowserReleasePackageKind;
+  role: "installer" | "updater";
+  file_name: string;
+  url: string;
+  size_bytes: number;
+  sha256: string;
+  descriptor_sha256: string;
+}
+
+export type LocalBrowserReleaseAvailability =
+  | {
+      status: "available";
+      reason: string;
+      channel: LocalBrowserReleaseChannel;
+      release_id: string;
+      artifact_origin: string;
+      manifest_sha256: string;
+      release_sequence: number;
+      build_id: string;
+      app_version: string;
+      protocol_version: number;
+      released_at_ms: number;
+      artifacts: LocalBrowserReleaseArtifact[];
+    }
+  | {
+      status: "disabled" | "unassigned" | "unavailable";
+      reason: string;
+    };
 
 export interface RunnerChannelAvailability {
   status: RunnerAvailabilityStatus;
@@ -466,6 +656,7 @@ export interface RunnerChannelAvailability {
   distribution_enabled: boolean;
   reason: string;
   next_action: string;
+  release?: LocalBrowserReleaseAvailability;
 }
 
 export interface RunnerAvailability {
@@ -475,14 +666,40 @@ export interface RunnerAvailability {
   auto_submit_reason: string;
 }
 
+export interface JobsMatchesPageInfo {
+  schema_version: 1;
+  page_size: number;
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
+export interface JobsMatchesPage {
+  matches: JobPosting[];
+  page: JobsMatchesPageInfo;
+}
+
+/** Frozen display context only; never current handoff or effect authority. */
+export interface ApplicationJobContext {
+  id: string;
+  company: string;
+  title: string;
+  location: string;
+  track_id: string;
+}
+
 export interface JobsWorkspace {
+  selected_curated_verification_available?: boolean;
+  smartrecruiters_requirements_load_available?: boolean;
+  interview_prep_receipts?: Record<string, string>;
   profile: CareerProfile;
   preferences: JobPreferences;
   facts: CareerFact[];
   tracks: CareerTrack[];
   auto_submit_authorizations: AutoSubmitAuthorization[];
   matches: JobPosting[];
+  matches_page: JobsMatchesPageInfo;
   applications: JobApplication[];
+  application_jobs: ApplicationJobContext[];
   application_evidence: ApplicationEvidence[];
   browser_sessions: BrowserSession[];
   interventions: Intervention[];
@@ -525,5 +742,24 @@ export interface QueueApplicationRunResponse {
   browser_session: BrowserSession;
   workflow_id: string;
   run_id: string;
+  workflow_command?: WorkflowCommandAdmission;
   launch_url?: string;
+}
+
+export interface WorkflowCommandAdmission {
+  schema_version: 2;
+  command_id: string;
+  request_id: string;
+  workflow_id: string;
+  operation: "start" | "resume";
+  state:
+    | "pending"
+    | "claimed"
+    | "delivering"
+    | "delivery_unknown"
+    | "accepted"
+    | "identity_conflict"
+    | "rejected"
+    | "cancelled";
+  replayed: boolean;
 }

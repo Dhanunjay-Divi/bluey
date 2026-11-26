@@ -246,7 +246,7 @@ fn empty_global_materialization_result() -> GlobalMaterializationResult {
 }
 
 fn global_candidate_posting(input: &DiscoveredJobInput) -> JobPosting {
-    JobPosting {
+    let mut posting = JobPosting {
         id: String::new(),
         canonical_key: String::new(),
         source: format!(
@@ -276,8 +276,13 @@ fn global_candidate_posting(input: &DiscoveredJobInput) -> JobPosting {
         status: default_match_status(),
         created_at_ms: 0,
         updated_at_ms: 0,
+        discovery_evidence: JobDiscoveryEvidence::default(),
         eligibility: None,
-    }
+    };
+    posting.canonical_key = canonical_job_key(&posting);
+    posting.discovery_evidence =
+        JobDiscoveryEvidence::external_feed_lead(posting.canonical_key.clone());
+    posting
 }
 
 fn namespaced_global_external_id(input: &DiscoveredJobInput) -> String {
@@ -609,6 +614,7 @@ fn persist_global_materialization(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
             tx.execute(
                 "INSERT INTO jobs_global_candidate_materializations (
                     account_id, candidate_id, job_id, track_id, source_updated_at_ms,

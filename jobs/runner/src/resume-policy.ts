@@ -1,5 +1,6 @@
 import {
   createDefaultAdapterRegistry,
+  type ApplicationPacket,
   type ProviderAdapterRegistryOptions,
 } from "@bluey/jobs-automation";
 
@@ -16,4 +17,23 @@ export function providerOptionsForResumeAction(
 export function providerRegistryForResumeAction(action: string | undefined) {
   const options = providerOptionsForResumeAction(action);
   return options ? createDefaultAdapterRegistry(undefined, options) : undefined;
+}
+
+export function providerRegistryForExecution(
+  packet: Pick<
+    ApplicationPacket,
+    "approvedExecutionAdmission" | "approvedExecutionSchemaVersion"
+  >,
+  resumeAction: string | undefined,
+) {
+  const certifiedAuto = packet.approvedExecutionSchemaVersion === 3
+    && packet.approvedExecutionAdmission?.kind === "track_auto_submit"
+    && packet.approvedExecutionAdmission.ats_certification !== undefined;
+  if (certifiedAuto) {
+    return createDefaultAdapterRegistry(undefined, {
+      greenhouse: { finalReviewApproval: async () => true },
+      lever: { finalReviewApproval: async () => true },
+    });
+  }
+  return providerRegistryForResumeAction(resumeAction);
 }

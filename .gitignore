@@ -12,6 +12,7 @@ dist/
 **/.vite/
 jobs/browser/browser-bundle/
 jobs/browser/release/
+jobs/browser/release-authority/
 
 # Local visual QA screenshots.
 tmp-*.png

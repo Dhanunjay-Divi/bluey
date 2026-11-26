@@ -4,7 +4,14 @@ use anyhow::Result;
 
 use crate::db::DbPool;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationalHoldMetric {
+    pub capability: String,
+    pub scope_kind: String,
+    pub active_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub accounts: i64,
     pub balance_sum: i64,
@@ -16,9 +23,63 @@ pub struct MetricsSnapshot {
     pub credit_batches: i64,
     pub usage_24h: i64,
     pub webhook_processed: i64,
+    pub jobs_public_beta_state: &'static str,
+    pub jobs_public_beta_hard_cap: i64,
+    pub jobs_public_beta_assigned: i64,
+    pub jobs_public_beta_live_enrollments: i64,
+    pub jobs_public_beta_public_enrollments: i64,
+    pub jobs_public_beta_admin_enrollments: i64,
+    pub jobs_public_beta_active_denials: i64,
+    /// Active operational holds grouped only by closed, low-cardinality
+    /// capability and scope-kind dimensions. Scope identifiers and reasons
+    /// never cross this read-model boundary.
+    pub operational_holds: Vec<OperationalHoldMetric>,
+    pub paused_discovery_sources: i64,
+    pub open_ats_circuits: i64,
+}
+
+impl Default for MetricsSnapshot {
+    fn default() -> Self {
+        Self {
+            accounts: 0,
+            balance_sum: 0,
+            trial_active: 0,
+            request_idempotency_total: 0,
+            request_idempotency_complete: 0,
+            request_idempotency_in_progress: 0,
+            mark_complete_failed: 0,
+            credit_batches: 0,
+            usage_24h: 0,
+            webhook_processed: 0,
+            jobs_public_beta_state: "draft",
+            jobs_public_beta_hard_cap: 0,
+            jobs_public_beta_assigned: 0,
+            jobs_public_beta_live_enrollments: 0,
+            jobs_public_beta_public_enrollments: 0,
+            jobs_public_beta_admin_enrollments: 0,
+            jobs_public_beta_active_denials: 0,
+            operational_holds: Vec::new(),
+            paused_discovery_sources: 0,
+            open_ats_circuits: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobsReadinessSnapshot {
+    pub operational_holds: Vec<OperationalHoldMetric>,
+    pub paused_discovery_sources: i64,
+    pub open_ats_circuits: i64,
 }
 
 pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
+    let public_beta = crate::db::jobs_beta_access::public_beta_aggregate_snapshot(pool)?;
+    let public_beta_state = match public_beta.state {
+        crate::db::jobs_beta_access::PublicBetaCohortState::Draft => "draft",
+        crate::db::jobs_beta_access::PublicBetaCohortState::Open => "open",
+        crate::db::jobs_beta_access::PublicBetaCohortState::ClosedToNew => "closed_to_new",
+        crate::db::jobs_beta_access::PublicBetaCohortState::Suspended => "suspended",
+    };
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
@@ -59,6 +120,16 @@ pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
                     &conn,
                     "SELECT COUNT(*) FROM stripe_webhook_events WHERE processed_at IS NOT NULL",
                 )?,
+                jobs_public_beta_state: public_beta_state,
+                jobs_public_beta_hard_cap: public_beta.hard_cap,
+                jobs_public_beta_assigned: public_beta.assigned_count,
+                jobs_public_beta_live_enrollments: public_beta.live_enrollment_count,
+                jobs_public_beta_public_enrollments: public_beta.public_enrollment_count,
+                jobs_public_beta_admin_enrollments: public_beta.admin_enrollment_count,
+                jobs_public_beta_active_denials: public_beta.active_denial_count,
+                operational_holds: operational_hold_metrics_sqlite(&conn)?,
+                paused_discovery_sources: paused_discovery_sources_sqlite(&conn)?,
+                open_ats_circuits: open_ats_circuits_sqlite(&conn)?,
             })
         }
         DbPool::Postgres(_) => {
@@ -103,6 +174,38 @@ pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
                     &mut conn,
                     "SELECT COUNT(*)::bigint FROM stripe_webhook_events WHERE processed_at IS NOT NULL",
                 )?,
+                jobs_public_beta_state: public_beta_state,
+                jobs_public_beta_hard_cap: public_beta.hard_cap,
+                jobs_public_beta_assigned: public_beta.assigned_count,
+                jobs_public_beta_live_enrollments: public_beta.live_enrollment_count,
+                jobs_public_beta_public_enrollments: public_beta.public_enrollment_count,
+                jobs_public_beta_admin_enrollments: public_beta.admin_enrollment_count,
+                jobs_public_beta_active_denials: public_beta.active_denial_count,
+                operational_holds: operational_hold_metrics_pg(&mut conn)?,
+                paused_discovery_sources: paused_discovery_sources_pg(&mut conn)?,
+                open_ats_circuits: open_ats_circuits_pg(&mut conn)?,
+            })
+        }
+    })
+}
+
+/// Privacy-safe inputs for the Jobs readiness endpoint.
+pub fn jobs_readiness_snapshot(pool: &DbPool) -> Result<JobsReadinessSnapshot> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            Ok(JobsReadinessSnapshot {
+                operational_holds: operational_hold_metrics_sqlite(&conn)?,
+                paused_discovery_sources: paused_discovery_sources_sqlite(&conn)?,
+                open_ats_circuits: open_ats_circuits_sqlite(&conn)?,
+            })
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            Ok(JobsReadinessSnapshot {
+                operational_holds: operational_hold_metrics_pg(&mut conn)?,
+                paused_discovery_sources: paused_discovery_sources_pg(&mut conn)?,
+                open_ats_circuits: open_ats_circuits_pg(&mut conn)?,
             })
         }
     })
@@ -114,4 +217,149 @@ fn count_one_sqlite(conn: &rusqlite::Connection, sql: &str) -> Result<i64> {
 
 fn count_one_pg(conn: &mut postgres::Client, sql: &str) -> Result<i64> {
     Ok(conn.query_one(sql, &[])?.try_get(0)?)
+}
+
+fn operational_hold_metrics_sqlite(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<OperationalHoldMetric>> {
+    operational_hold_metrics_from_counts(
+        crate::db::jobs::validated_operational_hold_active_counts_sqlite(conn)
+            .map_err(anyhow::Error::new)?,
+    )
+}
+
+fn operational_hold_metrics_pg(conn: &mut postgres::Client) -> Result<Vec<OperationalHoldMetric>> {
+    operational_hold_metrics_from_counts(
+        crate::db::jobs::validated_operational_hold_active_counts_postgres(conn)
+            .map_err(anyhow::Error::new)?,
+    )
+}
+
+fn operational_hold_metrics_from_counts(
+    counts: Vec<(String, String, i64)>,
+) -> Result<Vec<OperationalHoldMetric>> {
+    counts
+        .into_iter()
+        .map(|(capability, scope_kind, active_count)| {
+            if active_count < 0 {
+                anyhow::bail!("invalid operational hold count")
+            }
+            Ok(OperationalHoldMetric {
+                capability,
+                scope_kind,
+                active_count,
+            })
+        })
+        .collect()
+}
+
+fn paused_discovery_sources_sqlite(conn: &rusqlite::Connection) -> Result<i64> {
+    count_one_sqlite(
+        conn,
+        "SELECT
+           (SELECT COUNT(*) FROM jobs_discovery_sources
+             WHERE status = 'paused' OR health = 'paused')
+           +
+           (SELECT COUNT(*) FROM jobs_global_discovery_sources
+             WHERE status = 'paused' OR health = 'paused')",
+    )
+}
+
+fn paused_discovery_sources_pg(conn: &mut postgres::Client) -> Result<i64> {
+    count_one_pg(
+        conn,
+        "SELECT
+           ((SELECT COUNT(*) FROM jobs_discovery_sources
+              WHERE status = 'paused' OR health = 'paused')
+            +
+            (SELECT COUNT(*) FROM jobs_global_discovery_sources
+              WHERE status = 'paused' OR health = 'paused'))::bigint",
+    )
+}
+
+fn open_ats_circuits_sqlite(conn: &rusqlite::Connection) -> Result<i64> {
+    count_one_sqlite(
+        conn,
+        "SELECT COUNT(*) FROM jobs_ats_certification_circuit_heads
+         WHERE state <> 'closed'",
+    )
+}
+
+fn open_ats_circuits_pg(conn: &mut postgres::Client) -> Result<i64> {
+    count_one_pg(
+        conn,
+        "SELECT COUNT(*)::bigint FROM jobs_ats_certification_circuit_heads
+         WHERE state <> 'closed'",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operational_hold_metric_projection_groups_without_private_scope_ids() {
+        let metrics = operational_hold_metrics_from_counts(vec![
+            ("all".to_string(), "global".to_string(), 1),
+            ("generation".to_string(), "account".to_string(), 2),
+        ])
+        .unwrap();
+        assert_eq!(
+            metrics,
+            vec![
+                OperationalHoldMetric {
+                    capability: "all".to_string(),
+                    scope_kind: "global".to_string(),
+                    active_count: 1,
+                },
+                OperationalHoldMetric {
+                    capability: "generation".to_string(),
+                    scope_kind: "account".to_string(),
+                    active_count: 2,
+                },
+            ]
+        );
+        let encoded = format!("{metrics:?}");
+        for private_scope_id in [
+            "private-account-a",
+            "private-account-b",
+            "private-account-c",
+            "private-global-scope",
+        ] {
+            assert!(!encoded.contains(private_scope_id));
+        }
+    }
+
+    #[test]
+    fn native_jobs_blocker_projection_counts_account_global_and_ats_authorities() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE jobs_discovery_sources (
+                status TEXT NOT NULL,
+                health TEXT NOT NULL
+             );
+             CREATE TABLE jobs_global_discovery_sources (
+                status TEXT NOT NULL,
+                health TEXT NOT NULL
+             );
+             CREATE TABLE jobs_ats_certification_circuit_heads (
+                state TEXT NOT NULL
+             );
+             INSERT INTO jobs_discovery_sources VALUES
+                ('paused', 'healthy'),
+                ('active', 'paused'),
+                ('active', 'healthy');
+             INSERT INTO jobs_global_discovery_sources VALUES
+                ('paused', 'healthy'),
+                ('active', 'healthy');
+             INSERT INTO jobs_ats_certification_circuit_heads VALUES
+                ('opened'),
+                ('held'),
+                ('closed');",
+        )
+        .unwrap();
+
+        assert_eq!(paused_discovery_sources_sqlite(&conn).unwrap(), 3);
+        assert_eq!(open_ats_circuits_sqlite(&conn).unwrap(), 2);
+    }
 }

@@ -80,12 +80,36 @@ const KNOWN_SECRET_PATTERNS = [
 
 const GENERIC_CREDENTIAL_PATTERN =
   /\b(api[_-]?key|auth[_-]?token|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|passwd)\b\s*[:=]\s*(["'`])([^"'`\r\n]{8,})\2/gi;
-const UNQUOTED_ENV_CREDENTIAL_PATTERN =
-  /^\s*(?:export\s+)?((?:[A-Z][A-Z0-9_]*_)?(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET|ENCRYPTION_KEY|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|TOKEN))\s*=\s*([A-Za-z0-9_+/=-]{8,})/i;
+const ENV_CREDENTIAL_ASSIGNMENT_PREFIX =
+  /^\s*(?:export\s+)?((?:[A-Z][A-Z0-9_]*_)?(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET|ENCRYPTION_KEY|PRIVATE_KEY|PASSWORD|PASSWD|SECRET|TOKEN))\s*=\s*/i;
+const UNQUOTED_ENV_CREDENTIAL_VALUE = /^[A-Za-z0-9_+/=-]{8,}/;
+const ENV_EXAMPLE_ASSIGNMENT_PREFIX = /^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*/i;
+const ENV_EXAMPLE_CREDENTIAL_NAME =
+  /(?:^|_)(?:TOKENS?|SECRETS?|PASSWORDS?|PASSWDS?|(?:API|PRIVATE|ENCRYPTION|SIGNING|DATA|CAPABILITY|WEBHOOK_SIGNATURE|SECRET(?:_ACCESS)?)_KEYS?)$/i;
+const ENV_EXAMPLE_PLACEHOLDER =
+  /^(?:replace-with-[a-z0-9]+(?:-[a-z0-9]+)*|\$\{[A-Za-z_][A-Za-z0-9_]*\}|<[a-z][a-z0-9-]*>)$/;
+const ENV_EXAMPLE_NAMED_PLACEHOLDERS = new Map([
+  ["SQUARE_SANDBOX_ACCESS_TOKEN", "EAAA_sandbox_xxxxx"],
+  ["SQUARE_PRODUCTION_ACCESS_TOKEN", "EAAA_production_xxxxx"],
+]);
 const CREDENTIAL_URL_PATTERN = /\bhttps?:\/\/([^\s:/@]+):([^\s/@]{8,})@[^\s]+/gi;
 
 function normalizedPath(filePath) {
   return filePath.replaceAll("\\", "/").replace(/^\.\//, "");
+}
+
+function isEnvExamplePath(filePath) {
+  return normalizedPath(filePath).toLowerCase().endsWith(".env.example");
+}
+
+function parseEnvExampleValue(raw) {
+  if (raw.startsWith('"')) return /^"((?:[^"\\]|\\.)*)"\s*(?:#.*)?$/.exec(raw)?.[1];
+  if (raw.startsWith("'")) return /^'((?:[^'\\]|\\.)*)'\s*(?:#.*)?$/.exec(raw)?.[1];
+  return raw.replace(/(?:^|\s+)#.*$/, "").trim();
+}
+
+function isEnvExamplePlaceholder(value) {
+  return /^(?:x+|0+|\*+|redacted)$/i.test(value) || ENV_EXAMPLE_PLACEHOLDER.test(value);
 }
 
 function compareText(left, right) {
@@ -122,6 +146,7 @@ function isPlaceholderValue(value, filePath, line) {
   const candidate = value.trim();
   const lower = candidate.toLowerCase();
   const context = `${candidate} ${line}`.toLowerCase();
+  if (isEnvExamplePath(filePath)) return isEnvExamplePlaceholder(candidate);
   if (/\$\{[^}]+\}|\$\{\{[^}]+\}\}|<[^>]+>|process\.env|std::env|env::var/.test(candidate)) return true;
   if (/^(?:x+|0+|\*+|redacted)$/i.test(candidate)) return true;
   if (/^[a-z]+(?:\s+[a-z]+){2,}[.!]?$/i.test(candidate) && (isTestOrExamplePath(filePath) || normalizedPath(filePath).startsWith("web/"))) {
@@ -256,6 +281,7 @@ export function classifyTrackedPath(filePath) {
 export function scanTextForSecrets(filePath, contents) {
   const findings = [];
   const lines = contents.split(/\r?\n/);
+  const envExample = isEnvExamplePath(filePath);
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
@@ -275,10 +301,25 @@ export function scanTextForSecrets(filePath, contents) {
       }
     }
 
-    if (/\.(?:cfg|conf|env|ini|properties|sh|toml|ya?ml)$/i.test(filePath)) {
-      const match = UNQUOTED_ENV_CREDENTIAL_PATTERN.exec(line);
-      if (match && looksOpaqueCredential(match[2]) && !isPlaceholderValue(match[2], filePath, line)) {
-        findings.push({ line: index + 1, kind: `raw ${match[1].toLowerCase()} assignment` });
+    if (envExample) {
+      const assignment = ENV_EXAMPLE_ASSIGNMENT_PREFIX.exec(line);
+      if (assignment && ENV_EXAMPLE_CREDENTIAL_NAME.test(assignment[1])) {
+        const key = assignment[1];
+        const value = parseEnvExampleValue(line.slice(assignment[0].length));
+        if (value === undefined) {
+          findings.push({ line: index + 1, kind: "unreadable template credential assignment" });
+        } else if (value !== "" && value !== ENV_EXAMPLE_NAMED_PLACEHOLDERS.get(key) && !isEnvExamplePlaceholder(value)) {
+          findings.push({ line: index + 1, kind: `raw ${key.toLowerCase()} assignment` });
+        }
+      }
+    } else if (/\.(?:cfg|conf|env|ini|properties|sh|toml|ya?ml)$/i.test(filePath)) {
+      const assignment = ENV_CREDENTIAL_ASSIGNMENT_PREFIX.exec(line);
+      if (assignment) {
+        const remaining = line.slice(assignment[0].length);
+        const value = UNQUOTED_ENV_CREDENTIAL_VALUE.exec(remaining)?.[0];
+        if (value && looksOpaqueCredential(value) && !isPlaceholderValue(value, filePath, line)) {
+          findings.push({ line: index + 1, kind: `raw ${assignment[1].toLowerCase()} assignment` });
+        }
       }
     }
 
@@ -301,8 +342,13 @@ function isTextPath(filePath) {
   return (
     extension === "" ||
     TEXT_EXTENSIONS.has(extension) ||
+    isEnvExamplePath(filePath) ||
     ["dockerfile", "gemfile", "makefile", "procfile"].includes(basename)
   );
+}
+
+function isScannableTextEntry(entry) {
+  return entry.mode !== "160000" && isTextPath(entry.filePath);
 }
 
 function trackedEntries(repoRoot) {
@@ -323,7 +369,7 @@ function trackedEntries(repoRoot) {
 }
 
 function readTrackedText(entries, repoRoot) {
-  const textEntries = entries.filter((entry) => entry.mode !== "160000" && isTextPath(entry.filePath));
+  const textEntries = entries.filter(isScannableTextEntry);
   const hashes = [...new Set(textEntries.map((entry) => entry.hash))];
   if (hashes.length === 0) return { blobs: new Map(), oversizedPaths: [] };
 
@@ -379,6 +425,7 @@ export function runPrivacyGate(repoRoot) {
   const entries = trackedEntries(repoRoot);
   const { blobs, oversizedPaths } = readTrackedText(entries, repoRoot);
   const issues = [];
+  let scannedTextFiles = 0;
 
   for (const filePath of oversizedPaths) issues.push({ filePath, kind: "tracked text exceeds the privacy scan limit" });
 
@@ -386,8 +433,9 @@ export function runPrivacyGate(repoRoot) {
     for (const kind of classifyTrackedPath(entry.filePath)) {
       issues.push({ filePath: entry.filePath, kind });
     }
-    const contents = blobs.get(entry.hash);
+    const contents = isScannableTextEntry(entry) ? blobs.get(entry.hash) : undefined;
     if (contents !== undefined) {
+      scannedTextFiles += 1;
       for (const finding of scanTextForSecrets(entry.filePath, contents)) {
         issues.push({ filePath: entry.filePath, ...finding });
       }
@@ -400,7 +448,7 @@ export function runPrivacyGate(repoRoot) {
       (left.line ?? 0) - (right.line ?? 0) ||
       compareText(left.kind, right.kind),
   );
-  return { trackedPaths: entries.length, scannedTextFiles: entries.filter((entry) => blobs.has(entry.hash)).length, issues };
+  return { trackedPaths: entries.length, scannedTextFiles, issues };
 }
 
 function main() {

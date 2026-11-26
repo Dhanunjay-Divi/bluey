@@ -1,0 +1,10548 @@
+import {
+  createHash,
+  createPublicKey,
+  verify as verifySignature,
+} from "node:crypto";
+import { execFile } from "node:child_process";
+import { constants, createReadStream } from "node:fs";
+import {
+  copyFile,
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import {
+  basename,
+  dirname,
+  join,
+  posix,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import {
+  bindManagedCloudAuthorizationPolicy,
+  selectManagedCloudAuthorizationOrigin,
+  selectManagedCloudCandidateOrigin,
+} from "./check-managed-cloud-authorization-origin.mjs";
+import { verifyManagedCloudObservabilityPolicy } from "./check-managed-cloud-observability-policy.mjs";
+
+export const MANAGED_CLOUD_AUDIENCES = Object.freeze({
+  activation: "bluey-jobs-managed-cloud-activation-v1",
+  activationV2: "bluey-jobs-managed-cloud-activation-v2",
+  activationV3: "bluey-jobs-managed-cloud-activation-v3",
+  activationV4: "bluey-jobs-managed-cloud-activation-v4",
+  authorization: "bluey-jobs-managed-cloud-authorization-v1",
+  authorizationV2: "bluey-jobs-managed-cloud-authorization-v2",
+  builderPolicy: "bluey-jobs-managed-cloud-builder-policy-v1",
+  builderPolicyV2: "bluey-jobs-managed-cloud-builder-policy-v2",
+  builderPolicyV3: "bluey-jobs-managed-cloud-builder-policy-v3",
+  candidate: "bluey-jobs-managed-cloud-candidate-v1",
+  canaryEvidence: "bluey-jobs-managed-cloud-canary-evidence-v1",
+  cleanupEvidence: "bluey-jobs-managed-cloud-cleanup-evidence-v1",
+  cohort: "bluey-jobs-managed-cloud-cohort-v1",
+  componentInventory: "bluey-jobs-managed-cloud-component-inventory-v1",
+  configContract: "bluey-jobs-managed-cloud-config-contract-v1",
+  contentInventory: "bluey-jobs-managed-cloud-content-inventory-v1",
+  failureConverterEvidence:
+    "bluey-jobs-managed-cloud-failure-converter-evidence-v1",
+  manifest: "bluey-jobs-managed-cloud-release-v1",
+  manifestV2: "bluey-jobs-managed-cloud-release-v2",
+  manifestV3: "bluey-jobs-managed-cloud-release-v3",
+  manifestV4: "bluey-jobs-managed-cloud-release-v4",
+  migrationContract: "bluey-jobs-managed-cloud-migration-contract-v1",
+  publicationPlan: "bluey-jobs-managed-cloud-publication-plan-v1",
+  publicationPreflight: "bluey-jobs-managed-cloud-publication-preflight-v1",
+  publicationSet: "bluey-jobs-managed-cloud-publication-set-v1",
+  publicationWorkflowEvidence:
+    "bluey-jobs-managed-cloud-publication-workflow-evidence-v1",
+  promotion: "bluey-jobs-managed-cloud-promotion-v1",
+  promotionV2: "bluey-jobs-managed-cloud-promotion-v2",
+  portalReadbackEvidence:
+    "bluey-jobs-managed-cloud-portal-readback-evidence-v1",
+  portalReadbackEvidenceV2:
+    "bluey-jobs-managed-cloud-portal-readback-evidence-v2",
+  provenance: "bluey-jobs-managed-cloud-provenance-v1",
+  protocolContract: "bluey-jobs-managed-cloud-protocol-contract-v1",
+  rollback: "bluey-jobs-managed-cloud-rollback-v1",
+  rollbackV2: "bluey-jobs-managed-cloud-rollback-v2",
+  rollbackSet: "bluey-jobs-managed-cloud-rollback-set-v1",
+  rollbackSetV2: "bluey-jobs-managed-cloud-rollback-set-v2",
+  rootAnchor: "bluey-jobs-managed-cloud-root-anchor-v1",
+  runtimeMeasurement: "bluey-jobs-managed-cloud-runtime-measurement-v1",
+  runnerFleetEvidence: "bluey-jobs-managed-cloud-runner-fleet-evidence-v1",
+  sbom: "bluey-jobs-managed-cloud-file-sbom-v1",
+  signatureSet: "bluey-jobs-managed-cloud-signature-set-v1",
+  testEvidence: "bluey-jobs-managed-cloud-test-evidence-v1",
+  testEvidenceV2: "bluey-jobs-managed-cloud-test-evidence-v2",
+  taskQueueEvidence: "bluey-jobs-managed-cloud-task-queue-evidence-v1",
+  temporalEvidence: "bluey-jobs-managed-cloud-temporal-evidence-v1",
+  trustBundle: "bluey-jobs-managed-cloud-trust-bundle-v1",
+  trustPolicy: "bluey-jobs-managed-cloud-trust-policy-v1",
+  treeInventory: "bluey-jobs-managed-cloud-static-tree-inventory-v1",
+  storageEvidence: "bluey-jobs-managed-cloud-storage-evidence-v1",
+  verificationEvidence: "bluey-jobs-managed-cloud-verification-evidence-v1",
+});
+
+export const MANAGED_CLOUD_COMPONENTS = Object.freeze([
+  Object.freeze({
+    architecture: "x86_64",
+    artifactKind: "oci_image",
+    componentId: "jobs-api",
+    platform: "linux",
+  }),
+  Object.freeze({
+    architecture: "wasm",
+    artifactKind: "static_bundle",
+    componentId: "jobs-portal",
+    platform: "web",
+  }),
+  Object.freeze({
+    architecture: "x86_64",
+    artifactKind: "oci_image",
+    componentId: "jobs-runner",
+    platform: "linux",
+  }),
+  Object.freeze({
+    architecture: "x86_64",
+    artifactKind: "oci_image",
+    componentId: "jobs-workflows",
+    platform: "linux",
+  }),
+]);
+
+export const MANAGED_CLOUD_BASE_CAPABILITIES = Object.freeze([
+  Object.freeze({
+    capability: "jobs_api",
+    componentId: "jobs-api",
+  }),
+  Object.freeze({
+    capability: "workflow_cleanup_dispatcher",
+    componentId: "jobs-api",
+  }),
+  Object.freeze({
+    componentId: "jobs-api",
+    capability: "workflow_command_dispatcher",
+  }),
+  Object.freeze({
+    capability: "portal_static",
+    componentId: "jobs-portal",
+  }),
+  Object.freeze({
+    capability: "managed_runner",
+    componentId: "jobs-runner",
+  }),
+  Object.freeze({
+    capability: "workflow_gateway",
+    componentId: "jobs-workflows",
+  }),
+  Object.freeze({
+    capability: "workflow_worker",
+    componentId: "jobs-workflows",
+  }),
+]);
+
+export const MANAGED_CLOUD_BASE_RUNTIME_ROLES = Object.freeze([
+  "jobs_api",
+  "managed_runner",
+  "workflow_cleanup_dispatcher",
+  "workflow_command_dispatcher",
+  "workflow_gateway",
+  "workflow_worker",
+]);
+
+export const MANAGED_CLOUD_RESERVED_CAPABILITIES = Object.freeze([
+  "discovery_worker",
+  "global_discovery_worker",
+  "original_source_verifier",
+]);
+
+export const MANAGED_CLOUD_RUNTIME_CONTRACTS = Object.freeze({
+  "jobs-api": Object.freeze({
+    cmd: Object.freeze([]),
+    entrypoint: Object.freeze(["/usr/local/bin/bluey-jobs-api"]),
+    exposedPorts: Object.freeze(["8081/tcp"]),
+    requiredEnvironment: Object.freeze([
+      "BLUEY_JOBS_API_HOST=0.0.0.0",
+      "BLUEY_JOBS_API_PORT=8081",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ]),
+    requiredPaths: Object.freeze([
+      "app/.bluey/managed-cloud-runtime-measurement.json",
+      "usr/local/bin/bluey-jobs-api",
+    ]),
+    runtimeUser: "65532:65532",
+    workingDirectory: "/app",
+  }),
+  "jobs-runner": Object.freeze({
+    cmd: Object.freeze(["/usr/local/bin/node", "runner/dist/server.js"]),
+    entrypoint: Object.freeze([]),
+    exposedPorts: Object.freeze(["8091/tcp"]),
+    requiredEnvironment: Object.freeze([
+      "BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs-runner",
+      "NODE_ENV=production",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright",
+    ]),
+    requiredPaths: Object.freeze([
+      "app/.bluey/managed-cloud-runtime-measurement.json",
+      "app/runner/dist/native/bluey_jobs_runner_native_storage.node",
+      "app/runner/dist/server.js",
+      "usr/local/bin/node",
+    ]),
+    runtimeUser: "pwuser",
+    workingDirectory: "/app",
+  }),
+  "jobs-workflows": Object.freeze({
+    cmd: Object.freeze(["/usr/local/bin/node", "workflows/dist/worker.js"]),
+    entrypoint: Object.freeze([]),
+    exposedPorts: Object.freeze([]),
+    requiredEnvironment: Object.freeze([
+      "NODE_ENV=production",
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ]),
+    requiredPaths: Object.freeze([
+      "app/.bluey/managed-cloud-runtime-measurement.json",
+      "app/workflows/dist/discovery-worker.js",
+      "app/workflows/dist/failure-converter.js",
+      "app/workflows/dist/gateway.js",
+      "app/workflows/dist/global-discovery-worker.js",
+      "app/workflows/dist/worker.js",
+      "usr/local/bin/node",
+    ]),
+    runtimeUser: "node",
+    workingDirectory: "/app",
+  }),
+});
+
+export const MANAGED_CLOUD_PROTOCOL_IDS = Object.freeze([
+  "ats_certification",
+  "execution_lease",
+  "gateway_command",
+  "managed_cloud_release",
+  "object_evidence",
+  "runner_checkpoint",
+  "runner_profile_snapshot",
+  "runner_result",
+  "runtime_heartbeat",
+  "workflow_cleanup",
+  "workflow_command",
+]);
+
+export const MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS = Object.freeze([
+  ...MANAGED_CLOUD_PROTOCOL_IDS.slice(0, 9),
+  "source_verification",
+  ...MANAGED_CLOUD_PROTOCOL_IDS.slice(9),
+]);
+
+export const MANAGED_CLOUD_RELEASE_V3_PROTOCOL_IDS = Object.freeze([
+  ...MANAGED_CLOUD_PROTOCOL_IDS.slice(0, 9),
+  "source_verification",
+  "source_verifier_startup",
+  "source_verifier_boot",
+  ...MANAGED_CLOUD_PROTOCOL_IDS.slice(9),
+]);
+
+const MANAGED_CLOUD_BASE_CANARY_CHECK_IDS = Object.freeze([
+  "artifact-registry-readback",
+  "jobs-api-readiness",
+  "jobs-api-runtime-artifact-attestation",
+  "jobs-portal-readback",
+  "jobs-workflows-runtime-artifact-attestation",
+  "managed-runner-readiness",
+  "managed-runner-runtime-artifact-attestation",
+  "migration-contract-readback",
+  "protocol-contract-readback",
+  "read-only-rootfs-policy",
+  "workflow-cleanup-dispatcher-readiness",
+  "workflow-command-dispatcher-readiness",
+  "workflow-gateway-readiness",
+  "workflow-worker-readiness",
+]);
+
+const HEX_64 = /^[0-9a-f]{64}$/;
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const SOURCE_COMMIT = /^[0-9a-f]{40}$/;
+const SAFE_ID = /^[a-z0-9][a-z0-9._:-]{2,127}$/;
+const BASE64URL = /^[A-Za-z0-9_-]+$/;
+const IMAGE_REFERENCE =
+  /^[a-z0-9][a-z0-9._:-]*(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[0-9a-f]{64}$/;
+const REGISTRY_NAMESPACE =
+  /^[a-z0-9][a-z0-9.-]*(?::[0-9]{2,5})?\/[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/;
+const MAX_JSON_BYTES = 16 * 1024 * 1024;
+const MAX_SIGNED_OBJECT_BYTES = 128 * 1024;
+const MAX_INVENTORY_ATTACHMENT_BYTES = 12 * 1024 * 1024;
+const MAX_INVENTORY_ATTACHMENT_TRANSPORT_BYTES = 16 * 1024 * 1024 + 1_024;
+const MAX_INVENTORY_ENTRIES = 100_000;
+const MAX_TAR_HEADERS = 100_000;
+const MAX_LOCAL_PAX_BYTES = 64 * 1024;
+const MAX_LOCAL_PAX_VALUE_BYTES = 4096;
+const MAX_LOCAL_PAX_TOTAL_BYTES = 8 * 1024 * 1024;
+const RUNNER_UNUSED_PTP_HELPER =
+  "usr/lib/x86_64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-ptp-helper";
+const MAX_ACTIVATION_EVIDENCE_FILE_BYTES = 128 * 1024;
+const MAX_ACTIVATION_EVIDENCE_TOTAL_BYTES = 1024 * 1024;
+const MAX_PORTAL_OCI_MANIFEST_BYTES = 32 * 1024;
+const MAX_PUBLICATION_PREFLIGHT_BYTES = 128 * 1024;
+const MAX_PUBLICATION_ARTIFACTS_BYTES = 1024 * 1024;
+const MAX_PUBLICATION_ARTIFACT_ARCHIVE_BYTES = 1024 * 1024;
+const MAX_PUBLICATION_WORKFLOW_JOBS_BYTES = 1024 * 1024;
+const MAX_PUBLICATION_WORKFLOW_RUN_BYTES = 128 * 1024;
+const MAX_RUNTIME_MEASUREMENT_FILES = 512;
+const MAX_SAFE_GENERATION = Number.MAX_SAFE_INTEGER;
+const RUNTIME_MEASUREMENT_PATH =
+  "app/.bluey/managed-cloud-runtime-measurement.json";
+const RUNTIME_IDENTITY_DOMAIN =
+  "bluey-jobs-managed-cloud-runtime-identity-v1\0";
+const SQLITE_MIGRATION_HEAD = "056_jobs_canonical_taxonomy_authority.sql";
+const POSTGRES_MIGRATION_HEAD = "034_jobs_canonical_taxonomy_authority.sql";
+const SQLITE_SUCCESSOR_MIGRATION_HEAD =
+  "057_jobs_original_source_verification_authority.sql";
+const POSTGRES_SUCCESSOR_MIGRATION_HEAD =
+  "035_jobs_original_source_verification_authority.sql";
+const SQLITE_RELEASE_V3_MIGRATION_HEAD =
+  "065_jobs_source_verifier_heartbeat_boot_bindings.sql";
+const POSTGRES_RELEASE_V3_MIGRATION_HEAD =
+  "043_jobs_source_verifier_heartbeat_boot_bindings.sql";
+const SQLITE_RELEASE_V4_MIGRATION_HEAD =
+  "073_jobs_managed_cloud_release_v4_audiences.sql";
+const POSTGRES_RELEASE_V4_MIGRATION_HEAD =
+  "052_jobs_managed_cloud_release_v4_audiences.sql";
+const SQLITE_RELEASE_V4_MIGRATION_SUFFIX = Object.freeze([
+  "066_jobs_attempt_employer_identity.sql",
+  "067_jobs_provisioned_runtime_startup.sql",
+  "068_jobs_provisioned_runtime_observations.sql",
+  "069_jobs_ats_storage_fences.sql",
+  "070_jobs_application_answer_revisions.sql",
+  "071_jobs_workday_reconciliation_holds.sql",
+  "072_jobs_mcp_read_grants.sql",
+  SQLITE_RELEASE_V4_MIGRATION_HEAD,
+]);
+const POSTGRES_RELEASE_V4_MIGRATION_SUFFIX = Object.freeze([
+  "044_jobs_attempt_employer_identity.sql",
+  "045_jobs_provisioned_runtime_startup.sql",
+  "046_jobs_provisioned_runtime_observations.sql",
+  "047_jobs_ats_storage_fences.sql",
+  "048_jobs_application_answer_revisions.sql",
+  "049_jobs_process_attachment_signature_audience.sql",
+  "050_jobs_workday_reconciliation_holds.sql",
+  "051_jobs_mcp_read_grants.sql",
+  POSTGRES_RELEASE_V4_MIGRATION_HEAD,
+]);
+const JOBS_LOCK_EVIDENCE_PATH = "evidence/build/jobs-package-lock.json";
+const SERVER_LOCK_EVIDENCE_PATH = "evidence/build/server-cargo-lock";
+const REQUIRED_CANDIDATE_FILES = Object.freeze([
+  "builder-policy.json",
+  "candidate-set.json",
+  "component-inventory.json",
+  "config-contract.json",
+  "inventory-attachments.json",
+  "migration-contract.json",
+  "protocol-contract.json",
+  "release-manifest.json",
+  "test-evidence.json",
+  "verification-evidence.json",
+]);
+const REQUIRED_AUTHORIZED_FILES = Object.freeze([
+  "authorization-set.json",
+  "candidate",
+  "release-signatures.json",
+  "trust-bundle.json",
+]);
+const REQUIRED_PROMOTION_FILES_V1 = Object.freeze([
+  "activation-signatures.json",
+  "activation.json",
+  "authorized-candidate",
+  "cohort-signatures.json",
+  "cohort.json",
+  "evidence",
+  "promotion-set.json",
+  "published",
+  "readback",
+]);
+const REQUIRED_PROMOTION_FILES_V2 = Object.freeze([
+  "activation-signatures.json",
+  "activation.json",
+  "authorized-candidate",
+  "cohort-signatures.json",
+  "cohort.json",
+  "evidence",
+  "publication",
+  "publication-workflow-evidence.json",
+  "promotion-set.json",
+]);
+const REQUIRED_PUBLICATION_FILES = Object.freeze([
+  "publication-plan.json",
+  "publication-set.json",
+]);
+const MANAGED_CLOUD_PUBLICATION_PLAN_KEYS = Object.freeze([
+  "adapter",
+  "artifacts",
+  "audience",
+  "authorizationSetSha256",
+  "candidateSetSha256",
+  "manifestSha256",
+  "nativeArtifact",
+  "portalArtifactOrigin",
+  "portalManifestCreatedAt",
+  "registryNamespace",
+  "releaseId",
+  "sourceCommit",
+  "sourceDefaultBranch",
+  "sourceRepository",
+  "sourceRepositoryId",
+  "supplyChainStatus",
+  "version",
+]);
+const MANAGED_CLOUD_PUBLICATION_SET_KEYS = Object.freeze([
+  "adapter",
+  "artifacts",
+  "attestedAtMs",
+  "audience",
+  "authorizationSetSha256",
+  "manifestSha256",
+  "nativeArtifact",
+  "publicationPlanSha256",
+  "releaseId",
+  "sourceCommit",
+  "supplyChainStatus",
+  "version",
+  "workflowRunId",
+  "workflowRunAttempt",
+]);
+const MANAGED_CLOUD_PUBLICATION_PREFLIGHT_KEYS = Object.freeze([
+  "adapter",
+  "artifacts",
+  "audience",
+  "defaultBranch",
+  "portalManifestCreatedAt",
+  "publicationPlanSha256",
+  "publicationSetSha256",
+  "registryNamespace",
+  "releaseId",
+  "repository",
+  "repositoryId",
+  "sourceCommit",
+  "version",
+  "workflowEvidence",
+]);
+const MANAGED_CLOUD_PUBLICATION_PREFLIGHT_ARTIFACT_KEYS = Object.freeze([
+  "artifactKind",
+  "artifactSha256",
+  "candidatePayloadSha256",
+  "candidatePayloadSizeBytes",
+  "componentId",
+  "publishedManifestDigest",
+  "publishedRegistryRef",
+]);
+const OCI_IMAGE_MANIFEST_MEDIA_TYPE =
+  "application/vnd.oci.image.manifest.v1+json";
+const OCI_EMPTY_CONFIG_MEDIA_TYPE = "application/vnd.oci.empty.v1+json";
+const OCI_EMPTY_CONFIG_DIGEST =
+  "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+const PORTAL_OCI_ARTIFACT_TYPE = "application/vnd.bluey.jobs.portal.v1";
+const PORTAL_OCI_LAYER_MEDIA_TYPE = "application/vnd.bluey.jobs.portal.tar";
+const REQUIRED_ROLLBACK_FILES = Object.freeze([
+  "from-promotion",
+  "rollback-signatures.json",
+  "rollback-set.json",
+  "rollback.json",
+  "target-promotion",
+]);
+
+const BASE_PROTOCOL_SPECS = Object.freeze([
+  Object.freeze({
+    id: "ats_certification",
+    sourcePaths: Object.freeze([
+      "jobs/automation/src/certified-submit-form.ts",
+      "server/src/db/jobs/ats_certification_authority.rs",
+    ]),
+    version: 1,
+  }),
+  Object.freeze({
+    id: "execution_lease",
+    sourcePaths: Object.freeze([
+      "jobs/runner/src/execution-lease.ts",
+      "server/src/db/jobs/execution_leases.rs",
+    ]),
+    version: 1,
+  }),
+  Object.freeze({
+    id: "gateway_command",
+    sourcePaths: Object.freeze([
+      "jobs/workflows/src/contracts.ts",
+      "jobs/workflows/src/gateway-service.ts",
+      "jobs/workflows/src/gateway.ts",
+      "server/src/jobs_workflow_dispatch.rs",
+    ]),
+    version: 3,
+  }),
+  Object.freeze({
+    id: "managed_cloud_release",
+    sourcePaths: Object.freeze([
+      "jobs/automation/src/managed-cloud-execution.ts",
+      "jobs/automation/src/managed-cloud-runtime-client.ts",
+      "jobs/automation/src/managed-cloud-runtime.ts",
+      "jobs/workflows/src/contracts.ts",
+      "jobs/workflows/src/gateway-cleanup-service.ts",
+      "jobs/workflows/src/gateway-service.ts",
+      "jobs/workflows/src/workflows.ts",
+      "server/src/db/jobs/managed_cloud_release_authority.rs",
+      "server/src/db/jobs/workflow_commands.rs",
+      "server/src/jobs_workflow_dispatch.rs",
+    ]),
+    version: 1,
+  }),
+  Object.freeze({
+    id: "object_evidence",
+    sourcePaths: Object.freeze([
+      "server/src/db/object_uploads.rs",
+      "server/src/db/jobs/evidence.rs",
+    ]),
+    version: 1,
+  }),
+  Object.freeze({
+    id: "runner_checkpoint",
+    sourcePaths: Object.freeze([
+      "jobs/runner/src/run-checkpoint-store.ts",
+      "server/src/db/jobs/execution_leases.rs",
+    ]),
+    version: 2,
+  }),
+  Object.freeze({
+    id: "runner_profile_snapshot",
+    sourcePaths: Object.freeze([
+      "jobs/runner/src/profile-snapshot-client.ts",
+      "server/src/db/jobs/browser_profile_snapshots.rs",
+    ]),
+    version: 1,
+  }),
+  Object.freeze({
+    id: "runner_result",
+    sourcePaths: Object.freeze([
+      "jobs/runner/src/result-store.ts",
+      "jobs/runner/src/submitted-result-recovery.ts",
+      "server/src/db/jobs/local_runner.rs",
+    ]),
+    version: 2,
+  }),
+  Object.freeze({
+    id: "runtime_heartbeat",
+    sourcePaths: Object.freeze([
+      "jobs/automation/src/managed-cloud-runtime-client.ts",
+      "jobs/automation/src/managed-cloud-runtime.ts",
+      "server/src/jobs_managed_cloud_runtime.rs",
+      "server/src/api/jobs_worker_auth.rs",
+    ]),
+    version: 1,
+  }),
+  Object.freeze({
+    id: "workflow_cleanup",
+    sourcePaths: Object.freeze([
+      "jobs/workflows/src/gateway-cleanup-service.ts",
+      "jobs/workflows/src/gateway.ts",
+      "server/src/jobs_workflow_cleanup.rs",
+    ]),
+    version: 3,
+  }),
+  Object.freeze({
+    id: "workflow_command",
+    sourcePaths: Object.freeze([
+      "jobs/workflows/src/contracts.ts",
+      "jobs/workflows/src/gateway-service.ts",
+      "jobs/workflows/src/workflows.ts",
+      "server/src/db/jobs/workflow_commands.rs",
+      "jobs/workflows/src/gateway.ts",
+      "server/src/jobs_workflow_dispatch.rs",
+    ]),
+    version: 2,
+  }),
+]);
+
+const SOURCE_VERIFICATION_PROTOCOL_SPEC = Object.freeze({
+  id: "source_verification",
+  sourcePaths: Object.freeze([
+    "jobs/automation/src/original-source-verification.ts",
+    "jobs/automation/src/worker-auth.ts",
+    "jobs/workflows/src/original-source-verification-api.ts",
+    "jobs/workflows/src/original-source-verification-runtime.ts",
+    "jobs/workflows/src/original-source-verifier.ts",
+    "server/src/api/jobs_original_source_verifications.rs",
+    "server/src/api/jobs_worker_auth.rs",
+    "server/src/db/mod.rs",
+    "server/src/db/jobs/eligibility.rs",
+    "server/src/db/jobs/operational_holds.rs",
+    "server/src/db/jobs/original_source_verification.rs",
+    "server/src/jobs_ats_target.rs",
+  ]),
+  version: 1,
+});
+
+const SOURCE_VERIFIER_STARTUP_PROTOCOL_SPEC = Object.freeze({
+  id: "source_verifier_startup",
+  sourcePaths: Object.freeze([
+    "infra/postgres/server-runtime/040_jobs_original_source_verifier_startup_authority.sql",
+    "infra/sqlite/server-runtime/062_jobs_original_source_verifier_startup_authority.sql",
+    "jobs/automation/src/managed-cloud-runtime-client.ts",
+    "jobs/automation/src/worker-auth.ts",
+    "jobs/workflows/src/original-source-verification-runtime.ts",
+    "jobs/workflows/src/original-source-verifier.ts",
+    "server/src/api/jobs_managed_cloud_releases.rs",
+    "server/src/api/jobs_worker_auth.rs",
+    "server/src/db/jobs/managed_cloud_release_authority.rs",
+    "server/src/db/jobs/original_source_verification.rs",
+    "server/src/db/mod.rs",
+  ]),
+  version: 1,
+});
+
+const SOURCE_VERIFIER_BOOT_PROTOCOL_SPEC = Object.freeze({
+  id: "source_verifier_boot",
+  sourcePaths: Object.freeze([
+    "infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql",
+    "infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql",
+    "infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql",
+    "infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql",
+    "jobs/automation/src/managed-cloud-runtime-client.ts",
+    "jobs/automation/src/worker-auth.ts",
+    "jobs/workflows/src/original-source-verifier.ts",
+    "server/src/api/jobs.rs",
+    "server/src/api/jobs_worker_auth.rs",
+    "server/src/db/jobs/managed_cloud_release_authority.rs",
+    "server/src/db/jobs/source_verifier_boot.rs",
+    "server/src/db/mod.rs",
+  ]),
+  version: 1,
+});
+
+const SUCCESSOR_PROTOCOL_SPECS = Object.freeze([
+  ...BASE_PROTOCOL_SPECS.slice(0, 9),
+  SOURCE_VERIFICATION_PROTOCOL_SPEC,
+  ...BASE_PROTOCOL_SPECS.slice(9),
+]);
+
+const RELEASE_V3_PROTOCOL_SPECS = Object.freeze([
+  ...BASE_PROTOCOL_SPECS.slice(0, 9),
+  SOURCE_VERIFICATION_PROTOCOL_SPEC,
+  SOURCE_VERIFIER_STARTUP_PROTOCOL_SPEC,
+  SOURCE_VERIFIER_BOOT_PROTOCOL_SPEC,
+  ...BASE_PROTOCOL_SPECS.slice(9),
+]);
+
+function protocolSpecsForVersion(version) {
+  if (version === 1) return BASE_PROTOCOL_SPECS;
+  if (version === 2) return SUCCESSOR_PROTOCOL_SPECS;
+  if (version === 3 || version === 4) return RELEASE_V3_PROTOCOL_SPECS;
+  fail("Managed-cloud contract version is invalid");
+}
+
+function migrationHeadsForVersion(version) {
+  if (version === 1) {
+    return {
+      postgres: POSTGRES_MIGRATION_HEAD,
+      sqlite: SQLITE_MIGRATION_HEAD,
+    };
+  }
+  if (version === 2) {
+    return {
+      postgres: POSTGRES_SUCCESSOR_MIGRATION_HEAD,
+      sqlite: SQLITE_SUCCESSOR_MIGRATION_HEAD,
+    };
+  }
+  if (version === 3) {
+    return {
+      postgres: POSTGRES_RELEASE_V3_MIGRATION_HEAD,
+      sqlite: SQLITE_RELEASE_V3_MIGRATION_HEAD,
+    };
+  }
+  if (version === 4) {
+    return {
+      postgres: POSTGRES_RELEASE_V4_MIGRATION_HEAD,
+      sqlite: SQLITE_RELEASE_V4_MIGRATION_HEAD,
+    };
+  }
+  fail("Managed-cloud contract version is invalid");
+}
+
+function manifestAudienceForVersion(version) {
+  if (version === 1) return MANAGED_CLOUD_AUDIENCES.manifest;
+  if (version === 2) return MANAGED_CLOUD_AUDIENCES.manifestV2;
+  if (version === 3) return MANAGED_CLOUD_AUDIENCES.manifestV3;
+  if (version === 4) return MANAGED_CLOUD_AUDIENCES.manifestV4;
+  fail("Managed-cloud release version is invalid");
+}
+
+function activationAudienceForVersion(version) {
+  if (version === 1) return MANAGED_CLOUD_AUDIENCES.activation;
+  if (version === 2) return MANAGED_CLOUD_AUDIENCES.activationV2;
+  if (version === 3) return MANAGED_CLOUD_AUDIENCES.activationV3;
+  if (version === 4) return MANAGED_CLOUD_AUDIENCES.activationV4;
+  fail("Managed-cloud activation version is invalid");
+}
+
+function usesRemotePublicationContract(contractVersion) {
+  return [2, 3, 4].includes(contractVersion);
+}
+
+function validateReleaseV4MigrationSuffix(name, files) {
+  const expected =
+    name === "sqlite"
+      ? SQLITE_RELEASE_V4_MIGRATION_SUFFIX
+      : POSTGRES_RELEASE_V4_MIGRATION_SUFFIX;
+  const actual = files.map((file) => basename(file.path)).slice(-expected.length);
+  if (
+    files.length < expected.length ||
+    actual.some((filename, index) => filename !== expected[index])
+  ) {
+    fail(name + " release-v4 migration suffix is incomplete or out of order");
+  }
+}
+
+const CONFIG_ROLE_ROOTS = Object.freeze([
+  Object.freeze({
+    paths: Object.freeze(["server/src"]),
+    role: "jobs_api",
+  }),
+  Object.freeze({
+    paths: Object.freeze(["jobs/automation/src", "jobs/workflows/src"]),
+    role: "jobs_workflows",
+  }),
+  Object.freeze({
+    paths: Object.freeze(["jobs/automation/src", "jobs/runner/src"]),
+    role: "managed_runner",
+  }),
+  Object.freeze({
+    paths: Object.freeze(["jobs/portal/src", "jobs/portal/vite.config.ts"]),
+    role: "portal_static",
+  }),
+]);
+
+const MANAGED_CLOUD_SHARED_CONFIG_ROLES = Object.freeze([
+  "jobs_api",
+  "jobs_workflows",
+  "managed_runner",
+]);
+const MANAGED_CLOUD_WORKER_CONFIG_ROLES = Object.freeze([
+  "jobs_workflows",
+  "managed_runner",
+]);
+const MANAGED_CLOUD_JOBS_API_CONFIG_ROLES = Object.freeze(["jobs_api"]);
+const MANAGED_CLOUD_JOBS_API_AND_WORKFLOWS_CONFIG_ROLES = Object.freeze([
+  "jobs_api",
+  "jobs_workflows",
+]);
+const MANAGED_CLOUD_REQUIRED_CONFIG_SPECS = new Map([
+  [
+    "BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN",
+    Object.freeze({
+      classification: "configuration",
+      requiredRoles: MANAGED_CLOUD_SHARED_CONFIG_ROLES,
+      valueType: "https_url",
+    }),
+  ],
+  ...["CHANNEL", "ENVIRONMENT", "REGION"].map((suffix) => [
+    "BLUEY_JOBS_MANAGED_CLOUD_" + suffix,
+    Object.freeze({
+      classification: "configuration",
+      requiredRoles: MANAGED_CLOUD_SHARED_CONFIG_ROLES,
+      valueType: "canonical_id",
+    }),
+  ]),
+  [
+    "BLUEY_JOBS_MANAGED_CLOUD_HEARTBEAT_SECONDS",
+    Object.freeze({
+      classification: "configuration",
+      requiredRoles: MANAGED_CLOUD_SHARED_CONFIG_ROLES,
+      valueType: "positive_integer",
+    }),
+  ],
+  [
+    "BLUEY_JOBS_WORKER_SIGNING_KEY",
+    Object.freeze({
+      classification: "secret",
+      requiredRoles: MANAGED_CLOUD_SHARED_CONFIG_ROLES,
+      valueType: "secret_bytes",
+    }),
+  ],
+  ...[
+    "BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED",
+    "BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED",
+    "BLUEY_JOBS_WORKFLOW_COMMAND_RECONCILIATION_ENABLED",
+  ].map((name) => [
+    name,
+    Object.freeze({
+      classification: "deny_only_authority",
+      requiredRoles: MANAGED_CLOUD_JOBS_API_CONFIG_ROLES,
+      valueType: "boolean_true",
+    }),
+  ]),
+  [
+    "BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED",
+    Object.freeze({
+      classification: "deny_only_authority",
+      requiredRoles: MANAGED_CLOUD_JOBS_API_AND_WORKFLOWS_CONFIG_ROLES,
+      valueType: "boolean_true",
+    }),
+  ],
+  [
+    "BLUEY_JOBS_WORKFLOW_ORIGIN",
+    Object.freeze({
+      classification: "configuration",
+      requiredRoles: MANAGED_CLOUD_JOBS_API_CONFIG_ROLES,
+      valueType: "https_url",
+    }),
+  ],
+  [
+    "BLUEY_JOBS_WORKFLOW_TOKEN",
+    Object.freeze({
+      classification: "secret",
+      requiredRoles: MANAGED_CLOUD_JOBS_API_AND_WORKFLOWS_CONFIG_ROLES,
+      valueType: "secret_bytes",
+    }),
+  ],
+  [
+    "BLUEY_JOBS_WORKFLOW_NAMESPACE",
+    Object.freeze({
+      classification: "configuration",
+      requiredRoles: MANAGED_CLOUD_JOBS_API_AND_WORKFLOWS_CONFIG_ROLES,
+      valueType: "canonical_id",
+    }),
+  ],
+  [
+    "BLUEY_JOBS_WORKFLOW_CLEANUP_VISIBILITY_CUTOFF_MS",
+    Object.freeze({
+      classification: "configuration",
+      requiredRoles: MANAGED_CLOUD_JOBS_API_CONFIG_ROLES,
+      valueType: "positive_integer",
+    }),
+  ],
+  [
+    "BLUEY_JOBS_MANAGED_CLOUD_RUNTIME_ENABLED",
+    Object.freeze({
+      classification: "deny_only_authority",
+      requiredRoles: MANAGED_CLOUD_SHARED_CONFIG_ROLES,
+      valueType: "boolean_true",
+    }),
+  ],
+  ...[
+    ["RUNTIME_GRANT_ID", "canonical_id", "configuration"],
+    ["RUNTIME_GRANT_TOKEN", "secret_bytes", "secret"],
+    ["RUNTIME_INSTANCE_ID", "canonical_id", "configuration"],
+    ["WORKER_ID", "canonical_id", "configuration"],
+  ].map(([suffix, valueType, classification]) => [
+    "BLUEY_JOBS_MANAGED_CLOUD_" + suffix,
+    Object.freeze({
+      classification,
+      requiredRoles: MANAGED_CLOUD_WORKER_CONFIG_ROLES,
+      valueType,
+    }),
+  ]),
+  ...[
+    "JOBS_API",
+    "WORKFLOW_CLEANUP_DISPATCHER",
+    "WORKFLOW_COMMAND_DISPATCHER",
+  ].flatMap((role) =>
+    [
+      ["GRANT_ID", "canonical_id", "configuration"],
+      ["GRANT_TOKEN", "secret_bytes", "secret"],
+      ["RUNTIME_INSTANCE_ID", "canonical_id", "configuration"],
+      ["WORKER_ID", "canonical_id", "configuration"],
+    ].map(([suffix, valueType, classification]) => [
+      "BLUEY_JOBS_MANAGED_CLOUD_" + role + "_" + suffix,
+      Object.freeze({
+        classification,
+        requiredRoles: Object.freeze(["jobs_api"]),
+        valueType,
+      }),
+    ]),
+  ),
+]);
+const MANAGED_CLOUD_FORBIDDEN_CONFIG_SUFFIX = "_RUNTIME_IDENTITY_SHA256";
+
+const BUILDER_POLICY_PATHS = Object.freeze([
+  ".github/workflows/jobs-managed-cloud-release.yml",
+  "jobs/.dockerignore",
+  "jobs/automation/package.json",
+  "jobs/package-lock.json",
+  "jobs/package.json",
+  "jobs/portal/package.json",
+  "jobs/runner/Dockerfile",
+  "jobs/runner/native-storage/Cargo.lock",
+  "jobs/runner/native-storage/Cargo.toml",
+  "jobs/runner/package.json",
+  "jobs/scripts/managed-cloud-release-gate.mjs",
+  "jobs/workflows/Dockerfile",
+  "jobs/workflows/package.json",
+  "server/Cargo.lock",
+  "server/Dockerfile.jobs",
+  "server/Dockerfile.jobs.dockerignore",
+]);
+
+// Historical policies retain their exact paths; only release-v4 adds inputs.
+const BUILDER_POLICY_V3_PATHS = Object.freeze([
+  ...BUILDER_POLICY_PATHS,
+  "jobs/scripts/check-managed-cloud-authorization-origin.mjs",
+  "jobs/scripts/check-managed-cloud-observability-policy.mjs",
+]);
+const BUILDER_POLICY_NO_REBUILD_STAGES = Object.freeze([
+  "authorize", "promote", "publish", "rollback", "verify",
+]);
+
+export class ManagedCloudReleaseGateError extends Error {
+  constructor(message = "Managed cloud release gate rejected the input") {
+    super(message);
+    this.name = "ManagedCloudReleaseGateError";
+  }
+}
+
+function fail(message) {
+  throw new ManagedCloudReleaseGateError(message);
+}
+
+function requireObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    fail(label + " must be an object");
+  }
+  return value;
+}
+
+function requireExactKeys(value, expected, label) {
+  requireObject(value, label);
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  if (
+    actual.length !== wanted.length ||
+    actual.some((key, index) => key !== wanted[index])
+  ) {
+    fail(label + " must contain exactly: " + wanted.join(", "));
+  }
+}
+
+function requireArray(value, label, minimum = 0) {
+  if (!Array.isArray(value) || value.length < minimum) {
+    fail(label + " must be an array with at least " + minimum + " entries");
+  }
+  return value;
+}
+
+function requireBoundedArray(value, label, minimum, maximum) {
+  const array = requireArray(value, label, minimum);
+  if (array.length > maximum) {
+    fail(label + " must contain at most " + maximum + " entries");
+  }
+  return array;
+}
+
+function requireSignedObjectSize(value, label) {
+  if (canonicalJsonBytes(value).length > MAX_SIGNED_OBJECT_BYTES) {
+    fail(label + " exceeds the 128 KiB signed-object limit");
+  }
+}
+
+function requireString(value, label) {
+  if (
+    typeof value !== "string" ||
+    value.trim() !== value ||
+    value.length === 0
+  ) {
+    fail(label + " must be a nonempty canonical string");
+  }
+  return value;
+}
+
+function requireSafeId(value, label) {
+  const id = requireString(value, label);
+  if (!SAFE_ID.test(id)) {
+    fail(label + " is not a safe identifier");
+  }
+  return id;
+}
+
+function requireGitBranchName(value, label) {
+  const branch = requireString(value, label);
+  if (
+    branch.length > 255 ||
+    branch.startsWith("/") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".") ||
+    branch.endsWith(".lock") ||
+    branch.includes("..") ||
+    branch.includes("@{") ||
+    /[\u0000-\u0020\u007f~^:?*\\\[]/.test(branch) ||
+    branch.split("/").some((part) => part === "" || part.startsWith("."))
+  ) {
+    fail(label + " is not a canonical Git branch name");
+  }
+  return branch;
+}
+
+export function deriveManagedCloudPortalManifestCreatedAt(sourceDateEpoch) {
+  const seconds = requireInteger(
+    sourceDateEpoch,
+    "portal provenance sourceDateEpoch",
+  );
+  if (seconds > 253_402_300_799) {
+    fail("portal provenance sourceDateEpoch is outside the RFC3339 range");
+  }
+  const createdAt = new Date(seconds * 1_000).toISOString();
+  if (!createdAt.endsWith(".000Z")) {
+    fail("portal provenance sourceDateEpoch is not an exact whole second");
+  }
+  return createdAt.slice(0, -5) + "Z";
+}
+
+function requireCanonicalRfc3339Seconds(value, label) {
+  const timestamp = requireString(value, label);
+  const parsed = Date.parse(timestamp);
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < 0 ||
+    deriveManagedCloudPortalManifestCreatedAt(parsed / 1_000) !== timestamp
+  ) {
+    fail(label + " must be canonical UTC RFC3339 whole seconds");
+  }
+  return timestamp;
+}
+
+function requireHex64(value, label) {
+  if (typeof value !== "string" || !HEX_64.test(value)) {
+    fail(label + " must be 64 lowercase hexadecimal characters");
+  }
+  return value;
+}
+
+function requireSourceCommit(value) {
+  if (typeof value !== "string" || !SOURCE_COMMIT.test(value)) {
+    fail("sourceCommit must be 40 lowercase hexadecimal characters");
+  }
+  return value;
+}
+
+function requireDigest(value, label) {
+  if (typeof value !== "string" || !SHA256_DIGEST.test(value)) {
+    fail(label + " must be an immutable sha256 digest");
+  }
+  return value;
+}
+
+function requireInteger(value, label, minimum = 0) {
+  if (
+    !Number.isSafeInteger(value) ||
+    value < minimum ||
+    value > MAX_SAFE_GENERATION
+  ) {
+    fail(label + " must be a safe integer at least " + minimum);
+  }
+  return value;
+}
+
+function requireBoolean(value, label) {
+  if (typeof value !== "boolean") {
+    fail(label + " must be a boolean");
+  }
+  return value;
+}
+
+function requireEnum(value, values, label) {
+  if (!values.includes(value)) {
+    fail(label + " must be exactly one of: " + values.join(", "));
+  }
+  return value;
+}
+
+function requireSortedUniqueStrings(values, label) {
+  requireArray(values, label);
+  const copy = values.map((value, index) =>
+    requireString(value, label + "[" + index + "]"),
+  );
+  const sorted = [...copy].sort();
+  if (
+    new Set(copy).size !== copy.length ||
+    copy.some((value, index) => value !== sorted[index])
+  ) {
+    fail(label + " must be sorted and unique");
+  }
+  return copy;
+}
+
+function compareUtf8(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) {
+    return value.map(canonicalize);
+  }
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "string"
+  ) {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) {
+      fail("Canonical JSON permits only safe non-negative-zero integers");
+    }
+    return value;
+  }
+  if (
+    value &&
+    typeof value === "object" &&
+    Object.getPrototypeOf(value) === Object.prototype
+  ) {
+    const result = {};
+    const keys = Object.keys(value).sort(compareUtf8);
+    for (const key of keys) {
+      result[key] = canonicalize(value[key]);
+    }
+    return result;
+  }
+  fail("Canonical JSON permits only primitives, arrays, and plain objects");
+}
+
+export function canonicalJsonBytes(value) {
+  return Buffer.from(JSON.stringify(canonicalize(value)) + "\n", "utf8");
+}
+
+export function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function measurementRoots(componentId) {
+  if (componentId === "jobs-api") {
+    return ["usr/local/bin/bluey-jobs-api"];
+  }
+  if (componentId === "jobs-workflows") {
+    return ["app/automation", "app/workflows", "usr/local/bin/node"];
+  }
+  if (componentId === "jobs-runner") {
+    return [
+      "app/automation",
+      "app/runner",
+      "ms-playwright",
+      "usr/local/bin/node",
+    ];
+  }
+  fail("Runtime measurement supports only OCI runtime components");
+}
+
+function expectedMeasurementPaths(componentId, inventory) {
+  if (
+    inventory.entries.some(
+      (entry) =>
+        entry.type === "symlink" &&
+        measurementPathSelected(componentId, entry.path),
+    )
+  ) {
+    fail(
+      componentId + " runtime measurement roots may not contain symbolic links",
+    );
+  }
+  return inventory.entries
+    .filter(
+      (entry) =>
+        entry.type === "file" &&
+        entry.sizeBytes > 0 &&
+        entry.path !== RUNTIME_MEASUREMENT_PATH &&
+        measurementPathSelected(componentId, entry.path),
+    )
+    .map((entry) => entry.path)
+    .sort(compareUtf8);
+}
+
+function measurementPathSelected(componentId, path) {
+  return measurementRoots(componentId).some(
+    (root) => path === root || path.startsWith(root + "/"),
+  );
+}
+
+function isManagedChromiumExecutablePath(path) {
+  return /^ms-playwright\/chromium_headless_shell-[0-9]+\/[a-z0-9._-]+\/chrome-headless-shell$/.test(
+    path,
+  );
+}
+
+function expectedRuntimeRolesForComponent(componentId, capabilities) {
+  const roles = capabilities
+    .filter(
+      (capability) =>
+        capability.componentId === componentId &&
+        capability.capability !== "portal_static",
+    )
+    .map((capability) => capability.capability)
+    .sort(compareUtf8);
+  if (componentId === "jobs-portal") {
+    if (roles.length !== 0) {
+      fail("Static portal cannot claim a runtime identity");
+    }
+    return roles;
+  }
+  if (roles.length < 1) {
+    fail(componentId + " must claim at least one runtime role");
+  }
+  return roles;
+}
+
+export function deriveManagedCloudRequiredRuntimePaths(
+  componentId,
+  capabilities,
+) {
+  const contract = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId];
+  const paths = [...(contract?.requiredPaths ?? ["index.html"])];
+  if (
+    componentId === "jobs-workflows" &&
+    capabilities.some(
+      (entry) =>
+        entry.componentId === "jobs-workflows" &&
+        entry.capability === "original_source_verifier",
+    )
+  ) {
+    paths.push("app/workflows/dist/original-source-verifier.js");
+  }
+  return [...new Set(paths)].sort();
+}
+
+function runtimeMeasurementDocument({
+  buildId,
+  componentId,
+  configSchemaSha256,
+  inventory,
+  migrationSetSha256,
+  protocolSetSha256,
+  roles,
+  sourceCommit,
+}) {
+  if (componentId === "jobs-portal") {
+    fail("Static portal cannot contain a runtime measurement");
+  }
+  const inventoryEntries = new Map(
+    inventory.entries.map((entry) => [entry.path, entry]),
+  );
+  const measuredPaths = expectedMeasurementPaths(componentId, inventory);
+  if (
+    measuredPaths.length < 1 ||
+    measuredPaths.length > MAX_RUNTIME_MEASUREMENT_FILES
+  ) {
+    fail(componentId + " runtime measurement file set is invalid");
+  }
+  const measuredFiles = measuredPaths.map((path) => {
+    const entry = inventoryEntries.get(path);
+    if (!entry || entry.type !== "file" || entry.sizeBytes < 1) {
+      fail(componentId + " runtime measurement contains an invalid file");
+    }
+    return { path, sha256: entry.sha256 };
+  });
+  const document = {
+    audience: MANAGED_CLOUD_AUDIENCES.runtimeMeasurement,
+    buildId: requireSafeId(buildId, componentId + ".measurement.buildId"),
+    componentId,
+    configSchemaSha256: requireHex64(
+      configSchemaSha256,
+      componentId + ".measurement.configSchemaSha256",
+    ),
+    measuredFiles,
+    migrationSetSha256: requireHex64(
+      migrationSetSha256,
+      componentId + ".measurement.migrationSetSha256",
+    ),
+    protocolSetSha256: requireHex64(
+      protocolSetSha256,
+      componentId + ".measurement.protocolSetSha256",
+    ),
+    roles: requireSortedUniqueStrings(
+      roles,
+      componentId + ".measurement.roles",
+    ),
+    sourceCommit: requireSourceCommit(sourceCommit),
+    version: 1,
+  };
+  if (canonicalJsonBytes(document).length > MAX_SIGNED_OBJECT_BYTES) {
+    fail(componentId + " runtime measurement exceeds 128 KiB");
+  }
+  return document;
+}
+
+export function deriveManagedCloudRuntimeIdentitySha256(
+  measurementSha256,
+  componentId,
+  role,
+) {
+  requireHex64(measurementSha256, "runtime measurement SHA-256");
+  requireSafeId(componentId, "runtime measurement componentId");
+  requireEnum(
+    role,
+    [
+      "discovery_worker",
+      "global_discovery_worker",
+      "jobs_api",
+      "managed_runner",
+      "original_source_verifier",
+      "workflow_cleanup_dispatcher",
+      "workflow_command_dispatcher",
+      "workflow_gateway",
+      "workflow_worker",
+    ],
+    "runtime measurement role",
+  );
+  return sha256(
+    Buffer.concat([
+      Buffer.from(RUNTIME_IDENTITY_DOMAIN, "utf8"),
+      Buffer.from(measurementSha256, "ascii"),
+      Buffer.from("\0", "utf8"),
+      Buffer.from(componentId, "utf8"),
+      Buffer.from("\0", "utf8"),
+      Buffer.from(role, "utf8"),
+    ]),
+  );
+}
+
+export function validateManagedCloudRuntimeMeasurement(
+  measurement,
+  measurementSha256,
+  runtimeIdentities,
+  context,
+) {
+  requireExactKeys(
+    measurement,
+    [
+      "audience",
+      "buildId",
+      "componentId",
+      "configSchemaSha256",
+      "measuredFiles",
+      "migrationSetSha256",
+      "protocolSetSha256",
+      "roles",
+      "sourceCommit",
+      "version",
+    ],
+    context.componentId + " runtime measurement",
+  );
+  const expected = runtimeMeasurementDocument(context);
+  const bytes = canonicalJsonBytes(measurement);
+  if (
+    bytes.length > MAX_SIGNED_OBJECT_BYTES ||
+    bytes.compare(canonicalJsonBytes(expected)) !== 0 ||
+    measurementSha256 !== sha256(bytes)
+  ) {
+    fail(context.componentId + " runtime measurement is not exact");
+  }
+  const embedded = context.inventory.entries.find(
+    (entry) => entry.path === RUNTIME_MEASUREMENT_PATH,
+  );
+  if (
+    !embedded ||
+    embedded.type !== "file" ||
+    embedded.sizeBytes !== bytes.length ||
+    embedded.sha256 !== measurementSha256
+  ) {
+    fail(
+      context.componentId + " embedded runtime measurement bytes do not match",
+    );
+  }
+  const identities = requireArray(
+    runtimeIdentities,
+    context.componentId + ".runtimeIdentities",
+    expected.roles.length,
+  );
+  if (identities.length !== expected.roles.length) {
+    fail(context.componentId + " runtime identity set is incomplete");
+  }
+  for (const [index, role] of expected.roles.entries()) {
+    const identity = requireObject(
+      identities[index],
+      context.componentId + ".runtimeIdentities[" + index + "]",
+    );
+    requireExactKeys(
+      identity,
+      ["role", "runtimeIdentitySha256"],
+      context.componentId + ".runtimeIdentities[" + index + "]",
+    );
+    if (
+      identity.role !== role ||
+      identity.runtimeIdentitySha256 !==
+        deriveManagedCloudRuntimeIdentitySha256(
+          measurementSha256,
+          context.componentId,
+          role,
+        )
+    ) {
+      fail(context.componentId + " runtime identity is not locally derived");
+    }
+  }
+  return measurement;
+}
+
+/** Derive only from the exact validated runner inventory/embedded measurement.
+ * This is a managed-runner digest domain, not the desktop app.asar domain.
+ * Derivation does not itself attest that caller-provided archive bytes ran.
+ */
+export function deriveManagedRunnerAutomationBundleSha256(
+  measurement,
+  measurementSha256,
+  runtimeIdentities,
+  context,
+) {
+  if (context?.componentId !== "jobs-runner"
+    || JSON.stringify(context.roles) !== '["managed_runner"]') {
+    fail("Automation bundle evidence requires the exact managed runner role");
+  }
+  validateContentInventoryDocument(context.inventory, "jobs-runner");
+  validateManagedCloudRuntimeMeasurement(
+    measurement, measurementSha256, runtimeIdentities, context,
+  );
+  const entries = measurement.measuredFiles
+    .filter((entry) => entry.path.startsWith("app/automation/"))
+    .map(({ path, sha256 }) => ({ path, sha256 }));
+  if (entries.length < 2
+    || !entries.some((entry) => entry.path === "app/automation/package.json")
+    || !entries.some((entry) => entry.path === "app/automation/dist/index.js")) {
+    fail("Managed runner automation bundle is incomplete");
+  }
+  return sha256(canonicalJsonBytes({
+    audience: "bluey-jobs-managed-runner-automation-bundle-v1",
+    entries,
+    version: 1,
+  }));
+}
+
+function validateContentInventoryDocument(inventory, componentId) {
+  requireExactKeys(
+    inventory,
+    [
+      "artifactKind",
+      "artifactSha256",
+      "audience",
+      "componentId",
+      "entries",
+      "runtime",
+      "version",
+    ],
+    componentId + " content inventory",
+  );
+  const expected = MANAGED_CLOUD_COMPONENTS.find(
+    (component) => component.componentId === componentId,
+  );
+  if (
+    !expected ||
+    inventory.version !== 1 ||
+    inventory.audience !== MANAGED_CLOUD_AUDIENCES.contentInventory ||
+    inventory.componentId !== componentId ||
+    inventory.artifactKind !== expected.artifactKind
+  ) {
+    fail("Inventory attachment does not bind its component identity");
+  }
+  requireHex64(inventory.artifactSha256, componentId + ".artifactSha256");
+  const entries = requireBoundedArray(
+    inventory.entries,
+    componentId + ".entries",
+    1,
+    MAX_INVENTORY_ENTRIES,
+  );
+  const paths = [];
+  for (const [index, entry] of entries.entries()) {
+    requireObject(entry, componentId + ".entries[" + index + "]");
+    const path = requireSafeRelativePath(
+      entry.path,
+      componentId + ".entries[" + index + "].path",
+    );
+    paths.push(path);
+    if (typeof entry.mode !== "string" || !/^[0-7]{4}$/.test(entry.mode)) {
+      fail(componentId + " inventory entry mode is invalid");
+    }
+    if (entry.type === "directory") {
+      requireExactKeys(entry, ["mode", "path", "type"], path);
+      continue;
+    }
+    if (entry.type === "file") {
+      requireExactKeys(
+        entry,
+        ["mode", "path", "sha256", "sizeBytes", "type"],
+        path,
+      );
+      requireHex64(entry.sha256, path + ".sha256");
+      requireInteger(entry.sizeBytes, path + ".sizeBytes");
+      continue;
+    }
+    if (entry.type === "symlink" && expected.artifactKind === "oci_image") {
+      requireExactKeys(
+        entry,
+        ["mode", "path", "resolvedTarget", "target", "type"],
+        path,
+      );
+      requireString(entry.target, path + ".target");
+      requireSafeRelativePath(entry.resolvedTarget, path + ".resolvedTarget");
+      continue;
+    }
+    fail(componentId + " inventory entry type is invalid");
+  }
+  if (
+    new Set(paths).size !== paths.length ||
+    paths.some(
+      (path, index) => index > 0 && compareUtf8(paths[index - 1], path) >= 0,
+    )
+  ) {
+    fail(componentId + " inventory paths must be UTF-8 sorted and unique");
+  }
+  const runtimeContract = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId];
+  if (!runtimeContract) {
+    if (inventory.runtime !== null) {
+      fail("Static inventory must not contain an OCI runtime contract");
+    }
+    const index = entries.find((entry) => entry.path === "index.html");
+    if (!index || index.type !== "file" || index.sizeBytes < 1) {
+      fail("Static inventory must bind a nonempty regular index.html");
+    }
+    if (
+      entries.some(
+        (entry) =>
+          entry.path.endsWith(".map") ||
+          /(^|\/)(?:src|test|tests|node_modules)(\/|$)/.test(entry.path),
+      )
+    ) {
+      fail("Static inventory contains development or dependency content");
+    }
+    return inventory;
+  }
+  requireExactKeys(
+    inventory.runtime,
+    [
+      "cmd",
+      "environment",
+      "entrypoint",
+      "exposedPorts",
+      "user",
+      "workingDirectory",
+    ],
+    componentId + " inventory runtime",
+  );
+  const expectedRuntime = {
+    cmd: [...runtimeContract.cmd],
+    environment: [...runtimeContract.requiredEnvironment].sort(compareUtf8),
+    entrypoint: [...runtimeContract.entrypoint],
+    exposedPorts: [...runtimeContract.exposedPorts],
+    user: runtimeContract.runtimeUser,
+    workingDirectory: runtimeContract.workingDirectory,
+  };
+  if (
+    canonicalJsonBytes(inventory.runtime).compare(
+      canonicalJsonBytes(expectedRuntime),
+    ) !== 0
+  ) {
+    fail(componentId + " inventory runtime contract is not exact");
+  }
+  const inventoryMap = new Map(entries.map((entry) => [entry.path, entry]));
+  validateContainerSymlinkGraph(inventoryMap);
+  requireClosedRuntimeContent(componentId, entries);
+  return inventory;
+}
+
+export function validateManagedCloudInventoryAttachments(attachments) {
+  const componentIds = MANAGED_CLOUD_COMPONENTS.map(
+    (component) => component.componentId,
+  );
+  requireExactKeys(attachments, componentIds, "inventoryAttachments");
+  const decoded = new Map();
+  let totalBytes = 0;
+  for (const componentId of componentIds) {
+    const encoded = requireString(
+      attachments[componentId],
+      "inventoryAttachments." + componentId,
+    );
+    if (!BASE64URL.test(encoded)) {
+      fail("Inventory attachment must be unpadded canonical base64url");
+    }
+    const bytes = Buffer.from(encoded, "base64url");
+    if (bytes.toString("base64url") !== encoded) {
+      fail("Inventory attachment is not canonical base64url");
+    }
+    totalBytes += bytes.length;
+    if (totalBytes > MAX_INVENTORY_ATTACHMENT_BYTES) {
+      fail("Decoded inventory attachments exceed 12 MiB");
+    }
+    let inventory;
+    try {
+      inventory = JSON.parse(bytes.toString("utf8"));
+    } catch {
+      fail("Inventory attachment is not valid JSON");
+    }
+    if (!bytes.equals(canonicalJsonBytes(inventory))) {
+      fail("Inventory attachment bytes are not canonical JSON");
+    }
+    validateContentInventoryDocument(inventory, componentId);
+    decoded.set(componentId, { bytes, inventory });
+  }
+  return { decoded, totalBytes };
+}
+
+async function hashFile(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
+}
+
+async function readJson(
+  path,
+  label = basename(path),
+  maximumBytes = MAX_JSON_BYTES,
+) {
+  const bytes = await readFile(path);
+  if (bytes.length < 3 || bytes.length > maximumBytes) {
+    fail(label + " has an invalid byte length");
+  }
+  let value;
+  try {
+    value = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    fail(label + " must be valid JSON");
+  }
+  return { bytes, value };
+}
+
+async function readBoundedJson(path, label, maximumBytes) {
+  const metadata = await requireRegularFile(path, label);
+  if (metadata.size < 3 || metadata.size > maximumBytes) {
+    fail(label + " has an invalid byte length");
+  }
+  return readJson(path, label, maximumBytes);
+}
+
+async function readCanonicalJson(
+  path,
+  label = basename(path),
+  maximumBytes = MAX_JSON_BYTES,
+) {
+  const parsed = await readJson(path, label, maximumBytes);
+  if (!parsed.bytes.equals(canonicalJsonBytes(parsed.value))) {
+    fail(label + " must use canonical JSON encoding");
+  }
+  return parsed;
+}
+
+async function writeCanonicalJson(path, value) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, canonicalJsonBytes(value), { flag: "wx", mode: 0o444 });
+}
+
+async function requireRegularFile(path, label = path) {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch {
+    fail(label + " must exist");
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+    fail(label + " must be one regular, non-linked file");
+  }
+  return metadata;
+}
+
+async function requireEmptyOutputDirectory(path) {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  const entries = await readdir(path);
+  if (entries.length !== 0) {
+    fail("Output directory must be empty");
+  }
+}
+
+function requireSafeRelativePath(path, label = "path") {
+  const value = requireString(path, label);
+  if (
+    value !== value.normalize("NFC") ||
+    value.startsWith("/") ||
+    value.includes("\\") ||
+    value
+      .split("/")
+      .some((part) => part === "" || part === "." || part === "..") ||
+    /[\u0000-\u001f\u007f\ud800-\udfff\ufffd]/.test(value)
+  ) {
+    fail(label + " must be a canonical relative path");
+  }
+  return value;
+}
+
+async function collectTreeFiles(root) {
+  const rootPath = resolve(root);
+  const files = [];
+  const seenInodes = new Set();
+
+  async function visit(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => compareUtf8(left.name, right.name));
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      const metadata = await lstat(path);
+      const relativePath = relative(rootPath, path).split(sep).join("/");
+      requireSafeRelativePath(relativePath);
+      if (metadata.isSymbolicLink()) {
+        fail("Trees may not contain symbolic links: " + relativePath);
+      }
+      if (metadata.isDirectory()) {
+        await visit(path);
+        continue;
+      }
+      if (!metadata.isFile()) {
+        fail("Trees may contain only directories and regular files");
+      }
+      const inode = metadata.dev + ":" + metadata.ino;
+      if (metadata.nlink !== 1 || seenInodes.has(inode)) {
+        fail("Trees may not contain hard-linked files: " + relativePath);
+      }
+      seenInodes.add(inode);
+      files.push({ metadata, path, relativePath });
+      if (files.length > MAX_INVENTORY_ENTRIES) {
+        fail("Tree contains too many files");
+      }
+    }
+  }
+
+  await visit(rootPath);
+  return files;
+}
+
+async function requireExactFlatRegularFiles(root, expected, label) {
+  const rootPath = resolve(root);
+  const entries = await readdir(rootPath, { withFileTypes: true });
+  entries.sort((left, right) => compareUtf8(left.name, right.name));
+  const wanted = [...expected].sort(compareUtf8);
+  if (
+    entries.length !== wanted.length ||
+    entries.some(
+      (entry, index) => entry.name !== wanted[index] || !entry.isFile(),
+    )
+  ) {
+    fail(label + " must contain only its exact flat regular-file set");
+  }
+  const files = await collectTreeFiles(rootPath);
+  if (
+    files.length !== wanted.length ||
+    files.some((file, index) => file.relativePath !== wanted[index])
+  ) {
+    fail(label + " must contain only its exact flat regular-file set");
+  }
+  return files;
+}
+
+export async function createStaticTreeInventory(root, rootName) {
+  const files = await collectTreeFiles(root);
+  if (files.length === 0) {
+    fail("Static tree must contain at least one file");
+  }
+  const entries = [];
+  for (const file of files) {
+    entries.push({
+      mode: (file.metadata.mode & 0o777).toString(8).padStart(4, "0"),
+      path: file.relativePath,
+      sha256: await hashFile(file.path),
+      sizeBytes: file.metadata.size,
+      type: "file",
+    });
+  }
+  entries.sort((left, right) => compareUtf8(left.path, right.path));
+  return {
+    audience: MANAGED_CLOUD_AUDIENCES.treeInventory,
+    entries,
+    rootName: requireSafeId(rootName, "rootName"),
+    schemaVersion: 1,
+  };
+}
+
+export async function createRuntimeMeasurementFromFilesystem({
+  buildId,
+  componentId,
+  configSchemaSha256,
+  migrationSetSha256,
+  protocolSetSha256,
+  roles,
+  root,
+  sourceCommit,
+}) {
+  const rootPath = resolve(root);
+  const entries = [];
+  const seen = new Set();
+
+  async function visit(path) {
+    const metadata = await lstat(path).catch(() => undefined);
+    if (!metadata) {
+      fail("Runtime measurement root is missing: " + path);
+    }
+    if (metadata.isSymbolicLink()) {
+      fail(
+        componentId +
+          " runtime measurement roots may not contain symbolic links",
+      );
+    }
+    if (metadata.isDirectory()) {
+      const children = await readdir(path, { withFileTypes: true });
+      children.sort((left, right) => compareUtf8(left.name, right.name));
+      for (const child of children) {
+        await visit(join(path, child.name));
+      }
+      return;
+    }
+    if (!metadata.isFile()) {
+      fail("Runtime measurement roots may contain only files and directories");
+    }
+    const relativePath = relative(rootPath, path).split(sep).join("/");
+    requireSafeRelativePath(relativePath, "runtime measurement path");
+    if (
+      relativePath === RUNTIME_MEASUREMENT_PATH ||
+      metadata.size === 0 ||
+      !measurementPathSelected(componentId, relativePath)
+    ) {
+      return;
+    }
+    if (seen.has(relativePath)) {
+      fail("Runtime measurement contains a duplicate path");
+    }
+    seen.add(relativePath);
+    entries.push({
+      path: relativePath,
+      sha256: await hashFile(path),
+      sizeBytes: metadata.size,
+      type: "file",
+    });
+    if (entries.length > MAX_RUNTIME_MEASUREMENT_FILES) {
+      fail("Runtime measurement contains too many files");
+    }
+  }
+
+  for (const relativePath of measurementRoots(componentId)) {
+    await visit(resolve(rootPath, relativePath));
+  }
+  entries.sort((left, right) => compareUtf8(left.path, right.path));
+  return runtimeMeasurementDocument({
+    buildId,
+    componentId,
+    configSchemaSha256,
+    inventory: { entries },
+    migrationSetSha256,
+    protocolSetSha256,
+    roles,
+    sourceCommit,
+  });
+}
+
+function tarText(buffer, start, length) {
+  const end = buffer.indexOf(0, start);
+  const finish = end >= start && end < start + length ? end : start + length;
+  if (buffer.subarray(finish, start + length).some((byte) => byte !== 0)) {
+    fail("Tar entry must use canonical text field padding");
+  }
+  try {
+    const value = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer.subarray(start, finish));
+    if (/[\u0080-\u009f]/.test(value)) fail("Tar entry must use canonical UTF-8 text fields");
+    return value;
+  } catch { fail("Tar entry must use canonical UTF-8 text fields"); }
+}
+
+function tarInteger(buffer, start, length, label) {
+  if ((buffer[start] & 0x80) !== 0) {
+    fail("Base-256 tar integers are not allowed for " + label);
+  }
+  const value = buffer
+    .subarray(start, start + length)
+    .toString("ascii")
+    .replace(/\0.*$/s, "")
+    .trim();
+  if (value === "") {
+    return 0;
+  }
+  if (!/^[0-7]+$/.test(value)) {
+    fail("Tar " + label + " must be canonical octal");
+  }
+  return requireInteger(Number.parseInt(value, 8), "tar " + label);
+}
+
+function tarChecksum(header) {
+  let total = 0;
+  for (let index = 0; index < header.length; index += 1) {
+    total += index >= 148 && index < 156 ? 32 : header[index];
+  }
+  return total;
+}
+
+const TAR_DIAGNOSTIC_SCOPES = new Set(["layout", "layer", "runtime-bundle"]);
+const PAX_DIAGNOSTIC_LIMIT = 64 * 1024;
+const PAX_DIAGNOSTIC_RECORD_LIMIT = 128;
+const PAX_DIAGNOSTIC_KEYS = Object.freeze([
+  "path", "linkpath", "size", "uid", "gid", "mtime", "atime", "ctime",
+  "SCHILY.xattr.security.capability", "SCHILY.xattr.security.selinux",
+  "SCHILY.xattr.trusted.overlay.opaque", "SCHILY.xattr.user.overlay.opaque",
+  "GNU.sparse.map", "GNU.sparse.size", "GNU.sparse.realsize", "GNU.sparse.name",
+  "GNU.sparse.major", "GNU.sparse.minor", "GNU.sparse.numblocks",
+  "GNU.sparse.offset", "GNU.sparse.numbytes", "SCHILY.realsize",
+]);
+const TAR_DIAGNOSTIC_FLAGS = ["pathOverride", "linkOverride", "sizeOverride",
+  "ownershipOverride", "timeOverride", "xattrOverride", "sparseOverride"];
+const TAR_DIAGNOSTIC_FIELDS = ["version", "scope", "layerDigest", "layerSizeBytes", "layerOrdinal",
+  "headerOrdinal", "headerNameSha256", "headerNameBytes", "paxState", "paxBodyBytes",
+  "paxBodySha256", "paxRecordCount", "paxKnownKeys", "paxUnknownKeyCount", "paxKeySetSha256",
+  ...TAR_DIAGNOSTIC_FLAGS];
+
+function closedTarDiagnosticObject(value) {
+  if (!value || Object.getPrototypeOf(value) !== Object.prototype) fail("Invalid tar rejection diagnostic");
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Reflect.ownKeys(descriptors).sort().join("\n") !== [...TAR_DIAGNOSTIC_FIELDS].sort().join("\n")) {
+    fail("Invalid tar rejection diagnostic");
+  }
+  const copy = {};
+  for (const key of TAR_DIAGNOSTIC_FIELDS) {
+    if (!Object.hasOwn(descriptors[key], "value") || !descriptors[key].enumerable) {
+      fail("Invalid tar rejection diagnostic");
+    }
+    copy[key] = descriptors[key].value;
+  }
+  return copy;
+}
+
+// This closed, cloned diagnostic is never archive admission or a release receipt.
+export function validateTarRejectionDiagnostic(input) {
+  const value = closedTarDiagnosticObject(input);
+  const integer = (number, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) =>
+    Number.isSafeInteger(number) && number >= minimum && number <= maximum;
+  const digest = (text) => typeof text === "string" && /^[a-f0-9]{64}$/.test(text);
+  if (value.version !== 1 || !TAR_DIAGNOSTIC_SCOPES.has(value.scope) ||
+      !integer(value.headerOrdinal, 1, MAX_INVENTORY_ENTRIES + 1) ||
+      !integer(value.headerNameBytes, 1, 256) || !digest(value.headerNameSha256) ||
+      TAR_DIAGNOSTIC_FLAGS.some((key) => typeof value[key] !== "boolean")) {
+    fail("Invalid tar rejection diagnostic");
+  }
+  const unknownLayer = value.layerDigest === null && value.layerSizeBytes === null && value.layerOrdinal === null;
+  if (!unknownLayer && (value.scope !== "layer" ||
+      typeof value.layerDigest !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.layerDigest) ||
+      !integer(value.layerSizeBytes, 1) || !integer(value.layerOrdinal, 1))) {
+    fail("Invalid tar rejection diagnostic");
+  }
+  const array = value.paxKnownKeys;
+  if (!Array.isArray(array) || Object.getPrototypeOf(array) !== Array.prototype ||
+      array.length > PAX_DIAGNOSTIC_KEYS.length ||
+      Reflect.ownKeys(array).length !== array.length + 1) fail("Invalid tar rejection diagnostic");
+  const keys = [];
+  for (let index = 0; index < array.length; index += 1) {
+    const item = Object.getOwnPropertyDescriptor(array, String(index));
+    if (!item || !Object.hasOwn(item, "value") || !PAX_DIAGNOSTIC_KEYS.includes(item.value)) {
+      fail("Invalid tar rejection diagnostic");
+    }
+    keys.push(item.value);
+  }
+  if (keys.join("\n") !== [...new Set(keys)].sort(compareUtf8).join("\n")) {
+    fail("Invalid tar rejection diagnostic");
+  }
+  value.paxKnownKeys = keys;
+  if (value.paxState === "parsed") {
+    if (!integer(value.paxBodyBytes, 0, PAX_DIAGNOSTIC_LIMIT) || !digest(value.paxBodySha256) ||
+        !integer(value.paxRecordCount, 0, PAX_DIAGNOSTIC_RECORD_LIMIT) ||
+        !integer(value.paxUnknownKeyCount, 0, value.paxRecordCount) ||
+        keys.length + value.paxUnknownKeyCount > value.paxRecordCount || !digest(value.paxKeySetSha256)) {
+      fail("Invalid tar rejection diagnostic");
+    }
+    const knownFlags = paxOverrideClasses(keys);
+    if (TAR_DIAGNOSTIC_FLAGS.some((key, index) =>
+      index < 5 || value.paxUnknownKeyCount === 0
+        ? value[key] !== knownFlags[key] : knownFlags[key] && !value[key]) ||
+        (value.paxUnknownKeyCount === 0 && value.paxKeySetSha256 !== sha256(canonicalJsonBytes(keys)))) {
+      fail("Invalid tar rejection diagnostic");
+    }
+  } else {
+    if (!["not-pax", "out-of-bounds", "oversize", "unavailable", "invalid-utf8", "malformed"].includes(value.paxState) ||
+        keys.length !== 0 || value.paxRecordCount !== null || value.paxUnknownKeyCount !== null ||
+        value.paxKeySetSha256 !== null || TAR_DIAGNOSTIC_FLAGS.some((key) => value[key])) {
+      fail("Invalid tar rejection diagnostic");
+    }
+    if (value.paxState === "not-pax") {
+      if (value.paxBodyBytes !== null || value.paxBodySha256 !== null) fail("Invalid tar rejection diagnostic");
+    } else if (!integer(value.paxBodyBytes) ||
+        (["invalid-utf8", "malformed"].includes(value.paxState)
+          ? !digest(value.paxBodySha256) || value.paxBodyBytes > PAX_DIAGNOSTIC_LIMIT
+          : value.paxBodySha256 !== null) ||
+        (value.paxState === "oversize" && value.paxBodyBytes <= PAX_DIAGNOSTIC_LIMIT)) {
+      fail("Invalid tar rejection diagnostic");
+    }
+  }
+  if (canonicalJsonBytes(value).length > 1536) fail("Invalid tar rejection diagnostic");
+  return value;
+}
+
+function paxOverrideClasses(keys) {
+  return {
+    pathOverride: keys.includes("path"), linkOverride: keys.includes("linkpath"), sizeOverride: keys.includes("size"),
+    ownershipOverride: keys.includes("uid") || keys.includes("gid"),
+    timeOverride: ["mtime", "atime", "ctime"].some((key) => keys.includes(key)),
+    xattrOverride: keys.some((key) => key.startsWith("SCHILY.xattr.") || key.startsWith("LIBARCHIVE.xattr.")),
+    sparseOverride: keys.some((key) => key.startsWith("GNU.sparse.") || key === "SCHILY.realsize"),
+  };
+}
+
+function paxDiagnosticRecords(bytes) {
+  // Validate all UTF-8 before parsing any record; never retain values or partial keys.
+  try { new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+  catch { return { paxState: "invalid-utf8" }; }
+  const keys = new Set(); let offset = 0, records = 0;
+  while (offset < bytes.length) {
+    if (++records > PAX_DIAGNOSTIC_RECORD_LIMIT) return { paxState: "malformed" };
+    const space = bytes.indexOf(32, offset);
+    if (space < offset + 1 || space - offset > 6) return { paxState: "malformed" };
+    const lengthText = bytes.subarray(offset, space).toString("ascii");
+    if (!/^[1-9][0-9]{0,5}$/.test(lengthText)) return { paxState: "malformed" };
+    const end = offset + Number(lengthText);
+    const equals = bytes.indexOf(61, space + 1);
+    if (end > bytes.length || end <= space + 3 || bytes[end - 1] !== 10 ||
+        equals <= space + 1 || equals >= end - 1) return { paxState: "malformed" };
+    const key = bytes.subarray(space + 1, equals).toString("utf8");
+    if (/[\u0000-\u0020\u007f=]/u.test(key)) return { paxState: "malformed" };
+    keys.add(key); offset = end;
+  }
+  const sorted = [...keys].sort(compareUtf8);
+  return { paxState: "parsed", paxRecordCount: records,
+    paxKnownKeys: sorted.filter((key) => PAX_DIAGNOSTIC_KEYS.includes(key)),
+    paxUnknownKeyCount: sorted.filter((key) => !PAX_DIAGNOSTIC_KEYS.includes(key)).length,
+    paxKeySetSha256: sha256(canonicalJsonBytes(sorted)), ...paxOverrideClasses(sorted) };
+}
+
+async function tarRejectionDiagnostic(handle, header, context, ordinal, type, sizeBytes,
+  start, offset, archiveLength) {
+  const raw = (at, length) => {
+    const bytes = header.subarray(at, at + length), zero = bytes.indexOf(0);
+    return zero < 0 ? bytes : bytes.subarray(0, zero);
+  };
+  const prefix = raw(345, 155), name = raw(0, 100);
+  const headerName = prefix.length ? Buffer.concat([prefix, Buffer.from("/"), name]) : name;
+  const value = { version: 1, scope: context.scope, layerDigest: context.layerDigest ?? null,
+    layerSizeBytes: context.layerSizeBytes ?? null, layerOrdinal: context.layerOrdinal ?? null,
+    headerOrdinal: ordinal, headerNameSha256: sha256(headerName), headerNameBytes: headerName.length,
+    paxState: "not-pax", paxBodyBytes: null, paxBodySha256: null, paxRecordCount: null,
+    paxKnownKeys: [], paxUnknownKeyCount: null, paxKeySetSha256: null,
+    ...Object.fromEntries(TAR_DIAGNOSTIC_FLAGS.map((key) => [key, false])) };
+  if (type === "x" || type === "g") {
+    value.paxBodyBytes = sizeBytes;
+    const padded = Math.ceil(sizeBytes / 512) * 512;
+    if (!Number.isSafeInteger(offset + 512 + padded) || offset + 512 + padded > archiveLength) {
+      value.paxState = "out-of-bounds";
+    } else if (sizeBytes > PAX_DIAGNOSTIC_LIMIT) {
+      value.paxState = "oversize";
+    } else {
+      value.paxState = "unavailable";
+      const body = Buffer.alloc(sizeBytes);
+      const read = await handle.read(body, 0, sizeBytes, start + offset + 512);
+      if (read.bytesRead === sizeBytes) {
+        value.paxBodySha256 = sha256(body);
+        Object.assign(value, paxDiagnosticRecords(body));
+      }
+    }
+  }
+  return validateTarRejectionDiagnostic(value);
+}
+
+function localPaxPathNames(body) {
+  // Admission is intentionally independent of the diagnostic key summarizer.
+  // No global state, deletion semantics, numeric or security-attribute overrides.
+  const values = Object.create(null);
+  let offset = 0;
+  while (offset < body.length) {
+    const space = body.indexOf(32, offset);
+    if (space < offset + 1 || space - offset > 5) return null;
+    if (!body.subarray(offset, space).every((byte) => byte >= 48 && byte <= 57)) return null;
+    const digits = body.subarray(offset, space).toString("ascii");
+    if (!/^[1-9][0-9]{0,4}$/.test(digits)) return null;
+    const end = offset + Number(digits);
+    if (end > body.length || end <= space + 3 || body[end - 1] !== 10) return null;
+    const equals = body.indexOf(61, space + 1);
+    if (equals <= space + 1 || equals >= end - 1) return null;
+    const keyBytes = body.subarray(space + 1, equals);
+    if (!keyBytes.every((byte) => byte < 128)) return null;
+    const key = keyBytes.toString("ascii");
+    if (!["path", "linkpath"].includes(key) || Object.hasOwn(values, key)) return null;
+    const raw = body.subarray(equals + 1, end - 1);
+    if (raw.length === 0 || raw.length > MAX_LOCAL_PAX_VALUE_BYTES) return null;
+    let value;
+    try { value = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw); }
+    catch { return null; }
+    if (value !== value.normalize("NFC") || /[\u0000-\u001f\u007f-\u009f\ud800-\udfff\ufffd]/.test(value)) return null;
+    values[key] = value;
+    offset = end;
+  }
+  return Object.keys(values).length > 0 ? values : null;
+}
+
+async function readTarEntries(
+  archivePath,
+  { length, start = 0, allowLinks = false, allowLocalPaxNames = false,
+    tarBudget = { headers: 0, paxBytes: 0 }, diagnosticContext = { scope: "runtime-bundle" } } = {},
+) {
+  const metadata = await requireRegularFile(archivePath, "tar archive");
+  const archiveLength = length ?? metadata.size - start;
+  if (
+    !Number.isSafeInteger(start) ||
+    !Number.isSafeInteger(archiveLength) ||
+    start < 0 ||
+    archiveLength < 1024 ||
+    archiveLength % 512 !== 0 ||
+    start + archiveLength > metadata.size
+  ) {
+    fail("Tar archive bounds are invalid");
+  }
+  const handle = await open(archivePath, "r");
+  const entries = [];
+  const names = new Set();
+  let offset = 0;
+  let zeroBlocks = 0;
+  let headerOrdinal = 0;
+  let pending = null;
+  try {
+    while (offset + 512 <= archiveLength) {
+      const header = Buffer.alloc(512);
+      const read = await handle.read(header, 0, 512, start + offset);
+      if (read.bytesRead !== 512) {
+        fail("Tar header is truncated");
+      }
+      if (header.every((byte) => byte === 0)) {
+        if (pending) await pending.reject();
+        zeroBlocks += 1;
+        offset += 512;
+        if (zeroBlocks === 2) {
+          break;
+        }
+        continue;
+      }
+      if (zeroBlocks !== 0) {
+        fail("Tar archive has a nonterminal zero block");
+      }
+      headerOrdinal += 1;
+      tarBudget.headers += 1;
+      if (tarBudget.headers > MAX_TAR_HEADERS) fail("Tar archive contains too many physical headers");
+      if (
+        tarText(header, 257, 6) !== "ustar" ||
+        header.subarray(263, 265).toString("ascii") !== "00"
+      ) {
+        fail("Tar entry must use canonical POSIX ustar magic and version");
+      }
+      const expectedChecksum = tarInteger(header, 148, 8, "checksum");
+      if (expectedChecksum !== tarChecksum(header)) {
+        fail("Tar header checksum is invalid");
+      }
+      const name = tarText(header, 0, 100);
+      const prefix = tarText(header, 345, 155);
+      let path = prefix ? prefix + "/" + name : name;
+      const type = String.fromCharCode(header[156] || 48);
+      if (type === "5" && path.endsWith("/")) {
+        path = path.slice(0, -1);
+      }
+      requireSafeRelativePath(path, "tar path");
+      const sizeBytes = tarInteger(header, 124, 12, "size");
+      const mode = tarInteger(header, 100, 8, "mode");
+      const uid = tarInteger(header, 108, 8, "uid");
+      const gid = tarInteger(header, 116, 8, "gid");
+      const mtime = tarInteger(header, 136, 12, "mtime");
+      let linkTarget = tarText(header, 157, 100);
+      if (linkTarget !== linkTarget.normalize("NFC") || linkTarget.includes("\\")
+        || /[\u0000-\u001f\u007f-\u009f\ud800-\udfff\ufffd]/.test(linkTarget)) {
+        fail("Tar link target must use canonical UTF-8 text");
+      }
+      const allowedTypes = allowLinks ? ["0", "1", "2", "5"] : ["0", "5"];
+      const reject = async () => {
+        const error = new ManagedCloudReleaseGateError("Tar archive contains unsupported entry type " + type);
+        try {
+          error.tarDiagnostic = await tarRejectionDiagnostic(handle, header, diagnosticContext,
+            headerOrdinal, type, sizeBytes, start, offset, archiveLength);
+        } catch { /* Diagnostic failure cannot change the original unsupported-type rejection. */ }
+        throw error;
+      };
+      if (!allowedTypes.includes(type) && !(allowLocalPaxNames && type === "x")) await reject();
+      if (pending && !allowedTypes.includes(type)) await reject();
+      if (!["1", "2"].includes(type) && linkTarget !== "") {
+        fail("Tar link target is present on a non-link entry");
+      }
+      // Raw link fields must remain well formed. A symbolic relative target
+      // is resolved only after BOTH effective names are known: a path override
+      // can legitimately move that link beneath its parent directory.
+      if (type === "1" && linkTarget !== "") normalizeContainerPath(linkTarget);
+      if (type !== "0" && type !== "x" && sizeBytes !== 0) {
+        fail("Non-file tar entries must have zero content size");
+      }
+      const paddedSize = Math.ceil(sizeBytes / 512) * 512;
+      if (offset + 512 + paddedSize > archiveLength) {
+        fail("Tar entry content is truncated");
+      }
+      const paddingLength = paddedSize - sizeBytes;
+      if (paddingLength > 0) {
+        const padding = Buffer.alloc(paddingLength);
+        const paddingRead = await handle.read(
+          padding,
+          0,
+          paddingLength,
+          start + offset + 512 + sizeBytes,
+        );
+        if (
+          paddingRead.bytesRead !== paddingLength ||
+          padding.some((byte) => byte !== 0)
+        ) {
+          fail("Tar entry padding must be all zero");
+        }
+      }
+      if (type === "x") {
+        if (pending || sizeBytes === 0 || sizeBytes > MAX_LOCAL_PAX_BYTES
+          || tarBudget.paxBytes + sizeBytes > MAX_LOCAL_PAX_TOTAL_BYTES) await reject();
+        tarBudget.paxBytes += sizeBytes;
+        const body = Buffer.alloc(sizeBytes);
+        const bodyRead = await handle.read(body, 0, sizeBytes, start + offset + 512);
+        if (bodyRead.bytesRead !== sizeBytes) fail("Tar entry content is truncated");
+        const values = localPaxPathNames(body);
+        if (!values) await reject();
+        // Retain the physical extension header for bounded redacted rejection
+        // if its required next ordinary entry is missing or incompatible.
+        const at = offset, ordinal = headerOrdinal;
+        pending = { values, reject: async () => {
+          const error = new ManagedCloudReleaseGateError("Tar archive contains unsupported entry type x");
+          try { error.tarDiagnostic = await tarRejectionDiagnostic(handle, header, diagnosticContext,
+            ordinal, "x", sizeBytes, start, at, archiveLength); } catch { /* Remain refused. */ }
+          throw error;
+        } };
+      } else {
+        if (pending) {
+          if (Object.hasOwn(pending.values, "linkpath") && !["1", "2"].includes(type)) await pending.reject();
+          path = pending.values.path ?? path;
+          linkTarget = pending.values.linkpath ?? linkTarget;
+          if (type === "5" && path.endsWith("/")) path = path.slice(0, -1);
+          pending = null;
+        }
+        requireSafeRelativePath(path, "tar path");
+        if (names.has(path)) fail("Tar archive contains a duplicate path");
+        names.add(path);
+        if (["1", "2"].includes(type) && linkTarget.length === 0) fail("Tar link target must be nonempty");
+        entries.push({ dataOffset: start + offset + 512, gid, linkTarget, mode, mtime, path, sizeBytes, type, uid });
+      }
+      offset += 512 + paddedSize;
+      if (entries.length > MAX_INVENTORY_ENTRIES) {
+        fail("Tar archive contains too many entries");
+      }
+    }
+    if (pending) await pending.reject();
+  } finally {
+    await handle.close();
+  }
+  if (zeroBlocks !== 2) {
+    fail("Tar archive must end with two zero blocks");
+  }
+  while (offset < archiveLength) {
+    const lengthToRead = Math.min(64 * 1024, archiveLength - offset);
+    const trailing = Buffer.alloc(lengthToRead);
+    const trailingHandle = await open(archivePath, "r");
+    try {
+      const trailingRead = await trailingHandle.read(
+        trailing,
+        0,
+        lengthToRead,
+        start + offset,
+      );
+      if (
+        trailingRead.bytesRead !== lengthToRead ||
+        trailing.some((byte) => byte !== 0)
+      ) {
+        fail("Tar archive contains nonzero bytes after its terminator");
+      }
+    } finally {
+      await trailingHandle.close();
+    }
+    offset += lengthToRead;
+  }
+  return entries;
+}
+
+async function readArchiveSlice(path, entry, maximum = MAX_JSON_BYTES) {
+  if (entry.type !== "0" || entry.sizeBytes < 2 || entry.sizeBytes > maximum) {
+    fail(entry.path + " is not a bounded regular file");
+  }
+  const handle = await open(path, "r");
+  try {
+    const bytes = Buffer.alloc(entry.sizeBytes);
+    const read = await handle.read(bytes, 0, entry.sizeBytes, entry.dataOffset);
+    if (read.bytesRead !== entry.sizeBytes) {
+      fail(entry.path + " is truncated");
+    }
+    return bytes;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function hashArchiveSlice(path, entry) {
+  const hash = createHash("sha256");
+  if (entry.sizeBytes === 0) {
+    return hash.digest("hex");
+  }
+  const stream = createReadStream(path, {
+    end: entry.dataOffset + entry.sizeBytes - 1,
+    start: entry.dataOffset,
+  });
+  for await (const chunk of stream) {
+    hash.update(chunk);
+  }
+  return hash.digest("hex");
+}
+
+async function parseArchiveJson(path, entry, label) {
+  const bytes = await readArchiveSlice(path, entry);
+  let value;
+  try {
+    value = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    fail(label + " must contain valid JSON");
+  }
+  return value;
+}
+
+function requireOciDescriptor(value, label) {
+  requireObject(value, label);
+  for (const key of ["digest", "mediaType", "size"]) {
+    if (!(key in value)) {
+      fail(label + " is missing " + key);
+    }
+  }
+  requireDigest(value.digest, label + ".digest");
+  requireString(value.mediaType, label + ".mediaType");
+  requireInteger(value.size, label + ".size", 1);
+  return value;
+}
+
+function normalizeContainerPath(path) {
+  const value = path.startsWith("./") ? path.slice(2) : path;
+  return requireSafeRelativePath(value, "container path");
+}
+
+function removeContainerPath(entries, target) {
+  entries.delete(target);
+  for (const path of entries.keys()) {
+    if (path.startsWith(target + "/")) {
+      entries.delete(path);
+    }
+  }
+}
+
+function requireUnblockedContainerAncestors(entries, path) {
+  const parts = path.split("/");
+  for (let index = 1; index < parts.length; index += 1) {
+    const ancestor = parts.slice(0, index).join("/");
+    const value = entries.get(ancestor);
+    if (value && value.type !== "directory") {
+      fail("OCI layer writes beneath a non-directory ancestor");
+    }
+  }
+}
+
+function resolveContainerLinkTarget(path, target) {
+  if (/[\u0000-\u001f\u007f\ufffd]/.test(target) || target.length === 0) {
+    fail("OCI symbolic link target is invalid");
+  }
+  const normalized = target.startsWith("/")
+    ? posix.normalize(target).slice(1)
+    : posix.normalize(posix.join(posix.dirname(path), target));
+  if (
+    normalized === "" ||
+    normalized === "." ||
+    normalized === ".." ||
+    normalized.startsWith("../")
+  ) {
+    fail("OCI symbolic link escapes the image root");
+  }
+  return requireSafeRelativePath(normalized, "resolved symlink target");
+}
+
+function validateContainerSymlinkGraph(inventory) {
+  for (const entry of inventory.values()) {
+    if (entry.type !== "symlink") {
+      continue;
+    }
+    const visited = new Set([entry.path]);
+    let target = entry.resolvedTarget;
+    for (;;) {
+      const resolved = inventory.get(target);
+      if (!resolved) {
+        fail("OCI symbolic link target is missing");
+      }
+      if (resolved.type !== "symlink") {
+        break;
+      }
+      if (visited.has(resolved.path)) {
+        fail("OCI symbolic link graph contains a cycle");
+      }
+      visited.add(resolved.path);
+      target = resolved.resolvedTarget;
+    }
+  }
+}
+
+async function applyOciLayer(archivePath, layerEntry, inventory, descriptor, layerOrdinal, tarBudget) {
+  const entries = await readTarEntries(archivePath, {
+    allowLinks: true,
+    allowLocalPaxNames: true,
+    tarBudget,
+    length: layerEntry.sizeBytes,
+    start: layerEntry.dataOffset,
+    diagnosticContext: { scope: "layer", layerDigest: descriptor.digest,
+      layerSizeBytes: descriptor.size, layerOrdinal },
+  });
+  const layerEntries = entries.map((entry) => ({
+    ...entry,
+    path: normalizeContainerPath(entry.path),
+  }));
+  for (const entry of layerEntries) {
+    const path = entry.path;
+    const name = basename(path);
+    if (name.startsWith(".wh.") && (entry.type !== "0" || entry.sizeBytes !== 0 || entry.linkTarget !== "")) {
+      fail("OCI whiteout must be an empty regular file");
+    }
+    if (name === ".wh..wh..opq") {
+      const parent = dirname(path) === "." ? "" : dirname(path);
+      for (const existing of inventory.keys()) {
+        if (parent === "" || existing.startsWith(parent + "/")) {
+          inventory.delete(existing);
+        }
+      }
+      continue;
+    }
+    if (name.startsWith(".wh.")) {
+      const targetName = name.slice(4);
+      if (!targetName) {
+        fail("OCI whiteout target is invalid");
+      }
+      const parent = dirname(path) === "." ? "" : dirname(path);
+      removeContainerPath(
+        inventory,
+        parent ? parent + "/" + targetName : targetName,
+      );
+      continue;
+    }
+  }
+  for (const entry of layerEntries) {
+    const path = entry.path;
+    const name = basename(path);
+    if (name === ".wh..wh..opq" || name.startsWith(".wh.")) {
+      continue;
+    }
+    const mode = entry.mode.toString(8).padStart(4, "0");
+    requireUnblockedContainerAncestors(inventory, path);
+    if (entry.type === "5") {
+      const existing = inventory.get(path);
+      if (existing && existing.type !== "directory") {
+        fail("OCI layer replaces a non-directory without an explicit whiteout");
+      }
+      inventory.set(path, { mode, path, type: "directory" });
+      continue;
+    }
+    removeContainerPath(inventory, path);
+    if (entry.type === "2") {
+      inventory.set(path, {
+        mode,
+        path,
+        resolvedTarget: resolveContainerLinkTarget(path, entry.linkTarget),
+        target: entry.linkTarget,
+        type: "symlink",
+      });
+      continue;
+    }
+    if (entry.type === "1") {
+      const target = normalizeContainerPath(entry.linkTarget);
+      const existing = inventory.get(target);
+      if (!existing || existing.type !== "file") {
+        fail("OCI hard link must target an earlier regular file");
+      }
+      inventory.set(path, { ...existing, mode, path });
+      continue;
+    }
+    inventory.set(path, {
+      mode,
+      path,
+      sha256: await hashArchiveSlice(archivePath, entry),
+      sizeBytes: entry.sizeBytes,
+      type: "file",
+    });
+  }
+}
+
+function requireClosedRuntimeContent(componentId, entries) {
+  const contract = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId];
+  if (!contract) {
+    fail("Unknown OCI runtime component");
+  }
+  const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+  const paths = new Set(byPath.keys());
+  if (
+    entries.some(
+      (entry) =>
+        entry.type === "symlink" &&
+        measurementPathSelected(componentId, entry.path),
+    )
+  ) {
+    fail(
+      componentId + " runtime measurement roots may not contain symbolic links",
+    );
+  }
+  for (const path of contract.requiredPaths) {
+    const entry = byPath.get(path);
+    if (!entry || entry.type !== "file" || entry.sizeBytes < 1) {
+      fail(
+        componentId +
+          " runtime is missing regular file or it is empty: " +
+          path,
+      );
+    }
+    if (
+      (path === "usr/local/bin/bluey-jobs-api" ||
+        path === "usr/local/bin/node") &&
+      (Number.parseInt(entry.mode, 8) & 0o111) === 0
+    ) {
+      fail(componentId + " required runtime executable is not executable");
+    }
+  }
+  for (const path of paths) {
+    if (
+      path.startsWith("app/") &&
+      (/(^|\/)(?:src|test|tests|__tests__)(\/|$)/.test(path) ||
+        /\.(?:map|ts|tsx)$/.test(path) ||
+        /(?:^|\/)(?:Dockerfile|package-lock\.json)$/.test(path))
+    ) {
+      fail(componentId + " runtime contains development content");
+    }
+    if (/original[-_]?source[-_]?verifier|source[-_]?verifier/i.test(path)) {
+      const entry = byPath.get(path);
+      if (
+        componentId !== "jobs-workflows" ||
+        path !== "app/workflows/dist/original-source-verifier.js"
+      ) {
+        fail(
+          componentId +
+            " runtime contains unexpected source-verifier path",
+        );
+      }
+      if (!entry || entry.type !== "file" || entry.sizeBytes < 1) {
+        fail(
+          "jobs-workflows source-verifier entrypoint must be a nonempty regular file",
+        );
+      }
+    }
+  }
+  if (componentId === "jobs-runner") {
+    if (paths.has(RUNNER_UNUSED_PTP_HELPER)) {
+      fail("Managed runner image contains the unused privileged PTP helper");
+    }
+    const browserEntries = entries.filter((entry) =>
+      entry.path.startsWith("ms-playwright/"),
+    );
+    if (
+      browserEntries.some((entry) => {
+        const topLevel = entry.path.split("/")[1];
+        return !/^(?:chromium_headless_shell|ffmpeg)-[0-9]+$/.test(topLevel);
+      })
+    ) {
+      fail(
+        "Managed runner may contain only Chromium headless shell and ffmpeg",
+      );
+    }
+    const chromium = entries.filter(
+      (entry) =>
+        entry.type === "file" && isManagedChromiumExecutablePath(entry.path),
+    );
+    if (
+      chromium.length < 1 ||
+      chromium.some((entry) => (Number.parseInt(entry.mode, 8) & 0o111) === 0)
+    ) {
+      fail(
+        "Managed runner image must contain executable Playwright Chromium headless shell",
+      );
+    }
+    if (
+      [...paths].some((path) =>
+        /ms-playwright\/(?:firefox|webkit)[^/]*\//.test(path),
+      )
+    ) {
+      fail("Managed runner image may not contain unused Firefox or WebKit");
+    }
+  }
+}
+
+function requireWorkflowVerifierEntrypointAuthority(
+  componentId,
+  entries,
+  requiredPaths,
+) {
+  if (componentId !== "jobs-workflows") return;
+  const path = "app/workflows/dist/original-source-verifier.js";
+  const expected = requiredPaths.includes(path);
+  const entry = entries.find((item) => item.path === path);
+  const present = entry?.type === "file" && entry.sizeBytes > 0;
+  if (present !== expected) {
+    fail(
+      "jobs-workflows source-verifier entrypoint does not match release authority",
+    );
+  }
+}
+
+function validateOciRuntimeConfig(runtime, imageConfig, componentId, contract) {
+  if (imageConfig.os !== "linux" || imageConfig.architecture !== "amd64") {
+    fail(componentId + " OCI config must be exactly linux/amd64");
+  }
+  const allowedRuntimeKeys = new Set([
+    "ArgsEscaped",
+    "Cmd",
+    "Entrypoint",
+    "Env",
+    "ExposedPorts",
+    "Healthcheck",
+    "Labels",
+    "OnBuild",
+    "Shell",
+    "StopSignal",
+    "User",
+    "Volumes",
+    "WorkingDir",
+  ]);
+  if (Object.keys(runtime).some((key) => !allowedRuntimeKeys.has(key))) {
+    fail(componentId + " OCI runtime config contains an unknown key");
+  }
+  // Pinned BuildKit emits this optional CMD compatibility metadata on Linux.
+  // Admit only true for these exact linux/amd64 command runtimes; omission
+  // remains valid; null is not an admitted absence representation. The admitted
+  // Linux/containerd path ignores Windows command-line escaping metadata, and
+  // this field grants no authority to change the exact Cmd or Entrypoint.
+  if (
+    Object.hasOwn(runtime, "ArgsEscaped") &&
+    (runtime.ArgsEscaped !== true ||
+      !["jobs-runner", "jobs-workflows"].includes(componentId))
+  ) {
+    fail(componentId + " OCI ArgsEscaped is not admitted for this runtime");
+  }
+  const environment = runtime.Env ?? [];
+  if (!Array.isArray(environment)) {
+    fail(componentId + " OCI Env must be an array");
+  }
+  const allowedEnvironment = new Set([
+    "BLUEY_JOBS_API_HOST",
+    "BLUEY_JOBS_API_PORT",
+    "BLUEY_JOBS_RUNNER_DATA",
+    "LANG",
+    "LC_ALL",
+    "NODE_ENV",
+    "NODE_VERSION",
+    "PATH",
+    "PLAYWRIGHT_BROWSERS_PATH",
+    "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+    "YARN_VERSION",
+  ]);
+  const dangerousEnvironment = new Set([
+    "BASH_ENV",
+    "ENV",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PYTHONPATH",
+    "RUSTC_WRAPPER",
+  ]);
+  const values = new Map();
+  for (const item of environment) {
+    const value = requireString(item, componentId + " OCI environment");
+    if (value.length > 4_096 || /[\u0000-\u001f\u007f\ufffd]/.test(value)) {
+      fail(componentId + " OCI environment value is unsafe or oversized");
+    }
+    const separator = value.indexOf("=");
+    const name = separator > 0 ? value.slice(0, separator) : "";
+    if (
+      !/^[A-Z][A-Z0-9_]*$/.test(name) ||
+      values.has(name) ||
+      dangerousEnvironment.has(name) ||
+      !allowedEnvironment.has(name)
+    ) {
+      fail(componentId + " OCI environment is duplicated, unsafe, or unknown");
+    }
+    values.set(name, value);
+  }
+  for (const required of contract.requiredEnvironment) {
+    const name = required.slice(0, required.indexOf("="));
+    if (values.get(name) !== required) {
+      fail(componentId + " OCI environment is missing " + required);
+    }
+  }
+  // Env is a unique name/value set, not an ordered command vector. BuildKit
+  // inserts PATH for scratch stages before dispatching Dockerfile ENV, and
+  // replacing PATH retains that position. The checks above already require
+  // every exact value and reject duplicate/unsafe/unknown names; cardinality
+  // closes the set without depending on builder serialization order.
+  if (environment.length !== contract.requiredEnvironment.length) {
+    fail(componentId + " OCI environment is not the exact closed set");
+  }
+  if ((runtime.WorkingDir ?? "") !== contract.workingDirectory) {
+    fail(componentId + " OCI working directory is not exact");
+  }
+  for (const key of [
+    "Healthcheck",
+    "OnBuild",
+    "Shell",
+    "StopSignal",
+    "Volumes",
+  ]) {
+    const value = runtime[key];
+    if (
+      value !== undefined &&
+      value !== null &&
+      !(Array.isArray(value) && value.length === 0) &&
+      !(
+        value &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        Object.keys(value).length === 0
+      )
+    ) {
+      fail(componentId + " OCI runtime contains unsupported " + key);
+    }
+  }
+  const exposedPorts = Object.keys(runtime.ExposedPorts ?? {}).sort();
+  if (JSON.stringify(exposedPorts) !== JSON.stringify(contract.exposedPorts)) {
+    fail(componentId + " OCI exposed-port set is not exact");
+  }
+  const labels = runtime.Labels ?? {};
+  requireObject(labels, componentId + " OCI labels");
+  for (const [name, value] of Object.entries(labels)) {
+    if (
+      ![
+        "org.opencontainers.image.created",
+        "org.opencontainers.image.revision",
+        "org.opencontainers.image.source",
+      ].includes(name) ||
+      typeof value !== "string" ||
+      /[\u0000-\u001f\u007f\ufffd]/.test(value)
+    ) {
+      fail(componentId + " OCI labels contain an unknown or unsafe value");
+    }
+  }
+}
+
+export async function inspectOciImageArtifact(archivePath, componentId) {
+  const contract = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId];
+  if (!contract) {
+    fail("OCI inventory supports only managed cloud runtime components");
+  }
+  const tarEntries = await readTarEntries(archivePath, { diagnosticContext: { scope: "layout" } });
+  const files = new Map();
+  for (const entry of tarEntries) {
+    if (entry.type === "5") {
+      continue;
+    }
+    if (
+      !["index.json", "oci-layout"].includes(entry.path) &&
+      !/^blobs\/sha256\/[0-9a-f]{64}$/.test(entry.path)
+    ) {
+      fail("OCI layout contains an unknown path: " + entry.path);
+    }
+    files.set(entry.path, entry);
+  }
+  for (const required of ["index.json", "oci-layout"]) {
+    if (!files.has(required)) {
+      fail("OCI layout is missing " + required);
+    }
+  }
+  const layout = await parseArchiveJson(
+    archivePath,
+    files.get("oci-layout"),
+    "oci-layout",
+  );
+  requireExactKeys(layout, ["imageLayoutVersion"], "oci-layout");
+  if (layout.imageLayoutVersion !== "1.0.0") {
+    fail("OCI layout version must be 1.0.0");
+  }
+  for (const [path, entry] of files) {
+    if (!path.startsWith("blobs/sha256/")) {
+      continue;
+    }
+    if (
+      entry.sizeBytes < 1 ||
+      (await hashArchiveSlice(archivePath, entry)) !== basename(path)
+    ) {
+      fail("OCI blob does not match its content digest: " + path);
+    }
+  }
+  const index = await parseArchiveJson(
+    archivePath,
+    files.get("index.json"),
+    "OCI index",
+  );
+  requireObject(index, "OCI index");
+  if (
+    index.schemaVersion !== 2 ||
+    !Array.isArray(index.manifests) ||
+    index.manifests.length !== 1
+  ) {
+    fail("OCI index must contain exactly one image manifest");
+  }
+  const imageDescriptor = requireOciDescriptor(
+    index.manifests[0],
+    "OCI image descriptor",
+  );
+  if (
+    imageDescriptor.mediaType !== "application/vnd.oci.image.manifest.v1+json"
+  ) {
+    fail("OCI candidate must use one OCI image manifest");
+  }
+  const manifestEntry = files.get(
+    "blobs/sha256/" + imageDescriptor.digest.slice(7),
+  );
+  if (!manifestEntry || manifestEntry.sizeBytes !== imageDescriptor.size) {
+    fail("OCI image manifest descriptor is not size-bound");
+  }
+  const manifest = await parseArchiveJson(
+    archivePath,
+    manifestEntry,
+    "OCI image manifest",
+  );
+  requireObject(manifest, "OCI image manifest");
+  if (
+    manifest.schemaVersion !== 2 ||
+    !Array.isArray(manifest.layers) ||
+    manifest.layers.length < 1
+  ) {
+    fail("OCI image manifest is invalid");
+  }
+  const configDescriptor = requireOciDescriptor(
+    manifest.config,
+    "OCI config descriptor",
+  );
+  if (
+    configDescriptor.mediaType !== "application/vnd.oci.image.config.v1+json"
+  ) {
+    fail("OCI image config media type is invalid");
+  }
+  const configEntry = files.get(
+    "blobs/sha256/" + configDescriptor.digest.slice(7),
+  );
+  if (!configEntry || configEntry.sizeBytes !== configDescriptor.size) {
+    fail("OCI image config descriptor is not size-bound");
+  }
+  const imageConfig = await parseArchiveJson(
+    archivePath,
+    configEntry,
+    "OCI image config",
+  );
+  requireObject(imageConfig, "OCI image config");
+  const allowedImageConfigKeys = new Set([
+    "architecture",
+    "config",
+    "created",
+    "history",
+    "os",
+    "rootfs",
+  ]);
+  if (
+    Object.keys(imageConfig).some((key) => !allowedImageConfigKeys.has(key))
+  ) {
+    fail("OCI image config contains an unknown top-level key");
+  }
+  requireExactKeys(imageConfig.rootfs, ["diff_ids", "type"], "OCI rootfs");
+  if (
+    imageConfig.rootfs.type !== "layers" ||
+    !Array.isArray(imageConfig.rootfs.diff_ids) ||
+    JSON.stringify(imageConfig.rootfs.diff_ids) !==
+      JSON.stringify(manifest.layers.map((layer) => layer.digest))
+  ) {
+    fail("OCI config rootfs does not bind the exact uncompressed layers");
+  }
+  const runtime = requireObject(imageConfig.config, "OCI runtime config");
+  const user = runtime.User ?? "";
+  const entrypoint = runtime.Entrypoint ?? [];
+  const cmd = runtime.Cmd ?? [];
+  const workingDirectory = runtime.WorkingDir ?? "";
+  validateOciRuntimeConfig(runtime, imageConfig, componentId, contract);
+  if (
+    user !== contract.runtimeUser ||
+    JSON.stringify(entrypoint) !== JSON.stringify(contract.entrypoint) ||
+    JSON.stringify(cmd) !== JSON.stringify(contract.cmd)
+  ) {
+    fail(componentId + " OCI runtime user or entrypoint is not canonical");
+  }
+  const inventory = new Map();
+  const selectedBlobPaths = new Set([
+    "blobs/sha256/" + imageDescriptor.digest.slice(7),
+    "blobs/sha256/" + configDescriptor.digest.slice(7),
+    ...manifest.layers.map(
+      (descriptor) => "blobs/sha256/" + descriptor.digest.slice(7),
+    ),
+  ]);
+  const actualBlobPaths = [...files.keys()].filter((path) =>
+    path.startsWith("blobs/sha256/"),
+  );
+  if (
+    actualBlobPaths.length !== selectedBlobPaths.size ||
+    actualBlobPaths.some((path) => !selectedBlobPaths.has(path))
+  ) {
+    fail("OCI layout contains an unreferenced or duplicate-selected blob");
+  }
+  // One budget across all layer readers: splitting metadata across layers
+  // cannot evade physical-header or cumulative extension-byte limits.
+  const tarBudget = { headers: 0, paxBytes: 0 };
+  for (const [index, descriptor] of manifest.layers.entries()) {
+    requireOciDescriptor(descriptor, "OCI layer[" + index + "]");
+    if (descriptor.mediaType !== "application/vnd.oci.image.layer.v1.tar") {
+      fail("OCI verification requires deterministic uncompressed layers");
+    }
+    const layerEntry = files.get("blobs/sha256/" + descriptor.digest.slice(7));
+    if (!layerEntry || layerEntry.sizeBytes !== descriptor.size) {
+      fail("OCI layer descriptor is not size-bound");
+    }
+    await applyOciLayer(archivePath, layerEntry, inventory, descriptor, index + 1, tarBudget);
+  }
+  validateContainerSymlinkGraph(inventory);
+  const entries = [...inventory.values()].sort((left, right) =>
+    compareUtf8(left.path, right.path),
+  );
+  requireClosedRuntimeContent(componentId, entries);
+  const contentInventory = {
+    artifactKind: "oci_image",
+    artifactSha256: imageDescriptor.digest.slice(7),
+    audience: MANAGED_CLOUD_AUDIENCES.contentInventory,
+    componentId,
+    entries,
+    runtime: {
+      cmd,
+      environment: [...(runtime.Env ?? [])].sort(compareUtf8),
+      entrypoint,
+      exposedPorts: Object.keys(runtime.ExposedPorts ?? {}).sort(compareUtf8),
+      user,
+      workingDirectory,
+    },
+    version: 1,
+  };
+  return Object.freeze({
+    imageConfigSha256: manifest.config.digest.slice(7),
+    inventory: contentInventory,
+  });
+}
+
+export async function inspectOciImageArchive(archivePath, componentId) {
+  return (await inspectOciImageArtifact(archivePath, componentId)).inventory;
+}
+
+export async function inspectStaticBundleArchive(
+  archivePath,
+  componentId = "jobs-portal",
+) {
+  if (componentId !== "jobs-portal") {
+    fail("Static bundle inventory is reserved for jobs-portal");
+  }
+  const entries = await readTarEntries(archivePath, { diagnosticContext: { scope: "runtime-bundle" } });
+  const inventory = [];
+  for (const entry of entries) {
+    if (entry.uid !== 0 || entry.gid !== 0 || entry.mtime !== 0) {
+      fail(
+        "Static bundle tar metadata must be normalized to uid/gid/mtime zero",
+      );
+    }
+    if (entry.type === "5") {
+      inventory.push({
+        mode: entry.mode.toString(8).padStart(4, "0"),
+        path: entry.path,
+        type: "directory",
+      });
+      continue;
+    }
+    if (
+      entry.path.endsWith(".map") ||
+      /(^|\/)(?:src|test|tests|node_modules)(\/|$)/.test(entry.path)
+    ) {
+      fail("Static bundle contains source, test, map, or dependency content");
+    }
+    inventory.push({
+      mode: entry.mode.toString(8).padStart(4, "0"),
+      path: entry.path,
+      sha256: await hashArchiveSlice(archivePath, entry),
+      sizeBytes: entry.sizeBytes,
+      type: "file",
+    });
+  }
+  inventory.sort((left, right) => compareUtf8(left.path, right.path));
+  const index = inventory.find((entry) => entry.path === "index.html");
+  if (!index || index.type !== "file" || index.sizeBytes < 1) {
+    fail(
+      "Jobs portal static bundle must contain a nonempty regular index.html",
+    );
+  }
+  return {
+    artifactKind: "static_bundle",
+    artifactSha256: await hashFile(archivePath),
+    audience: MANAGED_CLOUD_AUDIENCES.contentInventory,
+    componentId,
+    entries: inventory,
+    runtime: null,
+    version: 1,
+  };
+}
+
+export async function inspectPreparedArtifact(
+  archivePath,
+  componentId,
+  artifactKind,
+) {
+  return artifactKind === "oci_image"
+    ? inspectOciImageArchive(archivePath, componentId)
+    : inspectStaticBundleArchive(archivePath, componentId);
+}
+
+async function listSourceFiles(root, requestedPath) {
+  const absolute = resolve(root, requestedPath);
+  const metadata = await lstat(absolute).catch(() => undefined);
+  if (!metadata) {
+    fail("Required contract source is missing: " + requestedPath);
+  }
+  if (metadata.isFile()) {
+    return [requestedPath];
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    fail("Contract source must be a file or directory: " + requestedPath);
+  }
+  const result = [];
+  async function visit(directory) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name, "en"));
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(path);
+      } else if (entry.isFile()) {
+        const relativePath = relative(root, path).split(sep).join("/");
+        if (/\.(?:rs|ts|tsx|json|toml|sql|yml|yaml)$/.test(relativePath)) {
+          result.push(relativePath);
+        }
+      } else {
+        fail("Contract sources may not contain links or special files");
+      }
+    }
+  }
+  await visit(absolute);
+  return result;
+}
+
+async function createSourceSet(root, paths) {
+  const expanded = [];
+  for (const path of paths) {
+    expanded.push(...(await listSourceFiles(root, path)));
+  }
+  const unique = [...new Set(expanded)].sort();
+  const files = [];
+  for (const path of unique) {
+    const absolute = resolve(root, path);
+    const metadata = await requireRegularFile(absolute, path);
+    files.push({
+      path,
+      sha256: await hashFile(absolute),
+      sizeBytes: metadata.size,
+    });
+  }
+  return {
+    files,
+    setSha256: sha256(canonicalJsonBytes(files)),
+  };
+}
+
+function validateSourceFileSet(
+  files,
+  label,
+  { expectedPaths, pathAllowed } = {},
+) {
+  const entries = requireBoundedArray(
+    files,
+    label + ".files",
+    1,
+    MAX_INVENTORY_ENTRIES,
+  );
+  const paths = [];
+  for (const [index, file] of entries.entries()) {
+    requireExactKeys(
+      file,
+      ["path", "sha256", "sizeBytes"],
+      label + ".files[" + index + "]",
+    );
+    const path = requireSafeRelativePath(
+      file.path,
+      label + ".files[" + index + "].path",
+    );
+    paths.push(path);
+    requireHex64(file.sha256, path + ".sha256");
+    requireInteger(file.sizeBytes, path + ".sizeBytes", 1);
+    if (pathAllowed && !pathAllowed(path)) {
+      fail(label + " contains an out-of-scope source path: " + path);
+    }
+  }
+  const sorted = [...paths].sort();
+  if (
+    new Set(paths).size !== paths.length ||
+    paths.some((path, index) => path !== sorted[index])
+  ) {
+    fail(label + " source paths must be sorted and unique");
+  }
+  if (
+    expectedPaths &&
+    (paths.length !== expectedPaths.length ||
+      paths.some((path, index) => path !== [...expectedPaths].sort()[index]))
+  ) {
+    fail(label + " does not bind its exact required source paths");
+  }
+  return entries;
+}
+
+function validateBuilderPolicyShape(builderPolicy) {
+  requireExactKeys(
+    builderPolicy,
+    [
+      "audience",
+      "buildNetwork",
+      "candidateBuildIsolation",
+      "files",
+      "immutableBaseImageRequired",
+      "noRebuildStages",
+      "rootlessRuntimeRequired",
+      "schemaVersion",
+      "setSha256",
+    ],
+    "builder policy",
+  );
+  const legacy =
+    builderPolicy.schemaVersion === 1 &&
+    builderPolicy.audience === MANAGED_CLOUD_AUDIENCES.builderPolicy &&
+    JSON.stringify(builderPolicy.noRebuildStages) ===
+      JSON.stringify(["authorize", "promote", "rollback", "verify"]);
+  const publication =
+    ((builderPolicy.schemaVersion === 2 &&
+      builderPolicy.audience === MANAGED_CLOUD_AUDIENCES.builderPolicyV2) ||
+     (builderPolicy.schemaVersion === 3 &&
+      builderPolicy.audience === MANAGED_CLOUD_AUDIENCES.builderPolicyV3)) &&
+    JSON.stringify(builderPolicy.noRebuildStages) ===
+      JSON.stringify(BUILDER_POLICY_NO_REBUILD_STAGES);
+  if (
+    (!legacy && !publication) ||
+    builderPolicy.buildNetwork !== "dependency-fetch-only" ||
+    builderPolicy.candidateBuildIsolation !== "credential-free" ||
+    builderPolicy.immutableBaseImageRequired !== true ||
+    builderPolicy.rootlessRuntimeRequired !== true
+  ) {
+    fail("Builder policy does not enforce the closed build-once contract");
+  }
+  const generation = builderPolicy.schemaVersion;
+  const files = validateSourceFileSet(builderPolicy.files, "builder policy", {
+    expectedPaths: generation === 3 ? BUILDER_POLICY_V3_PATHS : BUILDER_POLICY_PATHS,
+  });
+  requireHex64(builderPolicy.setSha256, "builder policy setSha256");
+  if (builderPolicy.setSha256 !== sha256(canonicalJsonBytes(files))) {
+    fail("Builder policy source-set digest is invalid");
+  }
+  return { files, generation };
+}
+
+function validateBuilderPolicyContract(builderPolicy, contractVersion) {
+  const validated = validateBuilderPolicyShape(builderPolicy);
+  if (contractVersion === 1 && validated.generation !== 1) {
+    fail("Release-v1 requires the historical builder policy bytes");
+  }
+  if (contractVersion === 2 && validated.generation > 2) {
+    fail("Release-v2 requires a historical builder policy generation");
+  }
+  if (contractVersion === 3 && validated.generation !== 2) {
+    fail("Release-v3 requires builder policy generation v2");
+  }
+  if (contractVersion === 4 && validated.generation !== 3) {
+    fail("Release-v4 requires builder policy generation v3");
+  }
+  return validated.files;
+}
+
+export function validateManagedCloudPublicationBuilderPolicy(builderPolicy, contractVersion) {
+  if (![2, 3, 4].includes(contractVersion)) {
+    fail("Production publication requires release-v2 or later with an exact builder policy");
+  }
+  const generation = contractVersion === 4 ? 3 : 2;
+  if (validateBuilderPolicyShape(builderPolicy).generation !== generation) {
+    fail(
+      "Release-v" + contractVersion + " publication requires builder policy v" +
+        generation + " with publish fenced",
+    );
+  }
+  return true;
+}
+
+function validateMigrationContract(migrationContract, contractVersion) {
+  requireExactKeys(
+    migrationContract,
+    ["audience", "paritySha256", "postgres", "schemaVersion", "sqlite"],
+    "migration contract",
+  );
+  if (
+    migrationContract.schemaVersion !== 1 ||
+    migrationContract.audience !== MANAGED_CLOUD_AUDIENCES.migrationContract
+  ) {
+    fail("Migration contract audience or version is invalid");
+  }
+  const dialects = {};
+  const expectedHeads = migrationHeadsForVersion(contractVersion);
+  for (const [name, expectedHead] of [
+    ["postgres", expectedHeads.postgres],
+    ["sqlite", expectedHeads.sqlite],
+  ]) {
+    const dialect = requireObject(
+      migrationContract[name],
+      name + " migration contract",
+    );
+    requireExactKeys(
+      dialect,
+      ["files", "head", "name", "setSha256"],
+      name + " migration contract",
+    );
+    if (dialect.name !== name || dialect.head !== expectedHead) {
+      fail(name + " migration contract has the wrong identity or head");
+    }
+    const prefix = "infra/" + name + "/server-runtime/";
+    const files = validateSourceFileSet(dialect.files, name + " migrations", {
+      pathAllowed: (path) => path.startsWith(prefix) && path.endsWith(".sql"),
+    });
+    requireHex64(dialect.setSha256, name + " migration setSha256");
+    if (
+      dialect.setSha256 !== sha256(canonicalJsonBytes(files)) ||
+      basename(files.at(-1).path) !== expectedHead
+    ) {
+      fail(name + " migration source set or head is invalid");
+    }
+    if (contractVersion === 4) {
+      validateReleaseV4MigrationSuffix(name, files);
+    }
+    dialects[name] = files;
+  }
+  requireHex64(migrationContract.paritySha256, "migration paritySha256");
+  const expectedParitySha256 = sha256(
+    canonicalJsonBytes({
+      postgres: dialects.postgres.map((file) => basename(file.path)),
+      sqlite: dialects.sqlite.map((file) => basename(file.path)),
+    }),
+  );
+  if (migrationContract.paritySha256 !== expectedParitySha256) {
+    fail("Migration parity digest does not bind both exact filename sets");
+  }
+  return migrationContract;
+}
+
+function validateProtocolContract(
+  protocolContract,
+  releaseProtocols,
+  contractVersion,
+) {
+  requireExactKeys(
+    protocolContract,
+    ["audience", "protocols", "schemaVersion"],
+    "protocol contract",
+  );
+  if (
+    protocolContract.schemaVersion !== contractVersion ||
+    protocolContract.audience !== MANAGED_CLOUD_AUDIENCES.protocolContract
+  ) {
+    fail("Protocol contract audience or version is invalid");
+  }
+  const specs = protocolSpecsForVersion(contractVersion);
+  const protocols = requireArray(
+    protocolContract.protocols,
+    "protocol contract protocols",
+    specs.length,
+  );
+  if (protocols.length !== specs.length) {
+    fail("Protocol contract must contain the exact versioned protocol set");
+  }
+  const projected = [];
+  for (const [index, protocol] of protocols.entries()) {
+    const spec = specs[index];
+    requireExactKeys(
+      protocol,
+      ["protocolId", "protocolVersion", "schemaSha256", "sourceFiles"],
+      "protocol contract protocols[" + index + "]",
+    );
+    if (
+      protocol.protocolId !== spec.id ||
+      protocol.protocolVersion !== spec.version
+    ) {
+      fail("Protocol contract identity/version set is not exact");
+    }
+    const sourceFiles = validateSourceFileSet(
+      protocol.sourceFiles,
+      protocol.protocolId + " protocol",
+      { expectedPaths: spec.sourcePaths },
+    );
+    requireHex64(protocol.schemaSha256, protocol.protocolId + ".schemaSha256");
+    if (protocol.schemaSha256 !== sha256(canonicalJsonBytes(sourceFiles))) {
+      fail(protocol.protocolId + " protocol source-set digest is invalid");
+    }
+    projected.push({
+      protocolId: protocol.protocolId,
+      protocolVersion: protocol.protocolVersion,
+      schemaSha256: protocol.schemaSha256,
+    });
+  }
+  if (
+    releaseProtocols &&
+    canonicalJsonBytes(projected).compare(
+      canonicalJsonBytes(releaseProtocols),
+    ) !== 0
+  ) {
+    fail(
+      "Release protocol rows do not project from the full protocol contract",
+    );
+  }
+  return protocolContract;
+}
+
+function validateConfigContract(configContract) {
+  requireExactKeys(
+    configContract,
+    ["audience", "roleSources", "schemaVersion", "variables"],
+    "config contract",
+  );
+  if (
+    configContract.schemaVersion !== 1 ||
+    configContract.audience !== MANAGED_CLOUD_AUDIENCES.configContract
+  ) {
+    fail("Config contract audience or version is invalid");
+  }
+  const expectedRoles = [...CONFIG_ROLE_ROOTS].sort((left, right) =>
+    left.role.localeCompare(right.role, "en"),
+  );
+  const roleSources = requireArray(
+    configContract.roleSources,
+    "config contract roleSources",
+    expectedRoles.length,
+  );
+  if (roleSources.length !== expectedRoles.length) {
+    fail("Config contract must bind the exact component role set");
+  }
+  for (const [index, value] of roleSources.entries()) {
+    const expected = expectedRoles[index];
+    requireExactKeys(
+      value,
+      ["role", "sourceFiles", "sourceSetSha256"],
+      "config contract roleSources[" + index + "]",
+    );
+    if (value.role !== expected.role) {
+      fail("Config contract role source set is not exact or sorted");
+    }
+    const sourceFiles = validateSourceFileSet(
+      value.sourceFiles,
+      value.role + " config sources",
+      {
+        pathAllowed: (path) =>
+          expected.paths.some((root) =>
+            root.endsWith("/src") ? path.startsWith(root + "/") : path === root,
+          ),
+      },
+    );
+    requireHex64(value.sourceSetSha256, value.role + ".sourceSetSha256");
+    if (value.sourceSetSha256 !== sha256(canonicalJsonBytes(sourceFiles))) {
+      fail(value.role + " config source-set digest is invalid");
+    }
+  }
+  const allowedRoles = new Set(expectedRoles.map((value) => value.role));
+  const variableNames = [];
+  for (const [index, variable] of requireBoundedArray(
+    configContract.variables,
+    "config contract variables",
+    1,
+    4_096,
+  ).entries()) {
+    requireExactKeys(
+      variable,
+      ["classification", "name", "required", "roles", "valueType"],
+      "config contract variables[" + index + "]",
+    );
+    const name = requireString(variable.name, "config variable name");
+    if (!/^BLUEY_[A-Z0-9_]+$/.test(name)) {
+      fail("Config contract variable name is invalid");
+    }
+    if (
+      name.startsWith("BLUEY_JOBS_MANAGED_CLOUD_") &&
+      name.endsWith(MANAGED_CLOUD_FORBIDDEN_CONFIG_SUFFIX)
+    ) {
+      fail(
+        "Runtime identity must be measured locally and cannot be configured",
+      );
+    }
+    variableNames.push(name);
+    const requiredSpec = MANAGED_CLOUD_REQUIRED_CONFIG_SPECS.get(name);
+    const expectedClassification =
+      requiredSpec?.classification ?? classifyConfigVariable(name);
+    if (variable.classification !== expectedClassification) {
+      fail("Config variable classification is not derived from its name");
+    }
+    requireBoolean(variable.required, name + ".required");
+    requireEnum(
+      variable.valueType,
+      [
+        "boolean_true",
+        "canonical_id",
+        "https_url",
+        "positive_integer",
+        "secret_bytes",
+        "sha256_hex",
+        "string",
+      ],
+      name + ".valueType",
+    );
+    if (
+      variable.required !== Boolean(requiredSpec) ||
+      variable.valueType !== (requiredSpec?.valueType ?? "string")
+    ) {
+      fail("Config variable required/type authority is not exact");
+    }
+    const roles = requireSortedUniqueStrings(variable.roles, name + ".roles");
+    if (roles.length < 1 || roles.some((role) => !allowedRoles.has(role))) {
+      fail("Config variable roles are empty or outside the closed role set");
+    }
+    if (
+      requiredSpec &&
+      requiredSpec.requiredRoles.some((role) => !roles.includes(role))
+    ) {
+      fail("Required managed-cloud config is missing an owning runtime role");
+    }
+  }
+  if (
+    new Set(variableNames).size !== variableNames.length ||
+    variableNames.some(
+      (name, index) => name !== [...variableNames].sort()[index],
+    )
+  ) {
+    fail("Config variable names must be sorted and unique");
+  }
+  if (
+    [...MANAGED_CLOUD_REQUIRED_CONFIG_SPECS.keys()].some(
+      (name) => !variableNames.includes(name),
+    )
+  ) {
+    fail("Config contract omits required managed-cloud runtime configuration");
+  }
+  return configContract;
+}
+
+export function validateManagedCloudReleaseContracts({
+  builderPolicy,
+  configContract,
+  manifest,
+  migrationContract,
+  protocolContract,
+}) {
+  const contractVersion = manifest.version ?? protocolContract.schemaVersion;
+  if (
+    ![1, 2, 3, 4].includes(contractVersion) ||
+    protocolContract.schemaVersion !== contractVersion ||
+    (manifest.version !== undefined && manifest.version !== contractVersion)
+  ) {
+    fail("Release contracts do not share one exact version");
+  }
+  validateBuilderPolicyContract(builderPolicy, contractVersion);
+  validateConfigContract(configContract);
+  validateMigrationContract(migrationContract, contractVersion);
+  validateProtocolContract(
+    protocolContract,
+    manifest.protocols,
+    contractVersion,
+  );
+  if (
+    sha256(canonicalJsonBytes(configContract)) !==
+      manifest.configSchemaSha256 ||
+    sha256(canonicalJsonBytes(migrationContract)) !==
+      manifest.migrationSetSha256 ||
+    sha256(canonicalJsonBytes(protocolContract)) !==
+      manifest.protocolSetSha256 ||
+    migrationContract.sqlite.head !== manifest.sqliteMigrationHead ||
+    migrationContract.postgres.head !== manifest.postgresMigrationHead
+  ) {
+    fail("Release manifest does not bind the exact managed-cloud contracts");
+  }
+  return true;
+}
+
+function classifyConfigVariable(name) {
+  if (/(?:KEY|PASSWORD|SECRET|TOKEN|CREDENTIAL|PRIVATE)/.test(name)) {
+    return "secret";
+  }
+  if (/(?:ENABLED|ALLOW|DISABLE)/.test(name)) {
+    return "deny_only_authority";
+  }
+  return "configuration";
+}
+
+export async function createManagedCloudContracts(
+  repoRoot,
+  outputDirectory,
+  contractVersion = 1,
+  { requireCurrentMigrations = false } = {},
+) {
+  const root = resolve(repoRoot);
+  const output = resolve(outputDirectory);
+  const protocolSpecs = protocolSpecsForVersion(contractVersion);
+  const expectedMigrationHeads = migrationHeadsForVersion(contractVersion);
+  await requireEmptyOutputDirectory(output);
+
+  const builderGeneration = contractVersion === 4 ? 3 : contractVersion === 1 ? 1 : 2;
+  const builderSources = await createSourceSet(
+    root,
+    builderGeneration === 3 ? BUILDER_POLICY_V3_PATHS : BUILDER_POLICY_PATHS,
+  );
+  const builderPolicy = {
+    audience:
+      builderGeneration === 1
+        ? MANAGED_CLOUD_AUDIENCES.builderPolicy
+        : builderGeneration === 2
+          ? MANAGED_CLOUD_AUDIENCES.builderPolicyV2
+          : MANAGED_CLOUD_AUDIENCES.builderPolicyV3,
+    buildNetwork: "dependency-fetch-only",
+    candidateBuildIsolation: "credential-free",
+    files: builderSources.files,
+    immutableBaseImageRequired: true,
+    noRebuildStages:
+      builderGeneration === 1
+        ? ["authorize", "promote", "rollback", "verify"]
+        : [...BUILDER_POLICY_NO_REBUILD_STAGES],
+    rootlessRuntimeRequired: true,
+    schemaVersion: builderGeneration,
+    setSha256: builderSources.setSha256,
+  };
+
+  const protocols = [];
+  for (const spec of protocolSpecs) {
+    const sources = await createSourceSet(root, spec.sourcePaths);
+    protocols.push({
+      protocolId: spec.id,
+      protocolVersion: spec.version,
+      schemaSha256: sources.setSha256,
+      sourceFiles: sources.files,
+    });
+  }
+  const protocolContract = {
+    audience: MANAGED_CLOUD_AUDIENCES.protocolContract,
+    protocols,
+    schemaVersion: contractVersion,
+  };
+
+  const sqliteFiles = await listSourceFiles(
+    root,
+    "infra/sqlite/server-runtime",
+  );
+  const postgresFiles = await listSourceFiles(
+    root,
+    "infra/postgres/server-runtime",
+  );
+  async function migrationDialect(name, paths) {
+    const sqlPaths = paths.filter((path) => path.endsWith(".sql")).sort();
+    const expectedHead = expectedMigrationHeads[name];
+    const headIndex = sqlPaths.findIndex(
+      (path) => basename(path) === expectedHead,
+    );
+    if (headIndex < 0) {
+      fail(name + " migration contract is missing its versioned head");
+    }
+    if (requireCurrentMigrations && headIndex !== sqlPaths.length - 1) {
+      fail(name + " has runtime migrations after release-v" + contractVersion +
+        " head; use a release contract that covers the current migration set");
+    }
+    const sourceSet = await createSourceSet(
+      root,
+      sqlPaths.slice(0, headIndex + 1),
+    );
+    if (sourceSet.files.length === 0) {
+      fail(name + " migration contract is empty");
+    }
+    if (contractVersion === 4) {
+      validateReleaseV4MigrationSuffix(name, sourceSet.files);
+    }
+    return {
+      files: sourceSet.files,
+      head: basename(sourceSet.files.at(-1).path),
+      name,
+      setSha256: sourceSet.setSha256,
+    };
+  }
+  const sqlite = await migrationDialect("sqlite", sqliteFiles);
+  const postgres = await migrationDialect("postgres", postgresFiles);
+  const migrationContract = {
+    audience: MANAGED_CLOUD_AUDIENCES.migrationContract,
+    paritySha256: sha256(
+      canonicalJsonBytes({
+        postgres: postgres.files.map((file) => basename(file.path)),
+        sqlite: sqlite.files.map((file) => basename(file.path)),
+      }),
+    ),
+    postgres,
+    schemaVersion: 1,
+    sqlite,
+  };
+
+  const variables = new Map();
+  const roleSources = [];
+  for (const roleRoot of CONFIG_ROLE_ROOTS) {
+    const sources = await createSourceSet(root, roleRoot.paths);
+    roleSources.push({
+      role: roleRoot.role,
+      sourceFiles: sources.files,
+      sourceSetSha256: sources.setSha256,
+    });
+    for (const file of sources.files) {
+      const text = await readFile(resolve(root, file.path), "utf8");
+      for (const match of text.matchAll(/\bBLUEY_[A-Z0-9_]+\b/g)) {
+        const roles = variables.get(match[0]) ?? new Set();
+        roles.add(roleRoot.role);
+        variables.set(match[0], roles);
+      }
+    }
+  }
+  const configContract = {
+    audience: MANAGED_CLOUD_AUDIENCES.configContract,
+    roleSources: roleSources.sort((left, right) =>
+      left.role.localeCompare(right.role, "en"),
+    ),
+    schemaVersion: 1,
+    variables: [...variables.entries()]
+      .sort(([left], [right]) => compareUtf8(left, right))
+      .map(([name, roles]) => ({
+        classification:
+          MANAGED_CLOUD_REQUIRED_CONFIG_SPECS.get(name)?.classification ??
+          classifyConfigVariable(name),
+        name,
+        required: MANAGED_CLOUD_REQUIRED_CONFIG_SPECS.has(name),
+        roles: [...roles].sort(),
+        valueType:
+          MANAGED_CLOUD_REQUIRED_CONFIG_SPECS.get(name)?.valueType ?? "string",
+      })),
+  };
+
+  await writeCanonicalJson(join(output, "builder-policy.json"), builderPolicy);
+  await writeCanonicalJson(
+    join(output, "config-contract.json"),
+    configContract,
+  );
+  await writeCanonicalJson(
+    join(output, "migration-contract.json"),
+    migrationContract,
+  );
+  await writeCanonicalJson(
+    join(output, "protocol-contract.json"),
+    protocolContract,
+  );
+
+  return {
+    builderPolicy,
+    configContract,
+    migrationContract,
+    protocolContract,
+  };
+}
+
+function requireFeatureAuthority(featureAuthority, contractVersion) {
+  requireExactKeys(
+    featureAuthority,
+    [
+      "cloudDistribution",
+      "directDiscovery",
+      "globalDiscovery",
+      "sourceVerification",
+      "workflowCleanup",
+      "workflowCommandDispatch",
+    ],
+    "featureAuthority",
+  );
+  for (const key of Object.keys(featureAuthority)) {
+    requireBoolean(featureAuthority[key], "featureAuthority." + key);
+  }
+  if (
+    !featureAuthority.cloudDistribution ||
+    !featureAuthority.workflowCommandDispatch ||
+    !featureAuthority.workflowCleanup
+  ) {
+    fail("Managed cloud base authorities must be enabled atomically");
+  }
+  const exactVersion =
+    contractVersion ??
+    (featureAuthority.directDiscovery || featureAuthority.globalDiscovery
+      ? 3
+      : featureAuthority.sourceVerification
+        ? 2
+        : 1);
+  if (![1, 2, 3, 4].includes(exactVersion)) {
+    fail("Managed cloud feature-authority contract version is invalid");
+  }
+  if (
+    exactVersion < 3 &&
+    (featureAuthority.directDiscovery || featureAuthority.globalDiscovery)
+  ) {
+    fail("Managed cloud reserves conditional discovery without enabling it");
+  }
+  if (featureAuthority.sourceVerification !== exactVersion >= 2) {
+    fail(
+      "Source verification must use the exact v1=false or v2=true contract; " +
+        (exactVersion === 4
+          ? "release v4 also requires true"
+          : "release v3 also requires true"),
+    );
+  }
+  if (
+    exactVersion >= 3 &&
+    (!featureAuthority.directDiscovery || !featureAuthority.globalDiscovery)
+  ) {
+    fail(
+      (exactVersion === 4 ? "Release-v4" : "Release-v3") +
+        " requires direct and global discovery authority",
+    );
+  }
+  return featureAuthority;
+}
+
+function expectedCapabilities(featureAuthority, contractVersion) {
+  requireFeatureAuthority(featureAuthority, contractVersion);
+  const capabilities = MANAGED_CLOUD_BASE_CAPABILITIES.map((entry) => ({
+    capability: entry.capability,
+    componentId: entry.componentId,
+  }));
+  if (featureAuthority.directDiscovery) {
+    capabilities.push({
+      capability: "discovery_worker",
+      componentId: "jobs-workflows",
+    });
+  }
+  if (featureAuthority.globalDiscovery) {
+    capabilities.push({
+      capability: "global_discovery_worker",
+      componentId: "jobs-workflows",
+    });
+  }
+  if (featureAuthority.sourceVerification) {
+    capabilities.push({
+      capability: "original_source_verifier",
+      componentId: "jobs-workflows",
+    });
+  }
+  return capabilities.sort((left, right) => {
+    const componentOrder = left.componentId.localeCompare(
+      right.componentId,
+      "en",
+    );
+    return (
+      componentOrder || left.capability.localeCompare(right.capability, "en")
+    );
+  });
+}
+
+function requireCapabilities(capabilities, featureAuthority, contractVersion) {
+  const expected = expectedCapabilities(featureAuthority, contractVersion);
+  requireArray(capabilities, "capabilities", expected.length);
+  if (capabilities.length !== expected.length) {
+    fail("Release capability count does not match signed feature authority");
+  }
+  for (const [index, capability] of capabilities.entries()) {
+    requireExactKeys(
+      capability,
+      ["capability", "componentId"],
+      "capabilities[" + index + "]",
+    );
+    if (
+      capability.componentId !== expected[index].componentId ||
+      capability.capability !== expected[index].capability
+    ) {
+      fail("Release capability mapping is not the exact closed mapping");
+    }
+  }
+  return capabilities;
+}
+
+function requireImmutableArtifactReference(component, releaseId) {
+  if (component.artifactKind === "oci_image") {
+    if (
+      !IMAGE_REFERENCE.test(component.artifactRef) ||
+      !component.artifactRef.endsWith("@sha256:" + component.artifactSha256)
+    ) {
+      fail(component.componentId + " must use its exact immutable OCI digest");
+    }
+    return;
+  }
+  let url;
+  try {
+    url = new URL(component.artifactRef);
+  } catch {
+    fail("Portal artifactRef must be an immutable HTTPS URL");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !url.pathname.split("/").includes(releaseId) ||
+    !url.pathname
+      .split("/")
+      .some(
+        (segment) =>
+          segment === component.artifactSha256 ||
+          segment === component.artifactSha256 + ".tar",
+      )
+  ) {
+    fail("Portal artifactRef must be content-addressed and release-bound");
+  }
+}
+
+function requireReleaseComponents(
+  components,
+  releaseId,
+  sourceCommit,
+  configSchemaSha256,
+) {
+  requireArray(components, "components", MANAGED_CLOUD_COMPONENTS.length);
+  if (components.length !== MANAGED_CLOUD_COMPONENTS.length) {
+    fail("Release must contain exactly four artifact components");
+  }
+  for (const [index, component] of components.entries()) {
+    requireExactKeys(
+      component,
+      [
+        "architecture",
+        "artifactKind",
+        "artifactRef",
+        "artifactSha256",
+        "buildId",
+        "componentId",
+        "configSchemaSha256",
+        "platform",
+        "provenanceSha256",
+        "sbomSha256",
+        "sourceCommit",
+      ],
+      "components[" + index + "]",
+    );
+    const expected = MANAGED_CLOUD_COMPONENTS[index];
+    for (const key of [
+      "architecture",
+      "artifactKind",
+      "componentId",
+      "platform",
+    ]) {
+      if (component[key] !== expected[key]) {
+        fail("Release component inventory is not exact or sorted");
+      }
+    }
+    requireSafeId(component.buildId, component.componentId + ".buildId");
+    if (
+      component.sourceCommit !== sourceCommit ||
+      component.configSchemaSha256 !== configSchemaSha256
+    ) {
+      fail(component.componentId + " source or config binding is inconsistent");
+    }
+    for (const key of [
+      "artifactSha256",
+      "configSchemaSha256",
+      "provenanceSha256",
+      "sbomSha256",
+    ]) {
+      requireHex64(component[key], component.componentId + "." + key);
+    }
+    requireImmutableArtifactReference(component, releaseId);
+  }
+  return components;
+}
+
+function requireProtocols(protocols, contractVersion) {
+  const specs = protocolSpecsForVersion(contractVersion);
+  requireArray(protocols, "protocols", specs.length);
+  if (protocols.length !== specs.length) {
+    fail("Release must bind exactly " + specs.length + " versioned protocols");
+  }
+  for (const [index, protocol] of protocols.entries()) {
+    requireExactKeys(
+      protocol,
+      ["protocolId", "protocolVersion", "schemaSha256"],
+      "protocols[" + index + "]",
+    );
+    if (
+      protocol.protocolId !== specs[index].id ||
+      protocol.protocolVersion !== specs[index].version
+    ) {
+      fail("Release protocols must use the exact sorted versioned set");
+    }
+    requireInteger(protocol.protocolVersion, "protocolVersion", 1);
+    requireHex64(protocol.schemaSha256, "protocol.schemaSha256");
+  }
+  return protocols;
+}
+
+function componentInventoryDocument(components, capabilities) {
+  return {
+    audience: MANAGED_CLOUD_AUDIENCES.componentInventory,
+    capabilities,
+    components,
+    version: 1,
+  };
+}
+
+export function validateReleaseManifest(manifest) {
+  requireSignedObjectSize(manifest, "release manifest");
+  requireExactKeys(
+    manifest,
+    [
+      "audience",
+      "capabilities",
+      "components",
+      "componentSetSha256",
+      "configSchemaSha256",
+      "featureAuthority",
+      "featureAuthoritySha256",
+      "manifestGeneration",
+      "manifestId",
+      "migrationSetSha256",
+      "postgresMigrationHead",
+      "protocolSetSha256",
+      "protocols",
+      "publishedAtMs",
+      "releaseId",
+      "releaseSequence",
+      "sourceCommit",
+      "sqliteMigrationHead",
+      "verificationEvidenceSha256",
+      "version",
+    ],
+    "release manifest",
+  );
+  if (
+    ![1, 2, 3, 4].includes(manifest.version) ||
+    manifest.audience !== manifestAudienceForVersion(manifest.version)
+  ) {
+    fail("Release audience or version is invalid");
+  }
+  requireSafeId(manifest.manifestId, "manifestId");
+  requireInteger(manifest.manifestGeneration, "manifestGeneration", 1);
+  const releaseId = requireSafeId(manifest.releaseId, "releaseId");
+  requireInteger(manifest.releaseSequence, "releaseSequence", 1);
+  if (!SOURCE_COMMIT.test(manifest.sourceCommit)) {
+    fail("sourceCommit must be 40 lowercase hexadecimal characters");
+  }
+  requireInteger(manifest.publishedAtMs, "publishedAtMs");
+  requireString(manifest.sqliteMigrationHead, "sqliteMigrationHead");
+  requireString(manifest.postgresMigrationHead, "postgresMigrationHead");
+  const expectedMigrationHeads = migrationHeadsForVersion(manifest.version);
+  if (
+    manifest.sqliteMigrationHead !== expectedMigrationHeads.sqlite ||
+    manifest.postgresMigrationHead !== expectedMigrationHeads.postgres
+  ) {
+    fail("Release migration heads must be the exact current SQL filenames");
+  }
+  for (const key of [
+    "componentSetSha256",
+    "configSchemaSha256",
+    "featureAuthoritySha256",
+    "migrationSetSha256",
+    "protocolSetSha256",
+    "verificationEvidenceSha256",
+  ]) {
+    requireHex64(manifest[key], key);
+  }
+  requireFeatureAuthority(manifest.featureAuthority, manifest.version);
+  if (
+    sha256(canonicalJsonBytes(manifest.featureAuthority)) !==
+    manifest.featureAuthoritySha256
+  ) {
+    fail("featureAuthoritySha256 does not bind featureAuthority");
+  }
+  requireReleaseComponents(
+    manifest.components,
+    releaseId,
+    manifest.sourceCommit,
+    manifest.configSchemaSha256,
+  );
+  requireCapabilities(
+    manifest.capabilities,
+    manifest.featureAuthority,
+    manifest.version,
+  );
+  requireProtocols(manifest.protocols, manifest.version);
+  if (
+    sha256(
+      canonicalJsonBytes(
+        componentInventoryDocument(manifest.components, manifest.capabilities),
+      ),
+    ) !== manifest.componentSetSha256
+  ) {
+    fail("componentSetSha256 does not bind the exact component/capability set");
+  }
+  return manifest;
+}
+
+function validateFileSbom(sbom, componentId, inventory) {
+  requireExactKeys(
+    sbom,
+    [
+      "artifactSha256",
+      "audience",
+      "componentId",
+      "contentInventorySha256",
+      "files",
+      "version",
+    ],
+    componentId + " SBOM",
+  );
+  if (
+    sbom.version !== 1 ||
+    sbom.audience !== MANAGED_CLOUD_AUDIENCES.sbom ||
+    sbom.componentId !== componentId ||
+    sbom.artifactSha256 !== inventory.artifactSha256 ||
+    sbom.contentInventorySha256 !== sha256(canonicalJsonBytes(inventory))
+  ) {
+    fail(componentId + " SBOM does not bind the artifact inventory");
+  }
+  const expectedFiles = inventory.entries
+    .filter((entry) => entry.type === "file")
+    .map((entry) => ({
+      path: entry.path,
+      sha256: entry.sha256,
+      sizeBytes: entry.sizeBytes,
+    }));
+  if (
+    canonicalJsonBytes(sbom.files).compare(
+      canonicalJsonBytes(expectedFiles),
+    ) !== 0
+  ) {
+    fail(componentId + " SBOM must exhaustively match inventory files");
+  }
+}
+
+export function createFileSbom(inventory) {
+  requireObject(inventory, "content inventory");
+  requireSafeId(inventory.componentId, "inventory.componentId");
+  requireHex64(inventory.artifactSha256, "inventory.artifactSha256");
+  requireArray(inventory.entries, "inventory.entries", 1);
+  return {
+    artifactSha256: inventory.artifactSha256,
+    audience: MANAGED_CLOUD_AUDIENCES.sbom,
+    componentId: inventory.componentId,
+    contentInventorySha256: sha256(canonicalJsonBytes(inventory)),
+    files: inventory.entries
+      .filter((entry) => entry.type === "file")
+      .map((entry) => ({
+        path: entry.path,
+        sha256: entry.sha256,
+        sizeBytes: entry.sizeBytes,
+      })),
+    version: 1,
+  };
+}
+
+export function createArtifactProvenance({
+  artifactSha256,
+  buildId,
+  builderPolicySha256,
+  componentId,
+  sourceCommit,
+  sourceDateEpoch,
+}) {
+  const provenance = {
+    artifactSha256,
+    audience: MANAGED_CLOUD_AUDIENCES.provenance,
+    buildId,
+    builderPolicySha256,
+    componentId,
+    sourceCommit,
+    sourceDateEpoch,
+    version: 1,
+  };
+  validateProvenance(provenance, provenance);
+  return provenance;
+}
+
+function validateProvenance(
+  provenance,
+  {
+    artifactSha256,
+    buildId,
+    builderPolicySha256,
+    componentId,
+    sourceCommit,
+    sourceDateEpoch,
+  },
+) {
+  requireExactKeys(
+    provenance,
+    [
+      "artifactSha256",
+      "audience",
+      "buildId",
+      "builderPolicySha256",
+      "componentId",
+      "sourceCommit",
+      "sourceDateEpoch",
+      "version",
+    ],
+    componentId + " provenance",
+  );
+  const expected = {
+    artifactSha256,
+    audience: MANAGED_CLOUD_AUDIENCES.provenance,
+    buildId,
+    builderPolicySha256,
+    componentId,
+    sourceCommit,
+    sourceDateEpoch,
+    version: 1,
+  };
+  if (
+    canonicalJsonBytes(provenance).compare(canonicalJsonBytes(expected)) !== 0
+  ) {
+    fail(componentId + " provenance is not exact");
+  }
+}
+
+const REQUIRED_EXACT_TIP_CI_RUNS = Object.freeze([
+  Object.freeze({
+    checkId: "jobs-ci",
+    workflowPath: ".github/workflows/jobs-ci.yml",
+  }),
+  Object.freeze({
+    checkId: "observability-policy",
+    workflowPath: ".github/workflows/observability-policy.yml",
+  }),
+]);
+
+function normalizeExactTipCiRun(
+  run,
+  expected,
+  repository,
+  defaultBranch,
+  sourceCommit,
+) {
+  requireObject(run, expected.checkId + " GitHub workflow run");
+  const runRepository = requireObject(
+    run.repository,
+    expected.checkId + " repository",
+  );
+  const repositoryId = requireInteger(
+    runRepository.id,
+    expected.checkId + " repository.id",
+    1,
+  );
+  const workflowPath = requireString(
+    run.path,
+    expected.checkId + " workflow path",
+  );
+  if (
+    runRepository.full_name !== repository ||
+    ![
+      expected.workflowPath,
+      expected.workflowPath + "@" + defaultBranch,
+    ].includes(workflowPath) ||
+    run.event !== "push" ||
+    run.status !== "completed" ||
+    run.conclusion !== "success" ||
+    run.head_sha !== sourceCommit ||
+    run.head_branch !== defaultBranch
+  ) {
+    fail(
+      expected.checkId +
+        " must be a successful exact-tip default-branch push run",
+    );
+  }
+  return {
+    checkId: expected.checkId,
+    conclusion: "success",
+    event: "push",
+    headBranch: defaultBranch,
+    headSha: sourceCommit,
+    repositoryId,
+    runAttempt: requireInteger(
+      run.run_attempt,
+      expected.checkId + ".run_attempt",
+      1,
+    ),
+    runId: requireInteger(run.id, expected.checkId + ".id", 1),
+    workflowPath: expected.workflowPath,
+  };
+}
+
+export function createManagedCloudCiEvidence({
+  defaultBranch,
+  jobsCiRun,
+  observabilityRun,
+  releaseContractSelfTestSha256,
+  repository,
+  sourceCommit,
+}) {
+  const exactRepository = requireString(repository, "repository");
+  const exactDefaultBranch = requireGitBranchName(
+    defaultBranch,
+    "defaultBranch",
+  );
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(exactRepository)) {
+    fail("repository must be one exact GitHub owner/name");
+  }
+  requireSourceCommit(sourceCommit);
+  const ciRuns = [jobsCiRun, observabilityRun]
+    .map((run, index) =>
+      normalizeExactTipCiRun(
+        run,
+        REQUIRED_EXACT_TIP_CI_RUNS[index],
+        exactRepository,
+        exactDefaultBranch,
+        sourceCommit,
+      ),
+    )
+    .sort((left, right) => compareUtf8(left.checkId, right.checkId));
+  if (ciRuns[0].repositoryId !== ciRuns[1].repositoryId) {
+    fail("Exact-tip CI runs must belong to the same repository identity");
+  }
+  const evidence = {
+    audience: MANAGED_CLOUD_AUDIENCES.testEvidenceV2,
+    ciRuns,
+    defaultBranch: exactDefaultBranch,
+    releaseContractSelfTestSha256: requireHex64(
+      releaseContractSelfTestSha256,
+      "releaseContractSelfTestSha256",
+    ),
+    repository: exactRepository,
+    repositoryId: ciRuns[0].repositoryId,
+    sourceCommit,
+    version: 2,
+  };
+  validateManagedCloudTestEvidence(evidence, sourceCommit, 2);
+  return evidence;
+}
+
+export function validateManagedCloudTestEvidence(
+  testEvidence,
+  sourceCommit,
+  contractVersion,
+) {
+  if (contractVersion === 1) {
+    requireExactKeys(
+      testEvidence,
+      ["audience", "checks", "sourceCommit", "version"],
+      "test evidence",
+    );
+    if (
+      testEvidence.version !== 1 ||
+      testEvidence.audience !== MANAGED_CLOUD_AUDIENCES.testEvidence ||
+      testEvidence.sourceCommit !== sourceCommit
+    ) {
+      fail("Test evidence does not bind the candidate source");
+    }
+    const checkIds = [];
+    for (const [index, check] of requireArray(
+      testEvidence.checks,
+      "test evidence checks",
+      1,
+    ).entries()) {
+      requireExactKeys(
+        check,
+        ["checkId", "evidenceSha256", "status"],
+        "test evidence check[" + index + "]",
+      );
+      checkIds.push(requireSafeId(check.checkId, "checkId"));
+      requireHex64(check.evidenceSha256, "test evidence digest");
+      if (check.status !== "pass") {
+        fail("Every candidate test evidence check must pass");
+      }
+    }
+    if (
+      new Set(checkIds).size !== checkIds.length ||
+      checkIds.some((id, index) => id !== [...checkIds].sort()[index])
+    ) {
+      fail("Test evidence check IDs must be sorted and unique");
+    }
+    return testEvidence;
+  }
+  if (!usesRemotePublicationContract(contractVersion)) {
+    fail("Test evidence contract version is invalid");
+  }
+  requireExactKeys(
+    testEvidence,
+    [
+      "audience",
+      "ciRuns",
+      "defaultBranch",
+      "releaseContractSelfTestSha256",
+      "repository",
+      "repositoryId",
+      "sourceCommit",
+      "version",
+    ],
+    "test evidence",
+  );
+  if (
+    testEvidence.version !== 2 ||
+    testEvidence.audience !== MANAGED_CLOUD_AUDIENCES.testEvidenceV2 ||
+    testEvidence.sourceCommit !== sourceCommit ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(testEvidence.repository)
+  ) {
+    fail(
+      "Release-v2/v3/v4 test evidence does not bind its exact source repository",
+    );
+  }
+  requireInteger(testEvidence.repositoryId, "test evidence repositoryId", 1);
+  const defaultBranch = requireGitBranchName(
+    testEvidence.defaultBranch,
+    "test evidence defaultBranch",
+  );
+  requireHex64(
+    testEvidence.releaseContractSelfTestSha256,
+    "releaseContractSelfTestSha256",
+  );
+  const runs = requireArray(testEvidence.ciRuns, "test evidence ciRuns", 2);
+  if (runs.length !== REQUIRED_EXACT_TIP_CI_RUNS.length) {
+    fail("Release-v2/v3 test evidence requires both exact-tip CI workflows");
+  }
+  for (const [index, expected] of REQUIRED_EXACT_TIP_CI_RUNS.entries()) {
+    const run = runs[index];
+    requireExactKeys(
+      run,
+      [
+        "checkId",
+        "conclusion",
+        "event",
+        "headBranch",
+        "headSha",
+        "repositoryId",
+        "runAttempt",
+        "runId",
+        "workflowPath",
+      ],
+      "test evidence ciRuns[" + index + "]",
+    );
+    if (
+      run.checkId !== expected.checkId ||
+      run.workflowPath !== expected.workflowPath ||
+      run.conclusion !== "success" ||
+      run.event !== "push" ||
+      run.headBranch !== defaultBranch ||
+      run.headSha !== sourceCommit ||
+      run.repositoryId !== testEvidence.repositoryId
+    ) {
+      fail("Release-v2/v3 test evidence is not exact-tip CI authority");
+    }
+    requireGitBranchName(run.headBranch, expected.checkId + ".headBranch");
+    requireInteger(run.runAttempt, expected.checkId + ".runAttempt", 1);
+    requireInteger(run.runId, expected.checkId + ".runId", 1);
+  }
+  if (runs[0].runId === runs[1].runId) {
+    fail("Exact-tip CI workflow run IDs must be distinct");
+  }
+  return testEvidence;
+}
+
+async function descriptorBuildToComponent(
+  build,
+  {
+    builderPolicySha256,
+    capabilities,
+    configSchemaSha256,
+    migrationSetSha256,
+    protocolSetSha256,
+    releaseId,
+    sourceCommit,
+    sourceDateEpoch,
+  },
+) {
+  requireExactKeys(
+    build,
+    [
+      "architecture",
+      "artifactKind",
+      "artifactRef",
+      "buildId",
+      "candidateFile",
+      "componentId",
+      "contentInventoryFile",
+      "platform",
+      "provenanceFile",
+      "sbomFile",
+    ],
+    "build descriptor",
+  );
+  const componentId = requireSafeId(build.componentId, "componentId");
+  const expected = MANAGED_CLOUD_COMPONENTS.find(
+    (component) => component.componentId === componentId,
+  );
+  if (
+    !expected ||
+    build.artifactKind !== expected.artifactKind ||
+    build.platform !== expected.platform ||
+    build.architecture !== expected.architecture
+  ) {
+    fail("Build descriptor does not match a closed managed cloud component");
+  }
+  const candidateFile = resolve(
+    requireString(build.candidateFile, "candidateFile"),
+  );
+  const contentInventoryFile = resolve(
+    requireString(build.contentInventoryFile, "contentInventoryFile"),
+  );
+  const provenanceFile = resolve(
+    requireString(build.provenanceFile, "provenanceFile"),
+  );
+  const sbomFile = resolve(requireString(build.sbomFile, "sbomFile"));
+  for (const path of [
+    candidateFile,
+    contentInventoryFile,
+    provenanceFile,
+    sbomFile,
+  ]) {
+    await requireRegularFile(path);
+  }
+  const inspected = await inspectPreparedArtifact(
+    candidateFile,
+    componentId,
+    build.artifactKind,
+  );
+  const inventory = (
+    await readCanonicalJson(contentInventoryFile, componentId + " inventory")
+  ).value;
+  if (
+    canonicalJsonBytes(inventory).compare(canonicalJsonBytes(inspected)) !== 0
+  ) {
+    fail(componentId + " inventory does not match inspected artifact bytes");
+  }
+  const sbom = (await readCanonicalJson(sbomFile, componentId + " SBOM")).value;
+  validateFileSbom(sbom, componentId, inventory);
+  const provenance = (
+    await readCanonicalJson(provenanceFile, componentId + " provenance")
+  ).value;
+  const buildId = requireSafeId(build.buildId, componentId + ".buildId");
+  validateProvenance(provenance, {
+    artifactSha256: inventory.artifactSha256,
+    buildId,
+    builderPolicySha256,
+    componentId,
+    sourceCommit,
+    sourceDateEpoch,
+  });
+  const component = {
+    architecture: expected.architecture,
+    artifactKind: expected.artifactKind,
+    artifactRef: requireString(build.artifactRef, "artifactRef"),
+    artifactSha256: inventory.artifactSha256,
+    buildId,
+    componentId,
+    configSchemaSha256,
+    platform: expected.platform,
+    provenanceSha256: await hashFile(provenanceFile),
+    sbomSha256: await hashFile(sbomFile),
+    sourceCommit,
+  };
+  requireImmutableArtifactReference(component, releaseId);
+  const managedRuntimeContract = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId];
+  const runtimeContract = managedRuntimeContract ?? {
+    cmd: [],
+    entrypoint: [],
+    requiredPaths: ["index.html"],
+    runtimePath: null,
+    runtimeUser: "static",
+  };
+  const runtimePath =
+    runtimeContract.requiredEnvironment
+      ?.find((entry) => entry.startsWith("PATH="))
+      ?.slice("PATH=".length) ?? runtimeContract.runtimePath;
+  const requiredPaths = deriveManagedCloudRequiredRuntimePaths(
+    componentId,
+    capabilities,
+  );
+  if (componentId === "jobs-runner") {
+    requiredPaths.push(
+      ...inventory.entries
+        .filter(
+          (entry) =>
+            entry.type === "file" &&
+            isManagedChromiumExecutablePath(entry.path),
+        )
+        .map((entry) => entry.path),
+    );
+  }
+  requiredPaths.sort();
+  requireWorkflowVerifierEntrypointAuthority(
+    componentId,
+    inventory.entries,
+    requiredPaths,
+  );
+  const runtimeRoles = expectedRuntimeRolesForComponent(
+    componentId,
+    capabilities,
+  );
+  const runtimeMeasurement = managedRuntimeContract
+    ? runtimeMeasurementDocument({
+        buildId,
+        componentId,
+        configSchemaSha256,
+        inventory,
+        migrationSetSha256,
+        protocolSetSha256,
+        roles: runtimeRoles,
+        sourceCommit,
+      })
+    : null;
+  const runtimeMeasurementSha256 = runtimeMeasurement
+    ? sha256(canonicalJsonBytes(runtimeMeasurement))
+    : null;
+  const runtimeIdentities = runtimeMeasurement
+    ? runtimeRoles.map((role) => ({
+        role,
+        runtimeIdentitySha256: deriveManagedCloudRuntimeIdentitySha256(
+          runtimeMeasurementSha256,
+          componentId,
+          role,
+        ),
+      }))
+    : [];
+  if (runtimeMeasurement) {
+    validateManagedCloudRuntimeMeasurement(
+      runtimeMeasurement,
+      runtimeMeasurementSha256,
+      runtimeIdentities,
+      {
+        buildId,
+        componentId,
+        configSchemaSha256,
+        inventory,
+        migrationSetSha256,
+        protocolSetSha256,
+        roles: runtimeRoles,
+        sourceCommit,
+      },
+    );
+  }
+  return {
+    candidateFile,
+    component,
+    contentInventoryFile,
+    evidence: {
+      artifactSha256: component.artifactSha256,
+      cmd: [...runtimeContract.cmd],
+      componentId,
+      contentInventorySha256: await hashFile(contentInventoryFile),
+      entrypoint: [...runtimeContract.entrypoint],
+      provenanceSha256: component.provenanceSha256,
+      requiredPaths,
+      runtimeIdentities,
+      runtimeMeasurement,
+      runtimeMeasurementSha256,
+      runtimePath,
+      runtimeUser: runtimeContract.runtimeUser,
+      sbomSha256: component.sbomSha256,
+    },
+    provenanceFile,
+    sbomFile,
+  };
+}
+
+async function copyBoundPayload(source, destination, path, payloads) {
+  const metadata = await requireRegularFile(source, path);
+  await mkdir(dirname(destination), { recursive: true });
+  await copyFile(source, destination, 0);
+  payloads.push({
+    path,
+    sha256: await hashFile(destination),
+    sizeBytes: metadata.size,
+  });
+}
+
+export async function assembleManagedCloudCandidate({
+  contractsDirectory,
+  descriptorFile,
+  outputDirectory,
+  repoRoot,
+}) {
+  const contractsRoot = resolve(contractsDirectory);
+  const output = resolve(outputDirectory);
+  const root = resolve(repoRoot);
+  await requireEmptyOutputDirectory(output);
+  const { value: descriptor } = await readJson(
+    descriptorFile,
+    "release descriptor",
+  );
+  requireExactKeys(
+    descriptor,
+    [
+      "audience",
+      "builds",
+      "featureAuthority",
+      "manifestGeneration",
+      "manifestId",
+      "publishedAtMs",
+      "releaseId",
+      "releaseSequence",
+      "sourceCommit",
+      "sourceDateEpoch",
+      "testEvidenceFile",
+      "version",
+    ],
+    "release descriptor",
+  );
+  if (
+    ![1, 2, 3, 4].includes(descriptor.version) ||
+    descriptor.audience !==
+      `bluey-jobs-managed-cloud-release-descriptor-v${descriptor.version}`
+  ) {
+    fail("Release descriptor audience or version is invalid");
+  }
+  const releaseId = requireSafeId(descriptor.releaseId, "releaseId");
+  const sourceCommit = descriptor.sourceCommit;
+  if (!SOURCE_COMMIT.test(sourceCommit)) {
+    fail("Descriptor sourceCommit is invalid");
+  }
+  const sourceDateEpoch = requireInteger(
+    descriptor.sourceDateEpoch,
+    "sourceDateEpoch",
+  );
+  const featureAuthority = requireFeatureAuthority(
+    descriptor.featureAuthority,
+    descriptor.version,
+  );
+  const contractNames = [
+    "builder-policy.json",
+    "config-contract.json",
+    "migration-contract.json",
+    "protocol-contract.json",
+  ];
+  const contracts = {};
+  for (const name of contractNames) {
+    const source = join(contractsRoot, name);
+    await readCanonicalJson(source, name);
+    await copyFile(source, join(output, name), 0);
+    contracts[name] = await hashFile(source);
+  }
+  const jobsLockPath = join(root, "jobs/package-lock.json");
+  const serverLockPath = join(root, "server/Cargo.lock");
+  await requireRegularFile(jobsLockPath);
+  await requireRegularFile(serverLockPath);
+  const migrationContract = (
+    await readCanonicalJson(
+      join(output, "migration-contract.json"),
+      "migration contract",
+    )
+  ).value;
+  requireObject(migrationContract.sqlite, "SQLite migration contract");
+  requireObject(migrationContract.postgres, "Postgres migration contract");
+  const protocolContract = (
+    await readCanonicalJson(
+      join(output, "protocol-contract.json"),
+      "protocol contract",
+    )
+  ).value;
+  if (protocolContract.schemaVersion !== descriptor.version) {
+    fail("Protocol contract version is invalid");
+  }
+  const protocolSpecs = protocolSpecsForVersion(descriptor.version);
+  const protocols = requireProtocols(
+    requireArray(
+      protocolContract.protocols,
+      "protocol contract protocols",
+      protocolSpecs.length,
+    )
+      .map((protocol) => ({
+        protocolId: protocol.protocolId,
+        protocolVersion: protocol.protocolVersion,
+        schemaSha256: protocol.schemaSha256,
+      })),
+    descriptor.version,
+  );
+  const capabilities = expectedCapabilities(
+    featureAuthority,
+    descriptor.version,
+  );
+  const buildRecords = await Promise.all(
+    requireArray(descriptor.builds, "descriptor.builds", 4).map((build) =>
+      descriptorBuildToComponent(build, {
+        builderPolicySha256: contracts["builder-policy.json"],
+        capabilities,
+        configSchemaSha256: contracts["config-contract.json"],
+        migrationSetSha256: contracts["migration-contract.json"],
+        protocolSetSha256: contracts["protocol-contract.json"],
+        releaseId,
+        sourceCommit,
+        sourceDateEpoch,
+      }),
+    ),
+  );
+  buildRecords.sort((left, right) =>
+    left.component.componentId.localeCompare(right.component.componentId, "en"),
+  );
+  const components = buildRecords.map((record) => record.component);
+  const inventoryAttachments = {};
+  for (const record of buildRecords) {
+    inventoryAttachments[record.component.componentId] = (
+      await readFile(record.contentInventoryFile)
+    ).toString("base64url");
+  }
+  validateManagedCloudInventoryAttachments(inventoryAttachments);
+  await writeCanonicalJson(
+    join(output, "inventory-attachments.json"),
+    inventoryAttachments,
+  );
+  const componentInventory = componentInventoryDocument(
+    components,
+    capabilities,
+  );
+  await writeCanonicalJson(
+    join(output, "component-inventory.json"),
+    componentInventory,
+  );
+  const testEvidenceFile = resolve(
+    requireString(descriptor.testEvidenceFile, "testEvidenceFile"),
+  );
+  const { value: testEvidence } = await readCanonicalJson(
+    testEvidenceFile,
+    "test evidence",
+  );
+  validateManagedCloudTestEvidence(
+    testEvidence,
+    sourceCommit,
+    descriptor.version,
+  );
+  await copyFile(testEvidenceFile, join(output, "test-evidence.json"), 0);
+  const verificationEvidence = {
+    audience: MANAGED_CLOUD_AUDIENCES.verificationEvidence,
+    builderPolicySha256: contracts["builder-policy.json"],
+    components: buildRecords.map((record) => record.evidence),
+    configContractSha256: contracts["config-contract.json"],
+    jobsLockSha256: await hashFile(jobsLockPath),
+    migrationContractSha256: contracts["migration-contract.json"],
+    protocolContractSha256: contracts["protocol-contract.json"],
+    serverLockSha256: await hashFile(serverLockPath),
+    sourceCommit,
+    testEvidenceSha256: await hashFile(testEvidenceFile),
+    version: 1,
+  };
+  requireSignedObjectSize(verificationEvidence, "verification evidence");
+  await writeCanonicalJson(
+    join(output, "verification-evidence.json"),
+    verificationEvidence,
+  );
+  const manifest = {
+    audience: manifestAudienceForVersion(descriptor.version),
+    capabilities,
+    components,
+    componentSetSha256: await hashFile(
+      join(output, "component-inventory.json"),
+    ),
+    configSchemaSha256: contracts["config-contract.json"],
+    featureAuthority,
+    featureAuthoritySha256: sha256(canonicalJsonBytes(featureAuthority)),
+    manifestGeneration: requireInteger(
+      descriptor.manifestGeneration,
+      "manifestGeneration",
+      1,
+    ),
+    manifestId: requireSafeId(descriptor.manifestId, "manifestId"),
+    migrationSetSha256: contracts["migration-contract.json"],
+    postgresMigrationHead: requireString(
+      migrationContract.postgres.head,
+      "postgresMigrationHead",
+    ),
+    protocolSetSha256: contracts["protocol-contract.json"],
+    protocols,
+    publishedAtMs: requireInteger(descriptor.publishedAtMs, "publishedAtMs"),
+    releaseId,
+    releaseSequence: requireInteger(
+      descriptor.releaseSequence,
+      "releaseSequence",
+      1,
+    ),
+    sourceCommit,
+    sqliteMigrationHead: requireString(
+      migrationContract.sqlite.head,
+      "sqliteMigrationHead",
+    ),
+    verificationEvidenceSha256: await hashFile(
+      join(output, "verification-evidence.json"),
+    ),
+    version: descriptor.version,
+  };
+  validateReleaseManifest(manifest);
+  await writeCanonicalJson(join(output, "release-manifest.json"), manifest);
+
+  const payloads = [];
+  for (const record of buildRecords) {
+    const id = record.component.componentId;
+    const extension =
+      record.component.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+    await copyBoundPayload(
+      record.candidateFile,
+      join(output, "payloads", id + extension),
+      "payloads/" + id + extension,
+      payloads,
+    );
+    for (const [kind, source] of [
+      ["content-inventory", record.contentInventoryFile],
+      ["provenance", record.provenanceFile],
+      ["sbom", record.sbomFile],
+    ]) {
+      const path = "evidence/" + id + "." + kind + ".json";
+      await copyBoundPayload(source, join(output, path), path, payloads);
+    }
+  }
+  await copyBoundPayload(
+    jobsLockPath,
+    join(output, JOBS_LOCK_EVIDENCE_PATH),
+    JOBS_LOCK_EVIDENCE_PATH,
+    payloads,
+  );
+  await copyBoundPayload(
+    serverLockPath,
+    join(output, SERVER_LOCK_EVIDENCE_PATH),
+    SERVER_LOCK_EVIDENCE_PATH,
+    payloads,
+  );
+  payloads.sort((left, right) => left.path.localeCompare(right.path, "en"));
+  const candidateSet = {
+    audience: MANAGED_CLOUD_AUDIENCES.candidate,
+    candidateId: manifest.manifestId,
+    manifestSha256: await hashFile(join(output, "release-manifest.json")),
+    payloads,
+    releaseId,
+    sourceCommit: manifest.sourceCommit,
+    verificationEvidenceSha256: manifest.verificationEvidenceSha256,
+    version: 1,
+  };
+  await writeCanonicalJson(join(output, "candidate-set.json"), candidateSet);
+  await validateManagedCloudCandidate(output);
+  return candidateSet;
+}
+
+function validateCandidateSetShape(candidate) {
+  requireExactKeys(
+    candidate,
+    [
+      "audience",
+      "candidateId",
+      "manifestSha256",
+      "payloads",
+      "releaseId",
+      "sourceCommit",
+      "verificationEvidenceSha256",
+      "version",
+    ],
+    "candidate set",
+  );
+  if (
+    candidate.version !== 1 ||
+    candidate.audience !== MANAGED_CLOUD_AUDIENCES.candidate
+  ) {
+    fail("Candidate set audience or schema version is invalid");
+  }
+  requireSafeId(candidate.candidateId, "candidateId");
+  requireSafeId(candidate.releaseId, "releaseId");
+  if (!SOURCE_COMMIT.test(candidate.sourceCommit)) {
+    fail("Candidate sourceCommit is invalid");
+  }
+  for (const key of ["manifestSha256", "verificationEvidenceSha256"]) {
+    requireHex64(candidate[key], "candidate." + key);
+  }
+  requireArray(candidate.payloads, "candidate.payloads", 18);
+  if (candidate.payloads.length !== 18) {
+    fail("Candidate set must bind exactly 18 artifact and evidence payloads");
+  }
+  const paths = [];
+  for (const [index, payload] of candidate.payloads.entries()) {
+    requireExactKeys(
+      payload,
+      ["path", "sha256", "sizeBytes"],
+      "candidate.payloads[" + index + "]",
+    );
+    paths.push(requireSafeRelativePath(payload.path));
+    requireHex64(payload.sha256, payload.path + ".sha256");
+    requireInteger(payload.sizeBytes, payload.path + ".sizeBytes", 1);
+  }
+  if (
+    new Set(paths).size !== paths.length ||
+    paths.some((path, index) => path !== [...paths].sort()[index])
+  ) {
+    fail("Candidate payload paths must be sorted and unique");
+  }
+}
+
+async function requireExactTopLevel(root, expected) {
+  const entries = await readdir(root);
+  entries.sort();
+  const wanted = [...expected].sort();
+  if (
+    entries.length !== wanted.length ||
+    entries.some((entry, index) => entry !== wanted[index])
+  ) {
+    fail("Directory contains an unexpected or missing top-level entry");
+  }
+}
+
+export async function validateManagedCloudCandidate(candidateDirectory) {
+  const root = resolve(candidateDirectory);
+  await requireExactTopLevel(root, [
+    ...REQUIRED_CANDIDATE_FILES,
+    "evidence",
+    "payloads",
+  ]);
+  const { value: manifest } = await readCanonicalJson(
+    join(root, "release-manifest.json"),
+  );
+  validateReleaseManifest(manifest);
+  const { value: candidate } = await readCanonicalJson(
+    join(root, "candidate-set.json"),
+  );
+  validateCandidateSetShape(candidate);
+  if (
+    candidate.releaseId !== manifest.releaseId ||
+    candidate.sourceCommit !== manifest.sourceCommit ||
+    candidate.manifestSha256 !==
+      (await hashFile(join(root, "release-manifest.json")))
+  ) {
+    fail("Candidate identity does not bind the release manifest");
+  }
+  const { value: builderPolicy } = await readCanonicalJson(
+    join(root, "builder-policy.json"),
+    "builder policy",
+  );
+  const boundContracts = {};
+  const contractBindings = [
+    ["component-inventory.json", "componentSetSha256"],
+    ["config-contract.json", "configSchemaSha256"],
+    ["migration-contract.json", "migrationSetSha256"],
+    ["protocol-contract.json", "protocolSetSha256"],
+    ["verification-evidence.json", "verificationEvidenceSha256"],
+  ];
+  for (const [name, key] of contractBindings) {
+    const { value } = await readCanonicalJson(join(root, name), name);
+    boundContracts[name] = value;
+    const digest = await hashFile(join(root, name));
+    if (digest !== manifest[key]) {
+      fail(name + " does not match its release manifest binding");
+    }
+  }
+  validateManagedCloudReleaseContracts({
+    builderPolicy,
+    configContract: boundContracts["config-contract.json"],
+    manifest,
+    migrationContract: boundContracts["migration-contract.json"],
+    protocolContract: boundContracts["protocol-contract.json"],
+  });
+  if (
+    candidate.verificationEvidenceSha256 !== manifest.verificationEvidenceSha256
+  ) {
+    fail("Candidate does not bind release verification evidence");
+  }
+  const requiredCandidatePayloadPaths = new Set([
+    JOBS_LOCK_EVIDENCE_PATH,
+    SERVER_LOCK_EVIDENCE_PATH,
+    ...manifest.components.flatMap((component) => {
+      const extension =
+        component.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+      return [
+        "evidence/" + component.componentId + ".content-inventory.json",
+        "evidence/" + component.componentId + ".provenance.json",
+        "evidence/" + component.componentId + ".sbom.json",
+        "payloads/" + component.componentId + extension,
+      ];
+    }),
+  ]);
+  const candidatePayloadPaths = new Set(
+    candidate.payloads.map((payload) => payload.path),
+  );
+  if (
+    candidatePayloadPaths.size !== requiredCandidatePayloadPaths.size ||
+    [...requiredCandidatePayloadPaths].some(
+      (path) => !candidatePayloadPaths.has(path),
+    )
+  ) {
+    fail("Candidate payload set is not the exact closed release payload set");
+  }
+  const { value: componentInventory } = await readCanonicalJson(
+    join(root, "component-inventory.json"),
+  );
+  if (
+    canonicalJsonBytes(componentInventory).compare(
+      canonicalJsonBytes(
+        componentInventoryDocument(manifest.components, manifest.capabilities),
+      ),
+    ) !== 0
+  ) {
+    fail("Component inventory does not match the release");
+  }
+  const { value: verificationEvidence } = await readCanonicalJson(
+    join(root, "verification-evidence.json"),
+    "verification evidence",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  const { value: inventoryAttachments } = await readCanonicalJson(
+    join(root, "inventory-attachments.json"),
+    "inventory attachments",
+    MAX_INVENTORY_ATTACHMENT_TRANSPORT_BYTES,
+  );
+  const validatedAttachments =
+    validateManagedCloudInventoryAttachments(inventoryAttachments);
+  requireExactKeys(
+    verificationEvidence,
+    [
+      "audience",
+      "builderPolicySha256",
+      "components",
+      "configContractSha256",
+      "jobsLockSha256",
+      "migrationContractSha256",
+      "protocolContractSha256",
+      "serverLockSha256",
+      "sourceCommit",
+      "testEvidenceSha256",
+      "version",
+    ],
+    "verification evidence",
+  );
+  if (
+    verificationEvidence.version !== 1 ||
+    verificationEvidence.audience !==
+      MANAGED_CLOUD_AUDIENCES.verificationEvidence ||
+    verificationEvidence.sourceCommit !== manifest.sourceCommit ||
+    verificationEvidence.configContractSha256 !== manifest.configSchemaSha256 ||
+    verificationEvidence.migrationContractSha256 !==
+      manifest.migrationSetSha256 ||
+    verificationEvidence.protocolContractSha256 !==
+      manifest.protocolSetSha256 ||
+    verificationEvidence.testEvidenceSha256 !==
+      (await hashFile(join(root, "test-evidence.json"))) ||
+    verificationEvidence.builderPolicySha256 !==
+      (await hashFile(join(root, "builder-policy.json"))) ||
+    verificationEvidence.jobsLockSha256 !==
+      (await hashFile(join(root, JOBS_LOCK_EVIDENCE_PATH))) ||
+    verificationEvidence.serverLockSha256 !==
+      (await hashFile(join(root, SERVER_LOCK_EVIDENCE_PATH)))
+  ) {
+    fail("Verification evidence does not bind the release contracts");
+  }
+  const { value: testEvidence } = await readCanonicalJson(
+    join(root, "test-evidence.json"),
+  );
+  validateManagedCloudTestEvidence(
+    testEvidence,
+    manifest.sourceCommit,
+    manifest.version,
+  );
+  if (verificationEvidence.components.length !== manifest.components.length) {
+    fail("Verification evidence component set is incomplete");
+  }
+  for (const [index, component] of manifest.components.entries()) {
+    const evidence = verificationEvidence.components[index];
+    requireExactKeys(
+      evidence,
+      [
+        "artifactSha256",
+        "cmd",
+        "componentId",
+        "contentInventorySha256",
+        "entrypoint",
+        "provenanceSha256",
+        "requiredPaths",
+        "runtimeIdentities",
+        "runtimeMeasurement",
+        "runtimeMeasurementSha256",
+        "runtimePath",
+        "runtimeUser",
+        "sbomSha256",
+      ],
+      "verification component evidence",
+    );
+    if (
+      evidence.componentId !== component.componentId ||
+      evidence.artifactSha256 !== component.artifactSha256 ||
+      evidence.sbomSha256 !== component.sbomSha256 ||
+      evidence.provenanceSha256 !== component.provenanceSha256
+    ) {
+      fail("Verification component evidence does not bind the manifest");
+    }
+    const runtimeContract =
+      MANAGED_CLOUD_RUNTIME_CONTRACTS[component.componentId];
+    if (runtimeContract) {
+      requireObject(
+        evidence.runtimeMeasurement,
+        component.componentId + ".runtimeMeasurement",
+      );
+      requireHex64(
+        evidence.runtimeMeasurementSha256,
+        component.componentId + ".runtimeMeasurementSha256",
+      );
+    } else if (
+      evidence.runtimeMeasurement !== null ||
+      evidence.runtimeMeasurementSha256 !== null ||
+      !Array.isArray(evidence.runtimeIdentities) ||
+      evidence.runtimeIdentities.length !== 0
+    ) {
+      fail("Static portal must not claim runtime measurement authority");
+    }
+    const expectedRuntimePath = runtimeContract
+      ? runtimeContract.requiredEnvironment
+          .find((entry) => entry.startsWith("PATH="))
+          ?.slice("PATH=".length)
+      : null;
+    const baseRequiredPaths = deriveManagedCloudRequiredRuntimePaths(
+      component.componentId,
+      manifest.capabilities,
+    );
+    const evidenceRequiredPaths = requireSortedUniqueStrings(
+      evidence.requiredPaths,
+      component.componentId + ".requiredPaths",
+    );
+    const runnerChromiumPaths = evidenceRequiredPaths.filter((path) =>
+      isManagedChromiumExecutablePath(path),
+    );
+    if (
+      evidence.runtimePath !== expectedRuntimePath ||
+      evidence.runtimeUser !== (runtimeContract?.runtimeUser ?? "static") ||
+      JSON.stringify(evidence.entrypoint) !==
+        JSON.stringify(runtimeContract?.entrypoint ?? []) ||
+      JSON.stringify(evidence.cmd) !==
+        JSON.stringify(runtimeContract?.cmd ?? []) ||
+      baseRequiredPaths.some((path) => !evidenceRequiredPaths.includes(path)) ||
+      (component.componentId === "jobs-runner"
+        ? runnerChromiumPaths.length < 1 ||
+          evidenceRequiredPaths.length !==
+            baseRequiredPaths.length + runnerChromiumPaths.length
+        : JSON.stringify(evidenceRequiredPaths) !==
+          JSON.stringify([...baseRequiredPaths].sort()))
+    ) {
+      fail(component.componentId + " runtime evidence is not exact");
+    }
+    const extension =
+      component.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+    const payloadPath = join(
+      root,
+      "payloads",
+      component.componentId + extension,
+    );
+    const inventoryPath = join(
+      root,
+      "evidence",
+      component.componentId + ".content-inventory.json",
+    );
+    const sbomPath = join(
+      root,
+      "evidence",
+      component.componentId + ".sbom.json",
+    );
+    const provenancePath = join(
+      root,
+      "evidence",
+      component.componentId + ".provenance.json",
+    );
+    const inspected = await inspectPreparedArtifact(
+      payloadPath,
+      component.componentId,
+      component.artifactKind,
+    );
+    const { value: inventory } = await readCanonicalJson(inventoryPath);
+    requireWorkflowVerifierEntrypointAuthority(
+      component.componentId,
+      inventory.entries,
+      baseRequiredPaths,
+    );
+    const attachedInventory = validatedAttachments.decoded.get(
+      component.componentId,
+    );
+    if (
+      canonicalJsonBytes(inspected).compare(canonicalJsonBytes(inventory)) !==
+        0 ||
+      !attachedInventory?.bytes.equals(await readFile(inventoryPath)) ||
+      evidence.contentInventorySha256 !== (await hashFile(inventoryPath)) ||
+      inspected.artifactSha256 !== component.artifactSha256
+    ) {
+      fail(
+        component.componentId + " payload/inventory relationship is invalid",
+      );
+    }
+    if (runtimeContract) {
+      const runtimeRoles = expectedRuntimeRolesForComponent(
+        component.componentId,
+        manifest.capabilities,
+      );
+      validateManagedCloudRuntimeMeasurement(
+        evidence.runtimeMeasurement,
+        evidence.runtimeMeasurementSha256,
+        evidence.runtimeIdentities,
+        {
+          buildId: component.buildId,
+          componentId: component.componentId,
+          configSchemaSha256: manifest.configSchemaSha256,
+          inventory,
+          migrationSetSha256: manifest.migrationSetSha256,
+          protocolSetSha256: manifest.protocolSetSha256,
+          roles: runtimeRoles,
+          sourceCommit: manifest.sourceCommit,
+        },
+      );
+    }
+    const { value: sbom } = await readCanonicalJson(sbomPath);
+    validateFileSbom(sbom, component.componentId, inventory);
+    const { value: provenance } = await readCanonicalJson(provenancePath);
+    validateProvenance(provenance, {
+      artifactSha256: component.artifactSha256,
+      buildId: component.buildId,
+      builderPolicySha256: verificationEvidence.builderPolicySha256,
+      componentId: component.componentId,
+      sourceCommit: manifest.sourceCommit,
+      sourceDateEpoch: requireInteger(
+        provenance.sourceDateEpoch,
+        component.componentId + " provenance sourceDateEpoch",
+      ),
+    });
+    if (
+      (await hashFile(sbomPath)) !== component.sbomSha256 ||
+      (await hashFile(provenancePath)) !== component.provenanceSha256
+    ) {
+      fail(component.componentId + " SBOM/provenance relationship is invalid");
+    }
+  }
+  const expectedPayloadPaths = new Set(
+    candidate.payloads.map((item) => item.path),
+  );
+  const treeFiles = await collectTreeFiles(root);
+  const actualPayloadPaths = treeFiles
+    .map((file) => file.relativePath)
+    .filter(
+      (path) => path.startsWith("evidence/") || path.startsWith("payloads/"),
+    );
+  if (
+    actualPayloadPaths.length !== expectedPayloadPaths.size ||
+    actualPayloadPaths.some((path) => !expectedPayloadPaths.has(path))
+  ) {
+    fail("Candidate contains unbound payload or evidence files");
+  }
+  for (const payload of candidate.payloads) {
+    const path = join(root, payload.path);
+    const metadata = await requireRegularFile(path, payload.path);
+    if (
+      metadata.size !== payload.sizeBytes ||
+      (await hashFile(path)) !== payload.sha256
+    ) {
+      fail(payload.path + " does not match the candidate binding");
+    }
+  }
+  return { candidate, manifest };
+}
+
+const TRUST_ROLES = Object.freeze([
+  "general_promotion",
+  "incident",
+  "promotion",
+  "release",
+  "root",
+]);
+const SIGNED_TARGET_AUDIENCES = Object.freeze([
+  MANAGED_CLOUD_AUDIENCES.activation,
+  MANAGED_CLOUD_AUDIENCES.activationV2,
+  MANAGED_CLOUD_AUDIENCES.activationV3,
+  MANAGED_CLOUD_AUDIENCES.activationV4,
+  MANAGED_CLOUD_AUDIENCES.cohort,
+  MANAGED_CLOUD_AUDIENCES.manifest,
+  MANAGED_CLOUD_AUDIENCES.manifestV2,
+  MANAGED_CLOUD_AUDIENCES.manifestV3,
+  MANAGED_CLOUD_AUDIENCES.manifestV4,
+  MANAGED_CLOUD_AUDIENCES.rollback,
+  MANAGED_CLOUD_AUDIENCES.rollbackV2,
+  MANAGED_CLOUD_AUDIENCES.trustPolicy,
+]);
+
+function requireCanonicalBase64url(value, byteLength, label) {
+  const encoded = requireString(value, label);
+  if (!BASE64URL.test(encoded)) {
+    fail(label + " must be unpadded base64url");
+  }
+  const bytes = Buffer.from(encoded, "base64url");
+  if (bytes.length !== byteLength || bytes.toString("base64url") !== encoded) {
+    fail(label + " must be canonical base64url with exact length");
+  }
+  return bytes;
+}
+
+function publicKeyFromRawBase64url(value, label) {
+  const raw = requireCanonicalBase64url(value, 32, label);
+  const prefix = Buffer.from("302a300506032b6570032100", "hex");
+  try {
+    const key = createPublicKey({
+      format: "der",
+      key: Buffer.concat([prefix, raw]),
+      type: "spki",
+    });
+    if (key.asymmetricKeyType !== "ed25519") {
+      fail(label + " must encode an Ed25519 public key");
+    }
+    return key;
+  } catch {
+    fail(label + " must encode an Ed25519 public key");
+  }
+}
+
+function validateRootAnchor(rootAnchor) {
+  requireSignedObjectSize(rootAnchor, "root anchor");
+  requireExactKeys(
+    rootAnchor,
+    ["audience", "keys", "threshold", "version"],
+    "root anchor",
+  );
+  if (
+    rootAnchor.version !== 1 ||
+    rootAnchor.audience !== MANAGED_CLOUD_AUDIENCES.rootAnchor
+  ) {
+    fail("Root anchor audience or version is invalid");
+  }
+  requireInteger(rootAnchor.threshold, "root anchor threshold", 1);
+  const keyIds = [];
+  const keys = new Map();
+  for (const [index, key] of requireBoundedArray(
+    rootAnchor.keys,
+    "root anchor keys",
+    1,
+    32,
+  ).entries()) {
+    requireExactKeys(
+      key,
+      ["keyId", "publicKey", "validFromMs", "validUntilMs"],
+      "root anchor key[" + index + "]",
+    );
+    const keyId = requireSafeId(key.keyId, "root anchor keyId");
+    keyIds.push(keyId);
+    requireInteger(key.validFromMs, "root key validFromMs");
+    requireInteger(key.validUntilMs, "root key validUntilMs", 1);
+    if (key.validUntilMs <= key.validFromMs) {
+      fail("Root key validity window is invalid");
+    }
+    keys.set(keyId, {
+      keyId,
+      publicKey: publicKeyFromRawBase64url(key.publicKey, "root key publicKey"),
+      validFromMs: key.validFromMs,
+      validUntilMs: key.validUntilMs,
+    });
+  }
+  if (
+    rootAnchor.threshold > keys.size ||
+    new Set(keyIds).size !== keyIds.length ||
+    keyIds.some((id, index) => id !== [...keyIds].sort()[index])
+  ) {
+    fail("Root anchor keys must be sorted, unique, and meet threshold");
+  }
+  return { keys, threshold: rootAnchor.threshold };
+}
+
+export function validateManagedCloudTrustPolicy(policy) {
+  requireSignedObjectSize(policy, "trust policy");
+  requireExactKeys(
+    policy,
+    [
+      "audience",
+      "expiresAtMs",
+      "issuedAtMs",
+      "keys",
+      "policyId",
+      "predecessorPolicySha256",
+      "roles",
+      "trustGeneration",
+      "validFromMs",
+      "version",
+    ],
+    "trust policy",
+  );
+  if (
+    policy.version !== 1 ||
+    policy.audience !== MANAGED_CLOUD_AUDIENCES.trustPolicy
+  ) {
+    fail("Trust policy audience or version is invalid");
+  }
+  requireSafeId(policy.policyId, "policyId");
+  requireInteger(policy.trustGeneration, "trustGeneration", 1);
+  requireInteger(policy.issuedAtMs, "policy.issuedAtMs");
+  requireInteger(policy.validFromMs, "policy.validFromMs");
+  requireInteger(policy.expiresAtMs, "policy.expiresAtMs", 1);
+  if (
+    policy.validFromMs > policy.issuedAtMs ||
+    policy.expiresAtMs <= policy.issuedAtMs
+  ) {
+    fail("Trust policy validity window is invalid");
+  }
+  if (policy.trustGeneration === 1) {
+    if (policy.predecessorPolicySha256 !== null) {
+      fail("Generation-one trust policy must not have a predecessor");
+    }
+  } else {
+    requireHex64(policy.predecessorPolicySha256, "predecessorPolicySha256");
+  }
+  const thresholds = new Map();
+  for (const [index, role] of requireArray(
+    policy.roles,
+    "trust policy roles",
+    TRUST_ROLES.length,
+  ).entries()) {
+    requireExactKeys(
+      role,
+      ["role", "threshold"],
+      "trust policy role[" + index + "]",
+    );
+    if (role.role !== TRUST_ROLES[index]) {
+      fail("Trust policy roles must be the exact sorted role set");
+    }
+    thresholds.set(
+      role.role,
+      requireInteger(role.threshold, role.role + " threshold", 1),
+    );
+  }
+  if (policy.roles.length !== TRUST_ROLES.length) {
+    fail("Trust policy role set is incomplete");
+  }
+  const keys = new Map();
+  const keyIds = [];
+  for (const [index, key] of requireBoundedArray(
+    policy.keys,
+    "trust policy keys",
+    TRUST_ROLES.length,
+    64,
+  ).entries()) {
+    requireExactKeys(
+      key,
+      [
+        "keyId",
+        "maximumTrustGeneration",
+        "minimumTrustGeneration",
+        "publicKey",
+        "role",
+        "state",
+        "validFromMs",
+        "validUntilMs",
+      ],
+      "trust policy key[" + index + "]",
+    );
+    const keyId = requireSafeId(key.keyId, "keyId");
+    keyIds.push(keyId);
+    requireEnum(key.role, TRUST_ROLES, "key role");
+    requireEnum(key.state, ["active", "retired", "revoked"], "key state");
+    requireInteger(key.validFromMs, "key.validFromMs");
+    requireInteger(key.validUntilMs, "key.validUntilMs", 1);
+    requireInteger(key.minimumTrustGeneration, "key.minimumTrustGeneration", 1);
+    requireInteger(key.maximumTrustGeneration, "key.maximumTrustGeneration", 1);
+    if (
+      key.validUntilMs <= key.validFromMs ||
+      key.maximumTrustGeneration < key.minimumTrustGeneration
+    ) {
+      fail("Trust key validity or generation window is invalid");
+    }
+    keys.set(keyId, {
+      ...key,
+      publicKeyObject: publicKeyFromRawBase64url(
+        key.publicKey,
+        "trust key publicKey",
+      ),
+    });
+  }
+  if (
+    new Set(keyIds).size !== keyIds.length ||
+    keyIds.some((id, index) => id !== [...keyIds].sort()[index])
+  ) {
+    fail("Trust policy key IDs must be sorted and unique");
+  }
+  for (const role of TRUST_ROLES) {
+    const activeCount = [...keys.values()].filter(
+      (key) =>
+        key.role === role &&
+        key.state === "active" &&
+        policy.trustGeneration >= key.minimumTrustGeneration &&
+        policy.trustGeneration <= key.maximumTrustGeneration &&
+        policy.issuedAtMs >= key.validFromMs &&
+        policy.issuedAtMs < key.validUntilMs,
+    ).length;
+    if (thresholds.get(role) > activeCount) {
+      fail(role + " threshold exceeds its active key count");
+    }
+  }
+  return { keys, thresholds };
+}
+
+function validateSignatureSetShape(signatureSet) {
+  requireSignedObjectSize(signatureSet, "signature set");
+  requireExactKeys(
+    signatureSet,
+    [
+      "audience",
+      "role",
+      "signatureSetId",
+      "signatures",
+      "signedAtMs",
+      "targetAudience",
+      "targetSha256",
+      "trustGeneration",
+      "version",
+    ],
+    "signature set",
+  );
+  if (
+    signatureSet.version !== 1 ||
+    signatureSet.audience !== MANAGED_CLOUD_AUDIENCES.signatureSet
+  ) {
+    fail("Signature set audience or version is invalid");
+  }
+  requireSafeId(signatureSet.signatureSetId, "signatureSetId");
+  requireInteger(signatureSet.trustGeneration, "signature trustGeneration", 1);
+  requireEnum(signatureSet.role, TRUST_ROLES, "signature role");
+  requireEnum(
+    signatureSet.targetAudience,
+    SIGNED_TARGET_AUDIENCES,
+    "signature targetAudience",
+  );
+  requireHex64(signatureSet.targetSha256, "signature targetSha256");
+  requireInteger(signatureSet.signedAtMs, "signature signedAtMs");
+  const keyIds = [];
+  for (const [index, signature] of requireBoundedArray(
+    signatureSet.signatures,
+    "signatures",
+    1,
+    32,
+  ).entries()) {
+    requireExactKeys(
+      signature,
+      ["keyId", "signature"],
+      "signature[" + index + "]",
+    );
+    keyIds.push(requireSafeId(signature.keyId, "signature keyId"));
+    requireCanonicalBase64url(signature.signature, 64, "signature");
+  }
+  if (
+    new Set(keyIds).size !== keyIds.length ||
+    keyIds.some((id, index) => id !== [...keyIds].sort()[index])
+  ) {
+    fail("Signature key IDs must be sorted and unique");
+  }
+  return signatureSet;
+}
+
+function signaturePayload(signatureSet) {
+  return canonicalJsonBytes({
+    audience: signatureSet.audience,
+    role: signatureSet.role,
+    signatureSetId: signatureSet.signatureSetId,
+    signedAtMs: signatureSet.signedAtMs,
+    targetAudience: signatureSet.targetAudience,
+    targetSha256: signatureSet.targetSha256,
+    trustGeneration: signatureSet.trustGeneration,
+    version: signatureSet.version,
+  });
+}
+
+function verifySignatureSetWithKeys({
+  expectedRole,
+  expectedTargetAudience,
+  expectedTargetBytes,
+  expectedTrustGeneration,
+  keys,
+  signatureSet,
+  threshold,
+}) {
+  validateSignatureSetShape(signatureSet);
+  const nowMs = Date.now();
+  if (
+    signatureSet.role !== expectedRole ||
+    signatureSet.targetAudience !== expectedTargetAudience ||
+    signatureSet.targetSha256 !== sha256(expectedTargetBytes) ||
+    signatureSet.trustGeneration !== expectedTrustGeneration ||
+    signatureSet.signedAtMs > nowMs
+  ) {
+    fail(
+      "Signature set does not bind the expected role, target, generation, and time",
+    );
+  }
+  const payload = signaturePayload(signatureSet);
+  const valid = new Set();
+  for (const signature of signatureSet.signatures) {
+    const key = keys.get(signature.keyId);
+    if (!key) {
+      fail("Signature set contains an untrusted key");
+    }
+    if (
+      key.role &&
+      (key.role !== expectedRole ||
+        key.state !== "active" ||
+        expectedTrustGeneration < key.minimumTrustGeneration ||
+        expectedTrustGeneration > key.maximumTrustGeneration)
+    ) {
+      fail("Signature key role, state, or generation is invalid");
+    }
+    const validFromMs = key.validFromMs;
+    const validUntilMs = key.validUntilMs;
+    if (
+      signatureSet.signedAtMs < validFromMs ||
+      signatureSet.signedAtMs >= validUntilMs
+    ) {
+      fail("Signature key is outside its signed-time validity window");
+    }
+    if (
+      !verifySignature(
+        null,
+        payload,
+        key.publicKeyObject ?? key.publicKey,
+        Buffer.from(signature.signature, "base64url"),
+      )
+    ) {
+      fail("Ed25519 signature verification failed");
+    }
+    valid.add(signature.keyId);
+  }
+  if (valid.size < threshold) {
+    fail("Role-separated signature threshold was not met");
+  }
+  return [...valid].sort();
+}
+
+function rootKeyEligible(key, trustGeneration, signedAtMs) {
+  return (
+    (!key.role ||
+      (key.role === "root" &&
+        key.state === "active" &&
+        trustGeneration >= key.minimumTrustGeneration &&
+        trustGeneration <= key.maximumTrustGeneration)) &&
+    signedAtMs >= key.validFromMs &&
+    signedAtMs < key.validUntilMs
+  );
+}
+
+function verifyUnionRootSignatureSet({
+  expectedTargetBytes,
+  expectedTrustGeneration,
+  signatureSet,
+  sides,
+}) {
+  validateSignatureSetShape(signatureSet);
+  if (
+    signatureSet.role !== "root" ||
+    signatureSet.targetAudience !== MANAGED_CLOUD_AUDIENCES.trustPolicy ||
+    signatureSet.targetSha256 !== sha256(expectedTargetBytes) ||
+    signatureSet.trustGeneration !== expectedTrustGeneration ||
+    signatureSet.signedAtMs > Date.now()
+  ) {
+    fail("Root signature set does not bind the policy and trust generation");
+  }
+  const payload = signaturePayload(signatureSet);
+  const counts = sides.map(() => new Set());
+  for (const signature of signatureSet.signatures) {
+    let eligibleAnywhere = false;
+    let verifiedAnywhere = false;
+    for (const [sideIndex, side] of sides.entries()) {
+      const key = side.keys.get(signature.keyId);
+      if (
+        !key ||
+        !rootKeyEligible(
+          key,
+          side.trustGeneration ?? expectedTrustGeneration,
+          signatureSet.signedAtMs,
+        )
+      ) {
+        continue;
+      }
+      eligibleAnywhere = true;
+      if (
+        verifySignature(
+          null,
+          payload,
+          key.publicKeyObject ?? key.publicKey,
+          Buffer.from(signature.signature, "base64url"),
+        )
+      ) {
+        verifiedAnywhere = true;
+        counts[sideIndex].add(signature.keyId);
+      }
+    }
+    if (!eligibleAnywhere) {
+      fail(
+        "Root signature set contains a signer ineligible on every trust side",
+      );
+    }
+    if (!verifiedAnywhere) {
+      fail("Root signature does not verify under any eligible trust-side key");
+    }
+  }
+  for (const [index, side] of sides.entries()) {
+    if (counts[index].size < side.threshold) {
+      fail(side.label + " root signature threshold was not met");
+    }
+  }
+  return [...new Set(counts.flatMap((count) => [...count]))].sort();
+}
+
+export function verifyManagedCloudSignatureSet({
+  expectedRole,
+  expectedTargetAudience,
+  expectedTargetBytes,
+  policy,
+  signatureSet,
+}) {
+  const validatedPolicy = validateManagedCloudTrustPolicy(policy);
+  const nowMs = Date.now();
+  if (
+    nowMs < policy.validFromMs ||
+    nowMs >= policy.expiresAtMs ||
+    signatureSet.signedAtMs < policy.validFromMs ||
+    signatureSet.signedAtMs >= policy.expiresAtMs
+  ) {
+    fail("Trust policy is not valid for this verification");
+  }
+  return verifySignatureSetWithKeys({
+    expectedRole,
+    expectedTargetAudience,
+    expectedTargetBytes,
+    expectedTrustGeneration: policy.trustGeneration,
+    keys: validatedPolicy.keys,
+    signatureSet,
+    threshold: validatedPolicy.thresholds.get(expectedRole),
+  });
+}
+
+export function validateManagedCloudTrustBundle(
+  trustBundle,
+  expectedRootAnchorSha256,
+) {
+  requireExactKeys(
+    trustBundle,
+    ["audience", "policies", "rootAnchor", "version"],
+    "trust bundle",
+  );
+  if (
+    trustBundle.version !== 1 ||
+    trustBundle.audience !== MANAGED_CLOUD_AUDIENCES.trustBundle
+  ) {
+    fail("Trust bundle audience or version is invalid");
+  }
+  requireHex64(expectedRootAnchorSha256, "expectedRootAnchorSha256");
+  if (
+    sha256(canonicalJsonBytes(trustBundle.rootAnchor)) !==
+    expectedRootAnchorSha256
+  ) {
+    fail("Trust bundle root anchor is not the independently pinned anchor");
+  }
+  const rootAnchor = validateRootAnchor(trustBundle.rootAnchor);
+  let previous;
+  for (const [index, entry] of requireArray(
+    trustBundle.policies,
+    "trust bundle policies",
+    1,
+  ).entries()) {
+    requireExactKeys(entry, ["authorization", "policy"], "trust entry");
+    const policy = entry.policy;
+    const validated = validateManagedCloudTrustPolicy(policy);
+    if (policy.trustGeneration !== index + 1) {
+      fail("Trust bundle generations must be contiguous and sorted");
+    }
+    validateSignatureSetShape(entry.authorization);
+    if (
+      entry.authorization.signedAtMs < policy.issuedAtMs ||
+      entry.authorization.signedAtMs < policy.validFromMs ||
+      entry.authorization.signedAtMs >= policy.expiresAtMs ||
+      (previous &&
+        (entry.authorization.signedAtMs < previous.policy.validFromMs ||
+          entry.authorization.signedAtMs >= previous.policy.expiresAtMs))
+    ) {
+      fail(
+        "Trust-policy authorization must be inside every required policy window",
+      );
+    }
+    const policyBytes = canonicalJsonBytes(policy);
+    if (index === 0) {
+      const rootKeys = new Map(
+        [...rootAnchor.keys.entries()].map(([keyId, key]) => [
+          keyId,
+          {
+            ...key,
+            publicKeyObject: key.publicKey,
+          },
+        ]),
+      );
+      const successorRootKeys = new Map(
+        [...validated.keys].filter(
+          ([, key]) => key.role === "root" && key.state === "active",
+        ),
+      );
+      verifyUnionRootSignatureSet({
+        expectedTargetBytes: policyBytes,
+        expectedTrustGeneration: 1,
+        signatureSet: entry.authorization,
+        sides: [
+          {
+            keys: rootKeys,
+            label: "pinned anchor",
+            threshold: rootAnchor.threshold,
+            trustGeneration: 1,
+          },
+          {
+            keys: successorRootKeys,
+            label: "successor policy",
+            threshold: validated.thresholds.get("root"),
+            trustGeneration: policy.trustGeneration,
+          },
+        ],
+      });
+    } else {
+      if (
+        policy.predecessorPolicySha256 !==
+        sha256(canonicalJsonBytes(previous.policy))
+      ) {
+        fail("Trust rotation does not bind its exact predecessor");
+      }
+      const previousRootKeys = new Map(
+        [...previous.validated.keys].filter(
+          ([, key]) => key.role === "root" && key.state === "active",
+        ),
+      );
+      const nextRootKeys = new Map(
+        [...validated.keys].filter(
+          ([, key]) => key.role === "root" && key.state === "active",
+        ),
+      );
+      verifyUnionRootSignatureSet({
+        expectedTargetBytes: policyBytes,
+        expectedTrustGeneration: policy.trustGeneration,
+        signatureSet: entry.authorization,
+        sides: [
+          {
+            keys: previousRootKeys,
+            label: "predecessor policy",
+            threshold: previous.validated.thresholds.get("root"),
+            trustGeneration: previous.policy.trustGeneration,
+          },
+          {
+            keys: nextRootKeys,
+            label: "successor policy",
+            threshold: validated.thresholds.get("root"),
+            trustGeneration: policy.trustGeneration,
+          },
+        ],
+      });
+    }
+    previous = { policy, validated };
+  }
+  const nowMs = Date.now();
+  if (
+    nowMs < previous.policy.validFromMs ||
+    nowMs >= previous.policy.expiresAtMs
+  ) {
+    fail("Active trust policy is outside its validity window");
+  }
+  return previous.policy;
+}
+
+export async function authorizeManagedCloudCandidate({
+  approvedObservabilityPolicySha256,
+  authorizationId,
+  candidateDirectory,
+  expectedCandidateSetSha256,
+  expectedRootAnchorSha256,
+  observabilityPolicyRepo,
+  outputDirectory,
+  signatureSetFile,
+  trustBundleFile,
+}, readPolicyGit) {
+  const output = resolve(outputDirectory);
+  const validated = await validateManagedCloudCandidate(candidateDirectory);
+  const candidateSetSha256 = sha256(canonicalJsonBytes(validated.candidate));
+  if (candidateSetSha256 !== requireHex64(expectedCandidateSetSha256, "verified candidate set digest")) {
+    fail("Authorization candidate differs from the verified intake");
+  }
+  const approvedObservabilityPolicy = verifyManagedCloudObservabilityPolicy({
+    approvedPolicySha256: approvedObservabilityPolicySha256,
+    repo: observabilityPolicyRepo,
+    sourceCommit: validated.manifest.sourceCommit,
+  }, readPolicyGit);
+  const { value: trustBundle } = await readCanonicalJson(
+    trustBundleFile,
+    "trust bundle",
+  );
+  const policy = validateManagedCloudTrustBundle(
+    trustBundle,
+    expectedRootAnchorSha256,
+  );
+  const { value: signatureSet } = await readCanonicalJson(
+    signatureSetFile,
+    "release signatures",
+  );
+  const manifestBytes = await readFile(
+    join(resolve(candidateDirectory), "release-manifest.json"),
+  );
+  if (sha256(manifestBytes) !== validated.candidate.manifestSha256) {
+    fail("Release manifest changed after candidate and policy validation");
+  }
+  const signerKeyIds = verifyManagedCloudSignatureSet({
+    expectedRole: "release",
+    expectedTargetAudience: manifestAudienceForVersion(
+      validated.manifest.version,
+    ),
+    expectedTargetBytes: manifestBytes,
+    policy,
+    signatureSet,
+  });
+  if (signatureSet.signedAtMs < validated.manifest.publishedAtMs) {
+    fail(
+      "Release signature cannot predate the deterministic manifest source epoch",
+    );
+  }
+  await requireEmptyOutputDirectory(output);
+  await cp(resolve(candidateDirectory), join(output, "candidate"), {
+    errorOnExist: true,
+    force: false,
+    recursive: true,
+  });
+  await copyFile(signatureSetFile, join(output, "release-signatures.json"), 0);
+  await copyFile(trustBundleFile, join(output, "trust-bundle.json"), 0);
+  const authorization = {
+    audience: MANAGED_CLOUD_AUDIENCES.authorizationV2,
+    authorizationId: requireSafeId(authorizationId, "authorizationId"),
+    authorizedAtMs: Date.now(),
+    candidateSetSha256,
+    manifestSha256: sha256(manifestBytes),
+    observabilityPolicySha256: approvedObservabilityPolicy.policySha256,
+    policySha256: sha256(canonicalJsonBytes(policy)),
+    releaseId: validated.manifest.releaseId,
+    releaseSignatureSetSha256: await hashFile(signatureSetFile),
+    signerKeyIds,
+    sourceCommit: approvedObservabilityPolicy.sourceCommit,
+    trustBundleSha256: await hashFile(trustBundleFile),
+    trustGeneration: policy.trustGeneration,
+    version: 2,
+  };
+  await writeCanonicalJson(
+    join(output, "authorization-set.json"),
+    authorization,
+  );
+  return authorization;
+}
+
+export async function validateAuthorizedManagedCloudCandidate(
+  authorizedDirectory,
+  expectedRootAnchorSha256,
+) {
+  const root = resolve(authorizedDirectory);
+  await requireExactTopLevel(root, REQUIRED_AUTHORIZED_FILES);
+  const validated = await validateManagedCloudCandidate(
+    join(root, "candidate"),
+  );
+  const { value: authorization } = await readCanonicalJson(
+    join(root, "authorization-set.json"),
+  );
+  const policyBound = authorization?.version === 2;
+  requireExactKeys(
+    authorization,
+    [
+      "audience",
+      "authorizationId",
+      "authorizedAtMs",
+      "candidateSetSha256",
+      "manifestSha256",
+      ...(policyBound ? ["observabilityPolicySha256", "sourceCommit"] : []),
+      "policySha256",
+      "releaseId",
+      "releaseSignatureSetSha256",
+      "signerKeyIds",
+      "trustBundleSha256",
+      "trustGeneration",
+      "version",
+    ],
+    "authorization set",
+  );
+  if (
+    (authorization.version !== 1 && !policyBound) ||
+    authorization.audience !== (policyBound
+      ? MANAGED_CLOUD_AUDIENCES.authorizationV2 : MANAGED_CLOUD_AUDIENCES.authorization) ||
+    authorization.releaseId !== validated.manifest.releaseId ||
+    authorization.manifestSha256 !== validated.candidate.manifestSha256 ||
+    authorization.candidateSetSha256 !==
+      (await hashFile(join(root, "candidate/candidate-set.json")))
+  ) {
+    fail("Authorization set does not bind the candidate");
+  }
+  if (policyBound) {
+    requireHex64(authorization.observabilityPolicySha256, "authorization Observability policy digest");
+    if (authorization.sourceCommit !== validated.manifest.sourceCommit) {
+      fail("Authorization Observability policy does not bind the candidate source");
+    }
+  }
+  requireSafeId(authorization.authorizationId, "authorizationId");
+  requireInteger(authorization.authorizedAtMs, "authorizedAtMs");
+  requireSortedUniqueStrings(authorization.signerKeyIds, "signerKeyIds");
+  const { value: trustBundle } = await readCanonicalJson(
+    join(root, "trust-bundle.json"),
+  );
+  const policy = validateManagedCloudTrustBundle(
+    trustBundle,
+    expectedRootAnchorSha256,
+  );
+  const { value: signatureSet } = await readCanonicalJson(
+    join(root, "release-signatures.json"),
+  );
+  const manifestBytes = await readFile(
+    join(root, "candidate/release-manifest.json"),
+  );
+  const signerKeyIds = verifyManagedCloudSignatureSet({
+    expectedRole: "release",
+    expectedTargetAudience: manifestAudienceForVersion(
+      validated.manifest.version,
+    ),
+    expectedTargetBytes: manifestBytes,
+    policy,
+    signatureSet,
+  });
+  if (signatureSet.signedAtMs < validated.manifest.publishedAtMs) {
+    fail(
+      "Release signature cannot predate the deterministic manifest source epoch",
+    );
+  }
+  if (
+    authorization.authorizedAtMs < signatureSet.signedAtMs ||
+    authorization.authorizedAtMs > Date.now() ||
+    authorization.authorizedAtMs >= policy.expiresAtMs
+  ) {
+    fail("Authorization receipt time is outside its signed policy window");
+  }
+  const bindings = [
+    ["manifestSha256", sha256(manifestBytes)],
+    ["policySha256", sha256(canonicalJsonBytes(policy))],
+    [
+      "releaseSignatureSetSha256",
+      await hashFile(join(root, "release-signatures.json")),
+    ],
+    ["trustBundleSha256", await hashFile(join(root, "trust-bundle.json"))],
+  ];
+  for (const [key, expected] of bindings) {
+    if (authorization[key] !== expected) {
+      fail("Authorization readback does not bind " + key);
+    }
+  }
+  if (
+    authorization.trustGeneration !== policy.trustGeneration ||
+    JSON.stringify(authorization.signerKeyIds) !== JSON.stringify(signerKeyIds)
+  ) {
+    fail("Authorization readback signer or trust generation is invalid");
+  }
+  return {
+    ...validated,
+    authorization,
+    policy,
+    root,
+    signatureSet,
+    trustBundle,
+  };
+}
+
+const executeAuthorizationArchiveStager = promisify(execFile);
+const authorizationArchiveStager = fileURLToPath(
+  new URL("./stage-managed-cloud-authorization-archive.py", import.meta.url),
+);
+
+function custodyStamp(stat) {
+  return [stat.dev, stat.ino, stat.uid, stat.mode, stat.nlink, stat.size, stat.mtimeNs, stat.ctimeNs]
+    .map(String).join(":");
+}
+
+async function readAuthorizationCapture(path, label, maximumBytes) {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n || before.uid !== BigInt(process.getuid()) ||
+        (before.mode & 0o022n) !== 0n || before.size < 3n || before.size > BigInt(maximumBytes)) {
+      fail(label + " must be a bounded private regular capture");
+    }
+    const bytes = Buffer.alloc(Number(before.size));
+    for (let offset = 0; offset < bytes.length;) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (!bytesRead) fail(label + " capture ended early");
+      offset += bytesRead;
+    }
+    if (custodyStamp(before) !== custodyStamp(await handle.stat({ bigint: true })) ||
+        custodyStamp(before) !== custodyStamp(await lstat(path, { bigint: true }))) {
+      fail(label + " capture changed during read");
+    }
+    let value;
+    try {
+      value = JSON.parse(bytes.toString("utf8"));
+    } catch {
+      fail(label + " capture is not valid JSON");
+    }
+    return { value, digest: sha256(bytes) };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function selectManagedCloudReleaseArchive({
+  artifactsFile, expected, jobsFile, runFile,
+}, candidateMode) {
+  // Caller owns the trusted API endpoints and producer terminal status;
+  // the downloaded archive is not a source for any of these three records.
+  const [run, jobs, artifacts] = await Promise.all([
+    readAuthorizationCapture(runFile, "Authorization run", MAX_PUBLICATION_WORKFLOW_RUN_BYTES),
+    readAuthorizationCapture(jobsFile, "Authorization jobs", MAX_PUBLICATION_WORKFLOW_JOBS_BYTES),
+    readAuthorizationCapture(artifactsFile, "Authorization artifacts", MAX_PUBLICATION_ARTIFACTS_BYTES),
+  ]);
+  return {
+    ...(candidateMode ? selectManagedCloudCandidateOrigin : selectManagedCloudAuthorizationOrigin)({
+      artifacts: artifacts.value, expected, jobs: jobs.value, run: run.value,
+    }),
+    metadataSha256: { run: run.digest, jobs: jobs.digest, artifacts: artifacts.digest },
+  };
+}
+
+export function selectManagedCloudAuthorizationArtifact(input) {
+  return selectManagedCloudReleaseArchive(input, false);
+}
+
+export function selectManagedCloudCandidateArtifact(input) {
+  return selectManagedCloudReleaseArchive(input, true);
+}
+
+async function inspectAuthorizationPrivateDirectory(path, label) {
+  if (typeof path !== "string" || resolve(path) !== path || await realpath(path) !== path) {
+    fail(label + " must be a physical absolute path");
+  }
+  const stat = await lstat(path, { bigint: true });
+  if (!stat.isDirectory() || (stat.mode & 0o777n) !== 0o700n || stat.uid !== BigInt(process.getuid())) {
+    fail(label + " must be a private mode-0700 directory");
+  }
+  return [stat.dev, stat.ino, stat.mode, stat.uid].map(String).join(":");
+}
+
+async function runAuthorizationArchiveStager(args) {
+  try {
+    return await executeAuthorizationArchiveStager("/usr/bin/python3", args, {
+      env: { LC_ALL: "C", PATH: "/usr/bin:/bin" },
+      maxBuffer: 16 * 1024,
+      timeout: 10 * 60 * 1000,
+    });
+  } catch {
+    fail("Selected authorization archive did not pass the closed stager");
+  }
+}
+
+export function intakeManagedCloudAuthorization(input) {
+  return intakeManagedCloudReleaseArchive(input, false);
+}
+
+export function intakeManagedCloudCandidate(input) {
+  return intakeManagedCloudReleaseArchive(input, true);
+}
+
+async function intakeManagedCloudReleaseArchive({
+  approvedObservabilityPolicySha256,
+  archive,
+  artifactsFile,
+  downloadedArtifactId,
+  expected,
+  expectedRootAnchorSha256,
+  jobsFile,
+  maxUnpackedBytes,
+  parent,
+  reserveBytes,
+  runFile,
+}, candidateMode) {
+  if (!candidateMode) {
+    requireHex64(approvedObservabilityPolicySha256, "approved Observability policy");
+    requireHex64(expectedRootAnchorSha256, "protected root anchor");
+  }
+  requireInteger(downloadedArtifactId, "downloaded authorization artifact ID", 1);
+  requireInteger(maxUnpackedBytes, "authorization unpacked byte limit", 1);
+  requireInteger(reserveBytes, "authorization disk reserve", 0);
+  const parentStamp = await inspectAuthorizationPrivateDirectory(parent, "Authorization intake parent");
+  const selection = await selectManagedCloudReleaseArchive({ artifactsFile, expected, jobsFile, runFile }, candidateMode);
+  if (downloadedArtifactId !== selection.artifactId) {
+    fail("Downloaded authorization artifact ID no longer matches the selected attempt");
+  }
+  const attemptRoot = await mkdtemp(join(parent, "intake-"));
+  const attemptStamp = await inspectAuthorizationPrivateDirectory(attemptRoot, "Authorization attempt root");
+  const stageCustody = {};
+  const kind = candidateMode ? "candidate" : "authorized";
+  try {
+    return await completeManagedCloudAuthorizationIntake({
+      approvedObservabilityPolicySha256, archive, attemptRoot, attemptStamp,
+      expectedRootAnchorSha256, maxUnpackedBytes, parent, parentStamp, reserveBytes, selection,
+      defaultBranch: expected.defaultBranch, stageCustody, kind,
+    });
+  } catch (error) {
+    // This exact invocation root is disposable; never remove the caller's parent
+    // or adopt an unexpected sibling/entry after a custody failure.
+    try {
+      if (dirname(attemptRoot) !== parent ||
+          attemptStamp !== await inspectAuthorizationPrivateDirectory(attemptRoot, "Authorization attempt root") ||
+          parentStamp !== await inspectAuthorizationPrivateDirectory(parent, "Authorization intake parent")) {
+        fail("Authorization refusal cleanup custody changed");
+      }
+      const cleaned = await runAuthorizationArchiveStager([
+        "-I", "-S", "-B", authorizationArchiveStager, "discard",
+        "--kind", kind,
+        "--parent", parent, "--parent-identity", parentStamp,
+        "--attempt", basename(attemptRoot), "--attempt-identity", attemptStamp,
+        "--staged", stageCustody.root ? basename(stageCustody.root) : "",
+        "--staged-identity", stageCustody.stamp ?? "",
+      ]);
+      if (cleaned.stdout !== "" || cleaned.stderr !== "") {
+        fail("Authorization cleanup did not terminate cleanly");
+      }
+    } catch {
+      fail("Authorization intake refused; cleanup could not be proven");
+    }
+    throw error;
+  }
+}
+
+async function completeManagedCloudAuthorizationIntake({
+  approvedObservabilityPolicySha256, archive, attemptRoot, attemptStamp, defaultBranch,
+  expectedRootAnchorSha256, maxUnpackedBytes, parent, parentStamp, reserveBytes, selection, stageCustody, kind,
+}) {
+  const fileCount = kind === "candidate" ? 28 : 31;
+  const leaf = kind === "candidate" ? /^candidate-[0-9a-f]{24}$/ : /^authorized-[0-9a-f]{24}$/;
+  const stageResult = await runAuthorizationArchiveStager([
+    "-I", "-S", "-B", authorizationArchiveStager,
+    "--kind", kind,
+    "--archive", archive, "--parent", attemptRoot,
+    "--size", String(selection.artifactSizeBytes), "--digest", selection.artifactDigest,
+    "--max-unpacked-bytes", String(maxUnpackedBytes), "--reserve-bytes", String(reserveBytes),
+  ]);
+  if (stageResult.stderr !== "" || typeof stageResult.stdout !== "string" ||
+      Buffer.byteLength(stageResult.stdout) > 8192) {
+    fail("Authorization archive stager did not return a closed result");
+  }
+  let staged;
+  try {
+    staged = JSON.parse(stageResult.stdout);
+  } catch {
+    fail("Authorization archive stager did not return valid JSON");
+  }
+  requireExactKeys(staged, ["root", "archiveDigest", "archiveSizeBytes", "fileCount", "unpackedBytes"],
+    "authorization archive stage");
+  if (staged.archiveDigest !== selection.artifactDigest || staged.archiveSizeBytes !== selection.artifactSizeBytes ||
+      staged.fileCount !== fileCount || !Number.isSafeInteger(staged.unpackedBytes) ||
+      staged.unpackedBytes < fileCount || staged.unpackedBytes > maxUnpackedBytes || typeof staged.root !== "string" ||
+      dirname(staged.root) !== attemptRoot || !leaf.test(basename(staged.root))) {
+    fail("Authorization stage result does not bind the selected archive");
+  }
+  const stagedStamp = await inspectAuthorizationPrivateDirectory(staged.root, "Staged authorization");
+  Object.assign(stageCustody, { root: staged.root, stamp: stagedStamp });
+  const verified = kind === "candidate"
+    ? await validateManagedCloudCandidate(staged.root)
+    : await validateAuthorizedManagedCloudCandidate(staged.root, expectedRootAnchorSha256);
+  const ciEvidence = await readCandidateExactTipCiEvidence(
+    kind === "candidate" ? staged.root : join(staged.root, "candidate"), verified.manifest,
+  );
+  if (ciEvidence.repository !== selection.repository || ciEvidence.repositoryId !== selection.repositoryId ||
+      ciEvidence.defaultBranch !== defaultBranch || ciEvidence.sourceCommit !== selection.candidateSourceCommit) {
+    fail((kind === "candidate" ? "Candidate" : "Authorized candidate") +
+      " CI evidence does not bind the selected repository, branch and source");
+  }
+  const bound = kind === "candidate" ? {
+    audience: "bluey-jobs-managed-cloud-candidate-intake-v1",
+    ...selection,
+    candidateSetSha256: sha256(canonicalJsonBytes(verified.candidate)),
+  } : {
+    audience: "bluey-jobs-managed-cloud-authorization-intake-v1",
+    ...bindManagedCloudAuthorizationPolicy(selection, verified.authorization, approvedObservabilityPolicySha256),
+    authorizationSetSha256: sha256(canonicalJsonBytes(verified.authorization)),
+  };
+  if (parentStamp !== await inspectAuthorizationPrivateDirectory(parent, "Authorization intake parent") ||
+      attemptStamp !== await inspectAuthorizationPrivateDirectory(attemptRoot, "Authorization attempt root") ||
+      stagedStamp !== await inspectAuthorizationPrivateDirectory(staged.root, "Staged authorization")) {
+    fail("Authorization intake custody changed");
+  }
+  return {
+    ...bound,
+    candidateManifestSha256: verified.candidate.manifestSha256,
+    root: staged.root,
+    version: 1,
+  };
+}
+
+export function deriveRequiredRuntimeRoles(featureAuthority) {
+  requireFeatureAuthority(featureAuthority);
+  const roles = [...MANAGED_CLOUD_BASE_RUNTIME_ROLES];
+  if (featureAuthority.directDiscovery) {
+    roles.push("discovery_worker");
+  }
+  if (featureAuthority.globalDiscovery) {
+    roles.push("global_discovery_worker");
+  }
+  if (featureAuthority.sourceVerification) {
+    roles.push("original_source_verifier");
+  }
+  return roles.sort();
+}
+
+function validateScope(scope, label = "scope") {
+  requireExactKeys(scope, ["channel", "environment", "region"], label);
+  requireEnum(
+    scope.environment,
+    ["production", "staging"],
+    label + ".environment",
+  );
+  requireSafeId(scope.region, label + ".region");
+  requireEnum(
+    scope.channel,
+    ["canary", "general", "shadow"],
+    label + ".channel",
+  );
+  return scope;
+}
+
+function authorityRoleForChannel(channel) {
+  return channel === "general" ? "general_promotion" : "promotion";
+}
+
+function validateCohort(cohort) {
+  requireSignedObjectSize(cohort, "cohort");
+  requireExactKeys(
+    cohort,
+    [
+      "accountIdSha256s",
+      "approvalRef",
+      "audience",
+      "cohortGeneration",
+      "cohortId",
+      "expiresAtMs",
+      "issuedAtMs",
+      "notBeforeMs",
+      "rolloutMode",
+      "scope",
+      "trustGeneration",
+      "version",
+    ],
+    "cohort",
+  );
+  if (
+    cohort.version !== 1 ||
+    cohort.audience !== MANAGED_CLOUD_AUDIENCES.cohort
+  ) {
+    fail("Cohort audience or version is invalid");
+  }
+  requireSafeId(cohort.cohortId, "cohortId");
+  requireInteger(cohort.cohortGeneration, "cohortGeneration", 1);
+  requireInteger(cohort.trustGeneration, "cohort.trustGeneration", 1);
+  const scope = validateScope(cohort.scope, "cohort.scope");
+  requireEnum(
+    cohort.rolloutMode,
+    ["all_eligible_accounts", "allowlist", "none"],
+    "rolloutMode",
+  );
+  requireString(cohort.approvalRef, "approvalRef");
+  requireInteger(cohort.issuedAtMs, "cohort.issuedAtMs");
+  requireInteger(cohort.notBeforeMs, "cohort.notBeforeMs");
+  requireInteger(cohort.expiresAtMs, "cohort.expiresAtMs", 1);
+  if (
+    cohort.notBeforeMs < cohort.issuedAtMs ||
+    cohort.expiresAtMs <= cohort.notBeforeMs
+  ) {
+    fail("Cohort validity window is invalid");
+  }
+  const accounts = requireArray(cohort.accountIdSha256s, "accountIdSha256s");
+  if (accounts.length > 512) {
+    fail("Canary cohort may contain at most 512 account hashes");
+  }
+  accounts.forEach((value) => requireHex64(value, "accountIdSha256"));
+  if (
+    new Set(accounts).size !== accounts.length ||
+    accounts.some((value, index) => value !== [...accounts].sort()[index])
+  ) {
+    fail("Cohort account hashes must be sorted and unique");
+  }
+  if (
+    (scope.channel === "canary" &&
+      (cohort.rolloutMode !== "allowlist" || accounts.length < 1)) ||
+    (scope.channel === "general" &&
+      (cohort.rolloutMode !== "all_eligible_accounts" ||
+        accounts.length !== 0)) ||
+    (scope.channel === "shadow" &&
+      (cohort.rolloutMode !== "none" || accounts.length !== 0))
+  ) {
+    fail("Cohort rollout mode does not match its signed channel");
+  }
+  return cohort;
+}
+
+const ACTIVATION_EVIDENCE_FILES = Object.freeze([
+  Object.freeze({
+    field: "canaryEvidenceSha256",
+    name: "canary.json",
+  }),
+  Object.freeze({
+    field: "cleanupAuthoritySha256",
+    name: "cleanup-authority.json",
+  }),
+  Object.freeze({
+    field: "failureConverterSha256",
+    name: "failure-converter.json",
+  }),
+  Object.freeze({
+    field: "portalReadbackEvidenceSha256",
+    name: "portal-readback.json",
+  }),
+  Object.freeze({
+    field: "runnerFleetEvidenceSha256",
+    name: "runner-fleet.json",
+  }),
+  Object.freeze({
+    field: "storageConfigSha256",
+    name: "storage-config.json",
+  }),
+  Object.freeze({
+    field: "taskQueueSha256",
+    name: "task-queue.json",
+  }),
+  Object.freeze({
+    field: "temporalNamespaceSha256",
+    name: "temporal-namespace.json",
+  }),
+]);
+
+function requireTaskQueueIdentity(value, label) {
+  const identity = requireString(value, label);
+  const bytes = Buffer.from(identity, "utf8");
+  if (
+    identity.trim() !== identity ||
+    bytes.length > 240 ||
+    bytes.toString("utf8") !== identity ||
+    /[\p{Cc}\ufffd]/u.test(identity)
+  ) {
+    fail(
+      label + " must be a canonical string of at most 240 UTF-8 identity bytes",
+    );
+  }
+  return identity;
+}
+
+export function deriveManagedCloudTaskQueueSha256(namespace, taskQueue) {
+  const namespaceBytes = Buffer.from(
+    requireTaskQueueIdentity(namespace, "namespace"),
+    "utf8",
+  );
+  const taskQueueBytes = Buffer.from(
+    requireTaskQueueIdentity(taskQueue, "taskQueue"),
+    "utf8",
+  );
+  return sha256(
+    Buffer.concat([
+      Buffer.from("bluey-jobs-managed-cloud-task-queue-v1\0", "utf8"),
+      namespaceBytes,
+      Buffer.from([0]),
+      taskQueueBytes,
+    ]),
+  );
+}
+
+function requireEvidenceEnvelope(
+  value,
+  audience,
+  extraKeys,
+  activation,
+  manifestSha256,
+  label,
+) {
+  requireExactKeys(
+    value,
+    [
+      "audience",
+      "expiresAtMs",
+      "manifestSha256",
+      "observedAtMs",
+      "scope",
+      "status",
+      "version",
+      ...extraKeys,
+    ],
+    label,
+  );
+  if (
+    value.version !== 1 ||
+    value.audience !== audience ||
+    value.status !== "pass" ||
+    value.manifestSha256 !== manifestSha256 ||
+    canonicalJsonBytes(value.scope).compare(
+      canonicalJsonBytes(activation.scope),
+    ) !== 0
+  ) {
+    fail(label + " does not bind a passing activation scope and manifest");
+  }
+  validateScope(value.scope, label + ".scope");
+  requireInteger(value.observedAtMs, label + ".observedAtMs");
+  requireInteger(value.expiresAtMs, label + ".expiresAtMs", 1);
+  const nowMs = Date.now();
+  if (
+    value.observedAtMs > activation.issuedAtMs ||
+    value.expiresAtMs <= value.observedAtMs ||
+    value.expiresAtMs - value.observedAtMs > 2_592_000_000 ||
+    activation.expiresAtMs > value.expiresAtMs ||
+    nowMs < value.observedAtMs ||
+    nowMs >= value.expiresAtMs
+  ) {
+    fail(label + " is stale, future-dated, or does not cover activation");
+  }
+  return value;
+}
+
+export function deriveManagedCloudCanaryCheckIds(featureAuthority) {
+  const ids = [...MANAGED_CLOUD_BASE_CANARY_CHECK_IDS];
+  if (featureAuthority.directDiscovery) {
+    ids.push("discovery-worker-readiness");
+  }
+  if (featureAuthority.globalDiscovery) {
+    ids.push("global-discovery-worker-readiness");
+  }
+  if (featureAuthority.sourceVerification) {
+    ids.push("original-source-verifier-readiness");
+  }
+  return ids.sort();
+}
+
+async function readActivationEvidence(
+  evidenceDirectory,
+  activation,
+  authorized,
+) {
+  const root = resolve(evidenceDirectory);
+  await requireExactTopLevel(
+    root,
+    ACTIVATION_EVIDENCE_FILES.map((entry) => entry.name),
+  );
+  const hashes = {};
+  let taskQueueNamespace;
+  let evidenceBytes = 0;
+  for (const entry of ACTIVATION_EVIDENCE_FILES) {
+    const path = join(root, entry.name);
+    const metadata = await requireRegularFile(path, entry.name);
+    evidenceBytes += metadata.size;
+    if (
+      metadata.size > MAX_ACTIVATION_EVIDENCE_FILE_BYTES ||
+      evidenceBytes > MAX_ACTIVATION_EVIDENCE_TOTAL_BYTES
+    ) {
+      fail("Activation evidence exceeds its bounded transport size");
+    }
+    const { value } = await readCanonicalJson(
+      path,
+      entry.name,
+      MAX_ACTIVATION_EVIDENCE_FILE_BYTES,
+    );
+    if (entry.field === "canaryEvidenceSha256") {
+      requireEvidenceEnvelope(
+        value,
+        MANAGED_CLOUD_AUDIENCES.canaryEvidence,
+        ["checks"],
+        activation,
+        authorized.candidate.manifestSha256,
+        "canary evidence",
+      );
+      const expectedIds = deriveManagedCloudCanaryCheckIds(
+        activation.featureAuthority,
+      );
+      const ids = [];
+      for (const [index, check] of requireArray(
+        value.checks,
+        "canary checks",
+        expectedIds.length,
+      ).entries()) {
+        requireExactKeys(
+          check,
+          ["checkId", "evidenceSha256", "status"],
+          "canary check[" + index + "]",
+        );
+        ids.push(requireSafeId(check.checkId, "canary checkId"));
+        requireHex64(check.evidenceSha256, "canary check evidenceSha256");
+        if (check.status !== "pass") {
+          fail("Every canary check must pass");
+        }
+      }
+      if (JSON.stringify(ids) !== JSON.stringify(expectedIds)) {
+        fail("Canary evidence does not contain the exact derived check set");
+      }
+      hashes[entry.field] = await hashFile(path);
+      continue;
+    }
+    if (entry.field === "cleanupAuthoritySha256") {
+      requireEvidenceEnvelope(
+        value,
+        MANAGED_CLOUD_AUDIENCES.cleanupEvidence,
+        ["cleanupAuthoritySha256", "dispatcherReady"],
+        activation,
+        authorized.candidate.manifestSha256,
+        "cleanup evidence",
+      );
+      requireHex64(value.cleanupAuthoritySha256, "cleanupAuthoritySha256");
+      if (value.dispatcherReady !== true) {
+        fail("Cleanup evidence must prove a ready dispatcher");
+      }
+      hashes[entry.field] = value.cleanupAuthoritySha256;
+      continue;
+    }
+    if (entry.field === "failureConverterSha256") {
+      requireEvidenceEnvelope(
+        value,
+        MANAGED_CLOUD_AUDIENCES.failureConverterEvidence,
+        ["deployedFileSha256"],
+        activation,
+        authorized.candidate.manifestSha256,
+        "failure converter evidence",
+      );
+      const { value: workflowsInventory } = await readCanonicalJson(
+        authorized.workflowsInventoryFile ??
+          join(
+            authorized.root,
+            "candidate/evidence/jobs-workflows.content-inventory.json",
+          ),
+        "jobs-workflows content inventory",
+      );
+      const deployedConverter = requireArray(
+        workflowsInventory.entries,
+        "jobs-workflows inventory entries",
+        1,
+      ).find(
+        (item) =>
+          item.path === "app/workflows/dist/failure-converter.js" &&
+          item.type === "file",
+      );
+      if (!deployedConverter) {
+        fail("Workflows inventory omits the deployed failure converter");
+      }
+      const deployedFileSha256 = requireHex64(
+        deployedConverter.sha256,
+        "deployed failure converter SHA-256",
+      );
+      if (value.deployedFileSha256 !== deployedFileSha256) {
+        fail("Failure converter evidence does not bind deployed raw bytes");
+      }
+      hashes[entry.field] = deployedFileSha256;
+      continue;
+    }
+    if (entry.field === "portalReadbackEvidenceSha256") {
+      const portalReadbackV2 = usesRemotePublicationContract(
+        authorized.manifest.version,
+      );
+      requireEvidenceEnvelope(
+        value,
+        portalReadbackV2
+          ? MANAGED_CLOUD_AUDIENCES.portalReadbackEvidenceV2
+          : MANAGED_CLOUD_AUDIENCES.portalReadbackEvidence,
+        portalReadbackV2
+          ? ["artifactRef", "portalArtifactSha256", "readbackSha256"]
+          : ["portalArtifactSha256", "readbackSha256"],
+        activation,
+        authorized.candidate.manifestSha256,
+        "portal readback evidence",
+      );
+      const portal = authorized.manifest.components.find(
+        (component) => component.componentId === "jobs-portal",
+      );
+      if (
+        (portalReadbackV2 && value.artifactRef !== portal.artifactRef) ||
+        value.portalArtifactSha256 !== portal.artifactSha256
+      ) {
+        fail(
+          portalReadbackV2
+            ? "Portal readback evidence does not bind the signed portal URL and artifact"
+            : "Portal readback evidence does not bind portal artifact",
+        );
+      }
+      requireHex64(value.readbackSha256, "portal readbackSha256");
+      if (value.readbackSha256 !== portal.artifactSha256) {
+        fail("Portal readback bytes differ from the released artifact bytes");
+      }
+      if (value.observedAtMs !== activation.portalReadbackAtMs) {
+        fail("Portal readback timestamp does not bind activation");
+      }
+      hashes[entry.field] = await hashFile(path);
+      continue;
+    }
+    if (entry.field === "runnerFleetEvidenceSha256") {
+      requireEvidenceEnvelope(
+        value,
+        MANAGED_CLOUD_AUDIENCES.runnerFleetEvidence,
+        ["fleetIdSha256", "readyInstances", "requiredInstances"],
+        activation,
+        authorized.candidate.manifestSha256,
+        "runner fleet evidence",
+      );
+      requireHex64(value.fleetIdSha256, "fleetIdSha256");
+      requireInteger(value.requiredInstances, "requiredInstances", 1);
+      requireInteger(value.readyInstances, "readyInstances", 1);
+      if (value.readyInstances < value.requiredInstances) {
+        fail("Runner fleet evidence has insufficient ready instances");
+      }
+      hashes[entry.field] = await hashFile(path);
+      continue;
+    }
+    if (entry.field === "storageConfigSha256") {
+      requireEvidenceEnvelope(
+        value,
+        MANAGED_CLOUD_AUDIENCES.storageEvidence,
+        ["readProbeSha256", "storageConfigSha256", "writeProbeSha256"],
+        activation,
+        authorized.candidate.manifestSha256,
+        "storage evidence",
+      );
+      for (const key of [
+        "readProbeSha256",
+        "storageConfigSha256",
+        "writeProbeSha256",
+      ]) {
+        requireHex64(value[key], "storage evidence " + key);
+      }
+      hashes[entry.field] = value.storageConfigSha256;
+      continue;
+    }
+    if (entry.field === "taskQueueSha256") {
+      requireEvidenceEnvelope(
+        value,
+        MANAGED_CLOUD_AUDIENCES.taskQueueEvidence,
+        ["namespace", "taskQueue", "taskQueueSha256"],
+        activation,
+        authorized.candidate.manifestSha256,
+        "task queue evidence",
+      );
+      if (
+        value.taskQueueSha256 !==
+        deriveManagedCloudTaskQueueSha256(value.namespace, value.taskQueue)
+      ) {
+        fail("Task queue evidence is not canonical or correctly derived");
+      }
+      taskQueueNamespace = value.namespace;
+      hashes[entry.field] = value.taskQueueSha256;
+      continue;
+    }
+    if (entry.field === "temporalNamespaceSha256") {
+      requireEvidenceEnvelope(
+        value,
+        MANAGED_CLOUD_AUDIENCES.temporalEvidence,
+        ["gatewayReady", "namespace", "namespaceSha256", "workflowWorkerReady"],
+        activation,
+        authorized.candidate.manifestSha256,
+        "Temporal evidence",
+      );
+      const namespace = requireTaskQueueIdentity(
+        value.namespace,
+        "Temporal namespace",
+      );
+      if (
+        namespace !== taskQueueNamespace ||
+        value.namespaceSha256 !== sha256(Buffer.from(namespace, "utf8")) ||
+        value.gatewayReady !== true ||
+        value.workflowWorkerReady !== true
+      ) {
+        fail("Temporal evidence does not prove namespace/gateway/worker");
+      }
+      hashes[entry.field] = value.namespaceSha256;
+      continue;
+    }
+    fail("Unknown activation evidence binding");
+  }
+  return hashes;
+}
+
+export async function validateManagedCloudActivationEvidence({
+  activation,
+  evidenceDirectory,
+  manifest,
+  manifestSha256,
+  workflowsInventoryFile,
+}) {
+  requireSignedObjectSize(activation, "activation");
+  validateReleaseManifest(manifest);
+  requireHex64(manifestSha256, "manifestSha256");
+  if (
+    canonicalJsonBytes(activation.featureAuthority).compare(
+      canonicalJsonBytes(manifest.featureAuthority),
+    ) !== 0
+  ) {
+    fail("Activation evidence authority differs from the release authority");
+  }
+  return readActivationEvidence(evidenceDirectory, activation, {
+    candidate: { manifestSha256 },
+    manifest,
+    workflowsInventoryFile: resolve(
+      requireString(workflowsInventoryFile, "workflowsInventoryFile"),
+    ),
+  });
+}
+
+function validateActivation(
+  activation,
+  authorized,
+  cohort,
+  cohortSignatureSetSha256,
+  evidenceHashes,
+) {
+  requireSignedObjectSize(activation, "activation");
+  requireExactKeys(
+    activation,
+    [
+      "activationGeneration",
+      "activationId",
+      "audience",
+      "canaryEvidenceSha256",
+      "channelSequence",
+      "cleanupAuthoritySha256",
+      "cohortSha256",
+      "cohortSignatureSetSha256",
+      "expectedHeadRevision",
+      "expectedTransitionSha256",
+      "expiresAtMs",
+      "failureConverterSha256",
+      "featureAuthority",
+      "featureAuthoritySha256",
+      "heartbeatTtlMs",
+      "issuedAtMs",
+      "manifestSha256",
+      "manifestSignatureSetSha256",
+      "maximumDailyAdmissions",
+      "maximumInflight",
+      "notBeforeMs",
+      "portalReadbackAtMs",
+      "portalReadbackEvidenceSha256",
+      "portalReadbackTtlMs",
+      "predecessorActivationSha256",
+      "recoveryAcceptances",
+      "runnerFleetEvidenceSha256",
+      "scope",
+      "storageConfigSha256",
+      "taskQueueSha256",
+      "temporalNamespaceSha256",
+      "trustGeneration",
+      "version",
+    ],
+    "activation",
+  );
+  if (
+    ![1, 2, 3, 4].includes(activation.version) ||
+    activation.audience !== activationAudienceForVersion(activation.version) ||
+    activation.version !== authorized.manifest.version
+  ) {
+    fail("Activation audience or version is invalid");
+  }
+  requireSafeId(activation.activationId, "activationId");
+  requireInteger(activation.activationGeneration, "activationGeneration", 1);
+  requireInteger(activation.trustGeneration, "activation.trustGeneration", 1);
+  const scope = validateScope(activation.scope, "activation.scope");
+  requireInteger(activation.channelSequence, "channelSequence", 1);
+  requireInteger(activation.expectedHeadRevision, "expectedHeadRevision");
+  if (activation.expectedHeadRevision === 0) {
+    if (
+      activation.expectedTransitionSha256 !== null ||
+      activation.predecessorActivationSha256 !== null
+    ) {
+      fail("Initial activation must use null predecessor CAS bindings");
+    }
+  } else {
+    requireHex64(
+      activation.expectedTransitionSha256,
+      "expectedTransitionSha256",
+    );
+    requireHex64(
+      activation.predecessorActivationSha256,
+      "predecessorActivationSha256",
+    );
+  }
+  for (const key of [
+    "canaryEvidenceSha256",
+    "cleanupAuthoritySha256",
+    "cohortSha256",
+    "cohortSignatureSetSha256",
+    "failureConverterSha256",
+    "featureAuthoritySha256",
+    "manifestSha256",
+    "manifestSignatureSetSha256",
+    "portalReadbackEvidenceSha256",
+    "runnerFleetEvidenceSha256",
+    "storageConfigSha256",
+    "taskQueueSha256",
+    "temporalNamespaceSha256",
+  ]) {
+    requireHex64(activation[key], "activation." + key);
+  }
+  requireFeatureAuthority(activation.featureAuthority, activation.version);
+  if (
+    canonicalJsonBytes(activation.featureAuthority).compare(
+      canonicalJsonBytes(authorized.manifest.featureAuthority),
+    ) !== 0 ||
+    activation.featureAuthoritySha256 !==
+      authorized.manifest.featureAuthoritySha256
+  ) {
+    fail(
+      "Activation feature authority must exactly equal the release authority",
+    );
+  }
+  const bindings = [
+    ["manifestSha256", authorized.candidate.manifestSha256],
+    [
+      "manifestSignatureSetSha256",
+      authorized.authorization.releaseSignatureSetSha256,
+    ],
+    ["cohortSha256", sha256(canonicalJsonBytes(cohort))],
+    ["cohortSignatureSetSha256", cohortSignatureSetSha256],
+  ];
+  for (const [key, expected] of bindings) {
+    if (activation[key] !== expected) {
+      fail("Activation does not bind " + key);
+    }
+  }
+  for (const entry of ACTIVATION_EVIDENCE_FILES) {
+    if (activation[entry.field] !== evidenceHashes[entry.field]) {
+      fail("Activation does not bind " + entry.field);
+    }
+  }
+  if (
+    activation.trustGeneration !== authorized.policy.trustGeneration ||
+    canonicalJsonBytes(scope).compare(canonicalJsonBytes(cohort.scope)) !== 0
+  ) {
+    fail("Activation trust generation or scope is inconsistent");
+  }
+  requireInteger(activation.maximumInflight, "maximumInflight");
+  requireInteger(activation.maximumDailyAdmissions, "maximumDailyAdmissions");
+  if (
+    (scope.channel === "shadow" &&
+      (activation.maximumInflight !== 0 ||
+        activation.maximumDailyAdmissions !== 0)) ||
+    (scope.channel !== "shadow" &&
+      (activation.maximumInflight < 1 || activation.maximumDailyAdmissions < 1))
+  ) {
+    fail("Activation admission caps do not match its channel");
+  }
+  requireInteger(activation.heartbeatTtlMs, "heartbeatTtlMs", 5_000);
+  if (activation.heartbeatTtlMs > 300_000) {
+    fail("Activation heartbeat TTL is out of range");
+  }
+  requireInteger(activation.portalReadbackAtMs, "portalReadbackAtMs");
+  requireInteger(activation.portalReadbackTtlMs, "portalReadbackTtlMs", 60_000);
+  if (activation.portalReadbackTtlMs > 2_592_000_000) {
+    fail("Portal readback TTL is out of range");
+  }
+  requireInteger(activation.issuedAtMs, "activation.issuedAtMs");
+  requireInteger(activation.notBeforeMs, "activation.notBeforeMs");
+  requireInteger(activation.expiresAtMs, "activation.expiresAtMs", 1);
+  validateManagedCloudActivationWindow(activation, cohort, authorized.policy);
+  const recoveryKeys = [];
+  for (const [index, recovery] of requireBoundedArray(
+    activation.recoveryAcceptances,
+    "recoveryAcceptances",
+    0,
+    32,
+  ).entries()) {
+    requireExactKeys(
+      recovery,
+      ["activationSha256", "manifestSha256"],
+      "recovery acceptance[" + index + "]",
+    );
+    requireHex64(recovery.activationSha256, "recovery activationSha256");
+    requireHex64(recovery.manifestSha256, "recovery manifestSha256");
+    recoveryKeys.push(
+      recovery.activationSha256 + ":" + recovery.manifestSha256,
+    );
+  }
+  if (
+    new Set(recoveryKeys).size !== recoveryKeys.length ||
+    recoveryKeys.some((key, index) => key !== [...recoveryKeys].sort()[index])
+  ) {
+    fail("Recovery acceptances must be sorted and unique");
+  }
+  deriveRequiredRuntimeRoles(activation.featureAuthority);
+  return activation;
+}
+
+export function validateManagedCloudActivationWindow(
+  activation,
+  cohort,
+  policy,
+) {
+  const nowMs = Date.now();
+  if (
+    activation.notBeforeMs < activation.issuedAtMs ||
+    activation.expiresAtMs <= activation.notBeforeMs ||
+    activation.portalReadbackAtMs > activation.issuedAtMs ||
+    activation.portalReadbackAtMs >
+      Number.MAX_SAFE_INTEGER - activation.portalReadbackTtlMs ||
+    activation.expiresAtMs >
+      activation.portalReadbackAtMs + activation.portalReadbackTtlMs ||
+    activation.issuedAtMs < cohort.issuedAtMs ||
+    activation.notBeforeMs < cohort.notBeforeMs ||
+    activation.expiresAtMs > cohort.expiresAtMs ||
+    activation.issuedAtMs < policy.validFromMs ||
+    activation.expiresAtMs > policy.expiresAtMs ||
+    nowMs < activation.notBeforeMs ||
+    nowMs >= activation.expiresAtMs
+  ) {
+    fail("Activation or portal-readback validity window is invalid");
+  }
+  return true;
+}
+
+const MANAGED_CLOUD_NATIVE_ADDON_PATH =
+  "app/runner/dist/native/bluey_jobs_runner_native_storage.node";
+const MANAGED_CLOUD_RELEASE_WORKFLOW_PATH =
+  ".github/workflows/jobs-managed-cloud-release.yml";
+const MANAGED_CLOUD_PUBLICATION_JOB_NAME = "publish";
+const MANAGED_CLOUD_PUBLICATION_ENVIRONMENT =
+  "jobs-managed-cloud-artifact-publication";
+const MANAGED_CLOUD_PUBLICATION_RECEIPT_STEP =
+  "Upload the remote publication receipt only";
+
+function requireRegistryNamespace(value) {
+  const namespace = requireString(value, "registry namespace");
+  if (
+    namespace !== namespace.toLowerCase() ||
+    !REGISTRY_NAMESPACE.test(namespace) ||
+    namespace.includes("@") ||
+    namespace === "ghcr.io/bluey" ||
+    namespace.startsWith("ghcr.io/bluey/")
+  ) {
+    fail(
+      "Registry namespace must be one controlled lowercase repository prefix",
+    );
+  }
+  return namespace;
+}
+
+function requirePortalArtifactOrigin(value) {
+  const origin = requireString(value, "portal artifact origin");
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    fail("Portal artifact origin must be one canonical HTTPS directory");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    origin.endsWith("/") ||
+    url.toString() !== origin
+  ) {
+    fail("Portal artifact origin must be one canonical HTTPS directory");
+  }
+  return origin;
+}
+
+function publicationRepository(registryNamespace, componentId) {
+  return registryNamespace + "-" + componentId.slice("jobs-".length);
+}
+
+function publicationTagRef(registryNamespace, componentId, releaseId) {
+  if (!/^[a-z0-9][a-z0-9._-]{2,127}$/.test(releaseId)) {
+    fail("releaseId must also be a canonical OCI tag");
+  }
+  return (
+    publicationRepository(registryNamespace, componentId) + ":" + releaseId
+  );
+}
+
+function portalArtifactRef(portalOrigin, releaseId, artifactSha256) {
+  return portalOrigin + "/" + releaseId + "/" + artifactSha256 + ".tar";
+}
+
+async function candidateContentInventory(authorized, componentId) {
+  const path = join(
+    authorized.root,
+    "candidate/evidence/" + componentId + ".content-inventory.json",
+  );
+  const { value } = await readCanonicalJson(path, componentId + " inventory");
+  validateContentInventoryDocument(value, componentId);
+  return value;
+}
+
+async function candidateNativeAddon(authorized) {
+  const inventory = await candidateContentInventory(authorized, "jobs-runner");
+  const entry = inventory.entries.find(
+    (item) => item.path === MANAGED_CLOUD_NATIVE_ADDON_PATH,
+  );
+  if (!entry || entry.type !== "file" || entry.sizeBytes < 1) {
+    fail("Managed runner candidate is missing the exact native addon artifact");
+  }
+  return {
+    componentId: "jobs-runner",
+    mode: entry.mode,
+    path: entry.path,
+    sha256: entry.sha256,
+    sizeBytes: entry.sizeBytes,
+  };
+}
+
+async function candidateExactTipCiEvidence(authorized) {
+  return readCandidateExactTipCiEvidence(join(authorized.root, "candidate"), authorized.manifest);
+}
+
+async function readCandidateExactTipCiEvidence(candidateRoot, manifest) {
+  const { value } = await readCanonicalJson(
+    join(candidateRoot, "test-evidence.json"),
+    "candidate exact-tip CI evidence",
+  );
+  validateManagedCloudTestEvidence(
+    value,
+    manifest.sourceCommit,
+    manifest.version,
+  );
+  if (
+    value.version !== 2 ||
+    value.audience !== MANAGED_CLOUD_AUDIENCES.testEvidenceV2
+  ) {
+    fail("Production publication requires release-v2/v3 exact-tip CI evidence");
+  }
+  return value;
+}
+
+async function candidatePortalManifestCreatedAt(authorized) {
+  const component = authorized.manifest.components.find(
+    (item) => item.componentId === "jobs-portal",
+  );
+  if (!component || component.artifactKind !== "static_bundle") {
+    fail("Authorized candidate must contain the exact Jobs portal component");
+  }
+  const provenancePath = join(
+    authorized.root,
+    "candidate/evidence/jobs-portal.provenance.json",
+  );
+  const { value: provenance } = await readCanonicalJson(
+    provenancePath,
+    "portal artifact provenance",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  validateProvenance(provenance, {
+    artifactSha256: component.artifactSha256,
+    buildId: component.buildId,
+    builderPolicySha256: provenance.builderPolicySha256,
+    componentId: "jobs-portal",
+    sourceCommit: authorized.manifest.sourceCommit,
+    sourceDateEpoch: requireInteger(
+      provenance.sourceDateEpoch,
+      "portal provenance sourceDateEpoch",
+    ),
+  });
+  if ((await hashFile(provenancePath)) !== component.provenanceSha256) {
+    fail("Portal provenance bytes do not bind the authorized candidate");
+  }
+  return deriveManagedCloudPortalManifestCreatedAt(provenance.sourceDateEpoch);
+}
+
+function publicationSupplyChainStatus() {
+  return {
+    blueyFileInventorySbom: "present",
+    blueyRecipeProvenance: "present",
+    ociProvenanceAttestation: "not_generated",
+    ociSbomAttestation: "not_generated",
+  };
+}
+
+export function validateManagedCloudPublicationAdapter(adapter) {
+  if (adapter !== "remote_registry_readback_v1") {
+    fail("local_fixture is test-only and cannot supply production publication");
+  }
+  return adapter;
+}
+
+async function publicationPlanDocument(
+  authorized,
+  registryNamespace,
+  portalOrigin,
+) {
+  const namespace = requireRegistryNamespace(registryNamespace);
+  const artifactOrigin = requirePortalArtifactOrigin(portalOrigin);
+  const { value: builderPolicy } = await readCanonicalJson(
+    join(authorized.root, "candidate/builder-policy.json"),
+    "publication builder policy",
+  );
+  validateManagedCloudPublicationBuilderPolicy(builderPolicy, authorized.manifest.version);
+  const exactTipCi = await candidateExactTipCiEvidence(authorized);
+  const payloads = new Map(
+    authorized.candidate.payloads.map((payload) => [payload.path, payload]),
+  );
+  const artifacts = [];
+  for (const component of authorized.manifest.components) {
+    const extension =
+      component.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+    const candidatePayloadPath =
+      "payloads/" + component.componentId + extension;
+    const payload = payloads.get(candidatePayloadPath);
+    if (!payload) {
+      fail(component.componentId + " publication payload is missing");
+    }
+    const repository = publicationRepository(namespace, component.componentId);
+    const signedArtifactRef =
+      component.artifactKind === "oci_image"
+        ? repository + "@sha256:" + component.artifactSha256
+        : portalArtifactRef(
+            artifactOrigin,
+            authorized.manifest.releaseId,
+            component.artifactSha256,
+          );
+    if (component.artifactRef !== signedArtifactRef) {
+      fail(
+        component.componentId +
+          " signed artifact reference is outside the controlled publication namespace",
+      );
+    }
+    artifacts.push({
+      artifactKind: component.artifactKind,
+      artifactSha256: component.artifactSha256,
+      candidatePayloadPath,
+      candidatePayloadSha256: payload.sha256,
+      candidatePayloadSizeBytes: payload.sizeBytes,
+      componentId: component.componentId,
+      publicationRepository: repository,
+      publicationTagRef: publicationTagRef(
+        namespace,
+        component.componentId,
+        authorized.manifest.releaseId,
+      ),
+      signedArtifactRef,
+    });
+  }
+  artifacts.sort((left, right) =>
+    compareUtf8(left.componentId, right.componentId),
+  );
+  const plan = {
+    adapter: "remote_registry_readback_v1",
+    artifacts,
+    audience: MANAGED_CLOUD_AUDIENCES.publicationPlan,
+    authorizationSetSha256: await hashFile(
+      join(authorized.root, "authorization-set.json"),
+    ),
+    candidateSetSha256: await hashFile(
+      join(authorized.root, "candidate/candidate-set.json"),
+    ),
+    manifestSha256: authorized.candidate.manifestSha256,
+    nativeArtifact: await candidateNativeAddon(authorized),
+    portalArtifactOrigin: artifactOrigin,
+    portalManifestCreatedAt: await candidatePortalManifestCreatedAt(authorized),
+    registryNamespace: namespace,
+    releaseId: authorized.manifest.releaseId,
+    sourceCommit: authorized.manifest.sourceCommit,
+    sourceDefaultBranch: exactTipCi.defaultBranch,
+    sourceRepository: exactTipCi.repository,
+    sourceRepositoryId: exactTipCi.repositoryId,
+    supplyChainStatus: publicationSupplyChainStatus(),
+    version: 1,
+  };
+  validateManagedCloudPublicationPlanShape(plan);
+  return plan;
+}
+
+export function validateManagedCloudPublicationPlanShape(plan) {
+  requireExactKeys(
+    plan,
+    MANAGED_CLOUD_PUBLICATION_PLAN_KEYS,
+    "publication plan",
+  );
+  requireCanonicalRfc3339Seconds(
+    plan.portalManifestCreatedAt,
+    "publication plan portalManifestCreatedAt",
+  );
+  return true;
+}
+
+export function validateManagedCloudPublicationRuntimeIdentity({
+  defaultBranch,
+  plan,
+  repository,
+  repositoryId,
+  sourceCommit,
+}) {
+  validateManagedCloudPublicationPlanShape(plan);
+  const exactRepository = requireString(repository, "runtime repository");
+  const repositoryIdText = requireString(repositoryId, "runtime repositoryId");
+  if (!/^[1-9][0-9]*$/.test(repositoryIdText)) {
+    fail("runtime repositoryId must be canonical positive decimal");
+  }
+  const exactRepositoryId = requireInteger(
+    Number(repositoryIdText),
+    "runtime repositoryId",
+    1,
+  );
+  const exactDefaultBranch = requireGitBranchName(
+    defaultBranch,
+    "runtime default branch",
+  );
+  const exactSourceCommit = requireSourceCommit(sourceCommit);
+  if (
+    plan.sourceCommit !== exactSourceCommit ||
+    plan.sourceDefaultBranch !== exactDefaultBranch ||
+    plan.sourceRepository !== exactRepository ||
+    plan.sourceRepositoryId !== exactRepositoryId
+  ) {
+    fail("Publication plan does not bind the exact GitHub runtime identity");
+  }
+  return true;
+}
+
+async function validatePublicationPlan(plan, authorized) {
+  validateManagedCloudPublicationPlanShape(plan);
+  if (
+    plan.version !== 1 ||
+    plan.audience !== MANAGED_CLOUD_AUDIENCES.publicationPlan ||
+    validateManagedCloudPublicationAdapter(plan.adapter) !== plan.adapter
+  ) {
+    fail("local_fixture is test-only and cannot supply production publication");
+  }
+  const expected = await publicationPlanDocument(
+    authorized,
+    plan.registryNamespace,
+    plan.portalArtifactOrigin,
+  );
+  if (canonicalJsonBytes(plan).compare(canonicalJsonBytes(expected)) !== 0) {
+    fail("Publication plan does not bind the exact authorized candidate");
+  }
+  return plan;
+}
+
+export async function createManagedCloudArtifactPublicationPlan({
+  authorizedDirectory,
+  expectedRootAnchorSha256,
+  outputFile,
+  portalArtifactOrigin,
+  registryNamespace,
+}) {
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  if (authorized.authorization.version !== 2) {
+    fail("New managed-cloud publication requires a policy-bound authorization receipt");
+  }
+  const plan = await publicationPlanDocument(
+    authorized,
+    registryNamespace,
+    portalArtifactOrigin,
+  );
+  await validatePublicationPlan(plan, authorized);
+  await writeCanonicalJson(outputFile, plan);
+  return plan;
+}
+
+export async function validateManagedCloudArtifactPublicationRuntimeIdentity({
+  authorizedDirectory,
+  defaultBranch,
+  expectedRootAnchorSha256,
+  planFile,
+  repository,
+  repositoryId,
+  sourceCommit,
+}) {
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  if (authorized.authorization.version !== 2) {
+    fail("New managed-cloud publication requires a policy-bound authorization receipt");
+  }
+  const { value: plan } = await readCanonicalJson(
+    planFile,
+    "publication plan",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  await validatePublicationPlan(plan, authorized);
+  validateManagedCloudPublicationRuntimeIdentity({
+    defaultBranch,
+    plan,
+    repository,
+    repositoryId,
+    sourceCommit,
+  });
+  return plan;
+}
+
+function requirePublicationArtifactRecord(record, expected, label) {
+  requireExactKeys(
+    record,
+    [
+      "artifactKind",
+      "candidatePayloadSha256",
+      "componentId",
+      "publishedManifestDigest",
+      "publishedRegistryRef",
+      "readbackArtifactSha256",
+      "readbackContentSizeBytes",
+      "readbackContentInventorySha256",
+      "signedArtifactRef",
+    ],
+    label,
+  );
+  if (
+    record.componentId !== expected.componentId ||
+    record.artifactKind !== expected.artifactKind ||
+    record.candidatePayloadSha256 !== expected.candidatePayloadSha256 ||
+    record.signedArtifactRef !== expected.signedArtifactRef
+  ) {
+    fail("Publication receipt artifact does not bind its exact plan");
+  }
+  requireDigest(
+    record.publishedManifestDigest,
+    label + ".publishedManifestDigest",
+  );
+  if (
+    record.publishedRegistryRef !==
+    expected.publicationRepository + "@" + record.publishedManifestDigest
+  ) {
+    fail(
+      "Publication receipt registry ref is outside its exact plan repository",
+    );
+  }
+  requireHex64(
+    record.readbackArtifactSha256,
+    label + ".readbackArtifactSha256",
+  );
+  requireHex64(
+    record.readbackContentInventorySha256,
+    label + ".readbackContentInventorySha256",
+  );
+  requireInteger(
+    record.readbackContentSizeBytes,
+    label + ".readbackContentSizeBytes",
+    1,
+  );
+  return record;
+}
+
+async function captureBoundedStream({
+  input,
+  label,
+  maximumBytes,
+  outputFile,
+}) {
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const value of input) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    totalBytes += chunk.length;
+    if (totalBytes > maximumBytes) {
+      fail(label + " transport exceeds its " + maximumBytes + "-byte limit");
+    }
+    chunks.push(chunk);
+  }
+  if (totalBytes < 3) {
+    fail(label + " transport has an invalid byte length");
+  }
+  const target = resolve(requireString(outputFile, label + " capture output"));
+  const temporary = target + ".partial";
+  await mkdir(dirname(target), { recursive: true });
+  let handle;
+  let created = false;
+  try {
+    try {
+      await lstat(target);
+      fail(label + " capture output already exists");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    handle = await open(temporary, "wx", 0o400);
+    created = true;
+    await handle.writeFile(Buffer.concat(chunks, totalBytes));
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, target);
+    created = false;
+  } catch (error) {
+    if (created) {
+      await handle?.close().catch(() => {});
+      handle = undefined;
+      await rm(temporary, { force: true });
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+  return { sizeBytes: totalBytes };
+}
+
+export async function captureManagedCloudPortalManifestStream({
+  input = process.stdin,
+  outputFile,
+}) {
+  return captureBoundedStream({
+    input,
+    label: "Portal OCI manifest",
+    maximumBytes: MAX_PORTAL_OCI_MANIFEST_BYTES,
+    outputFile,
+  });
+}
+
+export async function captureManagedCloudPublicationApiStream({
+  input = process.stdin,
+  kind,
+  outputFile,
+}) {
+  const limits = {
+    artifacts: MAX_PUBLICATION_ARTIFACTS_BYTES,
+    jobs: MAX_PUBLICATION_WORKFLOW_JOBS_BYTES,
+    run: MAX_PUBLICATION_WORKFLOW_RUN_BYTES,
+  };
+  const maximumBytes = limits[kind];
+  if (maximumBytes === undefined) {
+    fail("Publication API capture kind must be run, jobs, or artifacts");
+  }
+  return captureBoundedStream({
+    input,
+    label: "Publication API " + kind,
+    maximumBytes,
+    outputFile,
+  });
+}
+
+export async function validateManagedCloudPortalOciArtifactManifest(
+  artifact,
+  manifestFile,
+  portalRegistryRef,
+  portalManifestCreatedAt,
+) {
+  const { bytes: manifestBytes, value: manifest } = await readBoundedJson(
+    manifestFile,
+    "portal OCI artifact manifest",
+    MAX_PORTAL_OCI_MANIFEST_BYTES,
+  );
+  const separator = portalRegistryRef.lastIndexOf("@");
+  const manifestDigest = requireDigest(
+    separator < 0 ? "" : portalRegistryRef.slice(separator + 1),
+    "portal registry manifest digest",
+  );
+  if (
+    portalRegistryRef !==
+      artifact.publicationRepository + "@" + manifestDigest ||
+    sha256(manifestBytes) !== manifestDigest.slice("sha256:".length)
+  ) {
+    fail(
+      "Portal OCI manifest bytes or ref is outside its exact controlled repository",
+    );
+  }
+  requireExactKeys(
+    manifest,
+    [
+      "annotations",
+      "artifactType",
+      "config",
+      "layers",
+      "mediaType",
+      "schemaVersion",
+    ],
+    "portal OCI artifact manifest",
+  );
+  requireExactKeys(
+    manifest.annotations,
+    ["org.opencontainers.image.created"],
+    "portal OCI artifact annotations",
+  );
+  const created = requireString(
+    manifest.annotations["org.opencontainers.image.created"],
+    "portal OCI artifact created annotation",
+  );
+  if (
+    created !==
+    requireCanonicalRfc3339Seconds(
+      portalManifestCreatedAt,
+      "planned portal OCI artifact created annotation",
+    )
+  ) {
+    fail(
+      "Portal OCI artifact created annotation is not the deterministic plan value",
+    );
+  }
+  if (
+    manifest.schemaVersion !== 2 ||
+    manifest.mediaType !== OCI_IMAGE_MANIFEST_MEDIA_TYPE ||
+    manifest.artifactType !== PORTAL_OCI_ARTIFACT_TYPE
+  ) {
+    fail("Portal OCI artifact manifest or artifact type is not exact");
+  }
+  requireExactKeys(
+    manifest.config,
+    ["data", "digest", "mediaType", "size"],
+    "portal OCI artifact config",
+  );
+  if (
+    manifest.config.mediaType !== OCI_EMPTY_CONFIG_MEDIA_TYPE ||
+    manifest.config.digest !== OCI_EMPTY_CONFIG_DIGEST ||
+    manifest.config.size !== 2 ||
+    manifest.config.data !== "e30="
+  ) {
+    fail("Portal OCI artifact config is not the exact empty OCI config");
+  }
+  const layers = requireArray(manifest.layers, "portal OCI artifact layers", 1);
+  if (layers.length !== 1) {
+    fail("Portal OCI artifact must contain exactly one layer");
+  }
+  const layer = requireObject(layers[0], "portal OCI artifact layer");
+  requireExactKeys(
+    layer,
+    ["annotations", "digest", "mediaType", "size"],
+    "portal OCI artifact layer",
+  );
+  requireExactKeys(
+    layer.annotations,
+    ["org.opencontainers.image.title"],
+    "portal OCI artifact layer annotations",
+  );
+  if (
+    layer.digest !== "sha256:" + artifact.candidatePayloadSha256 ||
+    layer.size !== artifact.candidatePayloadSizeBytes ||
+    layer.mediaType !== PORTAL_OCI_LAYER_MEDIA_TYPE ||
+    layer.annotations["org.opencontainers.image.title"] !== "jobs-portal.tar"
+  ) {
+    fail("Portal OCI artifact layer does not bind the exact candidate tar");
+  }
+  return manifestDigest;
+}
+
+function publicationPortalArtifact(plan) {
+  validateManagedCloudPublicationPlanShape(plan);
+  const portal = plan.artifacts.filter(
+    (artifact) => artifact.componentId === "jobs-portal",
+  );
+  if (portal.length !== 1 || portal[0].artifactKind !== "static_bundle") {
+    fail("Publication plan must contain exactly one portal artifact");
+  }
+  return portal[0];
+}
+
+function publicationPortalExpectation({ plan, preflight }) {
+  if ((plan === undefined) === (preflight === undefined)) {
+    fail("Portal validation requires exactly one plan or preflight authority");
+  }
+  if (plan !== undefined) {
+    return {
+      artifact: publicationPortalArtifact(plan),
+      portalManifestCreatedAt: plan.portalManifestCreatedAt,
+    };
+  }
+  const { portalManifestCreatedAt, registryNamespace } =
+    validateManagedCloudPublicationPreflightDocument(preflight);
+  const portal = preflight.artifacts.filter(
+    (artifact) => artifact.componentId === "jobs-portal",
+  );
+  if (portal.length !== 1 || portal[0].artifactKind !== "static_bundle") {
+    fail("Publication preflight must contain exactly one portal artifact");
+  }
+  return {
+    artifact: {
+      ...portal[0],
+      publicationRepository: publicationRepository(
+        registryNamespace,
+        "jobs-portal",
+      ),
+    },
+    portalManifestCreatedAt,
+  };
+}
+
+export async function validateManagedCloudPortalArtifactManifestReadback({
+  manifestFile,
+  plan,
+  preflight,
+  portalRegistryRef,
+}) {
+  const expectation = publicationPortalExpectation({ plan, preflight });
+  return validateManagedCloudPortalOciArtifactManifest(
+    expectation.artifact,
+    manifestFile,
+    requireString(portalRegistryRef, "portal registry ref"),
+    expectation.portalManifestCreatedAt,
+  );
+}
+
+export async function stageManagedCloudPortalArtifactReadback({
+  downloadDirectory,
+  manifestFile,
+  outputFile,
+  plan,
+  preflight,
+  portalRegistryRef,
+}) {
+  const expectation = publicationPortalExpectation({ plan, preflight });
+  const portal = expectation.artifact;
+  await requireExactFlatRegularFiles(
+    downloadDirectory,
+    ["jobs-portal.tar"],
+    "Portal ORAS pull output",
+  );
+  await validateManagedCloudPortalArtifactManifestReadback({
+    manifestFile,
+    plan,
+    preflight,
+    portalRegistryRef,
+  });
+  const source = join(resolve(downloadDirectory), "jobs-portal.tar");
+  const bytes = await readFile(source);
+  if (
+    sha256(bytes) !== portal.candidatePayloadSha256 ||
+    bytes.length !== portal.candidatePayloadSizeBytes
+  ) {
+    fail("Portal ORAS pull output differs from the exact candidate tar");
+  }
+  await inspectStaticBundleArchive(source, "jobs-portal");
+  await writeFile(outputFile, bytes, { flag: "wx", mode: 0o444 });
+  return true;
+}
+
+async function publicationReadbackRecords(
+  plan,
+  readbackDirectory,
+  portalRegistryRef,
+) {
+  const root = resolve(readbackDirectory);
+  const expectedFiles = [
+    "jobs-api.oci.tar",
+    "jobs-portal.oci-manifest.json",
+    "jobs-portal.tar",
+    "jobs-runner.oci.tar",
+    "jobs-workflows.oci.tar",
+  ];
+  await requireExactFlatRegularFiles(
+    root,
+    expectedFiles,
+    "Remote publication readback",
+  );
+  const portalArtifact = plan.artifacts.find(
+    (artifact) => artifact.componentId === "jobs-portal",
+  );
+  if (!portalArtifact) {
+    fail("Publication plan is missing its portal artifact");
+  }
+  await validateManagedCloudPortalOciArtifactManifest(
+    portalArtifact,
+    join(root, "jobs-portal.oci-manifest.json"),
+    portalRegistryRef,
+    plan.portalManifestCreatedAt,
+  );
+  const records = [];
+  for (const artifact of plan.artifacts) {
+    const extension =
+      artifact.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+    const path = join(root, artifact.componentId + extension);
+    const metadata = await requireRegularFile(path);
+    const inventory = await inspectPreparedArtifact(
+      path,
+      artifact.componentId,
+      artifact.artifactKind,
+    );
+    if (inventory.artifactSha256 !== artifact.artifactSha256) {
+      fail(
+        artifact.componentId + " remote readback digest differs from candidate",
+      );
+    }
+    const publishedManifestDigest =
+      artifact.artifactKind === "oci_image"
+        ? "sha256:" + artifact.artifactSha256
+        : requireDigest(
+            portalRegistryRef.slice(portalRegistryRef.lastIndexOf("@") + 1),
+            "portal registry digest",
+          );
+    const publishedRegistryRef =
+      artifact.publicationRepository + "@" + publishedManifestDigest;
+    if (
+      artifact.artifactKind === "static_bundle" &&
+      portalRegistryRef !== publishedRegistryRef
+    ) {
+      fail("Portal registry readback is outside the controlled namespace");
+    }
+    if (
+      artifact.artifactKind === "oci_image" &&
+      artifact.signedArtifactRef !== publishedRegistryRef
+    ) {
+      fail(
+        artifact.componentId +
+          " registry readback differs from its signed OCI ref",
+      );
+    }
+    if (
+      artifact.artifactKind === "static_bundle" &&
+      ((await hashFile(path)) !== artifact.candidatePayloadSha256 ||
+        metadata.size !== artifact.candidatePayloadSizeBytes)
+    ) {
+      fail(
+        "Portal registry readback bytes differ from the exact candidate tar",
+      );
+    }
+    records.push({
+      artifactKind: artifact.artifactKind,
+      candidatePayloadSha256: artifact.candidatePayloadSha256,
+      componentId: artifact.componentId,
+      publishedManifestDigest,
+      publishedRegistryRef,
+      readbackArtifactSha256: inventory.artifactSha256,
+      readbackContentSizeBytes: inventory.entries
+        .filter((entry) => entry.type === "file")
+        .reduce((total, entry) => total + entry.sizeBytes, 0),
+      readbackContentInventorySha256: sha256(canonicalJsonBytes(inventory)),
+      signedArtifactRef: artifact.signedArtifactRef,
+    });
+  }
+  return records.sort((left, right) =>
+    compareUtf8(left.componentId, right.componentId),
+  );
+}
+
+export async function inspectManagedCloudArtifactPublicationReadback({
+  plan,
+  portalRegistryRef,
+  readbackDirectory,
+}) {
+  validateManagedCloudPublicationAdapter(plan.adapter);
+  return publicationReadbackRecords(
+    plan,
+    readbackDirectory,
+    requireString(portalRegistryRef, "portal registry ref"),
+  );
+}
+
+async function validatePublicationSetDocument(publication, plan, authorized) {
+  validateManagedCloudPublicationSetShape(publication);
+  if (
+    publication.version !== 1 ||
+    publication.audience !== MANAGED_CLOUD_AUDIENCES.publicationSet ||
+    validateManagedCloudPublicationAdapter(publication.adapter) !==
+      publication.adapter
+  ) {
+    fail("local_fixture is test-only and cannot supply production publication");
+  }
+  const nowMs = Date.now();
+  if (
+    publication.authorizationSetSha256 !== plan.authorizationSetSha256 ||
+    publication.manifestSha256 !== plan.manifestSha256 ||
+    publication.releaseId !== plan.releaseId ||
+    publication.sourceCommit !== plan.sourceCommit ||
+    publication.attestedAtMs < authorized.authorization.authorizedAtMs ||
+    publication.attestedAtMs > nowMs ||
+    canonicalJsonBytes(publication.nativeArtifact).compare(
+      canonicalJsonBytes(plan.nativeArtifact),
+    ) !== 0 ||
+    canonicalJsonBytes(publication.supplyChainStatus).compare(
+      canonicalJsonBytes(publicationSupplyChainStatus()),
+    ) !== 0
+  ) {
+    fail("Publication set does not bind its exact authorized candidate");
+  }
+  requireHex64(publication.publicationPlanSha256, "publicationPlanSha256");
+  requireInteger(publication.attestedAtMs, "attestedAtMs");
+  requireInteger(publication.workflowRunAttempt, "workflowRunAttempt", 1);
+  requireInteger(publication.workflowRunId, "workflowRunId", 1);
+  const artifacts = requireArray(
+    publication.artifacts,
+    "publication artifacts",
+    4,
+  );
+  if (artifacts.length !== plan.artifacts.length) {
+    fail("Publication set must bind all four artifacts");
+  }
+  for (const [index, expected] of plan.artifacts.entries()) {
+    requirePublicationArtifactRecord(
+      artifacts[index],
+      expected,
+      "publication artifacts[" + index + "]",
+    );
+    if (
+      expected.artifactKind === "oci_image" &&
+      (artifacts[index].publishedManifestDigest !==
+        "sha256:" + expected.artifactSha256 ||
+        artifacts[index].readbackArtifactSha256 !== expected.artifactSha256)
+    ) {
+      fail(
+        expected.componentId + " publication changed its OCI manifest digest",
+      );
+    }
+    if (
+      expected.artifactKind === "static_bundle" &&
+      artifacts[index].readbackArtifactSha256 !== expected.artifactSha256
+    ) {
+      fail("Portal publication changed its exact candidate bytes");
+    }
+  }
+  return publication;
+}
+
+export function validateManagedCloudPublicationSetShape(publication) {
+  requireExactKeys(
+    publication,
+    MANAGED_CLOUD_PUBLICATION_SET_KEYS,
+    "publication set",
+  );
+  return true;
+}
+
+export function createManagedCloudPublicationSetDocument({
+  artifacts,
+  attestedAtMs,
+  plan,
+  publicationPlanSha256,
+  workflowRunAttempt,
+  workflowRunId,
+}) {
+  const publication = {
+    adapter: "remote_registry_readback_v1",
+    artifacts,
+    attestedAtMs,
+    audience: MANAGED_CLOUD_AUDIENCES.publicationSet,
+    authorizationSetSha256: plan.authorizationSetSha256,
+    manifestSha256: plan.manifestSha256,
+    nativeArtifact: plan.nativeArtifact,
+    publicationPlanSha256,
+    releaseId: plan.releaseId,
+    sourceCommit: plan.sourceCommit,
+    supplyChainStatus: plan.supplyChainStatus,
+    version: 1,
+    workflowRunAttempt,
+    workflowRunId,
+  };
+  validateManagedCloudPublicationSetShape(publication);
+  return publication;
+}
+
+export async function attestManagedCloudArtifactPublication({
+  authorizedDirectory,
+  expectedRootAnchorSha256,
+  outputFile,
+  planFile,
+  portalRegistryRef,
+  readbackDirectory,
+  workflowRunAttempt,
+  workflowRunId,
+}) {
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const { value: plan } = await readCanonicalJson(planFile, "publication plan");
+  await validatePublicationPlan(plan, authorized);
+  const artifacts = await publicationReadbackRecords(
+    plan,
+    readbackDirectory,
+    requireString(portalRegistryRef, "portal registry ref"),
+  );
+  const nowMs = Date.now();
+  const publication = createManagedCloudPublicationSetDocument({
+    artifacts,
+    attestedAtMs: nowMs,
+    plan,
+    publicationPlanSha256: await hashFile(planFile),
+    workflowRunAttempt: requireInteger(
+      Number(workflowRunAttempt),
+      "workflowRunAttempt",
+      1,
+    ),
+    workflowRunId: requireInteger(Number(workflowRunId), "workflowRunId", 1),
+  });
+  await validatePublicationSetDocument(publication, plan, authorized);
+  await writeCanonicalJson(outputFile, publication);
+  return publication;
+}
+
+export async function validateManagedCloudArtifactPublication({
+  authorizedDirectory,
+  expectedWorkflowRunAttempt,
+  expectedWorkflowRunId,
+  expectedRootAnchorSha256,
+  publicationDirectory,
+  readbackDirectory,
+}) {
+  const root = resolve(publicationDirectory);
+  await requireExactTopLevel(root, REQUIRED_PUBLICATION_FILES);
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const planFile = join(root, "publication-plan.json");
+  const { value: plan } = await readCanonicalJson(planFile, "publication plan");
+  await validatePublicationPlan(plan, authorized);
+  const { value: publication } = await readCanonicalJson(
+    join(root, "publication-set.json"),
+    "publication set",
+  );
+  await validatePublicationSetDocument(publication, plan, authorized);
+  if (
+    expectedWorkflowRunId !== undefined &&
+    publication.workflowRunId !==
+      requireInteger(
+        Number(expectedWorkflowRunId),
+        "expected publication workflowRunId",
+        1,
+      )
+  ) {
+    fail(
+      "Publication receipt does not bind the selected protected workflow run",
+    );
+  }
+  if (
+    expectedWorkflowRunAttempt !== undefined &&
+    publication.workflowRunAttempt !==
+      requireInteger(
+        Number(expectedWorkflowRunAttempt),
+        "expected publication workflowRunAttempt",
+        1,
+      )
+  ) {
+    fail(
+      "Publication receipt does not bind the selected protected workflow attempt",
+    );
+  }
+  if (publication.publicationPlanSha256 !== (await hashFile(planFile))) {
+    fail("Publication set does not bind its canonical plan bytes");
+  }
+  if (readbackDirectory !== undefined) {
+    const portal = publication.artifacts.find(
+      (artifact) => artifact.componentId === "jobs-portal",
+    );
+    const portalPlan = plan.artifacts.find(
+      (artifact) => artifact.componentId === "jobs-portal",
+    );
+    const records = await publicationReadbackRecords(
+      plan,
+      readbackDirectory,
+      portalPlan.publicationRepository + "@" + portal.publishedManifestDigest,
+    );
+    if (
+      canonicalJsonBytes(records).compare(
+        canonicalJsonBytes(publication.artifacts),
+      ) !== 0
+    ) {
+      fail("Independent remote publication readback differs from its receipt");
+    }
+  }
+  return { authorized, plan, publication };
+}
+
+function validatePublicationWorkflowEvidenceDocument(
+  evidence,
+  plan,
+  publication,
+) {
+  requireExactKeys(
+    evidence,
+    [
+      "audience",
+      "artifactDigest",
+      "artifactId",
+      "artifactName",
+      "artifactSizeBytes",
+      "conclusion",
+      "environmentName",
+      "environmentProtectionStatus",
+      "headBranch",
+      "headSha",
+      "jobId",
+      "jobName",
+      "repository",
+      "repositoryId",
+      "runAttempt",
+      "runId",
+      "version",
+      "workflowPath",
+    ],
+    "publication workflow evidence",
+  );
+  if (
+    evidence.version !== 1 ||
+    evidence.audience !== MANAGED_CLOUD_AUDIENCES.publicationWorkflowEvidence ||
+    evidence.conclusion !== "success" ||
+    evidence.environmentName !== MANAGED_CLOUD_PUBLICATION_ENVIRONMENT ||
+    evidence.environmentProtectionStatus !==
+      "workflow_declared_settings_not_attested" ||
+    evidence.jobName !== MANAGED_CLOUD_PUBLICATION_JOB_NAME ||
+    evidence.repository !== plan.sourceRepository ||
+    evidence.repositoryId !== plan.sourceRepositoryId ||
+    evidence.runId !== publication.workflowRunId ||
+    evidence.runAttempt !== publication.workflowRunAttempt ||
+    evidence.headBranch !== plan.sourceDefaultBranch ||
+    evidence.headSha !== plan.sourceCommit ||
+    evidence.workflowPath !== MANAGED_CLOUD_RELEASE_WORKFLOW_PATH
+  ) {
+    fail(
+      "Publication workflow evidence is not the exact declared publication job",
+    );
+  }
+  requireGitBranchName(evidence.headBranch, "publication workflow headBranch");
+  requireDigest(evidence.artifactDigest, "publication workflow artifactDigest");
+  requireInteger(evidence.artifactId, "publication workflow artifactId", 1);
+  if (
+    evidence.artifactName !==
+    "jobs-managed-cloud-publication-" +
+      evidence.runId +
+      "-" +
+      evidence.runAttempt
+  ) {
+    fail("Publication workflow artifact name is not attempt-qualified");
+  }
+  const artifactSizeBytes = requireInteger(
+    evidence.artifactSizeBytes,
+    "publication workflow artifactSizeBytes",
+    1,
+  );
+  if (artifactSizeBytes > MAX_PUBLICATION_ARTIFACT_ARCHIVE_BYTES) {
+    fail("Publication workflow artifact exceeds the 1 MiB receipt limit");
+  }
+  requireInteger(evidence.jobId, "publication workflow jobId", 1);
+  requireInteger(evidence.repositoryId, "publication workflow repositoryId", 1);
+  requireInteger(evidence.runAttempt, "publication workflow runAttempt", 1);
+  requireInteger(evidence.runId, "publication workflow runId", 1);
+  return evidence;
+}
+
+export function createManagedCloudPublicationWorkflowEvidence({
+  artifacts,
+  defaultBranch,
+  jobs,
+  plan,
+  publication,
+  run,
+}) {
+  requireObject(plan, "publication plan");
+  requireObject(publication, "publication set");
+  requireObject(run, "publication workflow run");
+  const repository = requireObject(
+    run.repository,
+    "publication workflow repository",
+  );
+  const exactDefaultBranch = requireGitBranchName(
+    defaultBranch,
+    "publication workflow default branch",
+  );
+  const workflowPath = requireString(run.path, "publication workflow path");
+  const runId = requireInteger(run.id, "publication workflow run.id", 1);
+  const runAttempt = requireInteger(
+    run.run_attempt,
+    "publication workflow run_attempt",
+    1,
+  );
+  if (
+    runId !== publication.workflowRunId ||
+    runAttempt !== publication.workflowRunAttempt ||
+    repository.full_name !== plan.sourceRepository ||
+    repository.id !== plan.sourceRepositoryId ||
+    exactDefaultBranch !== plan.sourceDefaultBranch ||
+    run.event !== "workflow_dispatch" ||
+    run.status !== "completed" ||
+    run.conclusion !== "success" ||
+    run.head_branch !== exactDefaultBranch ||
+    run.head_sha !== plan.sourceCommit ||
+    ![
+      MANAGED_CLOUD_RELEASE_WORKFLOW_PATH,
+      MANAGED_CLOUD_RELEASE_WORKFLOW_PATH + "@" + exactDefaultBranch,
+    ].includes(workflowPath)
+  ) {
+    fail(
+      "Selected publication run is not a successful exact-source workflow dispatch",
+    );
+  }
+  requireObject(jobs, "publication workflow jobs response");
+  const jobRows = requireArray(jobs.jobs, "publication workflow jobs", 1);
+  const totalCount = requireInteger(
+    jobs.total_count,
+    "publication workflow jobs total_count",
+    1,
+  );
+  if (totalCount !== jobRows.length || totalCount > 100) {
+    fail("Publication workflow jobs response must be complete and unpaginated");
+  }
+  const publicationJobs = jobRows.filter(
+    (job) => job?.name === MANAGED_CLOUD_PUBLICATION_JOB_NAME,
+  );
+  if (publicationJobs.length !== 1) {
+    fail("Publication workflow must contain exactly one publish job");
+  }
+  const job = requireObject(
+    publicationJobs[0],
+    "publication workflow publish job",
+  );
+  if (
+    job.run_id !== runId ||
+    job.run_attempt !== runAttempt ||
+    job.head_sha !== plan.sourceCommit ||
+    job.status !== "completed" ||
+    job.conclusion !== "success"
+  ) {
+    fail(
+      "Publication workflow publish job did not complete successfully at source",
+    );
+  }
+  const steps = requireArray(
+    job.steps,
+    "publication workflow publish steps",
+    1,
+  );
+  const receiptSteps = steps.filter(
+    (step) => step?.name === MANAGED_CLOUD_PUBLICATION_RECEIPT_STEP,
+  );
+  if (
+    receiptSteps.length !== 1 ||
+    receiptSteps[0].status !== "completed" ||
+    receiptSteps[0].conclusion !== "success"
+  ) {
+    fail("Publication workflow did not successfully upload its exact receipt");
+  }
+  requireObject(artifacts, "publication workflow artifacts response");
+  const artifactRows = requireArray(
+    artifacts.artifacts,
+    "publication workflow artifacts",
+    1,
+  );
+  const artifactCount = requireInteger(
+    artifacts.total_count,
+    "publication workflow artifacts total_count",
+    1,
+  );
+  if (artifactCount !== artifactRows.length || artifactCount > 100) {
+    fail(
+      "Publication workflow artifacts response must be complete and unpaginated",
+    );
+  }
+  const expectedArtifactName =
+    "jobs-managed-cloud-publication-" + runId + "-" + runAttempt;
+  const receiptArtifacts = artifactRows.filter(
+    (artifact) => artifact?.name === expectedArtifactName,
+  );
+  if (receiptArtifacts.length !== 1) {
+    fail(
+      "Publication workflow must expose exactly one attempt-qualified receipt",
+    );
+  }
+  const artifact = requireObject(
+    receiptArtifacts[0],
+    "publication workflow receipt artifact",
+  );
+  const artifactWorkflowRun = requireObject(
+    artifact.workflow_run,
+    "publication workflow receipt artifact workflow_run",
+  );
+  if (
+    artifact.expired !== false ||
+    artifactWorkflowRun.id !== runId ||
+    artifactWorkflowRun.repository_id !== plan.sourceRepositoryId ||
+    artifactWorkflowRun.head_repository_id !== plan.sourceRepositoryId ||
+    artifactWorkflowRun.head_branch !== exactDefaultBranch ||
+    artifactWorkflowRun.head_sha !== plan.sourceCommit
+  ) {
+    fail(
+      "Publication artifact is not bound to the exact repository run and source",
+    );
+  }
+  const artifactSizeBytes = requireInteger(
+    artifact.size_in_bytes,
+    "publication workflow receipt artifact size_in_bytes",
+    1,
+  );
+  if (artifactSizeBytes > MAX_PUBLICATION_ARTIFACT_ARCHIVE_BYTES) {
+    fail("Publication workflow artifact exceeds the 1 MiB receipt limit");
+  }
+  const evidence = {
+    audience: MANAGED_CLOUD_AUDIENCES.publicationWorkflowEvidence,
+    artifactDigest: requireDigest(
+      artifact.digest,
+      "publication workflow receipt artifact digest",
+    ),
+    artifactId: requireInteger(
+      artifact.id,
+      "publication workflow receipt artifact id",
+      1,
+    ),
+    artifactName: expectedArtifactName,
+    artifactSizeBytes,
+    conclusion: "success",
+    environmentName: MANAGED_CLOUD_PUBLICATION_ENVIRONMENT,
+    environmentProtectionStatus: "workflow_declared_settings_not_attested",
+    headBranch: exactDefaultBranch,
+    headSha: plan.sourceCommit,
+    jobId: requireInteger(job.id, "publication workflow job.id", 1),
+    jobName: MANAGED_CLOUD_PUBLICATION_JOB_NAME,
+    repository: plan.sourceRepository,
+    repositoryId: plan.sourceRepositoryId,
+    runAttempt,
+    runId,
+    version: 1,
+    workflowPath: MANAGED_CLOUD_RELEASE_WORKFLOW_PATH,
+  };
+  return validatePublicationWorkflowEvidenceDocument(
+    evidence,
+    plan,
+    publication,
+  );
+}
+
+export function selectManagedCloudPublicationSource({
+  defaultBranch, repository, repositoryId, run, runAttempt, runId,
+}) {
+  const branch = requireGitBranchName(defaultBranch, "publication default branch");
+  requireInteger(repositoryId, "publication repository ID", 1);
+  requireInteger(runAttempt, "publication attempt", 1);
+  requireInteger(runId, "publication run ID", 1);
+  if (typeof repository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+      run?.id !== runId || run.run_attempt !== runAttempt ||
+      run.repository?.id !== repositoryId || run.repository?.full_name !== repository ||
+      (run.head_repository !== undefined && run.head_repository?.id !== repositoryId) ||
+      run.head_branch !== branch || run.event !== "workflow_dispatch" ||
+      run.status !== "completed" || run.conclusion !== "success" ||
+      ![MANAGED_CLOUD_RELEASE_WORKFLOW_PATH, MANAGED_CLOUD_RELEASE_WORKFLOW_PATH + "@" + branch].includes(run.path)) {
+    fail("Publication source requires the exact successful same-repository default-branch attempt");
+  }
+  return requireSourceCommit(run.head_sha);
+}
+
+export async function selectManagedCloudPublicationArtifact({
+  artifactsFile,
+  authorizedDirectory,
+  defaultBranch,
+  expectedRootAnchorSha256,
+  jobsFile,
+  outputFile,
+  repository,
+  repositoryId,
+  runAttempt,
+  runFile,
+  runId,
+}) {
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const candidateRoot = join(authorized.root, "candidate");
+  const { value: testEvidence } = await readCanonicalJson(
+    join(candidateRoot, "test-evidence.json"),
+    "authorized test evidence",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  validateManagedCloudTestEvidence(
+    testEvidence,
+    authorized.manifest.sourceCommit,
+    authorized.manifest.version,
+  );
+  const exactRepository = requireString(repository, "publication repository");
+  const repositoryIdText = requireString(
+    String(repositoryId),
+    "publication repositoryId",
+  );
+  if (!/^[1-9][0-9]*$/.test(repositoryIdText)) {
+    fail("publication repositoryId must be canonical positive decimal");
+  }
+  const exactRepositoryId = requireInteger(
+    Number(repositoryIdText),
+    "publication repositoryId",
+    1,
+  );
+  const exactDefaultBranch = requireGitBranchName(
+    defaultBranch,
+    "publication default branch",
+  );
+  if (
+    testEvidence.version !== 2 ||
+    testEvidence.repository !== exactRepository ||
+    testEvidence.repositoryId !== exactRepositoryId ||
+    testEvidence.defaultBranch !== exactDefaultBranch
+  ) {
+    fail("Authorized candidate does not bind the current repository identity");
+  }
+  const plan = {
+    sourceCommit: authorized.manifest.sourceCommit,
+    sourceDefaultBranch: exactDefaultBranch,
+    sourceRepository: exactRepository,
+    sourceRepositoryId: exactRepositoryId,
+  };
+  const publication = {
+    workflowRunAttempt: requireInteger(
+      Number(runAttempt),
+      "selected publication workflow runAttempt",
+      1,
+    ),
+    workflowRunId: requireInteger(
+      Number(runId),
+      "selected publication workflow runId",
+      1,
+    ),
+  };
+  const run = (
+    await readBoundedJson(
+      runFile,
+      "publication workflow run",
+      MAX_PUBLICATION_WORKFLOW_RUN_BYTES,
+    )
+  ).value;
+  const jobs = (
+    await readBoundedJson(
+      jobsFile,
+      "publication workflow jobs",
+      MAX_PUBLICATION_WORKFLOW_JOBS_BYTES,
+    )
+  ).value;
+  const artifacts = (
+    await readBoundedJson(
+      artifactsFile,
+      "publication workflow artifacts",
+      MAX_PUBLICATION_ARTIFACTS_BYTES,
+    )
+  ).value;
+  const evidence = createManagedCloudPublicationWorkflowEvidence({
+    artifacts,
+    defaultBranch: exactDefaultBranch,
+    jobs,
+    plan,
+    publication,
+    run,
+  });
+  await writeCanonicalJson(outputFile, evidence);
+  return evidence;
+}
+
+function publicationPreflightArtifactRecords(plan, publication) {
+  const publicationByComponent = new Map(
+    publication.artifacts.map((artifact) => [artifact.componentId, artifact]),
+  );
+  return plan.artifacts.map((artifact) => {
+    const published = publicationByComponent.get(artifact.componentId);
+    if (!published) {
+      fail("Publication preflight is missing " + artifact.componentId);
+    }
+    return {
+      artifactKind: artifact.artifactKind,
+      artifactSha256: artifact.artifactSha256,
+      candidatePayloadSha256: artifact.candidatePayloadSha256,
+      candidatePayloadSizeBytes: artifact.candidatePayloadSizeBytes,
+      componentId: artifact.componentId,
+      publishedManifestDigest: published.publishedManifestDigest,
+      publishedRegistryRef: published.publishedRegistryRef,
+    };
+  });
+}
+
+export function validateManagedCloudPublicationPreflightDocument(
+  preflight,
+  expected = {},
+) {
+  requireExactKeys(
+    preflight,
+    MANAGED_CLOUD_PUBLICATION_PREFLIGHT_KEYS,
+    "publication preflight",
+  );
+  if (
+    preflight.version !== 1 ||
+    preflight.audience !== MANAGED_CLOUD_AUDIENCES.publicationPreflight ||
+    validateManagedCloudPublicationAdapter(preflight.adapter) !==
+      preflight.adapter
+  ) {
+    fail("Publication preflight schema or adapter is invalid");
+  }
+  const repository = requireString(
+    preflight.repository,
+    "publication preflight repository",
+  );
+  const repositoryId = requireInteger(
+    preflight.repositoryId,
+    "publication preflight repositoryId",
+    1,
+  );
+  const sourceCommit = requireSourceCommit(preflight.sourceCommit);
+  const defaultBranch = requireGitBranchName(
+    preflight.defaultBranch,
+    "publication preflight defaultBranch",
+  );
+  const registryNamespace = requireRegistryNamespace(
+    preflight.registryNamespace,
+  );
+  const portalManifestCreatedAt = requireCanonicalRfc3339Seconds(
+    preflight.portalManifestCreatedAt,
+    "publication preflight portalManifestCreatedAt",
+  );
+  requireSafeId(preflight.releaseId, "publication preflight releaseId");
+  requireHex64(
+    preflight.publicationPlanSha256,
+    "publication preflight publicationPlanSha256",
+  );
+  requireHex64(
+    preflight.publicationSetSha256,
+    "publication preflight publicationSetSha256",
+  );
+  const artifacts = requireBoundedArray(
+    preflight.artifacts,
+    "publication preflight artifacts",
+    MANAGED_CLOUD_COMPONENTS.length,
+    MANAGED_CLOUD_COMPONENTS.length,
+  );
+  const expectedComponents = [...MANAGED_CLOUD_COMPONENTS].sort((left, right) =>
+    compareUtf8(left.componentId, right.componentId),
+  );
+  for (const [index, component] of expectedComponents.entries()) {
+    const artifact = requireObject(
+      artifacts[index],
+      "publication preflight artifacts[" + index + "]",
+    );
+    requireExactKeys(
+      artifact,
+      MANAGED_CLOUD_PUBLICATION_PREFLIGHT_ARTIFACT_KEYS,
+      "publication preflight artifacts[" + index + "]",
+    );
+    if (
+      artifact.componentId !== component.componentId ||
+      artifact.artifactKind !== component.artifactKind
+    ) {
+      fail("Publication preflight artifacts are not the exact component set");
+    }
+    requireHex64(
+      artifact.artifactSha256,
+      artifact.componentId + " preflight artifactSha256",
+    );
+    requireHex64(
+      artifact.candidatePayloadSha256,
+      artifact.componentId + " preflight candidatePayloadSha256",
+    );
+    requireInteger(
+      artifact.candidatePayloadSizeBytes,
+      artifact.componentId + " preflight candidatePayloadSizeBytes",
+      1,
+    );
+    const manifestDigest = requireDigest(
+      artifact.publishedManifestDigest,
+      artifact.componentId + " preflight publishedManifestDigest",
+    );
+    const repositoryName = publicationRepository(
+      registryNamespace,
+      artifact.componentId,
+    );
+    if (
+      artifact.publishedRegistryRef !== repositoryName + "@" + manifestDigest ||
+      (artifact.artifactKind === "oci_image" &&
+        manifestDigest !== "sha256:" + artifact.artifactSha256)
+    ) {
+      fail("Publication preflight artifact ref is outside its exact authority");
+    }
+  }
+  const workflowEvidencePlan = {
+    sourceCommit,
+    sourceDefaultBranch: defaultBranch,
+    sourceRepository: repository,
+    sourceRepositoryId: repositoryId,
+  };
+  const workflowEvidencePublication = {
+    workflowRunAttempt: preflight.workflowEvidence?.runAttempt,
+    workflowRunId: preflight.workflowEvidence?.runId,
+  };
+  validatePublicationWorkflowEvidenceDocument(
+    preflight.workflowEvidence,
+    workflowEvidencePlan,
+    workflowEvidencePublication,
+  );
+  if (
+    expected.plan !== undefined &&
+    (preflight.adapter !== expected.plan.adapter ||
+      preflight.defaultBranch !== expected.plan.sourceDefaultBranch ||
+      preflight.portalManifestCreatedAt !==
+        expected.plan.portalManifestCreatedAt ||
+      preflight.registryNamespace !== expected.plan.registryNamespace ||
+      preflight.releaseId !== expected.plan.releaseId ||
+      preflight.repository !== expected.plan.sourceRepository ||
+      preflight.repositoryId !== expected.plan.sourceRepositoryId ||
+      preflight.sourceCommit !== expected.plan.sourceCommit)
+  ) {
+    fail("Publication preflight does not bind its exact publication plan");
+  }
+  if (
+    expected.publication !== undefined &&
+    (preflight.adapter !== expected.publication.adapter ||
+      preflight.publicationPlanSha256 !==
+        expected.publication.publicationPlanSha256 ||
+      preflight.workflowEvidence.runAttempt !==
+        expected.publication.workflowRunAttempt ||
+      preflight.workflowEvidence.runId !== expected.publication.workflowRunId)
+  ) {
+    fail("Publication preflight does not bind its exact publication set");
+  }
+  if (
+    expected.plan !== undefined &&
+    expected.publication !== undefined &&
+    canonicalJsonBytes(preflight.artifacts).compare(
+      canonicalJsonBytes(
+        publicationPreflightArtifactRecords(
+          expected.plan,
+          expected.publication,
+        ),
+      ),
+    ) !== 0
+  ) {
+    fail("Publication preflight artifact set differs from its receipt");
+  }
+  if (canonicalJsonBytes(preflight).length > MAX_PUBLICATION_PREFLIGHT_BYTES) {
+    fail("Publication preflight exceeds the 128 KiB canonical limit");
+  }
+  return {
+    defaultBranch,
+    portalManifestCreatedAt,
+    registryNamespace,
+  };
+}
+
+export function createManagedCloudPublicationPreflightDocument({
+  plan,
+  publication,
+  publicationPlanSha256,
+  publicationSetSha256,
+  workflowEvidence,
+}) {
+  validateManagedCloudPublicationPlanShape(plan);
+  validateManagedCloudPublicationSetShape(publication);
+  const preflight = {
+    adapter: publication.adapter,
+    artifacts: publicationPreflightArtifactRecords(plan, publication),
+    audience: MANAGED_CLOUD_AUDIENCES.publicationPreflight,
+    defaultBranch: plan.sourceDefaultBranch,
+    portalManifestCreatedAt: plan.portalManifestCreatedAt,
+    publicationPlanSha256,
+    publicationSetSha256,
+    registryNamespace: plan.registryNamespace,
+    releaseId: plan.releaseId,
+    repository: plan.sourceRepository,
+    repositoryId: plan.sourceRepositoryId,
+    sourceCommit: plan.sourceCommit,
+    version: 1,
+    workflowEvidence,
+  };
+  validateManagedCloudPublicationPreflightDocument(preflight, {
+    plan,
+    publication,
+  });
+  return preflight;
+}
+
+export async function createManagedCloudArtifactPublicationPreflight({
+  authorizedDirectory,
+  defaultBranch,
+  expectedRootAnchorSha256,
+  outputFile,
+  publicationDirectory,
+  publicationWorkflowEvidenceFile,
+  repository,
+  repositoryId,
+}) {
+  const { value: selectedWorkflowEvidence } = await readCanonicalJson(
+    publicationWorkflowEvidenceFile,
+    "selected publication workflow evidence",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  const publicationValidation = await validateManagedCloudArtifactPublication({
+    authorizedDirectory,
+    expectedWorkflowRunAttempt: selectedWorkflowEvidence.runAttempt,
+    expectedWorkflowRunId: selectedWorkflowEvidence.runId,
+    expectedRootAnchorSha256,
+    publicationDirectory,
+  });
+  validateManagedCloudPublicationRuntimeIdentity({
+    defaultBranch,
+    plan: publicationValidation.plan,
+    repository,
+    repositoryId,
+    sourceCommit: publicationValidation.plan.sourceCommit,
+  });
+  validatePublicationWorkflowEvidenceDocument(
+    selectedWorkflowEvidence,
+    publicationValidation.plan,
+    publicationValidation.publication,
+  );
+  const publicationRoot = resolve(publicationDirectory);
+  const preflight = createManagedCloudPublicationPreflightDocument({
+    plan: publicationValidation.plan,
+    publication: publicationValidation.publication,
+    publicationPlanSha256: await hashFile(
+      join(publicationRoot, "publication-plan.json"),
+    ),
+    publicationSetSha256: await hashFile(
+      join(publicationRoot, "publication-set.json"),
+    ),
+    workflowEvidence: selectedWorkflowEvidence,
+  });
+  await writeCanonicalJson(outputFile, preflight);
+  return preflight;
+}
+
+async function validatePublicationPreflightAgainstPublication(
+  preflightFile,
+  plan,
+  publication,
+  publicationDirectory,
+) {
+  const { value: preflight } = await readCanonicalJson(
+    preflightFile,
+    "publication preflight",
+    MAX_PUBLICATION_PREFLIGHT_BYTES,
+  );
+  validateManagedCloudPublicationPreflightDocument(preflight, {
+    plan,
+    publication,
+  });
+  const publicationRoot = resolve(publicationDirectory);
+  if (
+    preflight.publicationPlanSha256 !==
+      (await hashFile(join(publicationRoot, "publication-plan.json"))) ||
+    preflight.publicationSetSha256 !==
+      (await hashFile(join(publicationRoot, "publication-set.json")))
+  ) {
+    fail(
+      "Publication preflight does not bind the exact canonical receipt bytes",
+    );
+  }
+  return preflight;
+}
+
+async function validatePublishedPayloads(root, candidateSet) {
+  const expected = candidateSet.payloads.filter((item) =>
+    item.path.startsWith("payloads/"),
+  );
+  const files = await collectTreeFiles(root);
+  if (
+    files.length !== expected.length ||
+    files.some((file, index) => file.relativePath !== expected[index].path)
+  ) {
+    fail("Published/readback payload tree is not exact");
+  }
+  for (const [index, file] of files.entries()) {
+    if (
+      file.metadata.size !== expected[index].sizeBytes ||
+      (await hashFile(file.path)) !== expected[index].sha256
+    ) {
+      fail("Published/readback payload digest changed");
+    }
+  }
+  return expected;
+}
+
+export async function promoteManagedCloudCandidate({
+  activationFile,
+  activationSignatureSetFile,
+  authorizedDirectory,
+  cohortFile,
+  cohortSignatureSetFile,
+  evidenceDirectory,
+  expectedRootAnchorSha256,
+  outputDirectory,
+  publicationDirectory,
+  publicationPreflightFile,
+  publicationReadbackDirectory,
+  promotionId,
+}) {
+  const output = resolve(outputDirectory);
+  await requireEmptyOutputDirectory(output);
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const { value: cohort } = await readCanonicalJson(cohortFile, "cohort");
+  validateCohort(cohort);
+  if (cohort.trustGeneration !== authorized.policy.trustGeneration) {
+    fail("Cohort trust generation does not match active policy");
+  }
+  const { value: cohortSignatures } = await readCanonicalJson(
+    cohortSignatureSetFile,
+    "cohort signatures",
+  );
+  const cohortSignerKeyIds = verifyManagedCloudSignatureSet({
+    expectedRole: authorityRoleForChannel(cohort.scope.channel),
+    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.cohort,
+    expectedTargetBytes: await readFile(cohortFile),
+    policy: authorized.policy,
+    signatureSet: cohortSignatures,
+  });
+  if (
+    cohortSignatures.signedAtMs < cohort.issuedAtMs ||
+    Date.now() < cohort.notBeforeMs ||
+    Date.now() >= cohort.expiresAtMs
+  ) {
+    fail("Cohort signature or current validity window is invalid");
+  }
+  const { value: activation } = await readCanonicalJson(
+    activationFile,
+    "activation",
+  );
+  const evidenceHashes = await readActivationEvidence(
+    evidenceDirectory,
+    activation,
+    authorized,
+  );
+  validateActivation(
+    activation,
+    authorized,
+    cohort,
+    await hashFile(cohortSignatureSetFile),
+    evidenceHashes,
+  );
+  const { value: activationSignatures } = await readCanonicalJson(
+    activationSignatureSetFile,
+    "activation signatures",
+  );
+  const activationSignerKeyIds = verifyManagedCloudSignatureSet({
+    expectedRole: authorityRoleForChannel(activation.scope.channel),
+    expectedTargetAudience: activationAudienceForVersion(activation.version),
+    expectedTargetBytes: await readFile(activationFile),
+    policy: authorized.policy,
+    signatureSet: activationSignatures,
+  });
+  if (activationSignatures.signedAtMs < activation.issuedAtMs) {
+    fail("Activation signature cannot predate activation issuance");
+  }
+  const { value: preflightReceipt } = await readCanonicalJson(
+    publicationPreflightFile,
+    "publication preflight",
+    MAX_PUBLICATION_PREFLIGHT_BYTES,
+  );
+  validateManagedCloudPublicationPreflightDocument(preflightReceipt);
+  const publicationValidation = await validateManagedCloudArtifactPublication({
+    authorizedDirectory,
+    expectedWorkflowRunAttempt: preflightReceipt.workflowEvidence.runAttempt,
+    expectedWorkflowRunId: preflightReceipt.workflowEvidence.runId,
+    expectedRootAnchorSha256,
+    publicationDirectory,
+    readbackDirectory: publicationReadbackDirectory,
+  });
+  const publicationPreflight =
+    await validatePublicationPreflightAgainstPublication(
+      publicationPreflightFile,
+      publicationValidation.plan,
+      publicationValidation.publication,
+      publicationDirectory,
+    );
+  const publicationWorkflowEvidence = publicationPreflight.workflowEvidence;
+  await cp(resolve(authorizedDirectory), join(output, "authorized-candidate"), {
+    errorOnExist: true,
+    force: false,
+    recursive: true,
+  });
+  await copyFile(activationFile, join(output, "activation.json"), 0);
+  await copyFile(
+    activationSignatureSetFile,
+    join(output, "activation-signatures.json"),
+    0,
+  );
+  await copyFile(cohortFile, join(output, "cohort.json"), 0);
+  await copyFile(
+    cohortSignatureSetFile,
+    join(output, "cohort-signatures.json"),
+    0,
+  );
+  await cp(resolve(evidenceDirectory), join(output, "evidence"), {
+    errorOnExist: true,
+    force: false,
+    recursive: true,
+  });
+  await cp(resolve(publicationDirectory), join(output, "publication"), {
+    errorOnExist: true,
+    force: false,
+    recursive: true,
+  });
+  await writeCanonicalJson(
+    join(output, "publication-workflow-evidence.json"),
+    publicationWorkflowEvidence,
+  );
+  const promotion = {
+    activationSha256: await hashFile(activationFile),
+    activationSignatureSetSha256: await hashFile(activationSignatureSetFile),
+    activationSignerKeyIds,
+    adapter: "remote_registry_readback_v1",
+    audience: MANAGED_CLOUD_AUDIENCES.promotionV2,
+    authorizationSetSha256: await hashFile(
+      join(resolve(authorizedDirectory), "authorization-set.json"),
+    ),
+    cohortSha256: await hashFile(cohortFile),
+    cohortSignatureSetSha256: await hashFile(cohortSignatureSetFile),
+    cohortSignerKeyIds,
+    manifestSha256: authorized.candidate.manifestSha256,
+    publicationSetSha256: await hashFile(
+      join(resolve(publicationDirectory), "publication-set.json"),
+    ),
+    publicationWorkflowEvidenceSha256: await hashFile(
+      join(output, "publication-workflow-evidence.json"),
+    ),
+    promotedAtMs: Date.now(),
+    promotionId: requireSafeId(promotionId, "promotionId"),
+    releaseSignatureSetSha256:
+      authorized.authorization.releaseSignatureSetSha256,
+    trustGeneration: authorized.policy.trustGeneration,
+    version: 2,
+  };
+  await writeCanonicalJson(join(output, "promotion-set.json"), promotion);
+  return promotion;
+}
+
+export async function validateManagedCloudPromotion(
+  promotionDirectory,
+  expectedRootAnchorSha256,
+) {
+  const root = resolve(promotionDirectory);
+  const { value: promotion } = await readCanonicalJson(
+    join(root, "promotion-set.json"),
+    "promotion set",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  const isHistoricalV1 =
+    promotion.version === 1 &&
+    promotion.audience === MANAGED_CLOUD_AUDIENCES.promotion &&
+    promotion.adapter === "local_fixture";
+  const isRemoteGeneration2 =
+    promotion.version === 2 &&
+    promotion.audience === MANAGED_CLOUD_AUDIENCES.promotionV2 &&
+    promotion.adapter === "remote_registry_readback_v1";
+  if (!isHistoricalV1 && !isRemoteGeneration2) {
+    fail("Promotion generation, audience, and adapter are not an admitted set");
+  }
+  await requireExactTopLevel(
+    root,
+    isHistoricalV1 ? REQUIRED_PROMOTION_FILES_V1 : REQUIRED_PROMOTION_FILES_V2,
+  );
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    join(root, "authorized-candidate"),
+    expectedRootAnchorSha256,
+  );
+  const { value: cohort } = await readCanonicalJson(join(root, "cohort.json"));
+  validateCohort(cohort);
+  if (cohort.trustGeneration !== authorized.policy.trustGeneration) {
+    fail("Cohort trust generation does not match active policy");
+  }
+  const { value: cohortSignatures } = await readCanonicalJson(
+    join(root, "cohort-signatures.json"),
+  );
+  const cohortSignerKeyIds = verifyManagedCloudSignatureSet({
+    expectedRole: authorityRoleForChannel(cohort.scope.channel),
+    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.cohort,
+    expectedTargetBytes: await readFile(join(root, "cohort.json")),
+    policy: authorized.policy,
+    signatureSet: cohortSignatures,
+  });
+  if (
+    cohortSignatures.signedAtMs < cohort.issuedAtMs ||
+    Date.now() < cohort.notBeforeMs ||
+    Date.now() >= cohort.expiresAtMs
+  ) {
+    fail("Cohort signature or current validity window is invalid");
+  }
+  const { value: activation } = await readCanonicalJson(
+    join(root, "activation.json"),
+  );
+  const evidenceHashes = await readActivationEvidence(
+    join(root, "evidence"),
+    activation,
+    authorized,
+  );
+  validateActivation(
+    activation,
+    authorized,
+    cohort,
+    await hashFile(join(root, "cohort-signatures.json")),
+    evidenceHashes,
+  );
+  const { value: activationSignatures } = await readCanonicalJson(
+    join(root, "activation-signatures.json"),
+  );
+  const activationSignerKeyIds = verifyManagedCloudSignatureSet({
+    expectedRole: authorityRoleForChannel(activation.scope.channel),
+    expectedTargetAudience: activationAudienceForVersion(activation.version),
+    expectedTargetBytes: await readFile(join(root, "activation.json")),
+    policy: authorized.policy,
+    signatureSet: activationSignatures,
+  });
+  if (activationSignatures.signedAtMs < activation.issuedAtMs) {
+    fail("Activation signature cannot predate activation issuance");
+  }
+  requireExactKeys(
+    promotion,
+    isHistoricalV1
+      ? [
+          "activationSha256",
+          "activationSignatureSetSha256",
+          "activationSignerKeyIds",
+          "adapter",
+          "audience",
+          "authorizationSetSha256",
+          "cohortSha256",
+          "cohortSignatureSetSha256",
+          "cohortSignerKeyIds",
+          "manifestSha256",
+          "promotedAtMs",
+          "promotionId",
+          "publishedPayloads",
+          "readbackPayloads",
+          "releaseSignatureSetSha256",
+          "trustGeneration",
+          "version",
+        ]
+      : [
+          "activationSha256",
+          "activationSignatureSetSha256",
+          "activationSignerKeyIds",
+          "adapter",
+          "audience",
+          "authorizationSetSha256",
+          "cohortSha256",
+          "cohortSignatureSetSha256",
+          "cohortSignerKeyIds",
+          "manifestSha256",
+          "publicationSetSha256",
+          "publicationWorkflowEvidenceSha256",
+          "promotedAtMs",
+          "promotionId",
+          "releaseSignatureSetSha256",
+          "trustGeneration",
+          "version",
+        ],
+    "promotion set",
+  );
+  requireSafeId(promotion.promotionId, "promotionId");
+  requireInteger(promotion.promotedAtMs, "promotedAtMs");
+  if (
+    promotion.manifestSha256 !== authorized.candidate.manifestSha256 ||
+    promotion.activationSha256 !==
+      (await hashFile(join(root, "activation.json"))) ||
+    promotion.activationSignatureSetSha256 !==
+      (await hashFile(join(root, "activation-signatures.json"))) ||
+    promotion.cohortSha256 !== (await hashFile(join(root, "cohort.json"))) ||
+    promotion.cohortSignatureSetSha256 !==
+      (await hashFile(join(root, "cohort-signatures.json"))) ||
+    promotion.authorizationSetSha256 !==
+      (await hashFile(
+        join(root, "authorized-candidate/authorization-set.json"),
+      )) ||
+    promotion.releaseSignatureSetSha256 !==
+      authorized.authorization.releaseSignatureSetSha256 ||
+    promotion.trustGeneration !== authorized.policy.trustGeneration ||
+    promotion.promotedAtMs < activation.issuedAtMs ||
+    promotion.promotedAtMs > Date.now() ||
+    JSON.stringify(promotion.activationSignerKeyIds) !==
+      JSON.stringify(activationSignerKeyIds) ||
+    JSON.stringify(promotion.cohortSignerKeyIds) !==
+      JSON.stringify(cohortSignerKeyIds)
+  ) {
+    fail("Promotion set does not bind its exact authorized bytes");
+  }
+  if (isHistoricalV1) {
+    const publishedPayloads = await validatePublishedPayloads(
+      join(root, "published"),
+      authorized.candidate,
+    );
+    const readbackPayloads = await validatePublishedPayloads(
+      join(root, "readback"),
+      authorized.candidate,
+    );
+    if (
+      canonicalJsonBytes(promotion.publishedPayloads).compare(
+        canonicalJsonBytes(publishedPayloads),
+      ) !== 0 ||
+      canonicalJsonBytes(promotion.readbackPayloads).compare(
+        canonicalJsonBytes(readbackPayloads),
+      ) !== 0
+    ) {
+      fail("Historical promotion does not bind published and read-back bytes");
+    }
+    return { activation, authorized, promotion, promotionGeneration: 1 };
+  }
+  if (
+    promotion.publicationSetSha256 !==
+      (await hashFile(join(root, "publication/publication-set.json"))) ||
+    promotion.publicationWorkflowEvidenceSha256 !==
+      (await hashFile(join(root, "publication-workflow-evidence.json")))
+  ) {
+    fail("Remote promotion does not bind its publication receipt bytes");
+  }
+  const publication = await validateManagedCloudArtifactPublication({
+    authorizedDirectory: join(root, "authorized-candidate"),
+    expectedRootAnchorSha256,
+    publicationDirectory: join(root, "publication"),
+  });
+  if (
+    publication.publication.manifestSha256 !==
+    authorized.candidate.manifestSha256
+  ) {
+    fail("Promotion receipt does not bind remote publication authority");
+  }
+  const { value: publicationWorkflowEvidence } = await readCanonicalJson(
+    join(root, "publication-workflow-evidence.json"),
+    "publication workflow evidence",
+  );
+  validatePublicationWorkflowEvidenceDocument(
+    publicationWorkflowEvidence,
+    publication.plan,
+    publication.publication,
+  );
+  return { activation, authorized, promotion, promotionGeneration: 2 };
+}
+
+export function validateManagedCloudRollbackSuccessor(rollback, from, to) {
+  const scope = validateScope(rollback.scope, "rollback.scope");
+  if (
+    canonicalJsonBytes(scope).compare(
+      canonicalJsonBytes(from.activation.scope),
+    ) !== 0 ||
+    canonicalJsonBytes(scope).compare(
+      canonicalJsonBytes(to.activation.scope),
+    ) !== 0 ||
+    to.activation.activationGeneration <=
+      from.activation.activationGeneration ||
+    to.activation.channelSequence <= from.activation.channelSequence ||
+    to.activation.predecessorActivationSha256 !==
+      from.promotion.activationSha256 ||
+    rollback.expectedHeadRevision !== to.activation.expectedHeadRevision ||
+    rollback.expectedTransitionSha256 !==
+      to.activation.expectedTransitionSha256 ||
+    to.authorized.manifest.releaseSequence >=
+      from.authorized.manifest.releaseSequence ||
+    to.promotion.manifestSha256 === from.promotion.manifestSha256 ||
+    rollback.issuedAtMs < to.activation.issuedAtMs ||
+    rollback.issuedAtMs > Date.now() ||
+    rollback.trustGeneration !== to.authorized.policy.trustGeneration
+  ) {
+    fail(
+      "Rollback must use a newly signed successor activation over older release bytes",
+    );
+  }
+  // New rollback evidence authorizes older bytes on the same database.
+  // Cross-contract recovery needs a separately qualified compatibility
+  // proof; the rollback envelope has no such proof today.
+  if (rollback.version === 2) {
+    const current = from.authorized.manifest;
+    const target = to.authorized.manifest;
+    const currentMigrations = requireHex64(
+      current.migrationSetSha256, "current rollback migration set",
+    );
+    const targetMigrations = requireHex64(
+      target.migrationSetSha256, "target rollback migration set",
+    );
+    if (
+      currentMigrations !== targetMigrations ||
+      current.postgresMigrationHead !== target.postgresMigrationHead ||
+      current.sqliteMigrationHead !== target.sqliteMigrationHead
+    ) {
+      fail("Same-database rollback requires the same signed migration contract");
+    }
+  }
+  // Release bytes may move backward, but the signer policy may not. Both
+  // bundles already verify individually; the successor must additionally
+  // contain the exact policy that governed the current promotion.
+  const currentPolicy = from.authorized.policy;
+  const successorPolicy = to.authorized.policy;
+  const retainedPolicy =
+    to.authorized.trustBundle.policies[currentPolicy.trustGeneration - 1]?.policy;
+  if (
+    successorPolicy.trustGeneration < currentPolicy.trustGeneration ||
+    !retainedPolicy ||
+    !canonicalJsonBytes(currentPolicy).equals(canonicalJsonBytes(retainedPolicy))
+  ) {
+    fail("Rollback trust lineage must preserve the exact current signing policy");
+  }
+  return scope;
+}
+
+export async function createManagedCloudRollback({
+  expectedRootAnchorSha256,
+  fromPromotionDirectory,
+  outputDirectory,
+  rollbackFile,
+  rollbackSignatureSetFile,
+  toPromotionDirectory,
+}) {
+  const output = resolve(outputDirectory);
+  await requireEmptyOutputDirectory(output);
+  const from = await validateManagedCloudPromotion(
+    fromPromotionDirectory,
+    expectedRootAnchorSha256,
+  );
+  const to = await validateManagedCloudPromotion(
+    toPromotionDirectory,
+    expectedRootAnchorSha256,
+  );
+  if (from.promotionGeneration !== 2 || to.promotionGeneration !== 2) {
+    fail(
+      "New rollback authority requires two remote promotion generation-v2 inputs",
+    );
+  }
+  const { value: rollback } = await readCanonicalJson(rollbackFile, "rollback");
+  requireSignedObjectSize(rollback, "rollback");
+  requireExactKeys(
+    rollback,
+    [
+      "audience",
+      "evidenceSha256",
+      "expectedHeadRevision",
+      "expectedTransitionSha256",
+      "fromActivationSha256",
+      "fromManifestSha256",
+      "issuedAtMs",
+      "reasonRef",
+      "rollbackGeneration",
+      "rollbackId",
+      "scope",
+      "toActivationSha256",
+      "toManifestSha256",
+      "trustGeneration",
+      "version",
+    ],
+    "rollback",
+  );
+  if (
+    rollback.version !== 2 ||
+    rollback.audience !== MANAGED_CLOUD_AUDIENCES.rollbackV2
+  ) {
+    fail("Rollback audience or schema version is invalid");
+  }
+  requireSafeId(rollback.rollbackId, "rollbackId");
+  requireString(rollback.reasonRef, "reasonRef");
+  requireInteger(rollback.rollbackGeneration, "rollbackGeneration", 1);
+  requireInteger(rollback.trustGeneration, "rollback.trustGeneration", 1);
+  requireInteger(rollback.issuedAtMs, "rollback.issuedAtMs");
+  const scope = validateScope(rollback.scope, "rollback.scope");
+  requireInteger(rollback.expectedHeadRevision, "expectedHeadRevision", 1);
+  requireHex64(rollback.expectedTransitionSha256, "expectedTransitionSha256");
+  for (const key of [
+    "fromActivationSha256",
+    "fromManifestSha256",
+    "toActivationSha256",
+    "toManifestSha256",
+    "evidenceSha256",
+  ]) {
+    requireHex64(rollback[key], "rollback." + key);
+  }
+  const expectedBindings = [
+    ["fromActivationSha256", from.promotion.activationSha256],
+    ["fromManifestSha256", from.promotion.manifestSha256],
+    ["toActivationSha256", to.promotion.activationSha256],
+    ["toManifestSha256", to.promotion.manifestSha256],
+  ];
+  for (const [key, expected] of expectedBindings) {
+    if (rollback[key] !== expected) {
+      fail("Rollback does not bind " + key);
+    }
+  }
+  validateManagedCloudRollbackSuccessor(rollback, from, to);
+  const { value: signatures } = await readCanonicalJson(
+    rollbackSignatureSetFile,
+    "rollback signatures",
+  );
+  const signerKeyIds = verifyManagedCloudSignatureSet({
+    expectedRole: authorityRoleForChannel(scope.channel),
+    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.rollbackV2,
+    expectedTargetBytes: await readFile(rollbackFile),
+    policy: to.authorized.policy,
+    signatureSet: signatures,
+  });
+  if (signatures.signedAtMs < rollback.issuedAtMs) {
+    fail("Rollback signature cannot predate rollback issuance");
+  }
+  await cp(resolve(fromPromotionDirectory), join(output, "from-promotion"), {
+    errorOnExist: true,
+    force: false,
+    recursive: true,
+  });
+  await cp(resolve(toPromotionDirectory), join(output, "target-promotion"), {
+    errorOnExist: true,
+    force: false,
+    recursive: true,
+  });
+  await copyFile(rollbackFile, join(output, "rollback.json"), 0);
+  await copyFile(
+    rollbackSignatureSetFile,
+    join(output, "rollback-signatures.json"),
+    0,
+  );
+  const rollbackSet = {
+    audience: MANAGED_CLOUD_AUDIENCES.rollbackSetV2,
+    fromPromotionSha256: await hashFile(
+      join(resolve(fromPromotionDirectory), "promotion-set.json"),
+    ),
+    rollbackSha256: await hashFile(rollbackFile),
+    rollbackSignatureSetSha256: await hashFile(rollbackSignatureSetFile),
+    signerKeyIds,
+    targetPromotionSha256: await hashFile(
+      join(resolve(toPromotionDirectory), "promotion-set.json"),
+    ),
+    version: 2,
+  };
+  await writeCanonicalJson(join(output, "rollback-set.json"), rollbackSet);
+  return rollbackSet;
+}
+
+export async function validateManagedCloudRollback(
+  rollbackDirectory,
+  expectedRootAnchorSha256,
+) {
+  const root = resolve(rollbackDirectory);
+  await requireExactTopLevel(root, REQUIRED_ROLLBACK_FILES);
+  const from = await validateManagedCloudPromotion(
+    join(root, "from-promotion"),
+    expectedRootAnchorSha256,
+  );
+  const to = await validateManagedCloudPromotion(
+    join(root, "target-promotion"),
+    expectedRootAnchorSha256,
+  );
+  if (from.promotionGeneration !== to.promotionGeneration) {
+    fail("Rollback cannot mix historical and remote promotion generations");
+  }
+  const rollbackGeneration = from.promotionGeneration;
+  const expectedRollbackAudience =
+    rollbackGeneration === 1
+      ? MANAGED_CLOUD_AUDIENCES.rollback
+      : MANAGED_CLOUD_AUDIENCES.rollbackV2;
+  const expectedRollbackSetAudience =
+    rollbackGeneration === 1
+      ? MANAGED_CLOUD_AUDIENCES.rollbackSet
+      : MANAGED_CLOUD_AUDIENCES.rollbackSetV2;
+  const { value: rollback } = await readCanonicalJson(
+    join(root, "rollback.json"),
+  );
+  requireSignedObjectSize(rollback, "rollback");
+  requireExactKeys(
+    rollback,
+    [
+      "audience",
+      "evidenceSha256",
+      "expectedHeadRevision",
+      "expectedTransitionSha256",
+      "fromActivationSha256",
+      "fromManifestSha256",
+      "issuedAtMs",
+      "reasonRef",
+      "rollbackGeneration",
+      "rollbackId",
+      "scope",
+      "toActivationSha256",
+      "toManifestSha256",
+      "trustGeneration",
+      "version",
+    ],
+    "rollback",
+  );
+  if (
+    rollback.version !== rollbackGeneration ||
+    rollback.audience !== expectedRollbackAudience
+  ) {
+    fail("Rollback audience or version is invalid");
+  }
+  requireSafeId(rollback.rollbackId, "rollbackId");
+  requireInteger(rollback.rollbackGeneration, "rollbackGeneration", 1);
+  requireInteger(rollback.trustGeneration, "rollback.trustGeneration", 1);
+  requireInteger(rollback.expectedHeadRevision, "expectedHeadRevision", 1);
+  requireInteger(rollback.issuedAtMs, "rollback.issuedAtMs");
+  requireString(rollback.reasonRef, "rollback.reasonRef");
+  for (const key of [
+    "evidenceSha256",
+    "expectedTransitionSha256",
+    "fromActivationSha256",
+    "fromManifestSha256",
+    "toActivationSha256",
+    "toManifestSha256",
+  ]) {
+    requireHex64(rollback[key], "rollback." + key);
+  }
+  const { value: signatures } = await readCanonicalJson(
+    join(root, "rollback-signatures.json"),
+  );
+  const scope = validateScope(rollback.scope, "rollback.scope");
+  if (
+    rollback.fromActivationSha256 !== from.promotion.activationSha256 ||
+    rollback.fromManifestSha256 !== from.promotion.manifestSha256 ||
+    rollback.toActivationSha256 !== to.promotion.activationSha256 ||
+    rollback.toManifestSha256 !== to.promotion.manifestSha256 ||
+    rollback.trustGeneration !== to.authorized.policy.trustGeneration
+  ) {
+    fail(
+      "Rollback readback does not bind a successor activation over old bytes",
+    );
+  }
+  validateManagedCloudRollbackSuccessor(rollback, from, to);
+  const signerKeyIds = verifyManagedCloudSignatureSet({
+    expectedRole: authorityRoleForChannel(scope.channel),
+    expectedTargetAudience: expectedRollbackAudience,
+    expectedTargetBytes: await readFile(join(root, "rollback.json")),
+    policy: to.authorized.policy,
+    signatureSet: signatures,
+  });
+  if (signatures.signedAtMs < rollback.issuedAtMs) {
+    fail("Rollback signature cannot predate rollback issuance");
+  }
+  const { value: rollbackSet } = await readCanonicalJson(
+    join(root, "rollback-set.json"),
+  );
+  requireExactKeys(
+    rollbackSet,
+    [
+      "audience",
+      "fromPromotionSha256",
+      "rollbackSha256",
+      "rollbackSignatureSetSha256",
+      "signerKeyIds",
+      "targetPromotionSha256",
+      "version",
+    ],
+    "rollback set",
+  );
+  if (
+    rollbackSet.version !== rollbackGeneration ||
+    rollbackSet.audience !== expectedRollbackSetAudience ||
+    rollbackSet.fromPromotionSha256 !==
+      (await hashFile(join(root, "from-promotion/promotion-set.json"))) ||
+    rollbackSet.targetPromotionSha256 !==
+      (await hashFile(join(root, "target-promotion/promotion-set.json"))) ||
+    rollbackSet.rollbackSha256 !==
+      (await hashFile(join(root, "rollback.json"))) ||
+    rollbackSet.rollbackSignatureSetSha256 !==
+      (await hashFile(join(root, "rollback-signatures.json"))) ||
+    JSON.stringify(rollbackSet.signerKeyIds) !== JSON.stringify(signerKeyIds)
+  ) {
+    fail("Rollback set does not survive full authority readback");
+  }
+  return { from, rollback, rollbackSet, to };
+}
+
+function markedSection(text, marker) {
+  const begin = "# RELEASE-GATE: " + marker + "-BEGIN";
+  const end = "# RELEASE-GATE: " + marker + "-END";
+  const start = text.indexOf(begin);
+  const finish = text.indexOf(end);
+  if (start < 0 || finish <= start || text.indexOf(begin, start + 1) >= 0) {
+    fail("Release workflow is missing one unambiguous " + marker + " section");
+  }
+  return text.slice(start + begin.length, finish);
+}
+
+function namedWorkflowStep(section, name) {
+  const marker = `      - name: ${name}`;
+  const start = section.indexOf(marker);
+  if (start < 0 || section.indexOf(marker, start + marker.length) >= 0) {
+    fail(`Release workflow must contain one unambiguous ${name} step`);
+  }
+  const next = section.indexOf("\n      - ", start + marker.length);
+  return section.slice(start, next < 0 ? section.length : next);
+}
+
+function validateAuthorizationPolicyWorkflow(text) {
+  const section = markedSection(text, "AUTHORIZE-NO-REBUILD");
+  const sourceOutput = "${{ steps.candidate-source.outputs.commit }}";
+  const verifyPin = "          APPROVED_OBSERVABILITY_POLICY_SHA256: " +
+    "${{ secrets.BLUEY_JOBS_OBSERVABILITY_POLICY_SHA256 }}";
+  const checkout = "        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
+  const sections = [
+    ["Check out only the verifier", [
+      checkout, "        with:", "          ref: ${{ github.workflow_sha }}",
+      "          persist-credentials: false",
+    ]],
+    ["Read the verified candidate source commit", [
+      "        id: candidate-source", "        env:",
+      "          AUTHORIZED_ARCHIVE_MAX_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_ARCHIVE_MAX_BYTES }}",
+      "          AUTHORIZED_MAX_UNPACKED_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_MAX_UNPACKED_BYTES }}",
+      "          AUTHORIZED_RESERVE_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_RESERVE_BYTES }}",
+      "          CANDIDATE_RUN_ATTEMPT: ${{ github.event.inputs.candidate_run_attempt }}",
+      "          CANDIDATE_RUN_ID: ${{ github.event.inputs.candidate_run_id }}",
+      "          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+      "          GH_TOKEN: ${{ github.token }}",
+      "        run: |", "          set -euo pipefail",
+      '          proof="$(bash jobs/scripts/intake-managed-cloud-authorized.sh candidate)"',
+      "          node -e '",
+      '            const { root, candidateSourceCommit, candidateSetSha256 } = JSON.parse(require("node:fs").readFileSync(0,"utf8"));',
+      '            if (!require("node:path").isAbsolute(root) || /[\\r\\n]/.test(root) ||',
+      '                !/^[0-9a-f]{40}$/.test(candidateSourceCommit) || !/^[0-9a-f]{64}$/.test(candidateSetSha256)) process.exit(1);',
+      '            process.stdout.write("root="+root+"\\ncommit="+candidateSourceCommit+"\\nset-digest="+candidateSetSha256+"\\n");',
+      '          \' <<<"$proof" >> "$GITHUB_OUTPUT"',
+    ]],
+    ["Check out candidate policy files as data only", [
+      checkout, "        with:", "          ref: " + sourceOutput, "          path: candidate-policy",
+      "          fetch-depth: 1", "          persist-credentials: false",
+      "          sparse-checkout-cone-mode: false", "          sparse-checkout: |",
+      "            /.github/workflows/observability-policy.yml", "            /scripts/analyze-tracing-calls.py",
+    ]],
+    ["Verify the protected Observability policy before handling release signatures", [
+      "        env:", verifyPin, "          POLICY_SOURCE_COMMIT: " + sourceOutput,
+      "        run: |", "          set -euo pipefail",
+      '          test "$(git --no-optional-locks -C candidate-policy rev-parse HEAD)" = "$POLICY_SOURCE_COMMIT"',
+      "          node jobs/scripts/check-managed-cloud-observability-policy.mjs \\",
+      '            --repo "$GITHUB_WORKSPACE/candidate-policy" \\',
+      '            --source-commit "$POLICY_SOURCE_COMMIT" \\',
+      '            --approved-policy-sha256 "$APPROVED_OBSERVABILITY_POLICY_SHA256" > /dev/null',
+    ]],
+  ];
+  let previous = -1;
+  for (const [name, lines] of sections) {
+    const header = "      - name: " + name;
+    const step = namedWorkflowStep(section, name);
+    const position = section.indexOf(header);
+    if (position <= previous || step.trimEnd() !== [header, ...lines].join("\n")) {
+      fail("Authorization must bind the exact approved Observability Policy before consuming signatures");
+    }
+    previous = position;
+  }
+  const authorization = namedWorkflowStep(section, "Reverify and authorize with protected trust material");
+  const upload = namedWorkflowStep(section, "Upload authorized bytes");
+  const authorizeCall = "          node jobs/scripts/managed-cloud-release-gate.mjs authorize \\\n";
+  const signatureSteps = [
+    "          RELEASE_SIGNATURES:",
+    "          TRUST_BUNDLE:",
+    "\n          mkdir authority\n",
+    'writeFileSync("authority/release-signatures.json"',
+    'writeFileSync("authority/trust-bundle.json"',
+    authorizeCall,
+  ];
+  if (
+    !section.includes("\n    environment: jobs-managed-cloud-release\n") ||
+    section.includes("uses: actions/download-artifact@") ||
+    signatureSteps.some((line) => section.indexOf(line) <= previous) ||
+    section.split("uses: actions/checkout@").length !== 3 ||
+    section.indexOf(upload) <= section.indexOf(authorization) ||
+    /\n        (?:if|continue-on-error):/.test(authorization + "\n" + upload) ||
+    !authorization.includes(verifyPin + "\n") ||
+    !authorization.includes("CANDIDATE_ROOT: ${{ steps.candidate-source.outputs.root }}") ||
+    !authorization.includes("VERIFIED_CANDIDATE_SET_SHA256: ${{ steps.candidate-source.outputs.set-digest }}") ||
+    !authorization.includes('--authorization-id "authorization-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"') ||
+    !authorization.includes(authorizeCall +
+      '            --candidate "$CANDIDATE_ROOT" \\\n' +
+      '            --expected-candidate-set-sha256 "$VERIFIED_CANDIDATE_SET_SHA256" \\\n' +
+      '            --observability-policy-repo "$GITHUB_WORKSPACE/candidate-policy" \\\n' +
+      '            --approved-observability-policy-sha256 "$APPROVED_OBSERVABILITY_POLICY_SHA256" \\\n')
+  ) {
+    fail("Authorization must bind the exact approved Observability Policy before consuming signatures");
+  }
+}
+
+function validateAuthorizationConsumerWorkflow(text, publication, promotion) {
+  const authorize = markedSection(text, "AUTHORIZE-NO-REBUILD");
+  const upload = namedWorkflowStep(authorize, "Upload authorized bytes");
+  const publishIntake = namedWorkflowStep(publication, "Intake exact protected authorization before publication");
+  const promoteIntake = namedWorkflowStep(promotion, "Select one immutable receipt from the exact publication attempt");
+  const publishScript = 'proof="$(bash jobs/scripts/intake-managed-cloud-authorized.sh)"';
+  const promoteScript = 'proof="$(AUTHORIZATION_WORKFLOW_COMMIT="$source_commit" CANDIDATE_SOURCE_COMMIT="$source_commit"';
+  const publishRoot = 'AUTHORIZED_ROOT: ${{ steps.intake-authorization.outputs.root }}';
+  const promoteRoot = 'AUTHORIZED_ROOT: ${{ steps.select-publication.outputs.authorized-root }}';
+  const requireTrustedInputs = (step) => [
+    "APPROVED_OBSERVABILITY_POLICY_SHA256: ${{ secrets.BLUEY_JOBS_OBSERVABILITY_POLICY_SHA256 }}",
+    "AUTHORIZED_ARCHIVE_MAX_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_ARCHIVE_MAX_BYTES }}",
+    "AUTHORIZED_MAX_UNPACKED_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_MAX_UNPACKED_BYTES }}",
+    "AUTHORIZED_RESERVE_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_RESERVE_BYTES }}",
+    "AUTHORIZED_RUN_ATTEMPT: ${{ github.event.inputs.authorized_run_attempt }}",
+    "AUTHORIZED_RUN_ID: ${{ github.event.inputs.authorized_run_id }}",
+    "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    "GH_TOKEN: ${{ github.token }}",
+    "ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}",
+    "\n        run: |\n          set -euo pipefail\n",
+  ].every((witness) => step.includes(witness)) &&
+    !/\n        (?:if|continue-on-error):/.test(step);
+  const publish = publication.indexOf(publishScript);
+  const publishPlan = publication.indexOf("managed-cloud-release-gate.mjs publication-plan");
+  const sourceCapture = promoteIntake.indexOf("--kind run --out publication-workflow-run.json");
+  const sourceSelection = promoteIntake.indexOf("managed-cloud-release-gate.mjs publication-source-commit");
+  const intake = promoteIntake.indexOf(promoteScript);
+  const receiptSelection = promoteIntake.indexOf("managed-cloud-release-gate.mjs publication-artifact-select");
+  if (
+    !upload.includes("name: jobs-managed-cloud-authorized-${{ github.run_id }}-${{ github.run_attempt }}") ||
+    !upload.includes("\n          path: authorized\n") ||
+    ![publication, promotion].every((section) =>
+      section.includes("\n          ref: ${{ github.workflow_sha }}\n          persist-credentials: false\n") &&
+      !section.includes("name: jobs-managed-cloud-authorized") &&
+      !section.includes("--authorized authorized")) ||
+    !requireTrustedInputs(publishIntake) || !requireTrustedInputs(promoteIntake) ||
+    !publishIntake.includes("AUTHORIZATION_WORKFLOW_COMMIT: ${{ github.workflow_sha }}") ||
+    !publishIntake.includes("CANDIDATE_SOURCE_COMMIT: ${{ github.sha }}") ||
+    !publishIntake.includes('test "$AUTHORIZATION_WORKFLOW_COMMIT" = "$CANDIDATE_SOURCE_COMMIT"\n          ' + publishScript) ||
+    publish < 0 || publishPlan <= publish ||
+    publication.split(publishRoot).length - 1 !== 3 ||
+    publication.split('--authorized "$AUTHORIZED_ROOT"').length - 1 !== 4 ||
+    sourceCapture < 0 || sourceSelection <= sourceCapture || intake <= sourceSelection || receiptSelection <= intake ||
+    promoteIntake.split('gh api --hostname github.com "/repos/$GITHUB_REPOSITORY/actions/').length - 1 !== 3 ||
+    !promoteIntake.includes("bash jobs/scripts/intake-managed-cloud-authorized.sh)") ||
+    !promoteIntake.includes('--authorized "$root"') ||
+    promotion.split(promoteRoot).length - 1 !== 2 ||
+    promotion.split('--authorized "$AUTHORIZED_ROOT"').length - 1 !== 3
+  ) fail("Publication and promotion must intake one exact protected authorization before use");
+}
+
+function validateCandidateProducerWorkflow(text) {
+  const build = markedSection(text, "CANDIDATE-BUILD");
+  const verify = markedSection(text, "VERIFY-NO-REBUILD");
+  const upload = namedWorkflowStep(build, "Upload the only candidate bytes");
+  const download = namedWorkflowStep(verify, "Fetch candidate bytes from the build job");
+  const inspection = namedWorkflowStep(verify, "Independently inspect the downloaded bytes");
+  const name = "name: jobs-managed-cloud-candidate-${{ github.run_id }}-${{ github.run_attempt }}";
+  if (
+    !verify.includes("\n    needs: candidate\n") ||
+    !verify.includes("\n          ref: ${{ github.workflow_sha }}\n          persist-credentials: false\n") ||
+    !upload.includes("uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02") ||
+    !download.includes("uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093") ||
+    /\n          (?:run-id|repository|artifact-ids):/.test(download) ||
+    !upload.includes(name + "\n          path: release/candidate\n          if-no-files-found: error") ||
+    !download.includes(name + "\n          path: candidate") ||
+    !inspection.includes("run: node jobs/scripts/managed-cloud-release-gate.mjs verify --candidate candidate") ||
+    verify.indexOf(download) >= verify.indexOf(inspection) ||
+    /\n        (?:if|continue-on-error):/.test(upload + "\n" + download + "\n" + inspection) ||
+    text.split("name: jobs-managed-cloud-candidate").length - 1 !== 2
+  ) fail("Candidate build and independent verification must bind the exact run attempt");
+}
+
+export async function validateManagedCloudWorkflowContract(workflowFile) {
+  const text = await readFile(workflowFile, "utf8");
+  const releaseOperations = new Map([
+    ["CANDIDATE-BUILD", "candidate"],
+    ["VERIFY-NO-REBUILD", "candidate"],
+    ["AUTHORIZE-NO-REBUILD", "authorize"],
+    ["PUBLISH-REMOTE", "publish"],
+    ["PROMOTE-NO-REBUILD", "promote"],
+    ["ROLLBACK-NO-REBUILD", "rollback"],
+  ]);
+  const releaseSections = [...releaseOperations.keys()];
+  for (const marker of releaseSections) {
+    markedSection(text, marker);
+  }
+  validateCandidateProducerWorkflow(text);
+  validateAuthorizationPolicyWorkflow(text);
+  const globalPermissions = text.match(
+    /(?:^|\n)permissions:\n((?:  [^\n]+\n)+)/,
+  );
+  if (
+    globalPermissions === null ||
+    globalPermissions[1].trim() !== "contents: read"
+  ) {
+    fail("Global workflow permissions must be contents: read only");
+  }
+  const jobPermissionContracts = new Map([
+    ["CANDIDATE-BUILD", ["actions: read", "contents: read"]],
+    ["VERIFY-NO-REBUILD", ["actions: read", "contents: read"]],
+    ["AUTHORIZE-NO-REBUILD", ["actions: read", "contents: read"]],
+    ["PUBLISH-REMOTE", ["actions: read", "contents: read", "packages: write"]],
+    [
+      "PROMOTE-NO-REBUILD",
+      ["actions: read", "contents: read", "packages: read"],
+    ],
+    ["ROLLBACK-NO-REBUILD", ["actions: read", "contents: read"]],
+  ]);
+  for (const [marker, expected] of jobPermissionContracts) {
+    const section = markedSection(text, marker);
+    const permissions = section.match(
+      /\n    permissions:\n((?:      [^\n]+\n)+)/,
+    );
+    const observed = permissions?.[1]
+      .trim()
+      .split("\n")
+      .map((line) => line.trim());
+    if (
+      permissions === null ||
+      section.split("\n    permissions:").length - 1 !== 1 ||
+      JSON.stringify(observed) !== JSON.stringify(expected)
+    ) {
+      fail(
+        marker + " must declare exact least-privilege job-local permissions",
+      );
+    }
+  }
+  const forbiddenCommands = [
+    /\b(?:cargo\s+(?:build|install)|docker\s+(?:build|buildx))\b/i,
+    /\b(?:npm\s+(?:ci|install|run\s+build)|pnpm\s+(?:install|build))\b/i,
+    /\byarn\s+(?:install|build)\b/i,
+  ];
+  const containsForbiddenCommand = (value) =>
+    forbiddenCommands.some((pattern) => pattern.test(value));
+  const candidateBuildSection = markedSection(text, "CANDIDATE-BUILD");
+  if (containsForbiddenCommand(text.replace(candidateBuildSection, ""))) {
+    fail(
+      "Artifact installation/build commands must be confined to candidate build",
+    );
+  }
+  const dependencyAuditIndex = candidateBuildSection.indexOf(
+    "npm audit --audit-level=moderate",
+  );
+  const firstArtifactBuildIndex = candidateBuildSection.indexOf(
+    "docker buildx build --platform",
+  );
+  if (
+    dependencyAuditIndex < 0 ||
+    firstArtifactBuildIndex <= dependencyAuditIndex ||
+    !candidateBuildSection.includes("$GITHUB_WORKSPACE/jobs:/workspace:ro") ||
+    !candidateBuildSection.includes("major===22&&minor<13")
+  ) {
+    fail(
+      "Candidate build must audit the read-only exact Jobs dependency graph before artifacts",
+    );
+  }
+  for (const marker of releaseSections.slice(1)) {
+    if (containsForbiddenCommand(markedSection(text, marker))) {
+      fail(marker + " must not install dependencies or rebuild artifacts");
+    }
+  }
+  if (/\$\{\{\s*secrets\./.test(markedSection(text, "CANDIDATE-BUILD"))) {
+    fail("Candidate build section must not receive repository secrets");
+  }
+  const allowedActions = new Set([
+    "actions/checkout",
+    "actions/download-artifact",
+    "actions/setup-node",
+    "actions/upload-artifact",
+    "oras-project/setup-oras",
+  ]);
+  for (const match of text.matchAll(/uses:\s*([^\s#]+)/g)) {
+    const [action, revision, extra] = match[1].split("@");
+    if (
+      extra !== undefined ||
+      !allowedActions.has(action) ||
+      !/^[0-9a-f]{40}$/.test(revision ?? "")
+    ) {
+      fail("Every GitHub Action must be pinned by full commit SHA");
+    }
+  }
+  const setupNodeAction =
+    "uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
+  const exactNodeVersion = "node-version: 22.23.2";
+  const exactNodeAssertion = 'test "$(node --version)" = "v22.23.2"';
+  const defaultBranchType = "github.ref_type == 'branch'";
+  const defaultBranchName =
+    "github.ref_name == github.event.repository.default_branch";
+  const protectedNodeCommand =
+    /(?:^|\n)\s*(?:run:\s*)?node\s+(?:jobs\/scripts\/managed-cloud-release-gate\.mjs|--test|-e|--input-type=module)/m;
+  for (const marker of releaseSections) {
+    const section = markedSection(text, marker);
+    const setupIndex = section.indexOf(setupNodeAction);
+    const assertionIndex = section.indexOf(exactNodeAssertion);
+    const commandIndex = section.search(protectedNodeCommand);
+    const stepsIndex = section.indexOf("steps:");
+    if (
+      section.split(defaultBranchType).length - 1 !== 1 ||
+      section.split(defaultBranchName).length - 1 !== 1 ||
+      section.indexOf(defaultBranchType) > stepsIndex ||
+      section.indexOf(defaultBranchName) > stepsIndex ||
+      section.split(setupNodeAction).length - 1 !== 1 ||
+      section.split(exactNodeVersion).length - 1 !== 1 ||
+      section.split(exactNodeAssertion).length - 1 !== 1 ||
+      setupIndex < 0 ||
+      assertionIndex <= setupIndex ||
+      commandIndex <= assertionIndex
+    ) {
+      fail(
+        marker +
+          " must be default-branch-only and pin Node 22.23.2 before release evidence",
+      );
+    }
+    // This is only a check of the workflow predicate, not of hosted settings.
+    const expectedCondition = [
+      `      ${defaultBranchType} &&`,
+      `      ${defaultBranchName} &&`,
+      "      github.ref_protected == true &&",
+      `      github.event.inputs.operation == '${releaseOperations.get(marker)}'\n`,
+    ].join("\n");
+    const condition = section.match(/^    if: >-\n((?:      [^\n]+\n)+)/m);
+    if (
+      condition?.[1] !== expectedCondition ||
+      condition.index >= stepsIndex ||
+      [...section.matchAll(/^    if[ \t]*:/gm)].length !== 1
+    ) {
+      fail(marker + " must require the protected default branch for exactly its release operation");
+    }
+  }
+  const exactWorkflowRuntimeRoles =
+    "discovery_worker,global_discovery_worker,original_source_verifier," +
+    "workflow_gateway,workflow_worker";
+  // The current candidate must bind one exact release-v4 tuple. Historical
+  // versioned artifact readers are deliberately independent of workflow shape.
+  const workflowCandidateBindings = [
+    [/^[ \t]*--version[ \t]+[^\n]+$/gm, "            --version 4"],
+    [
+      /^[ \t]*bluey-jobs-managed-cloud-release-gate-tests-v[^\n]+$/gm,
+      "            bluey-jobs-managed-cloud-release-gate-tests-v4 \\",
+    ],
+    [
+      /^[ \t]*audience:[^\n]+$/gm,
+      '            audience: "bluey-jobs-managed-cloud-release-descriptor-v4",',
+    ],
+    [/^[ \t]*version:[^\n]+$/gm, "            version: 4,"],
+  ];
+  const workflowRuntimeRoleAssignments = [
+    ...candidateBuildSection.matchAll(
+      /BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=([a-z_,]+)/g,
+    ),
+  ].map((match) => match[1]);
+  if (
+    !candidateBuildSection.includes("directDiscovery: true") ||
+    !candidateBuildSection.includes("globalDiscovery: true") ||
+    !candidateBuildSection.includes("managed-cloud-release-gate.mjs contracts-current") ||
+    !workflowCandidateBindings.every(([pattern, expected]) => {
+      const actual = candidateBuildSection.match(pattern);
+      return actual?.length === 1 && actual[0] === expected;
+    }) ||
+    JSON.stringify(workflowRuntimeRoleAssignments) !==
+      JSON.stringify([exactWorkflowRuntimeRoles]) ||
+    !candidateBuildSection.includes("sourceVerification: true") ||
+    candidateBuildSection.includes("directDiscovery: false") ||
+    candidateBuildSection.includes("globalDiscovery: false") ||
+    candidateBuildSection.includes("sourceVerification: false")
+  ) {
+    fail(
+      "Workflow must build the exact release-v4 discovery and source-verifier candidate",
+    );
+  }
+  const publicationSection = markedSection(text, "PUBLISH-REMOTE");
+  const promotionSection = markedSection(text, "PROMOTE-NO-REBUILD");
+  if (
+    candidateBuildSection.split("vars.BLUEY_JOBS_ARTIFACT_NAMESPACE").length -
+      1 !==
+      2 ||
+    candidateBuildSection.split("vars.BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN")
+      .length -
+      1 !==
+      2 ||
+    !candidateBuildSection.includes("ci-evidence") ||
+    candidateBuildSection.split(
+      "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    ).length -
+      1 !==
+      1 ||
+    !candidateBuildSection.includes('--default-branch "$DEFAULT_BRANCH"') ||
+    !candidateBuildSection.includes("jobs_ci_run_id") ||
+    !candidateBuildSection.includes("observability_run_id") ||
+    candidateBuildSection.includes("managed-cloud-test-evidence-v1") ||
+    text.includes("`ghcr.io/bluey/")
+  ) {
+    fail(
+      "Candidate must bind controlled namespaces and successful exact-tip CI evidence",
+    );
+  }
+  const candidateRunCaptures = [
+    {
+      endpoint:
+        'gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$JOBS_CI_RUN_ID"',
+      output: "release/prepared/jobs-ci-run.json",
+    },
+    {
+      endpoint:
+        'gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$OBSERVABILITY_RUN_ID"',
+      output: "release/prepared/observability-run.json",
+    },
+  ];
+  const candidateRunCaptureStep = namedWorkflowStep(
+    candidateBuildSection,
+    "Bind successful exact-tip CI instead of synthetic candidate evidence",
+  );
+  if (
+    candidateBuildSection.split("publication-api-capture").length - 1 !== 2 ||
+    candidateRunCaptureStep.split("publication-api-capture").length - 1 !== 2 ||
+    candidateBuildSection.split("--kind run --out").length - 1 !== 2 ||
+    candidateRunCaptureStep.split("--kind run --out").length - 1 !== 2 ||
+    candidateBuildSection.includes("> release/prepared/jobs-ci-run.json") ||
+    candidateBuildSection.includes("> release/prepared/observability-run.json")
+  ) {
+    fail("Candidate CI runs must use exactly two atomic 128 KiB captures");
+  }
+  if (
+    candidateRunCaptureStep.split(
+      "        run: |\n          set -euo pipefail\n",
+    ).length -
+      1 !==
+    1
+  ) {
+    fail(
+      "Candidate exact-tip CI capture step must enable pipefail before both producer pipelines",
+    );
+  }
+  for (const { endpoint, output } of candidateRunCaptures) {
+    const pipeline =
+      `if ! ${endpoint} \\\n` +
+      "            | node jobs/scripts/managed-cloud-release-gate.mjs " +
+      "publication-api-capture \\\n" +
+      `                --kind run --out ${output}`;
+    const cleanup = `rm -f -- ${output} \\\n              ${output}.partial`;
+    if (
+      candidateBuildSection.split(endpoint).length - 1 !== 1 ||
+      candidateBuildSection.split(output).length - 1 !== 4 ||
+      !candidateRunCaptureStep.includes(pipeline) ||
+      !candidateRunCaptureStep.includes(cleanup)
+    ) {
+      fail(
+        "Candidate CI run capture must fail closed without final or partial output",
+      );
+    }
+  }
+  const portalReadbackMarkers = [
+    'oras manifest fetch "$PORTAL_REGISTRY_REF"',
+    "publication-portal-capture",
+    "--out publication-readback/jobs-portal.oci-manifest.json",
+    "rm -f -- publication-readback/jobs-portal.oci-manifest.json",
+    "publication-readback/jobs-portal.oci-manifest.json.partial",
+    "publication-portal-manifest",
+    "publication-portal-readback",
+    "--manifest publication-readback/jobs-portal.oci-manifest.json",
+    "--download portal-download",
+    "--out publication-readback/jobs-portal.tar",
+  ];
+  for (const [label, section] of [
+    ["Publication", publicationSection],
+    ["Promotion", promotionSection],
+  ]) {
+    const fetchIndex = section.indexOf(
+      'oras manifest fetch "$PORTAL_REGISTRY_REF"',
+    );
+    const captureIndex = section.indexOf("publication-portal-capture");
+    const manifestIndex = section.indexOf("publication-portal-manifest");
+    const pullIndex = section.indexOf(
+      'oras pull "$PORTAL_REGISTRY_REF" --output portal-download',
+    );
+    const readbackIndex = section.indexOf("publication-portal-readback");
+    if (
+      portalReadbackMarkers.some((marker) => !section.includes(marker)) ||
+      section.includes(
+        "--output publication-readback/jobs-portal.oci-manifest.json",
+      ) ||
+      fetchIndex < 0 ||
+      captureIndex <= fetchIndex ||
+      manifestIndex <= captureIndex ||
+      pullIndex <= manifestIndex ||
+      readbackIndex <= pullIndex
+    ) {
+      fail(
+        label + " must verify the exact portal OCI manifest and one-file pull",
+      );
+    }
+  }
+  const publicationRuntimeIndex = publicationSection.indexOf(
+    "publication-runtime",
+  );
+  const registryLoginIndex = publicationSection.indexOf("oras login ghcr.io");
+  if (
+    !publicationSection.includes(
+      "environment: jobs-managed-cloud-artifact-publication",
+    ) ||
+    publicationSection.split("packages: write").length - 1 !== 1 ||
+    !publicationSection.includes(
+      "uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3",
+    ) ||
+    !publicationSection.includes("oras cp --from-oci-layout") ||
+    !publicationSection.includes("oras cp --to-oci-layout") ||
+    !publicationSection.includes(
+      'tar --extract --file "$AUTHORIZED_ROOT/candidate/payloads/$component.oci.tar"',
+    ) ||
+    !publicationSection.includes(
+      '"publication-source/$component@sha256:$DIGEST" "$TAG_REF"',
+    ) ||
+    !publicationSection.includes(
+      '"publication-layout/$component:$GITHUB_RUN_ID"',
+    ) ||
+    !publicationSection.includes("publication-readback/$component.oci.tar") ||
+    publicationRuntimeIndex < 0 ||
+    registryLoginIndex <= publicationRuntimeIndex ||
+    publicationSection.split(
+      "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    ).length -
+      1 !==
+      2 ||
+    !publicationSection.includes('--authorized "$AUTHORIZED_ROOT"') ||
+    !publicationSection.includes(
+      '--root-anchor-sha256 "$ROOT_ANCHOR_SHA256"',
+    ) ||
+    !publicationSection.includes('--default-branch "$DEFAULT_BRANCH"') ||
+    !publicationSection.includes('--source-commit "$GITHUB_SHA"') ||
+    !publicationSection.includes('--repository "$GITHUB_REPOSITORY"') ||
+    !publicationSection.includes('--repository-id "$GITHUB_REPOSITORY_ID"') ||
+    !publicationSection.includes(
+      '--annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT"',
+    ) ||
+    !publicationSection.includes(
+      "process.stdout.write(plan.portalManifestCreatedAt)",
+    ) ||
+    !publicationSection.includes("--plan publication/publication-plan.json") ||
+    !publicationSection.includes("publication-attest") ||
+    !publicationSection.includes("publication-verify") ||
+    !publicationSection.includes(
+      "name: jobs-managed-cloud-publication-${{ github.run_id }}-${{ github.run_attempt }}",
+    ) ||
+    publicationSection.split('--workflow-run-attempt "$GITHUB_RUN_ATTEMPT"')
+      .length -
+      1 !==
+      2 ||
+    publicationSection.includes("local_fixture") ||
+    text.split("packages: write").length - 1 !== 1
+  ) {
+    fail(
+      "Remote publication must use one protected package writer and immutable readback",
+    );
+  }
+  if (
+    !promotionSection.includes("environment: jobs-managed-cloud-release") ||
+    !promotionSection.includes("packages: read") ||
+    !promotionSection.includes("publication_run_id") ||
+    !promotionSection.includes("publication_run_attempt") ||
+    !promotionSection.includes("canonical positive safe integer") ||
+    !promotionSection.includes("Number.isSafeInteger(Number(value))") ||
+    promotionSection.split(
+      "PUBLICATION_RUN_ID: ${{ github.event.inputs.publication_run_id }}",
+    ).length -
+      1 !==
+      2 ||
+    !promotionSection.includes(
+      '"publication-layout/$component:$GITHUB_RUN_ID"',
+    ) ||
+    !promotionSection.includes("publication-readback/$component.oci.tar") ||
+    !promotionSection.includes("publication-verify") ||
+    promotionSection.split(
+      "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    ).length -
+      1 !==
+      2 ||
+    !promotionSection.includes('--default-branch "$DEFAULT_BRANCH"') ||
+    !promotionSection.includes(
+      "managed-cloud-release-gate.mjs publication-preflight",
+    ) ||
+    !promotionSection.includes(
+      "--publication-preflight publication-preflight.json",
+    ) ||
+    !promotionSection.includes('--repository "$GITHUB_REPOSITORY"') ||
+    !promotionSection.includes('--repository-id "$GITHUB_REPOSITORY_ID"') ||
+    !promotionSection.includes("--publication publication") ||
+    !promotionSection.includes("--publication-readback publication-readback") ||
+    !promotionSection.includes('/attempts/$PUBLICATION_RUN_ATTEMPT"') ||
+    !promotionSection.includes(
+      '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100"',
+    ) ||
+    !promotionSection.includes('/artifacts?per_page=100"') ||
+    !promotionSection.includes("publication-artifact-select") ||
+    promotionSection.split("publication-api-capture").length - 1 !== 3 ||
+    !promotionSection.includes(
+      "--kind run --out publication-workflow-run.json",
+    ) ||
+    !promotionSection.includes(
+      "--kind jobs --out publication-workflow-jobs.json",
+    ) ||
+    !promotionSection.includes(
+      "--kind artifacts --out publication-workflow-artifacts.json",
+    ) ||
+    !promotionSection.includes(
+      "rm -f -- publication-workflow-run.json publication-workflow-run.json.partial",
+    ) ||
+    !promotionSection.includes(
+      "rm -f -- publication-workflow-jobs.json publication-workflow-jobs.json.partial",
+    ) ||
+    !promotionSection.includes(
+      "rm -f -- publication-workflow-artifacts.json publication-workflow-artifacts.json.partial",
+    ) ||
+    !promotionSection.includes(
+      "artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}",
+    ) ||
+    !promotionSection.includes("merge-multiple: true") ||
+    !promotionSection.includes(
+      "--publication-workflow-evidence publication-workflow-evidence.json",
+    ) ||
+    !promotionSection.includes('--root-anchor-sha256 "$ROOT_ANCHOR_SHA256"') ||
+    !promotionSection.includes('--workflow-run-id "$PUBLICATION_RUN_ID"') ||
+    !promotionSection.includes(
+      '--workflow-run-attempt "$PUBLICATION_RUN_ATTEMPT"',
+    ) ||
+    promotionSection.includes("filter=latest") ||
+    promotionSection.includes("name: jobs-managed-cloud-publication\n") ||
+    promotionSection.includes(
+      'require("./publication/publication-plan.json")',
+    ) ||
+    promotionSection.includes(
+      'require("./publication/publication-set.json")',
+    ) ||
+    promotionSection.includes(
+      '--workflow-run-id "${{ github.event.inputs.publication_run_id }}"',
+    ) ||
+    promotionSection.includes("local_fixture")
+  ) {
+    fail(
+      "Promotion must independently read back the protected remote publication",
+    );
+  }
+  const publicationJobsReadIndex = promotionSection.indexOf(
+    '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100"',
+  );
+  const publicationSelectionIndex = promotionSection.indexOf(
+    "publication-artifact-select",
+  );
+  const publicationDownloadIndex = promotionSection.indexOf(
+    "artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}",
+  );
+  const promotionPreflightIndex = promotionSection.indexOf(
+    "managed-cloud-release-gate.mjs publication-preflight",
+  );
+  const promotionLoginIndex = promotionSection.indexOf("oras login ghcr.io");
+  const promotionPullIndex = promotionSection.indexOf(
+    "oras cp --to-oci-layout",
+  );
+  if (
+    publicationJobsReadIndex < 0 ||
+    publicationSelectionIndex <= publicationJobsReadIndex ||
+    publicationDownloadIndex <= publicationSelectionIndex ||
+    promotionPreflightIndex <= publicationDownloadIndex ||
+    promotionLoginIndex <= promotionPreflightIndex ||
+    promotionPullIndex <= promotionPreflightIndex
+  ) {
+    fail("Promotion preflight must pass before registry login or readback");
+  }
+  validateAuthorizationConsumerWorkflow(text, publicationSection, promotionSection);
+  if (
+    !text.includes("group: jobs-managed-cloud-release") ||
+    text.includes("jobs-managed-cloud-release-${{")
+  ) {
+    fail(
+      "All managed-cloud release operations must share one non-cancelling lock",
+    );
+  }
+  if (
+    !text.includes("vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256") ||
+    /inputs\.[A-Za-z0-9_]*root[A-Za-z0-9_]*anchor/i.test(text)
+  ) {
+    fail(
+      "Workflow must use the protected root-anchor digest, never caller input",
+    );
+  }
+  return true;
+}
+
+function parseCli(argv) {
+  const [command, ...tokens] = argv;
+  const options = {};
+  for (let index = 0; index < tokens.length; index += 2) {
+    const key = tokens[index];
+    const value = tokens[index + 1];
+    if (
+      !key?.startsWith("--") ||
+      value === undefined ||
+      value.startsWith("--")
+    ) {
+      fail("CLI options must use --name value pairs");
+    }
+    options[key.slice(2)] = value;
+  }
+  return { command, options };
+}
+
+function requireOption(options, name) {
+  return requireString(options[name], "--" + name);
+}
+
+function authorizationCliInteger(options, name, minimum = 1) {
+  const text = requireOption(options, name);
+  if (!/^(?:0|[1-9][0-9]*)$/.test(text)) fail("--" + name + " must be a canonical decimal");
+  return requireInteger(Number(text), "--" + name, minimum);
+}
+
+function authorizationCliInput(argv, options, stage, candidateMode = false) {
+  const metadata = [
+    "run", "jobs", "artifacts", "artifact-max-bytes", "default-branch",
+    "repository", "repository-id", "run-attempt", "run-id",
+    ...(candidateMode ? [] : ["authorization-workflow-commit", "candidate-source-commit"]),
+  ];
+  const staging = [
+    "archive", "downloaded-artifact-id", "max-unpacked-bytes", "parent", "reserve-bytes",
+    ...(candidateMode ? [] : ["approved-observability-policy-sha256", "root-anchor-sha256"]),
+  ];
+  const names = stage ? [...metadata, ...staging] : metadata;
+  requireExactKeys(options, names, "authorization intake CLI options");
+  if (argv.length !== 1 + names.length * 2) fail("Duplicate authorization intake option");
+  return {
+    artifactsFile: requireOption(options, "artifacts"),
+    expected: {
+      artifactMaxBytes: authorizationCliInteger(options, "artifact-max-bytes"),
+      ...(candidateMode ? {} : {
+        authorizationWorkflowCommit: requireOption(options, "authorization-workflow-commit"),
+        candidateSourceCommit: requireOption(options, "candidate-source-commit"),
+      }),
+      defaultBranch: requireOption(options, "default-branch"),
+      repository: requireOption(options, "repository"),
+      repositoryId: authorizationCliInteger(options, "repository-id"),
+      runAttempt: authorizationCliInteger(options, "run-attempt"),
+      runId: authorizationCliInteger(options, "run-id"),
+    },
+    jobsFile: requireOption(options, "jobs"),
+    runFile: requireOption(options, "run"),
+    ...(stage ? {
+      ...(candidateMode ? {} : {
+        approvedObservabilityPolicySha256: requireOption(options, "approved-observability-policy-sha256"),
+        expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      }),
+      archive: requireOption(options, "archive"),
+      downloadedArtifactId: authorizationCliInteger(options, "downloaded-artifact-id"),
+      maxUnpackedBytes: authorizationCliInteger(options, "max-unpacked-bytes"),
+      parent: requireOption(options, "parent"),
+      reserveBytes: authorizationCliInteger(options, "reserve-bytes", 0),
+    } : {}),
+  };
+}
+
+async function main(argv) {
+  const { command, options } = parseCli(argv);
+  if (["authorization-artifact-select", "authorization-intake", "candidate-artifact-select", "candidate-intake"].includes(command)) {
+    const stage = command.endsWith("-intake");
+    const candidateMode = command.startsWith("candidate-");
+    const input = authorizationCliInput(argv, options, stage, candidateMode);
+    const result = stage
+      ? await (candidateMode ? intakeManagedCloudCandidate : intakeManagedCloudAuthorization)(input)
+      : await (candidateMode ? selectManagedCloudCandidateArtifact : selectManagedCloudAuthorizationArtifact)(input);
+    process.stdout.write(canonicalJsonBytes(result));
+    return;
+  }
+  if (command === "publication-source-commit") {
+    const names = ["default-branch", "repository", "repository-id", "run", "run-attempt", "run-id"];
+    requireExactKeys(options, names, "publication source CLI options");
+    if (argv.length !== 1 + names.length * 2) fail("Duplicate publication source option");
+    const { value: run } = await readAuthorizationCapture(
+      requireOption(options, "run"), "Publication run", MAX_PUBLICATION_WORKFLOW_RUN_BYTES,
+    );
+    console.log(selectManagedCloudPublicationSource({
+      defaultBranch: requireOption(options, "default-branch"),
+      repository: requireOption(options, "repository"),
+      repositoryId: authorizationCliInteger(options, "repository-id"),
+      run,
+      runAttempt: authorizationCliInteger(options, "run-attempt"),
+      runId: authorizationCliInteger(options, "run-id"),
+    }));
+    return;
+  }
+  if (command === "contracts" || command === "contracts-current") {
+    const requireCurrentMigrations = command === "contracts-current";
+    if (requireCurrentMigrations) {
+      requireExactKeys(options, ["repo", "out", "version"], "current contracts CLI options");
+      if (argv.length !== 7) fail("Duplicate current contracts option");
+    }
+    await createManagedCloudContracts(
+      requireOption(options, "repo"),
+      requireOption(options, "out"),
+      options.version === undefined
+        ? 1
+        : requireInteger(Number(options.version), "--version", 1),
+      { requireCurrentMigrations },
+    );
+    return;
+  }
+  if (command === "inventory-tree") {
+    const inventory = await createStaticTreeInventory(
+      requireOption(options, "root"),
+      requireOption(options, "root-name"),
+    );
+    await writeCanonicalJson(requireOption(options, "out"), inventory);
+    return;
+  }
+  if (command === "runtime-measurement") {
+    const measurement = await createRuntimeMeasurementFromFilesystem({
+      buildId: requireOption(options, "build-id"),
+      componentId: requireOption(options, "component"),
+      configSchemaSha256: requireOption(options, "config-schema-sha256"),
+      migrationSetSha256: requireOption(options, "migration-set-sha256"),
+      protocolSetSha256: requireOption(options, "protocol-set-sha256"),
+      roles: requireOption(options, "roles").split(","),
+      root: requireOption(options, "root"),
+      sourceCommit: requireOption(options, "source-commit"),
+    });
+    await writeCanonicalJson(requireOption(options, "out"), measurement);
+    return;
+  }
+  if (command === "inspect-artifact") {
+    const inventory = await inspectPreparedArtifact(
+      requireOption(options, "file"),
+      requireOption(options, "component"),
+      requireOption(options, "kind"),
+    );
+    await writeCanonicalJson(requireOption(options, "out"), inventory);
+    return;
+  }
+  if (command === "sbom") {
+    const { value: inventory } = await readCanonicalJson(
+      requireOption(options, "inventory"),
+      "content inventory",
+    );
+    await writeCanonicalJson(
+      requireOption(options, "out"),
+      createFileSbom(inventory),
+    );
+    return;
+  }
+  if (command === "provenance") {
+    const { value: inventory } = await readCanonicalJson(
+      requireOption(options, "inventory"),
+      "content inventory",
+    );
+    await writeCanonicalJson(
+      requireOption(options, "out"),
+      createArtifactProvenance({
+        artifactSha256: inventory.artifactSha256,
+        buildId: requireOption(options, "build-id"),
+        builderPolicySha256: requireOption(options, "builder-policy-sha256"),
+        componentId: inventory.componentId,
+        sourceCommit: requireOption(options, "source-commit"),
+        sourceDateEpoch: Number(requireOption(options, "source-date-epoch")),
+      }),
+    );
+    return;
+  }
+  if (command === "ci-evidence") {
+    const jobsCiRun = (
+      await readJson(requireOption(options, "jobs-ci-run"), "Jobs CI run")
+    ).value;
+    const observabilityRun = (
+      await readJson(
+        requireOption(options, "observability-run"),
+        "observability run",
+      )
+    ).value;
+    await writeCanonicalJson(
+      requireOption(options, "out"),
+      createManagedCloudCiEvidence({
+        defaultBranch: requireOption(options, "default-branch"),
+        jobsCiRun,
+        observabilityRun,
+        releaseContractSelfTestSha256: requireOption(
+          options,
+          "release-contract-self-test-sha256",
+        ),
+        repository: requireOption(options, "repository"),
+        sourceCommit: requireOption(options, "source-commit"),
+      }),
+    );
+    return;
+  }
+  if (command === "assemble") {
+    await assembleManagedCloudCandidate({
+      contractsDirectory: requireOption(options, "contracts"),
+      descriptorFile: requireOption(options, "descriptor"),
+      outputDirectory: requireOption(options, "out"),
+      repoRoot: requireOption(options, "repo"),
+    });
+    return;
+  }
+  if (command === "verify") {
+    const validated = await validateManagedCloudCandidate(requireOption(options, "candidate"));
+    if (Object.hasOwn(options, "print-source-commit")) {
+      if (requireOption(options, "print-source-commit") !== "true") {
+        fail("print-source-commit must be true");
+      }
+      console.log(validated.manifest.sourceCommit);
+    }
+    return;
+  }
+  if (command === "authorize") {
+    await authorizeManagedCloudCandidate({
+      approvedObservabilityPolicySha256: requireOption(options, "approved-observability-policy-sha256"),
+      authorizationId: requireOption(options, "authorization-id"),
+      candidateDirectory: requireOption(options, "candidate"),
+      expectedCandidateSetSha256: requireOption(options, "expected-candidate-set-sha256"),
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      observabilityPolicyRepo: requireOption(options, "observability-policy-repo"),
+      outputDirectory: requireOption(options, "out"),
+      signatureSetFile: requireOption(options, "signatures"),
+      trustBundleFile: requireOption(options, "trust-bundle"),
+    });
+    return;
+  }
+  if (command === "publication-plan") {
+    await createManagedCloudArtifactPublicationPlan({
+      authorizedDirectory: requireOption(options, "authorized"),
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      outputFile: requireOption(options, "out"),
+      portalArtifactOrigin: requireOption(options, "portal-artifact-origin"),
+      registryNamespace: requireOption(options, "registry-namespace"),
+    });
+    return;
+  }
+  if (command === "publication-runtime") {
+    await validateManagedCloudArtifactPublicationRuntimeIdentity({
+      authorizedDirectory: requireOption(options, "authorized"),
+      defaultBranch: requireOption(options, "default-branch"),
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      planFile: requireOption(options, "plan"),
+      repository: requireOption(options, "repository"),
+      repositoryId: requireOption(options, "repository-id"),
+      sourceCommit: requireOption(options, "source-commit"),
+    });
+    return;
+  }
+  if (command === "publication-preflight") {
+    await createManagedCloudArtifactPublicationPreflight({
+      authorizedDirectory: requireOption(options, "authorized"),
+      defaultBranch: requireOption(options, "default-branch"),
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      outputFile: requireOption(options, "out"),
+      publicationDirectory: requireOption(options, "publication"),
+      publicationWorkflowEvidenceFile: requireOption(
+        options,
+        "publication-workflow-evidence",
+      ),
+      repository: requireOption(options, "repository"),
+      repositoryId: requireOption(options, "repository-id"),
+    });
+    return;
+  }
+  if (command === "publication-artifact-select") {
+    await selectManagedCloudPublicationArtifact({
+      artifactsFile: requireOption(options, "artifacts"),
+      authorizedDirectory: requireOption(options, "authorized"),
+      defaultBranch: requireOption(options, "default-branch"),
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      jobsFile: requireOption(options, "jobs"),
+      outputFile: requireOption(options, "out"),
+      repository: requireOption(options, "repository"),
+      repositoryId: requireOption(options, "repository-id"),
+      runAttempt: requireOption(options, "run-attempt"),
+      runFile: requireOption(options, "run"),
+      runId: requireOption(options, "run-id"),
+    });
+    return;
+  }
+  if (command === "publication-portal-capture") {
+    await captureManagedCloudPortalManifestStream({
+      outputFile: requireOption(options, "out"),
+    });
+    return;
+  }
+  if (command === "publication-api-capture") {
+    await captureManagedCloudPublicationApiStream({
+      kind: requireOption(options, "kind"),
+      outputFile: requireOption(options, "out"),
+    });
+    return;
+  }
+  if (command === "publication-portal-manifest") {
+    const hasPlan = options.plan !== undefined;
+    const hasPreflight = options.preflight !== undefined;
+    if (hasPlan === hasPreflight) {
+      fail(
+        "publication-portal-manifest requires exactly one --plan or --preflight",
+      );
+    }
+    const authority = hasPlan
+      ? {
+          plan: (
+            await readCanonicalJson(
+              requireOption(options, "plan"),
+              "publication plan",
+              MAX_SIGNED_OBJECT_BYTES,
+            )
+          ).value,
+        }
+      : {
+          preflight: (
+            await readCanonicalJson(
+              requireOption(options, "preflight"),
+              "publication preflight",
+              MAX_PUBLICATION_PREFLIGHT_BYTES,
+            )
+          ).value,
+        };
+    await validateManagedCloudPortalArtifactManifestReadback({
+      ...authority,
+      manifestFile: requireOption(options, "manifest"),
+      portalRegistryRef: requireOption(options, "portal-registry-ref"),
+    });
+    return;
+  }
+  if (command === "publication-portal-readback") {
+    const hasPlan = options.plan !== undefined;
+    const hasPreflight = options.preflight !== undefined;
+    if (hasPlan === hasPreflight) {
+      fail(
+        "publication-portal-readback requires exactly one --plan or --preflight",
+      );
+    }
+    const authority = hasPlan
+      ? {
+          plan: (
+            await readCanonicalJson(
+              requireOption(options, "plan"),
+              "publication plan",
+              MAX_SIGNED_OBJECT_BYTES,
+            )
+          ).value,
+        }
+      : {
+          preflight: (
+            await readCanonicalJson(
+              requireOption(options, "preflight"),
+              "publication preflight",
+              MAX_PUBLICATION_PREFLIGHT_BYTES,
+            )
+          ).value,
+        };
+    await stageManagedCloudPortalArtifactReadback({
+      ...authority,
+      downloadDirectory: requireOption(options, "download"),
+      manifestFile: requireOption(options, "manifest"),
+      outputFile: requireOption(options, "out"),
+      portalRegistryRef: requireOption(options, "portal-registry-ref"),
+    });
+    return;
+  }
+  if (command === "publication-attest") {
+    await attestManagedCloudArtifactPublication({
+      authorizedDirectory: requireOption(options, "authorized"),
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      outputFile: requireOption(options, "out"),
+      planFile: requireOption(options, "plan"),
+      portalRegistryRef: requireOption(options, "portal-registry-ref"),
+      readbackDirectory: requireOption(options, "readback"),
+      workflowRunAttempt: requireOption(options, "workflow-run-attempt"),
+      workflowRunId: requireOption(options, "workflow-run-id"),
+    });
+    return;
+  }
+  if (command === "publication-verify") {
+    await validateManagedCloudArtifactPublication({
+      authorizedDirectory: requireOption(options, "authorized"),
+      expectedWorkflowRunAttempt: requireOption(
+        options,
+        "workflow-run-attempt",
+      ),
+      expectedWorkflowRunId: requireOption(options, "workflow-run-id"),
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      publicationDirectory: requireOption(options, "publication"),
+      readbackDirectory: requireOption(options, "readback"),
+    });
+    return;
+  }
+  if (command === "promote") {
+    await promoteManagedCloudCandidate({
+      activationFile: requireOption(options, "activation"),
+      activationSignatureSetFile: requireOption(
+        options,
+        "activation-signatures",
+      ),
+      authorizedDirectory: requireOption(options, "authorized"),
+      cohortFile: requireOption(options, "cohort"),
+      cohortSignatureSetFile: requireOption(options, "cohort-signatures"),
+      evidenceDirectory: requireOption(options, "evidence"),
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      outputDirectory: requireOption(options, "out"),
+      publicationDirectory: requireOption(options, "publication"),
+      publicationPreflightFile: requireOption(options, "publication-preflight"),
+      publicationReadbackDirectory: requireOption(
+        options,
+        "publication-readback",
+      ),
+      promotionId: requireOption(options, "promotion-id"),
+    });
+    return;
+  }
+  if (command === "rollback") {
+    await createManagedCloudRollback({
+      expectedRootAnchorSha256: requireOption(options, "root-anchor-sha256"),
+      fromPromotionDirectory: requireOption(options, "from-promotion"),
+      outputDirectory: requireOption(options, "out"),
+      rollbackFile: requireOption(options, "rollback"),
+      rollbackSignatureSetFile: requireOption(options, "rollback-signatures"),
+      toPromotionDirectory: requireOption(options, "to-promotion"),
+    });
+    return;
+  }
+  if (command === "workflow") {
+    await validateManagedCloudWorkflowContract(requireOption(options, "file"));
+    return;
+  }
+  fail(
+    "Usage: managed-cloud-release-gate.mjs " +
+      "<contracts|inventory-tree|runtime-measurement|inspect-artifact|sbom|provenance|" +
+      "ci-evidence|assemble|verify|authorize|authorization-artifact-select|authorization-intake|" +
+      "candidate-artifact-select|candidate-intake|" +
+      "publication-plan|publication-runtime|publication-source-commit|" +
+      "publication-api-capture|publication-artifact-select|publication-preflight|" +
+      "publication-portal-capture|publication-portal-manifest|" +
+      "publication-portal-readback|publication-attest|" +
+      "publication-verify|promote|rollback|workflow>",
+  );
+}
+
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href
+) {
+  main(process.argv.slice(2)).catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}

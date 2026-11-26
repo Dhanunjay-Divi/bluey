@@ -17,14 +17,39 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "integration-test-support", not(debug_assertions)))]
+compile_error!("integration-test-support must never be enabled in release builds");
+
+#[cfg(all(
+    feature = "business-messaging-simulator-test-support",
+    not(debug_assertions)
+))]
+compile_error!("business-messaging-simulator-test-support must never be enabled in release builds");
+
 pub mod api;
 pub mod auth;
 pub mod billing;
 pub mod config;
 pub mod db;
+pub(crate) mod jobs_ats_target;
+#[cfg(feature = "business-messaging-simulator-test-support")]
+pub mod jobs_business_messaging_simulator;
+pub mod jobs_communication_dispatch;
 pub mod jobs_global_archive;
 pub mod jobs_mailbox_sync;
+pub mod jobs_managed_cloud_runtime;
+#[cfg(feature = "jobs-mcp-read")]
+mod jobs_mcp_stdio;
+pub(crate) mod jobs_provider_auth;
 pub mod jobs_resume_template;
+#[cfg(all(debug_assertions, feature = "integration-test-support"))]
+#[doc(hidden)]
+pub mod jobs_review_first_mock_receipt_fixture;
+#[cfg(all(debug_assertions, feature = "integration-test-support"))]
+mod jobs_review_first_mock_run_fixture;
+pub mod jobs_taxonomy;
+pub mod jobs_workflow_cleanup;
+pub mod jobs_workflow_dispatch;
 pub mod mail;
 pub mod object_storage;
 pub mod pricing;

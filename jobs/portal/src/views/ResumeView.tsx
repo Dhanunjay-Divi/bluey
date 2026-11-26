@@ -7,6 +7,7 @@ import {
   FileDiff,
   FileUp,
   History,
+  LoaderCircle,
   Pencil,
   Plus,
   ShieldCheck,
@@ -17,12 +18,10 @@ import {
   applyResumeImport,
   exportResumeDocx,
   exportResumePdf,
-  importResume,
-  prepareResumeImport,
   type ResumeImportMode,
-  type ResumeImportPreview,
 } from "../lib/documents";
 import { Dialog } from "../components/Dialog";
+import { workspaceJobById } from "../lib/workspace-jobs";
 import {
   CareerEducationEditor,
   CareerEmploymentEditor,
@@ -43,6 +42,7 @@ import {
 import { useLocationSuggestions } from "../data/use-location-suggestions";
 import { relativeTime } from "../lib/format";
 import { validateCareerProfile } from "../lib/profile-validation";
+import { useResumeImport } from "../lib/use-resume-import";
 import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
 import { jobsApi } from "../api";
 
@@ -60,8 +60,8 @@ export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, 
   const [editOpen, setEditOpen] = useState(false);
   const [selectedResume, setSelectedResume] = useState<ResumeVersion | undefined>();
   const [saving, setSaving] = useState(false);
-  const [importPreview, setImportPreview] = useState<ResumeImportPreview>();
-  const [pendingResume, setPendingResume] = useState<{ file: File; pageCount?: number }>();
+  const resumeImport = useResumeImport(profile);
+  const savingResume = useRef(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
@@ -113,33 +113,29 @@ export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, 
     if (!editOpen) setProfile(workspace.profile);
   }, [editOpen, workspace.profile]);
 
-  const upload = async (file?: File) => {
-    if (!file) return;
+  const upload = (file?: File) => {
+    if (!file || editOpen || selectedResume || saving || savingResume.current) return;
     setMessage("");
     setError("");
-    try {
-      const imported = await importResume(file);
-      setImportPreview(prepareResumeImport(profile, imported));
-      setPendingResume({ file, pageCount: imported.page_count });
-    } catch (requestError) {
-      setError(resumeErrorMessage(requestError, "Resume import failed."));
-    }
+    void resumeImport.select(file);
   };
 
   const applyImport = async (mode: ResumeImportMode) => {
-    if (!importPreview || !pendingResume) return;
+    const { preview, ready } = resumeImport;
+    if (!preview || !ready || editOpen || selectedResume || saving || savingResume.current ||
+        !resumeImport.isCurrent(ready.token)) return;
+    savingResume.current = true;
     setSaving(true);
     setError("");
     try {
-      const importedProfile = applyResumeImport(importPreview, mode);
+      const importedProfile = applyResumeImport(preview, mode);
       const savedProfile = await onImportResume(
-        pendingResume.file,
+        ready.file,
         importedProfile,
-        pendingResume.pageCount,
+        ready.parsed.page_count,
       );
       setProfile(savedProfile);
-      setImportPreview(undefined);
-      setPendingResume(undefined);
+      resumeImport.discard();
       setEditOpen(true);
       setMessage(savedProfile.source_resume_template_status === "exact_docx"
         ? "Resume imported. The original Word layout is preserved for tailored downloads."
@@ -147,8 +143,16 @@ export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, 
     } catch (requestError) {
       setError(resumeErrorMessage(requestError, "Resume import could not be saved."));
     } finally {
+      savingResume.current = false;
       setSaving(false);
     }
+  };
+
+  const startEdit = () => {
+    if (saving || savingResume.current) return;
+    resumeImport.discard();
+    setProfile(workspace.profile);
+    setEditOpen(true);
   };
 
   const cancelEdit = () => {
@@ -177,7 +181,8 @@ export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, 
   };
 
   const openVersion = async (resumeId?: string) => {
-    if (!resumeId) return;
+    if (!resumeId || saving || savingResume.current) return;
+    resumeImport.discard();
     setError("");
     try {
       const version = resumeVersions[resumeId] || (await onLoadResume(resumeId));
@@ -227,15 +232,28 @@ export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, 
     }
   };
 
+  const importError = resumeImport.error === undefined ? "" : resumeErrorMessage(resumeImport.error, "Resume import failed.");
   return (
     <div className="view-shell resume-view">
       <section className="view-heading">
         <div><p className="eyebrow">SOURCE OF TRUTH</p><h1>Resume</h1><span>One verified Career Profile, then a different resume version for every job.</span></div>
-        <div className="heading-actions"><input ref={fileRef} hidden type="file" accept=".pdf,.docx,.txt" onChange={(event) => { void upload(event.target.files?.[0]); event.target.value = ""; }} /><button className="button secondary" onClick={() => fileRef.current?.click()}><FileUp size={16} />Import resume</button><button className="button primary" onClick={() => { setProfile(workspace.profile); setEditOpen(true); }}><Pencil size={16} />Edit profile</button></div>
+        <div className="heading-actions">
+          <input ref={fileRef} hidden type="file" accept=".pdf,.docx,.txt"
+            disabled={saving || editOpen || Boolean(selectedResume)}
+            onChange={(event) => { upload(event.target.files?.[0]); event.target.value = ""; }} />
+          <button className="button secondary" disabled={saving || editOpen || Boolean(selectedResume)}
+            aria-busy={resumeImport.loading}
+            onClick={() => fileRef.current?.click()}>
+            {resumeImport.loading ? <LoaderCircle size={16} className="spin" aria-hidden="true" /> : <FileUp size={16} aria-hidden="true" />}
+            {resumeImport.loading ? "Reading resume…" : "Import resume"}
+          </button>
+          <span className="sr-only" role="status">{resumeImport.loading ? "Reading resume" : ""}</span>
+          <button className="button primary" disabled={saving} onClick={startEdit}><Pencil size={16} />Edit profile</button>
+        </div>
       </section>
 
       {message && <div className="global-message success"><Check size={16} />{message}</div>}
-      {error && <div className="global-message error" role="alert">{error}</div>}
+      {(error || importError) && <div className="global-message error" role="alert">{error || importError}</div>}
 
       <section className="profile-band">
         <div className="profile-identity"><div>{profile.full_name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div><span><h2>{profile.full_name}</h2><p>{profile.headline}</p><small>{profile.current_location} · {profile.email}</small></span></div>
@@ -262,7 +280,7 @@ export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, 
             <div className="section-heading compact"><div><p>JOB-SPECIFIC</p><h2>Version history</h2></div><History size={19} /></div>
             <div className="version-list">
               {applicationsWithResume.map((application) => {
-                const job = workspace.matches.find((item) => item.id === application.job_id);
+                const job = workspaceJobById(workspace, application.job_id);
                 return <button key={application.id} onClick={() => void openVersion(application.resume_version_id)}><FileCheck2 size={17} /><span><b>{job?.title || "Tailored resume"}</b><small>{job?.company} · {relativeTime(application.updated_at_ms)}</small></span><ChevronRight size={16} /></button>;
               })}
               {applicationsWithResume.length === 0 && <p className="muted-copy">Prepare your first application from Matches to create a tailored version.</p>}
@@ -271,7 +289,12 @@ export function ResumeView({ workspace, resumeVersions, onSave, onImportResume, 
         </aside>
       </div>
 
-      <ResumeImportReview preview={importPreview} busy={saving} onApply={applyImport} onClose={() => { setImportPreview(undefined); setPendingResume(undefined); }} />
+      <ResumeImportReview
+        preview={editOpen || selectedResume ? undefined : resumeImport.preview}
+        busy={saving}
+        onApply={applyImport}
+        onClose={() => { if (!savingResume.current) resumeImport.discard(); }}
+      />
 
       <Dialog open={editOpen} title="Edit Career Profile" description="These facts become reusable source material for job-specific resumes." onClose={cancelEdit} size="large">
         <div className="dialog-form profile-edit-form full-profile-editor">

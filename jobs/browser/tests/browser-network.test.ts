@@ -4,6 +4,7 @@ import {
   assertSafeBrowserRequestUrl,
   assertSafeBrowserWebSocketUrl,
   guardBrowserRequest,
+  guardBrowserWebSocket,
 } from "../src/browser-network.js";
 
 describe("local browser network guard", () => {
@@ -49,10 +50,20 @@ describe("local browser network guard", () => {
     expect(abort).toHaveBeenCalledWith("blockedbyclient");
   });
 
-  it("allows only public secure WebSocket targets", async () => {
-    await expect(assertSafeBrowserWebSocketUrl("wss://93.184.216.34/socket")).resolves.toBeUndefined();
+  it("denies every WebSocket target, including public secure endpoints", async () => {
+    await expect(assertSafeBrowserWebSocketUrl("wss://93.184.216.34/socket")).rejects.toThrow();
     await expect(assertSafeBrowserWebSocketUrl("ws://93.184.216.34/socket")).rejects.toThrow();
     await expect(assertSafeBrowserWebSocketUrl("wss://127.0.0.1/socket")).rejects.toThrow();
     await expect(assertSafeBrowserWebSocketUrl("wss://user:password@93.184.216.34/socket")).rejects.toThrow();
+
+    const connectToServer = vi.fn();
+    const close = vi.fn(async () => undefined);
+    await guardBrowserWebSocket({
+      url: () => "wss://93.184.216.34/socket",
+      connectToServer,
+      close,
+    });
+    expect(connectToServer).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledWith({ code: 1008, reason: "Network target blocked" });
   });
 });

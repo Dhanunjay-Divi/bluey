@@ -5,9 +5,8 @@
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, Request, StatusCode},
-    middleware::Next,
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, RawQuery, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
     Extension, Json, Router,
@@ -19,36 +18,108 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    api::{jobs_import, jobs_resume_generation, AppState},
-    auth::AuthedAccount,
-    db::jobs::{
-        self, normalize_candidate_employment_type, normalize_candidate_engagement_type,
-        AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CandidateEvent,
-        CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
-        JobEligibilityDecision, JobPosting, JobPreferences, JobsEntitlement, JobsIntegration,
-        JobsWorkspace, PacketCommitResult, ResumeVersion, RunEvent, RunnerAvailability,
-        RunnerChannelAvailability,
+    api::middleware::request_id::TraceId,
+    api::{
+        jobs_beta_access, jobs_import, jobs_resume_generation,
+        jobs_worker_auth::JobsWorkerIdentity, AppState,
     },
-    object_storage::{sha256_hex, ObjectStorage},
+    auth::AuthedAccount,
+    db::{
+        jobs::{
+            self, normalize_candidate_employment_type, normalize_candidate_engagement_type,
+            AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CandidateEvent,
+            CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
+            JobEligibilityDecision, JobPosting, JobPreferences, JobsEntitlement, JobsIntegration,
+            JobsMatchesPage, JobsWorkspace, PacketCommitResult, ResumeVersion, RunEvent,
+            RunnerAvailability, RunnerChannelAvailability,
+        },
+        object_uploads::{
+            self, ApplicationObjectBinding, NewObjectUpload, NewSubmissionEvidenceCapacity,
+            ObjectKind, StorageScope, UploadControlError,
+        },
+    },
+    jobs_ats_target::{parse_provider_application_target, ProviderApplicationTargetPurpose},
+    object_storage::{sha256_hex, ObjectReadIncomplete, ObjectReadLimitExceeded, ObjectStorage},
 };
 
 pub(super) type ApiError = (StatusCode, String);
+
+#[cfg(feature = "jobs-submission-observation")]
+#[path = "jobs_submission_observation.rs"]
+pub mod submission_observation;
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowCommandAdmissionResponse {
+    pub schema_version: i64,
+    pub command_id: String,
+    pub request_id: String,
+    pub workflow_id: String,
+    pub operation: String,
+    pub state: String,
+    pub replayed: bool,
+}
+
+impl WorkflowCommandAdmissionResponse {
+    fn from_admission(admission: &jobs::JobsWorkflowCommandAdmission) -> Self {
+        Self {
+            schema_version: admission.command.protocol_version,
+            command_id: admission.command.id.clone(),
+            request_id: admission.command.request_id.clone(),
+            workflow_id: admission.command.workflow_id.clone(),
+            operation: match admission.command.command_kind {
+                jobs::JobsWorkflowCommandKind::Start => "start",
+                jobs::JobsWorkflowCommandKind::Resume => "resume",
+            }
+            .to_string(),
+            state: workflow_command_state_name(admission.command.state).to_string(),
+            replayed: admission.replayed,
+        }
+    }
+}
+
+fn workflow_command_state_name(state: jobs::JobsWorkflowCommandState) -> &'static str {
+    match state {
+        jobs::JobsWorkflowCommandState::Pending => "pending",
+        jobs::JobsWorkflowCommandState::Claimed => "claimed",
+        jobs::JobsWorkflowCommandState::Delivering => "delivering",
+        jobs::JobsWorkflowCommandState::DeliveryUnknown => "delivery_unknown",
+        jobs::JobsWorkflowCommandState::Accepted => "accepted",
+        jobs::JobsWorkflowCommandState::IdentityConflict => "identity_conflict",
+        jobs::JobsWorkflowCommandState::Rejected => "rejected",
+        jobs::JobsWorkflowCommandState::Cancelled => "cancelled",
+    }
+}
 
 // Receipts include the exact resume and confirmation screenshot as base64 so
 // the server can verify and persist evidence before accepting "submitted".
 const RECEIPT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const DISCOVERY_SNAPSHOT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+const BROWSER_PROFILE_SNAPSHOT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const EXECUTION_LEASE_CLAIM_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const WORKFLOW_COMMAND_BODY_LIMIT_BYTES: usize = 16 * 1024;
+const WORKFLOW_INTERVENTION_PREPARE_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const TRUSTED_WORKER_RECEIPT_KEY: &str = "_bluey_worker_receipt_v1";
 const SUBMISSION_FINGERPRINT_KEY: &str = "_bluey_server_submission_fingerprint_v1";
 const MAX_RECEIPT_DOCUMENTS: usize = 8;
 const MAX_RECEIPT_SCREENSHOTS: usize = 4;
 const MAX_RECEIPT_EVIDENCE_OBJECTS: usize = 12;
 const MAX_RECEIPT_EVIDENCE_BYTES: usize = 40 * 1024 * 1024;
-const MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS: usize = 250;
+const MAX_RECEIPT_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
+const RECEIPT_BUNDLE_SCHEMA_VERSION: i64 = 1;
+const MAX_SUBMISSION_EVIDENCE_OBJECTS: i64 = (MAX_RECEIPT_EVIDENCE_OBJECTS + 1) as i64;
+const GREENHOUSE_SUBMISSION_ADAPTER_VERSION: &str = "2026.07.1-beta.1";
+const LEVER_SUBMISSION_ADAPTER_VERSION: &str = "2026.07.0-beta.1";
+// Final employer-submission evidence is part of the account's immutable
+// application history. It is retained for the account lifetime and erased by
+// the durable account-deletion workflow; the generic artifact TTL must not
+// silently sever a Submitted application's receipt pointer.
+const SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRY_MS: i64 = i64::MAX;
+const MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS: usize = 50;
 
-pub fn router() -> Router<AppState> {
-    Router::new()
+pub fn router(state: AppState) -> Router<AppState> {
+    let customer = Router::new()
         .route("/api/jobs/workspace", get(workspace))
+        .route("/api/jobs/taxonomy", get(taxonomy))
         .route("/api/jobs/onboarding/complete", post(complete_onboarding))
         .route("/api/jobs/profile", get(profile).put(save_profile))
         .route(
@@ -73,7 +144,16 @@ pub fn router() -> Router<AppState> {
             post(authorize_track_auto_submit).delete(revoke_track_auto_submit),
         )
         .route("/api/jobs/matches", get(matches).post(save_match))
+        .route("/api/jobs/matches/page", post(matches_page))
         .route("/api/jobs/matches/:job_id", get(match_detail))
+        .route(
+            "/api/jobs/matches/:job_id/verify-original",
+            post(verify_selected_curated_lead).route_layer(DefaultBodyLimit::max(1)),
+        )
+        .route(
+            "/api/jobs/matches/:job_id/load-requirements",
+            post(load_smartrecruiters_requirements).route_layer(DefaultBodyLimit::max(1)),
+        )
         .route(
             "/api/jobs/discovery/catalog",
             get(super::jobs_source_directory::search_catalog),
@@ -99,12 +179,20 @@ pub fn router() -> Router<AppState> {
             post(approve_application_packet),
         )
         .route(
+            "/api/jobs/applications/:application_id/reconcile-submission",
+            post(reconcile_submission),
+        )
+        .route(
             "/api/jobs/applications/:application_id/runs",
             post(queue_application_run),
         )
         .route(
             "/api/jobs/applications/:application_id/evidence",
             get(application_evidence),
+        )
+        .route(
+            "/api/jobs/applications/:application_id/evidence/:evidence_id/download",
+            get(download_application_evidence),
         )
         .route(
             "/api/jobs/applications/:application_id/interview-prep",
@@ -137,6 +225,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/jobs/answers/:answer_id",
             put(update_answer_memory).delete(delete_answer_memory),
+        )
+        .route(
+            "/api/jobs/answer-company-scopes/:job_id",
+            get(answer_memory_company_scope),
+        )
+        .route(
+            "/api/jobs/answer-revisions/:revision_id",
+            get(application_answer_revision),
         )
         .route(
             "/api/jobs/candidate-events",
@@ -175,6 +271,10 @@ pub fn router() -> Router<AppState> {
             post(super::jobs_mailbox_oauth::start_oauth),
         )
         .route(
+            "/api/jobs/mailbox-connections/:connection_id/communication-authorization/start",
+            post(super::jobs_mailbox_oauth::start_communication_oauth),
+        )
+        .route(
             "/api/jobs/mailbox-connections/:connection_id",
             delete(super::jobs_mailbox::remove_mailbox_connection),
         )
@@ -190,20 +290,90 @@ pub fn router() -> Router<AppState> {
             "/api/jobs/mailbox-messages",
             get(super::jobs_mailbox::mailbox_messages),
         )
+        .route(
+            "/api/jobs/communication-actions",
+            get(super::jobs_communication_actions::communication_actions)
+                .post(super::jobs_communication_actions::create_communication_action),
+        )
+        .route(
+            "/api/jobs/communication-actions/:action_id",
+            get(super::jobs_communication_actions::communication_action),
+        )
+        .route(
+            "/api/jobs/communication-actions/:action_id/approve",
+            post(super::jobs_communication_actions::approve_communication_action),
+        )
+        .route(
+            "/api/jobs/communication-actions/:action_id/cancel",
+            post(super::jobs_communication_actions::cancel_communication_action),
+        )
         .route("/api/jobs/entitlements", get(entitlements))
         .route("/api/jobs/runs/:run_id/events", get(run_events))
-        .route_layer(axum::middleware::from_fn(require_jobs_beta))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            jobs_beta_access::require_customer_access,
+        ));
+
+    Router::new()
+        .merge(jobs_beta_access::access_router())
+        .merge(customer)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobsTaxonomyResponse {
+    pub taxonomy_version: &'static str,
+    pub taxonomy_sha256: String,
+    pub registry: Value,
+}
+
+pub async fn taxonomy() -> Result<Json<JobsTaxonomyResponse>, ApiError> {
+    let registry =
+        crate::jobs_taxonomy::registry_json().map_err(|error| internal(anyhow::anyhow!(error)))?;
+    Ok(Json(JobsTaxonomyResponse {
+        taxonomy_version: crate::jobs_taxonomy::taxonomy_version(),
+        taxonomy_sha256: crate::jobs_taxonomy::taxonomy_sha256(),
+        registry,
+    }))
+}
+
+const JOBS_TAXONOMY_VERSION_HEADER: &str = "x-bluey-jobs-taxonomy-version";
+const JOBS_TAXONOMY_SHA256_HEADER: &str = "x-bluey-jobs-taxonomy-sha256";
+
+fn require_current_taxonomy_write(headers: &HeaderMap) -> Result<(), ApiError> {
+    let version = headers
+        .get(JOBS_TAXONOMY_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let digest = headers
+        .get(JOBS_TAXONOMY_SHA256_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if version == Some(crate::jobs_taxonomy::taxonomy_version())
+        && digest == Some(crate::jobs_taxonomy::taxonomy_sha256().as_str())
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::CONFLICT,
+        "Career Track taxonomy changed. Refresh Bluey Jobs and review this Track before saving."
+            .to_string(),
+    ))
 }
 
 pub fn worker_router() -> Router<AppState> {
     Router::new()
         .route(
             "/api/jobs/internal/execution-leases/claim",
-            post(worker_claim_execution_lease),
+            post(worker_claim_execution_lease).route_layer(DefaultBodyLimit::max(
+                EXECUTION_LEASE_CLAIM_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/api/jobs/internal/execution-leases/:run_id/heartbeat",
             post(worker_heartbeat_execution_lease),
+        )
+        .route(
+            "/api/jobs/internal/execution-leases/:run_id/authorize-managed-effect",
+            post(worker_authorize_managed_execution_effect),
         )
         .route(
             "/api/jobs/internal/execution-leases/:run_id/irreversible",
@@ -212,6 +382,41 @@ pub fn worker_router() -> Router<AppState> {
         .route(
             "/api/jobs/internal/execution-leases/:run_id/finish",
             post(worker_finish_execution_lease),
+        )
+        .route(
+            "/api/jobs/internal/execution-leases/:run_id/reconcile-checkpoint",
+            post(worker_reconcile_execution_checkpoint),
+        )
+        .route(
+            "/api/jobs/internal/execution-leases/:run_id/profile/restore",
+            post(worker_restore_browser_profile_snapshot),
+        )
+        .route(
+            "/api/jobs/internal/execution-leases/:run_id/profile/store",
+            post(worker_store_browser_profile_snapshot).route_layer(DefaultBodyLimit::max(
+                BROWSER_PROFILE_SNAPSHOT_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/api/jobs/internal/workflow-commands/:request_id/materialize",
+            post(worker_materialize_workflow_command)
+                .route_layer(DefaultBodyLimit::max(WORKFLOW_COMMAND_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/jobs/internal/workflow-commands/:request_id/intervention/prepare",
+            post(worker_prepare_workflow_intervention).route_layer(DefaultBodyLimit::max(
+                WORKFLOW_INTERVENTION_PREPARE_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/api/jobs/internal/workflow-commands/:request_id/intervention/:intervention_id/publish",
+            post(worker_publish_workflow_intervention)
+                .route_layer(DefaultBodyLimit::max(WORKFLOW_COMMAND_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/jobs/internal/workflow-commands/:request_id/finalize",
+            post(worker_finalize_workflow_execution)
+                .route_layer(DefaultBodyLimit::max(WORKFLOW_COMMAND_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/jobs/internal/discovery/lease",
@@ -274,14 +479,15 @@ pub fn local_runner_router() -> Router<AppState> {
         )
         .route(
             "/api/jobs/local-runs/:run_id/resume",
-            post(consume_local_run_resume),
+            post(consume_local_run_resume).route_layer(axum::middleware::from_fn(
+                jobs_beta_access::require_jobs_master,
+            )),
         )
         .route(
             "/api/jobs/local-runs/:run_id/result",
             post(save_local_run_result)
                 .route_layer(DefaultBodyLimit::max(RECEIPT_BODY_LIMIT_BYTES)),
         )
-        .route_layer(axum::middleware::from_fn(require_jobs_beta))
 }
 
 pub fn admin_router() -> Router<AppState> {
@@ -298,51 +504,93 @@ pub fn admin_router() -> Router<AppState> {
             "/admin/jobs/discovery-sources/:account_id/:source_id",
             patch(set_account_discovery_source_status),
         )
+        .merge(jobs_beta_access::admin_router())
 }
 
-async fn require_jobs_beta(request: Request<Body>, next: Next) -> Result<Response, ApiError> {
-    let enabled = cfg!(debug_assertions)
-        || std::env::var("BLUEY_JOBS_BETA_ENABLED")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                )
-            })
-            .unwrap_or(false);
-    if !enabled {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Bluey Jobs beta is not enabled.".to_string(),
-        ));
+fn runner_volume_fleet_is_distribution_ready(status: &jobs::RunnerVolumeFleetStatus) -> bool {
+    status.cutover_state == "ready"
+        && status.legacy_inventory_state == "ready"
+        && status.unresolved_legacy_volume_count == 0
+        && status.legacy_inventory_reconciliation_id.is_some()
+        && status.legacy_inventory_authority_id.is_some()
+        && status.legacy_inventory_authority_sha256.is_some()
+        && status.legacy_inventory_root_count == Some(0)
+        && status.legacy_inventory_root_set_sha256.as_deref()
+            == Some(jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256)
+        && status.cutover_enrollment_generation == Some(status.enrollment_generation)
+        && status.cutover_purge_generation == Some(status.purge_generation)
+        && status.cutover_tombstone_generation == Some(status.tombstone_generation)
+        && status.cutover_destruction_generation == Some(status.destruction_generation)
+        && status.cutover_legacy_reconciliation_generation
+            == Some(status.legacy_reconciliation_generation)
+        && status.storage_attestation_count == status.non_destroyed_volume_count
+        && status.cutover_storage_attestation_generation
+            == Some(status.storage_attestation_generation)
+        && status.cutover_storage_attestation_count == Some(status.storage_attestation_count)
+        && status.cutover_storage_attestation_set_sha256.as_deref()
+            == Some(status.storage_attestation_set_sha256.as_str())
+        && status.cutover_legacy_inventory_generation == Some(status.legacy_inventory_generation)
+        && status.cutover_legacy_inventory_reconciliation_id
+            == status.legacy_inventory_reconciliation_id
+        && status.cutover_legacy_inventory_authority_id == status.legacy_inventory_authority_id
+        && status.cutover_legacy_inventory_authority_sha256
+            == status.legacy_inventory_authority_sha256
+        && status.cutover_legacy_inventory_root_count == status.legacy_inventory_root_count
+        && status.cutover_legacy_inventory_root_set_sha256
+            == status.legacy_inventory_root_set_sha256
+        && status.cutover_non_destroyed_volume_count == Some(status.non_destroyed_volume_count)
+        && status.cutover_destruction_count == Some(status.destruction_count)
+        && status.cutover_unresolved_legacy_volume_count == Some(0)
+        && status.attested_reconciled_volume_count == status.non_destroyed_volume_count
+        && status.cutover_evidence_ref.is_some()
+        && status.cutover_evidence_sha256.is_some()
+        && status.cutover_authorized_by.is_some()
+        && status.cutover_at_ms.is_some()
+}
+
+fn runner_volume_fleet_distribution_ready(pool: &crate::db::DbPool) -> bool {
+    jobs::runner_volume_fleet_status(pool)
+        .as_ref()
+        .is_ok_and(runner_volume_fleet_is_distribution_ready)
+}
+
+fn distribution_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn jobs_local_browser_distribution_enabled(pool: &crate::db::DbPool) -> bool {
+    jobs_local_browser_distribution_flag_enabled() && runner_volume_fleet_distribution_ready(pool)
+}
+
+fn jobs_local_browser_distribution_flag_enabled() -> bool {
+    distribution_flag_enabled("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
+}
+
+fn jobs_cloud_browser_distribution_enabled(pool: &crate::db::DbPool, account_id: &str) -> bool {
+    if !distribution_flag_enabled("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
+        || !crate::jobs_workflow_dispatch::workflow_command_dispatch_configured_for_admission()
+        || !runner_volume_fleet_distribution_ready(pool)
+    {
+        return false;
     }
-    Ok(next.run(request).await)
-}
-
-fn jobs_local_browser_distribution_enabled() -> bool {
-    cfg!(debug_assertions)
-        || std::env::var("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                )
-            })
-            .unwrap_or(false)
-}
-
-fn jobs_cloud_browser_distribution_enabled() -> bool {
-    cfg!(debug_assertions)
-        || (std::env::var("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                )
-            })
-            .unwrap_or(false)
-            && std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN")
-                .is_ok_and(|value| !value.trim().is_empty()))
+    let Some(scope) = crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission() else {
+        return false;
+    };
+    jobs::resolve_managed_cloud_readiness(
+        pool,
+        &jobs::ManagedCloudReadinessQuery {
+            scope,
+            account_id: Some(account_id.to_string()),
+        },
+    )
+    .is_ok_and(|readiness| readiness.status.customer_admission)
 }
 
 fn apply_jobs_distribution_gates(
@@ -385,6 +633,7 @@ fn runner_channel_availability(
             distribution_enabled,
             reason,
             next_action,
+            release: None,
         };
     }
     if !distribution_enabled {
@@ -394,7 +643,7 @@ fn runner_channel_availability(
             "Background runner"
         };
         return RunnerChannelAvailability {
-            status: "invited_beta".to_string(),
+            status: "limited_beta".to_string(),
             available: false,
             plan_included: true,
             distribution_enabled: false,
@@ -404,6 +653,7 @@ fn runner_channel_availability(
             next_action:
                 "Use Review first; Bluey will prepare the exact resume and answers for handoff."
                     .to_string(),
+            release: None,
         };
     }
     let (reason, next_action) = if runner == "local" {
@@ -424,6 +674,7 @@ fn runner_channel_availability(
         distribution_enabled: true,
         reason,
         next_action,
+        release: None,
     }
 }
 
@@ -445,24 +696,81 @@ fn build_runner_availability(
         cloud_distribution_enabled,
     );
     let auto_submit_available = local.available || cloud.available;
-    let auto_submit_reason = if local.available && cloud.available {
-        "Auto-submit can use either Bluey Browser or the background runner.".to_string()
-    } else if local.available {
-        "Auto-submit can use Bluey Browser while this computer is running.".to_string()
-    } else if cloud.available {
-        "Auto-submit can use the background runner while your computer is off.".to_string()
-    } else if local.plan_included || cloud.plan_included {
-        "Auto-submit is not available in this release because your included runner is still in invited beta. Review first and job-site handoff remain available.".to_string()
-    } else {
-        "Auto-submit requires a Jobs plan with runner access. Review first remains available."
-            .to_string()
-    };
+    let auto_submit_reason = runner_auto_submit_reason(&local, &cloud);
     RunnerAvailability {
         local,
         cloud,
         auto_submit_available,
         auto_submit_reason,
     }
+}
+
+fn runner_auto_submit_reason(
+    local: &RunnerChannelAvailability,
+    cloud: &RunnerChannelAvailability,
+) -> String {
+    if local.available && cloud.available {
+        "Auto-submit can use either Bluey Browser or the background runner.".to_string()
+    } else if local.available {
+        "Auto-submit can use Bluey Browser while this computer is running.".to_string()
+    } else if cloud.available {
+        "Auto-submit can use the background runner while your computer is off.".to_string()
+    } else if local.plan_included || cloud.plan_included {
+        "Auto-submit is temporarily unavailable in this limited public beta. Review first and job-site handoff remain available.".to_string()
+    } else {
+        "Auto-submit requires a Jobs plan with runner access. Review first remains available."
+            .to_string()
+    }
+}
+
+fn account_runner_availability(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    entitlement: &JobsEntitlement,
+) -> Result<RunnerAvailability, ApiError> {
+    let local_distribution_enabled = jobs_local_browser_distribution_enabled(pool);
+    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled(pool, account_id);
+    let mut availability = build_runner_availability(
+        entitlement,
+        local_distribution_enabled,
+        cloud_distribution_enabled,
+    );
+    if entitlement.local_browser {
+        let release = if !local_distribution_enabled {
+            jobs::LocalBrowserReleaseAvailability::Disabled {
+                reason: "Bluey Browser distribution is disabled for this release.".to_string(),
+            }
+        } else if let Ok(server_release_id) = browser_server_release_id() {
+            jobs::local_browser_release_availability_for_distribution(
+                pool,
+                account_id,
+                &server_release_id,
+            )
+            .map_err(internal)?
+        } else {
+            jobs::LocalBrowserReleaseAvailability::Unavailable {
+                reason: "Bluey Browser release verification is unavailable.".to_string(),
+            }
+        };
+        if !release.is_available() {
+            availability.local.available = false;
+            availability.local.status = "limited_beta".to_string();
+            availability.local.reason = match &release {
+                jobs::LocalBrowserReleaseAvailability::Available { reason, .. }
+                | jobs::LocalBrowserReleaseAvailability::Disabled { reason }
+                | jobs::LocalBrowserReleaseAvailability::Unassigned { reason }
+                | jobs::LocalBrowserReleaseAvailability::Unavailable { reason } => reason.clone(),
+            };
+            availability.local.next_action =
+                "Use Review first; no local run or installer is authorized.".to_string();
+        }
+        availability.local.release = Some(release);
+        availability.auto_submit_available =
+            availability.local.available || availability.cloud.available;
+        availability.auto_submit_reason =
+            runner_auto_submit_reason(&availability.local, &availability.cloud);
+    }
+    Ok(availability)
 }
 
 fn auto_submit_request_error(
@@ -543,60 +851,157 @@ fn schedule_global_candidate_materialization(
     }));
 }
 
+fn ensure_managed_curated_discovery_source_best_effort(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    reason: &'static str,
+) {
+    if let Err(error) = jobs::ensure_managed_curated_discovery_source(pool, account_id) {
+        tracing::warn!(
+            account_fingerprint = %discovery_log_fingerprint(account_id),
+            reason,
+            error_category = discovery_enrollment_error_category(&error),
+            "Jobs saved the requested policy and will retry managed curated discovery enrollment"
+        );
+    }
+}
+
+fn schedule_verified_import_discovery_backfill(
+    pool: crate::db::DbPool,
+    account_id: String,
+    email: String,
+) {
+    let account_fingerprint = discovery_log_fingerprint(&account_id);
+    let lease = match jobs::claim_verified_import_backfill(&pool, &account_id) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(
+                account_fingerprint = %account_fingerprint,
+                error_category = discovery_enrollment_error_category(&error),
+                "Jobs could not claim bounded legacy verified-import repair"
+            );
+            return;
+        }
+    };
+    std::mem::drop(tokio::task::spawn_blocking(
+        move || match run_verified_import_discovery_backfill(&pool, &account_id, &email, &lease) {
+            Ok(result) if result.scanned_count > 0 || result.completed => tracing::info!(
+                account_fingerprint = %account_fingerprint,
+                scanned_count = result.scanned_count,
+                repaired_count = result.repaired_count,
+                checkpoint_advanced = result.checkpoint_advanced,
+                completed = result.completed,
+                "Jobs advanced the bounded legacy verified-import repair"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                account_fingerprint = %account_fingerprint,
+                error_category = discovery_enrollment_error_category(&error),
+                "Jobs retained the legacy verified-import checkpoint for retry"
+            ),
+        },
+    ));
+}
+
 pub async fn workspace(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-) -> Result<Json<JobsWorkspace>, ApiError> {
-    if let Err(error) = jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id) {
-        tracing::warn!(
-            account_fingerprint = %discovery_log_fingerprint(&account.id),
-            error_category = discovery_enrollment_error_category(&error),
-            "Jobs workspace could not ensure managed curated discovery"
-        );
-    }
+    Extension(TraceId(trace_id)): Extension<TraceId>,
+) -> Result<Response, ApiError> {
+    let request_started = std::time::Instant::now();
+    ensure_managed_curated_discovery_source_best_effort(&state.pool, &account.id, "workspace_load");
     schedule_global_candidate_materialization(
         state.pool.clone(),
         account.id.clone(),
         account.email.clone(),
         "workspace_load",
     );
-    let mut workspace =
-        jobs::workspace(&state.pool, &account.id, &account.email).map_err(internal)?;
-    if backfill_verified_import_discovery_sources(
+    let load = jobs::workspace_page(
         &state.pool,
         &account.id,
-        &workspace.matches,
-        &workspace.profile,
-        &workspace.preferences,
-    ) > 0
-    {
-        match jobs::list_discovery_sources(&state.pool, &account.id) {
-            Ok(sources) => {
-                workspace.discovery_sources = sources
-                    .iter()
-                    .map(jobs::DiscoverySourceSummary::from)
-                    .collect();
-            }
-            Err(_error) => tracing::warn!(
-                account_fingerprint = %discovery_log_fingerprint(&account.id),
-                error_category = "source_summary_refresh_failed",
-                "Jobs workspace completed without refreshed discovery source summaries"
-            ),
-        }
-    }
-    let local_distribution_enabled = jobs_local_browser_distribution_enabled();
-    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled();
-    workspace.runner_availability = build_runner_availability(
-        &workspace.entitlement,
-        local_distribution_enabled,
-        cloud_distribution_enabled,
+        &account.email,
+        jobs::JOBS_WORKSPACE_DEFAULT_PAGE_SIZE,
+        None,
+    )
+    .map_err(internal)?;
+    let diagnostics = load.diagnostics;
+    let mut workspace = load.workspace;
+    schedule_verified_import_discovery_backfill(
+        state.pool.clone(),
+        account.id.clone(),
+        account.email.clone(),
     );
+    workspace.runner_availability =
+        account_runner_availability(&state.pool, &account.id, &workspace.entitlement)?;
     apply_jobs_distribution_gates(
         &mut workspace.entitlement,
-        local_distribution_enabled,
-        cloud_distribution_enabled,
+        workspace.runner_availability.local.available,
+        workspace.runner_availability.cloud.available,
     );
-    Ok(Json(workspace))
+    tracing::info!(
+        request_id = %trace_id,
+        candidate_count = diagnostics.candidate_count,
+        returned_count = diagnostics.returned_count,
+        has_more = diagnostics.has_more,
+        authority_batch_count = diagnostics.authority_batch_count,
+        application_context_count = diagnostics.application_context_count,
+        application_context_fallback_batch_count =
+            diagnostics.application_context_fallback_batch_count,
+        representation_ms = diagnostics.representation_ms,
+        ancillary_ms = diagnostics.ancillary_ms,
+        db_total_ms = diagnostics.total_ms,
+        total_ms = request_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        "Bluey Jobs workspace page assembled"
+    );
+    Ok(workspace_response(
+        workspace,
+        selected_curated_verification_enabled(),
+        smartrecruiters_requirements_load_enabled_for(
+            std::env::var(SMARTRECRUITERS_REQUIREMENTS_LOAD_FLAG)
+                .ok()
+                .as_deref(),
+        ),
+    ))
+}
+
+#[derive(Serialize)]
+struct JobsWorkspaceResponse {
+    #[serde(flatten)]
+    workspace: JobsWorkspace,
+    selected_curated_verification_available: bool,
+    smartrecruiters_requirements_load_available: bool,
+    interview_prep_receipts: BTreeMap<String, String>,
+}
+
+fn workspace_response(
+    workspace: JobsWorkspace,
+    selected_curated_verification_available: bool,
+    smartrecruiters_requirements_load_available: bool,
+) -> Response {
+    let interview_prep_receipts = workspace
+        .applications
+        .iter()
+        .filter(|application| application.state == "submitted")
+        .map(|application| {
+            (
+                application.id.clone(),
+                super::jobs_interview_prep::receipt_fingerprint(&application.receipt),
+            )
+        })
+        .collect();
+    let mut response = Json(JobsWorkspaceResponse {
+        workspace,
+        selected_curated_verification_available,
+        smartrecruiters_requirements_load_available,
+        interview_prep_receipts,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 pub async fn profile(
@@ -630,8 +1035,10 @@ pub struct CompleteOnboardingRequest {
 pub async fn complete_onboarding(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    headers: HeaderMap,
     Json(mut input): Json<CompleteOnboardingRequest>,
 ) -> Result<Json<JobsWorkspace>, ApiError> {
+    require_current_taxonomy_write(&headers)?;
     input.profile.onboarding_step = 6;
     input.profile.onboarding_complete = true;
     validate_profile(&input.profile)?;
@@ -642,9 +1049,28 @@ pub async fn complete_onboarding(
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     enforce_track_limit(&input.track, &current, &entitlement)?;
 
+    // Persist policy-relevant profile semantics before constructing the Track
+    // policy, while leaving onboarding visibly incomplete until every later
+    // write succeeds. The final completion write changes transport state only,
+    // so the semantic-input ledger treats it as an exact no-op. A retry after
+    // any partial failure therefore cannot resurrect or churn policy authority.
+    let mut semantic_profile = input.profile.clone();
+    semantic_profile.onboarding_step = 0;
+    semantic_profile.onboarding_complete = false;
+    jobs::save_profile(&state.pool, &account.id, &semantic_profile).map_err(internal)?;
     jobs::save_preferences(&state.pool, &account.id, &input.preferences).map_err(internal)?;
-    jobs::upsert_track(&state.pool, &account.id, &input.track).map_err(internal)?;
-    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
+    jobs::upsert_track_with_limit(
+        &state.pool,
+        &account.id,
+        &input.track,
+        entitlement.track_limit,
+    )
+    .map_err(|error| track_write_error(error, &entitlement))?;
+    ensure_managed_curated_discovery_source_best_effort(
+        &state.pool,
+        &account.id,
+        "onboarding_complete",
+    );
     // Persist completion last. Retrying after any earlier write is idempotent,
     // while a partial request can never make the portal skip onboarding.
     jobs::save_profile(&state.pool, &account.id, &input.profile).map_err(internal)?;
@@ -746,14 +1172,22 @@ pub async fn tracks(
 pub async fn save_track(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    headers: HeaderMap,
     Json(track): Json<CareerTrack>,
 ) -> Result<Json<CareerTrack>, ApiError> {
+    require_current_taxonomy_write(&headers)?;
     validate_track(&track)?;
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     enforce_track_limit(&track, &current, &entitlement)?;
-    let saved = jobs::upsert_track(&state.pool, &account.id, &track).map_err(internal)?;
-    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
+    let saved =
+        jobs::upsert_track_with_limit(&state.pool, &account.id, &track, entitlement.track_limit)
+            .map_err(|error| track_write_error(error, &entitlement))?;
+    ensure_managed_curated_discovery_source_best_effort(
+        &state.pool,
+        &account.id,
+        "career_track_created",
+    );
     Ok(Json(saved))
 }
 
@@ -761,16 +1195,25 @@ pub async fn update_track(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(track_id): Path<String>,
+    headers: HeaderMap,
     Json(mut track): Json<CareerTrack>,
 ) -> Result<Json<CareerTrack>, ApiError> {
+    require_current_taxonomy_write(&headers)?;
     track.id = track_id;
     validate_track(&track)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     if !current.iter().any(|item| item.id == track.id) {
         return Err((StatusCode::NOT_FOUND, "Career Track not found.".to_string()));
     }
-    let saved = jobs::upsert_track(&state.pool, &account.id, &track).map_err(internal)?;
-    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
+    let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
+    let saved =
+        jobs::upsert_track_with_limit(&state.pool, &account.id, &track, entitlement.track_limit)
+            .map_err(|error| track_write_error(error, &entitlement))?;
+    ensure_managed_curated_discovery_source_best_effort(
+        &state.pool,
+        &account.id,
+        "career_track_updated",
+    );
     Ok(Json(saved))
 }
 
@@ -826,19 +1269,78 @@ pub async fn matches(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
 ) -> Result<Json<Vec<JobPosting>>, ApiError> {
-    let applications = jobs::list_applications(&state.pool, &account.id).map_err(internal)?;
-    let mut postings = jobs::list_postings(&state.pool, &account.id).map_err(internal)?;
-    for posting in &mut postings {
-        let existing_id = applications
-            .iter()
-            .find(|application| application.job_id == posting.id)
-            .map(|application| application.id.as_str());
-        posting.eligibility = Some(
-            jobs::evaluate_job_eligibility(&state.pool, &account.id, posting, true, existing_id)
-                .map_err(internal)?,
-        );
+    current_match_representations(&state.pool, &account)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchesPageRequest {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+pub async fn matches_page(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Extension(TraceId(trace_id)): Extension<TraceId>,
+    Json(request): Json<MatchesPageRequest>,
+) -> Result<Response, ApiError> {
+    let started = std::time::Instant::now();
+    let limit = request
+        .limit
+        .unwrap_or(jobs::JOBS_WORKSPACE_DEFAULT_PAGE_SIZE);
+    let load = jobs::load_current_posting_representation_page(
+        &state.pool,
+        &account.id,
+        &account.email,
+        limit,
+        request.cursor.as_deref(),
+    )
+    .map_err(matches_page_error)?;
+    let diagnostics = load.diagnostics;
+    let page = load.page;
+    tracing::info!(
+        request_id = %trace_id,
+        candidate_count = diagnostics.candidate_count,
+        returned_count = diagnostics.returned_count,
+        has_more = diagnostics.has_more,
+        authority_batch_count = diagnostics.authority_batch_count,
+        application_context_count = diagnostics.application_context_count,
+        application_context_fallback_batch_count =
+            diagnostics.application_context_fallback_batch_count,
+        page_size = page.page.page_size,
+        representation_ms = diagnostics.representation_ms,
+        ancillary_ms = diagnostics.ancillary_ms,
+        db_total_ms = diagnostics.total_ms,
+        total_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        "Bluey Jobs matches page assembled"
+    );
+    Ok(matches_page_response(page))
+}
+
+fn matches_page_response(page: JobsMatchesPage) -> Response {
+    let mut response = Json(page).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+fn matches_page_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.starts_with("Jobs match cursor") {
+        (
+            StatusCode::BAD_REQUEST,
+            "Jobs match cursor is invalid or expired; refresh the workspace".to_string(),
+        )
+    } else if message.starts_with("Jobs match page size") {
+        (StatusCode::BAD_REQUEST, message)
+    } else {
+        internal(error)
     }
-    Ok(Json(postings))
 }
 
 pub async fn match_detail(
@@ -846,26 +1348,36 @@ pub async fn match_detail(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobPosting>, ApiError> {
-    let mut posting = jobs::get_posting(&state.pool, &account.id, &job_id)
+    current_match_representation(&state.pool, &account, &job_id)
+}
+
+fn current_match_representations(
+    pool: &crate::db::DbPool,
+    account: &crate::db::accounts::Account,
+) -> Result<Json<Vec<JobPosting>>, ApiError> {
+    jobs::list_current_posting_representations(pool, &account.id, &account.email)
+        .map(Json)
+        .map_err(legacy_matches_error)
+}
+
+fn legacy_matches_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if message.starts_with("Jobs legacy matches require the paginated matches endpoint") {
+        (StatusCode::CONFLICT, message)
+    } else {
+        internal(error)
+    }
+}
+
+fn current_match_representation(
+    pool: &crate::db::DbPool,
+    account: &crate::db::accounts::Account,
+    job_id: &str,
+) -> Result<Json<JobPosting>, ApiError> {
+    jobs::get_current_posting_representation(pool, &account.id, &account.email, job_id)
         .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Job match not found.".to_string()))?;
-    let application = jobs::list_applications(&state.pool, &account.id)
-        .map_err(internal)?
-        .into_iter()
-        .find(|application| application.job_id == posting.id);
-    posting.eligibility = Some(
-        jobs::evaluate_job_eligibility(
-            &state.pool,
-            &account.id,
-            &posting,
-            true,
-            application
-                .as_ref()
-                .map(|application| application.id.as_str()),
-        )
-        .map_err(internal)?,
-    );
-    Ok(Json(posting))
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "Job match not found.".to_string()))
 }
 
 pub async fn save_match(
@@ -927,6 +1439,308 @@ pub async fn save_match(
             .map_err(internal)?,
     };
     Ok(Json(saved))
+}
+
+const SELECTED_CURATED_VERIFICATION_FLAG: &str = "BLUEY_JOBS_SELECTED_CURATED_VERIFICATION_ENABLED";
+const SMARTRECRUITERS_REQUIREMENTS_LOAD_FLAG: &str =
+    "BLUEY_JOBS_SMARTRECRUITERS_REQUIREMENTS_LOAD_ENABLED";
+
+#[cfg(test)]
+#[derive(Clone)]
+struct SmartRecruitersRequirementsRouteTestHarness {
+    enabled: bool,
+    expected_target: String,
+    payload: Value,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn smartrecruiters_requirements_load_enabled_for(setting: Option<&str>) -> bool {
+    setting == Some("1")
+}
+
+fn validate_smartrecruiters_requirements_request(
+    setting: Option<&str>,
+    job_id: &str,
+    has_query: bool,
+    has_body: bool,
+) -> Result<(), ApiError> {
+    if !smartrecruiters_requirements_load_enabled_for(setting)
+        || job_id.is_empty()
+        || job_id.len() > 128
+        || !job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(smartrecruiters_requirements_not_found());
+    }
+    if has_query || has_body {
+        return bad_request("Choose a saved job match without adding a URL or other fields.");
+    }
+    Ok(())
+}
+
+fn smartrecruiters_requirements_not_found() -> ApiError {
+    (
+        StatusCode::NOT_FOUND,
+        "Job match with missing requirements not found. Refresh Matches before retrying."
+            .to_string(),
+    )
+}
+
+async fn load_smartrecruiters_requirements(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(job_id): Path<String>,
+    RawQuery(query): RawQuery,
+    #[cfg(test)] test_harness: Option<Extension<SmartRecruitersRequirementsRouteTestHarness>>,
+    body: bytes::Bytes,
+) -> Result<Response, ApiError> {
+    let environment_setting = std::env::var(SMARTRECRUITERS_REQUIREMENTS_LOAD_FLAG).ok();
+    #[cfg(test)]
+    let setting = test_harness
+        .as_ref()
+        .map(|Extension(harness)| if harness.enabled { "1" } else { "0" })
+        .or(environment_setting.as_deref());
+    #[cfg(not(test))]
+    let setting = environment_setting.as_deref();
+    validate_smartrecruiters_requirements_request(
+        setting,
+        &job_id,
+        query.is_some(),
+        !body.is_empty(),
+    )?;
+
+    #[cfg(test)]
+    let saved = if let Some(Extension(harness)) = test_harness {
+        let provider_budget = &state.rate_limiters.jobs_expensive;
+        jobs_import::hydrate_saved_smartrecruiters_using(
+            &state.pool,
+            &account.id,
+            &job_id,
+            move |target| async move {
+                jobs_import::reserve_smartrecruiters_detail_read(provider_budget).await?;
+                harness
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if target.as_str() != harness.expected_target {
+                    return Err(jobs_import::SmartRecruitersHydrationError::DetailUnavailable);
+                }
+                Ok(harness.payload)
+            },
+        )
+        .await
+    } else {
+        jobs_import::load_saved_smartrecruiters_requirements(
+            &state.pool,
+            &account.id,
+            &job_id,
+            &state.rate_limiters.jobs_expensive,
+        )
+        .await
+    };
+    #[cfg(not(test))]
+    let saved = jobs_import::load_saved_smartrecruiters_requirements(
+        &state.pool,
+        &account.id,
+        &job_id,
+        &state.rate_limiters.jobs_expensive,
+    )
+    .await;
+    let saved = saved
+        .map_err(smartrecruiters_requirements_error)?
+        .ok_or_else(smartrecruiters_requirements_not_found)?;
+    smartrecruiters_requirements_response(&state.pool, &account, &saved.id)
+}
+
+fn smartrecruiters_requirements_response(
+    pool: &crate::db::DbPool,
+    account: &crate::db::accounts::Account,
+    job_id: &str,
+) -> Result<Response, ApiError> {
+    let mut response = current_match_representation(pool, account, job_id)?.into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
+fn smartrecruiters_requirements_error(
+    error: jobs_import::SmartRecruitersHydrationError,
+) -> ApiError {
+    use jobs_import::SmartRecruitersHydrationError::*;
+    let (status, message) = match error {
+        DetailUnavailable => (
+            StatusCode::BAD_GATEWAY,
+            "The employer did not return usable requirements. Your saved match is unchanged.",
+        ),
+        RateLimited => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Requirements loading is busy. Try again shortly.",
+        ),
+        CapacityUnavailable | Store => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey could not finish loading requirements. Refresh Matches before retrying.",
+        ),
+    };
+    (status, message.to_string())
+}
+
+fn selected_curated_verification_enabled() -> bool {
+    selected_curated_verification_enabled_for(
+        std::env::var(SELECTED_CURATED_VERIFICATION_FLAG)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn selected_curated_verification_enabled_for(setting: Option<&str>) -> bool {
+    setting == Some("1")
+}
+
+fn selected_curated_lead_not_found() -> ApiError {
+    (
+        StatusCode::NOT_FOUND,
+        "Verifiable job match not found.".to_string(),
+    )
+}
+
+fn validate_selected_curated_verification_request(
+    setting: Option<&str>,
+    job_id: &str,
+    has_query: bool,
+    has_body: bool,
+) -> Result<(), ApiError> {
+    if !selected_curated_verification_enabled_for(setting) {
+        return Err(selected_curated_lead_not_found());
+    }
+    if has_query || has_body {
+        return bad_request("Choose a saved job match without adding a URL or other fields.");
+    }
+    if job_id.is_empty()
+        || job_id.len() > 128
+        || !job_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(selected_curated_lead_not_found());
+    }
+    Ok(())
+}
+
+pub async fn verify_selected_curated_lead(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(job_id): Path<String>,
+    RawQuery(query): RawQuery,
+    body: bytes::Bytes,
+) -> Result<Response, ApiError> {
+    validate_selected_curated_verification_request(
+        std::env::var(SELECTED_CURATED_VERIFICATION_FLAG)
+            .ok()
+            .as_deref(),
+        &job_id,
+        query.is_some(),
+        !body.is_empty(),
+    )?;
+    let saved =
+        verify_selected_curated_lead_using(&state.pool, &account, &job_id, |url| async move {
+            jobs_import::import_supported_job(&url).await
+        })
+        .await?;
+    // Recompute current eligibility rather than returning the stored projection.
+    let mut response =
+        current_match_representation(&state.pool, &account, &saved.id)?.into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
+async fn verify_selected_curated_lead_using<F, Fut>(
+    pool: &crate::db::DbPool,
+    account: &crate::db::accounts::Account,
+    job_id: &str,
+    import: F,
+) -> Result<JobPosting, ApiError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<Option<jobs_import::ImportedJob>, jobs_import::JobImportError>,
+    >,
+{
+    let selection = jobs::capture_selected_curated_lead(pool, &account.id, job_id)
+        .map_err(internal)?
+        .ok_or_else(selected_curated_lead_not_found)?;
+    validate_match_track(pool, &account.id, selection.track_id())?;
+    let input = UserJobInput {
+        canonical_url: selection.canonical_url().to_string(),
+        track_id: selection.track_id().to_string(),
+        pasted_description: String::new(),
+        company: String::new(),
+        title: String::new(),
+        location: String::new(),
+        workplace: String::new(),
+        compensation: String::new(),
+    };
+    // Never fall back to a user-supplied or manual posting in this action.
+    let imported = import(input.canonical_url.clone())
+        .await
+        .map_err(job_import_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Bluey cannot verify the original site for this saved listing.".to_string(),
+            )
+        })?;
+    let posting = posting_from_user_input(input, Some(imported));
+    validate_posting(&posting)?;
+    let discovery_source = jobs::discovery_source_input_from_verified_import(
+        &posting.source,
+        &posting.canonical_url,
+        &posting.company,
+        &posting.track_id,
+    )
+    .map_err(selected_curated_import_error)?
+    .ok_or_else(selected_curated_lead_not_found)?;
+    let profile = jobs::get_profile(pool, &account.id, &account.email).map_err(internal)?;
+    let preferences = jobs::get_preferences(pool, &account.id).map_err(internal)?;
+    jobs::save_selected_curated_lead_verified_import(
+        pool,
+        &account.id,
+        &selection,
+        &posting,
+        &discovery_source,
+        &profile,
+        &preferences,
+    )
+    .map_err(selected_curated_import_error)
+}
+
+fn selected_curated_import_error(error: anyhow::Error) -> ApiError {
+    let message = error.to_string();
+    if matches!(
+        message.as_str(),
+        "selected curated lead changed before verified import"
+            | "verified import resolved a different job than the selected curated lead"
+            | "verified import does not match the selected curated lead"
+            | "selected curated lead has no unambiguous original-source subject"
+            | "discovery membership, canonical job, and job URL disagree"
+            | "canonical job URL refers to multiple Jobs matches"
+            | "discovery source Career Track was not found"
+            | "discovery board is already bound to another Career Track"
+            | "discovery source limit reached for this account"
+            | "discovery source limit reached for this Career Track"
+            | "job is already bound to another Career Track"
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            "This saved job or its Career Track changed. Refresh Matches before trying again."
+                .to_string(),
+        );
+    }
+    internal(error)
 }
 
 fn validate_match_track(
@@ -1011,39 +1825,83 @@ fn enroll_verified_import_discovery_source(
     Ok(())
 }
 
-fn backfill_verified_import_discovery_sources(
+#[derive(Debug, Default)]
+struct VerifiedImportBackfillRun {
+    scanned_count: usize,
+    repaired_count: usize,
+    checkpoint_advanced: bool,
+    completed: bool,
+}
+
+fn run_verified_import_discovery_backfill(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    email: &str,
+    lease: &jobs::VerifiedImportBackfillLease,
+) -> anyhow::Result<VerifiedImportBackfillRun> {
+    let result = run_verified_import_discovery_backfill_with_lease(pool, account_id, email, lease);
+    if result.is_err() {
+        if let Err(error) = jobs::release_verified_import_backfill_lease(pool, account_id, lease) {
+            return Err(error.context("release failed verified-import repair lease"));
+        }
+    }
+    result
+}
+
+fn run_verified_import_discovery_backfill_with_lease(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    email: &str,
+    lease: &jobs::VerifiedImportBackfillLease,
+) -> anyhow::Result<VerifiedImportBackfillRun> {
+    let batch = jobs::verified_import_backfill_batch(
+        pool,
+        account_id,
+        lease,
+        MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS,
+    )?;
+    let scanned_count = batch.scanned_count;
+    let completed = batch.scanned_count == 0;
+    let profile = jobs::get_profile(pool, account_id, email)?;
+    let preferences = jobs::get_preferences(pool, account_id)?;
+    let repaired_count = try_backfill_verified_import_discovery_sources(
+        pool,
+        account_id,
+        &batch.postings,
+        &profile,
+        &preferences,
+    )?;
+    let checkpoint_advanced = jobs::advance_verified_import_backfill_checkpoint(
+        pool,
+        account_id,
+        lease,
+        &batch.next_after_job_id,
+        completed,
+    )?;
+    if !checkpoint_advanced {
+        anyhow::bail!("verified-import backfill lease was lost before checkpoint advance")
+    }
+    Ok(VerifiedImportBackfillRun {
+        scanned_count,
+        repaired_count,
+        checkpoint_advanced,
+        completed,
+    })
+}
+
+fn try_backfill_verified_import_discovery_sources(
     pool: &crate::db::DbPool,
     account_id: &str,
     postings: &[JobPosting],
     profile: &CareerProfile,
     preferences: &JobPreferences,
-) -> usize {
-    let tracks = match jobs::list_tracks(pool, account_id) {
-        Ok(tracks) => tracks,
-        Err(error) => {
-            tracing::warn!(
-                account_fingerprint = %discovery_log_fingerprint(account_id),
-                error_category = discovery_enrollment_error_category(&error),
-                "Jobs workspace skipped discovery source backfill because Career Tracks could not be read"
-            );
-            return 0;
-        }
-    };
+) -> anyhow::Result<usize> {
+    let tracks = jobs::list_tracks(pool, account_id)?;
     let valid_track_ids = tracks
         .into_iter()
         .map(|track| track.id)
         .collect::<BTreeSet<_>>();
-    let existing_sources = match jobs::list_discovery_sources(pool, account_id) {
-        Ok(sources) => sources,
-        Err(error) => {
-            tracing::warn!(
-                account_fingerprint = %discovery_log_fingerprint(account_id),
-                error_category = discovery_enrollment_error_category(&error),
-                "Jobs workspace skipped discovery source backfill because sources could not be read"
-            );
-            return 0;
-        }
-    };
+    let existing_sources = jobs::list_discovery_sources(pool, account_id)?;
     let mut known_bindings = existing_sources
         .iter()
         .map(|source| {
@@ -1074,10 +1932,11 @@ fn backfill_verified_import_discovery_sources(
         ))
     });
     let mut enrolled = 0;
+    let mut repaired = 0;
 
     for posting in candidates
         .into_iter()
-        .take(MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS)
+        .take(MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS)
     {
         let source = match jobs::discovery_source_input_from_verified_import(
             &posting.source,
@@ -1116,16 +1975,7 @@ fn backfill_verified_import_discovery_sources(
         ) {
             Ok(Some(job_id)) if binding_exists && job_id == posting.id => continue,
             Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    account_fingerprint = %discovery_log_fingerprint(account_id),
-                    provider = discovery_provider_label(&posting.source),
-                    source_fingerprint = %discovery_log_fingerprint(&format!("{}\0{}", posting.source, posting.canonical_url)),
-                    error_category = discovery_enrollment_error_category(&error),
-                    "Jobs workspace could not inspect a verified-import membership"
-                );
-                continue;
-            }
+            Err(error) => return Err(error.context("inspect verified-import membership")),
         }
         if !binding_exists
             && (existing_sources.len() + enrolled >= jobs::DISCOVERY_MAX_SOURCES_PER_ACCOUNT
@@ -1146,6 +1996,7 @@ fn backfill_verified_import_discovery_sources(
             preferences,
         ) {
             Ok(_) => {
+                repaired += 1;
                 if !binding_exists {
                     known_bindings.insert(binding);
                     *source_counts_by_track
@@ -1154,17 +2005,23 @@ fn backfill_verified_import_discovery_sources(
                     enrolled += 1;
                 }
             }
-            Err(error) => tracing::warn!(
-                account_fingerprint = %discovery_log_fingerprint(account_id),
-                provider = discovery_provider_label(&posting.source),
-                source_fingerprint = %discovery_log_fingerprint(&format!("{}\0{}", posting.source, posting.canonical_url)),
-                error_category = discovery_enrollment_error_category(&error),
-                "Jobs workspace could not backfill a verified-import discovery source"
-            ),
+            Err(error) => return Err(error.context("save verified-import discovery repair")),
         }
     }
 
-    enrolled
+    Ok(repaired)
+}
+
+#[cfg(test)]
+fn backfill_verified_import_discovery_sources(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    postings: &[JobPosting],
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+) -> usize {
+    try_backfill_verified_import_discovery_sources(pool, account_id, postings, profile, preferences)
+        .expect("verified-import test repair")
 }
 
 fn discovery_log_fingerprint(value: &str) -> String {
@@ -1200,7 +2057,23 @@ fn posting_from_user_input(
     imported: Option<jobs_import::ImportedJob>,
 ) -> JobPosting {
     if let Some(imported) = imported {
-        return JobPosting {
+        let provider = discovery_provider_label(&imported.source);
+        let employer_id = format!(
+            "{provider}:{}",
+            imported
+                .company
+                .trim()
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("-")
+        );
+        let application_domain = reqwest::Url::parse(&imported.canonical_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string));
+        let verified_at_ms = imported.verified_at_ms;
+        let evidence_hash = imported.evidence_hash.clone();
+        let mut posting = JobPosting {
             id: String::new(),
             canonical_key: String::new(),
             source: imported.source,
@@ -1218,13 +2091,23 @@ fn posting_from_user_input(
             matched_reasons: Vec::new(),
             missing_requirements: Vec::new(),
             posted_at_ms: imported.posted_at_ms,
-            last_verified_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            last_verified_at_ms: Some(verified_at_ms),
             availability_status: "active".to_string(),
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: jobs::JobDiscoveryEvidence::default(),
             eligibility: None,
         };
+        posting.canonical_key = jobs::canonical_job_key(&posting);
+        posting.discovery_evidence = jobs::JobDiscoveryEvidence::provider_verified_original_source(
+            posting.canonical_key.clone(),
+            employer_id,
+            application_domain,
+            verified_at_ms,
+            evidence_hash,
+        );
+        return posting;
     }
     JobPosting {
         id: String::new(),
@@ -1249,6 +2132,7 @@ fn posting_from_user_input(
         status: "matched".to_string(),
         created_at_ms: 0,
         updated_at_ms: 0,
+        discovery_evidence: jobs::JobDiscoveryEvidence::default(),
         eligibility: None,
     }
 }
@@ -1290,6 +2174,7 @@ pub async fn applications(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrepareApplicationRequest {
     pub job_id: String,
     #[serde(default = "default_factual")]
@@ -1332,7 +2217,7 @@ pub async fn prepare_application(
         &req.mode,
         &req.submission_mode,
     )
-    .map_err(internal)?;
+    .map_err(domain_error)?;
     if !prepared.profile.onboarding_complete {
         return Err((
             StatusCode::CONFLICT,
@@ -1347,7 +2232,7 @@ pub async fn prepare_application(
             &account.email,
             &prepared.posting.track_id,
         )
-        .map_err(domain_error)?;
+        .map_err(auto_submit_authorization_error)?;
         let eligibility = prepared
             .application
             .receipt
@@ -1359,11 +2244,7 @@ pub async fn prepare_application(
                 "Auto-submit is unavailable because Bluey could not verify the current application-system and Career Track decision.".to_string(),
             ))?;
         let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-        let runners = build_runner_availability(
-            &entitlement,
-            jobs_local_browser_distribution_enabled(),
-            jobs_cloud_browser_distribution_enabled(),
-        );
+        let runners = account_runner_availability(&state.pool, &account.id, &entitlement)?;
         if let Some(error) = auto_submit_request_error(&eligibility, &runners) {
             return Err(error);
         }
@@ -1392,27 +2273,21 @@ pub async fn prepare_application(
     let jobs_resume_generation::GeneratedResume {
         content,
         diff,
+        cover_letter,
         public_provenance,
     } = generated;
-    let (mut application, resume_version) = jobs::finalize_prepared_application(
+    let (mut application, resume_version) = jobs::finalize_prepared_application_kit(
         &state.pool,
         &account.id,
         &prepared,
         content,
         diff,
+        cover_letter,
         public_provenance,
     )
-    .map_err(internal)?;
+    .map_err(domain_error)?;
     let mut metering = None;
     if application.state == "queued" {
-        application = freeze_approved_execution(
-            &state,
-            &account.id,
-            &account.email,
-            &application,
-            &prepared.posting,
-            &resume_version,
-        )?;
         if let Err(error) = jobs::reserve_application_attempt(
             &state.pool,
             &account.id,
@@ -1446,14 +2321,10 @@ pub async fn prepare_application(
                     Some(&application.submission_mode),
                 );
                 application.state = "awaiting_review".to_string();
-                if error.to_string().contains("insufficient Bluey balance") {
-                    return Err((
-                        StatusCode::PAYMENT_REQUIRED,
-                        "Add to your Bluey balance before Auto-submit can queue this packet."
-                            .to_string(),
-                    ));
-                }
-                return Err(internal(error));
+                return Err(packet_commit_error(
+                    error,
+                    "Add to your Bluey balance before Auto-submit can queue this packet.",
+                ));
             }
         }
     }
@@ -1498,6 +2369,31 @@ pub async fn update_application(
     .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReconcileSubmissionRequest {
+    pub outcome: String,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+pub async fn reconcile_submission(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(application_id): Path<String>,
+    Json(req): Json<ReconcileSubmissionRequest>,
+) -> Result<Json<JobApplication>, ApiError> {
+    if !req.confirmed || req.outcome != "not_submitted" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Confirm that the employer did not receive this application.".to_string(),
+        ));
+    }
+    jobs::reconcile_submission_not_submitted(&state.pool, &account.id, &application_id)
+        .map_err(submission_domain_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApproveApplicationResponse {
     pub application: JobApplication,
@@ -1509,26 +2405,25 @@ pub async fn approve_application_packet(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(application_id): Path<String>,
 ) -> Result<Json<ApproveApplicationResponse>, ApiError> {
-    let mut application = jobs::get_application(&state.pool, &account.id, &application_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    let approval_authority = jobs::current_application_approval_authority(
+        &state.pool,
+        &account.id,
+        &account.email,
+        &application_id,
+    )
+    .map_err(domain_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    let mut application = approval_authority.application.clone();
     if application.state != "awaiting_review" {
         return Err((
             StatusCode::CONFLICT,
             "Only a packet waiting for review can be approved.".to_string(),
         ));
     }
-    let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
-    let eligibility = jobs::evaluate_job_eligibility(
-        &state.pool,
-        &account.id,
-        &posting,
-        true,
-        Some(&application.id),
-    )
-    .map_err(internal)?;
+    let eligibility = approval_authority.posting.eligibility.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "Current signed job eligibility is unavailable. Prepare the packet again.".to_string(),
+    ))?;
     if !eligibility.can_queue_local && !eligibility.can_queue_cloud {
         let message = eligibility
             .hard_failures
@@ -1552,12 +2447,37 @@ pub async fn approve_application_packet(
         &state,
         &account.id,
         &account.email,
-        &application,
-        &posting,
+        &approval_authority,
         &resume,
     )?;
-    jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, "unassigned")
-        .map_err(domain_error)?;
+    let approved_checksum = application
+        .receipt
+        .pointer("/approved_execution/checksum")
+        .and_then(Value::as_str)
+        .expect("persisted approval has a validated checksum")
+        .to_string();
+    if let Err(error) =
+        jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, "unassigned")
+    {
+        match jobs::clear_current_review_approval(
+            &state.pool,
+            &account.id,
+            &application.id,
+            &approved_checksum,
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                application_id = %application.id,
+                "application reservation failed after approval, but the exact approval was no longer current"
+            ),
+            Err(cleanup_error) => tracing::error!(
+                application_id = %application.id,
+                error = %cleanup_error,
+                "application reservation failed and exact approval cleanup could not complete"
+            ),
+        }
+        return Err(domain_error(error));
+    }
     let metering =
         jobs::commit_packet(&state.pool, &account.id, &application.id).map_err(|error| {
             let _ = jobs::update_attempt_reservation_status(
@@ -1566,14 +2486,10 @@ pub async fn approve_application_packet(
                 &application.id,
                 "released",
             );
-            if error.to_string().contains("insufficient Bluey balance") {
-                (
-                    StatusCode::PAYMENT_REQUIRED,
-                    "Add to your Bluey balance before approving this packet.".to_string(),
-                )
-            } else {
-                internal(error)
-            }
+            packet_commit_error(
+                error,
+                "Add to your Bluey balance before approving this packet.",
+            )
         })?;
     let application = jobs::update_application(
         &state.pool,
@@ -1614,6 +2530,667 @@ pub async fn application_evidence(
         .map_err(internal)
 }
 
+pub async fn download_application_evidence(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path((application_id, evidence_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let application = jobs::get_application(&state.pool, &account.id, &application_id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    let evidence = jobs::list_application_evidence(&state.pool, &account.id, Some(&application_id))
+        .map_err(internal)?;
+    let selected = evidence
+        .iter()
+        .find(|item| item.id == evidence_id && item.application_id == application_id)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Application evidence not found.".to_string(),
+        ))?;
+    let expected_media_type = evidence_download_media_type(&selected.kind).ok_or((
+        StatusCode::NOT_FOUND,
+        "Application evidence not found.".to_string(),
+    ))?;
+    let expected_size = validate_evidence_download_binding(
+        &account.id,
+        &application,
+        selected,
+        &evidence,
+        expected_media_type,
+    )?;
+    let storage_config = state.config.object_storage.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Application evidence storage is not configured.".to_string(),
+    ))?;
+    let storage = ObjectStorage::new(storage_config);
+    let bytes = read_verified_application_evidence(
+        &storage,
+        &account.id,
+        &application,
+        selected,
+        expected_media_type,
+        expected_size,
+    )
+    .await?;
+
+    let file_name = evidence_download_file_name(selected);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, expected_media_type)
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{file_name}\""),
+        )
+        .header(axum::http::header::CACHE_CONTROL, "private, no-store")
+        .header(axum::http::header::PRAGMA, "no-cache")
+        .header("x-content-type-options", "nosniff")
+        .header(
+            axum::http::header::CONTENT_LENGTH,
+            expected_size.to_string(),
+        )
+        .body(Body::from(bytes))
+        .map_err(|error| internal(error.into()))
+}
+
+// Call only after validating the selected row against the account's application
+// and complete evidence set. A successful read is not a reporting verdict.
+async fn read_verified_application_evidence(
+    storage: &ObjectStorage,
+    account_id: &str,
+    application: &JobApplication,
+    selected: &ApplicationEvidence,
+    expected_media_type: &str,
+    expected_size: usize,
+) -> Result<bytes::Bytes, ApiError> {
+    let evidence_limit = if selected.kind == "application_receipt" {
+        MAX_RECEIPT_BUNDLE_BYTES
+    } else {
+        MAX_RECEIPT_EVIDENCE_BYTES
+    };
+    if selected.storage_key.len() > 4_096
+        || !storage.key_belongs_to_account(&selected.storage_key, account_id)
+        || expected_size > storage.max_object_bytes()
+        || expected_size > evidence_limit
+    {
+        return Err(evidence_download_integrity_error(
+            &application.id,
+            &selected.id,
+            "invalid object scope or recorded size",
+        ));
+    }
+    let stored = storage
+        .get_complete_exact(&selected.storage_key, expected_size)
+        .await
+        .map_err(|error| {
+            if error.is::<ObjectReadLimitExceeded>() || error.is::<ObjectReadIncomplete>() {
+                return evidence_download_integrity_error(
+                    &application.id,
+                    &selected.id,
+                    "object read-back did not match immutable evidence",
+                );
+            }
+            tracing::warn!(
+                error = %error,
+                application_id_hash = %sha256_hex(application.id.as_bytes()),
+                evidence_id_hash = %sha256_hex(selected.id.as_bytes()),
+                "application evidence object could not be read"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                "Bluey could not load this application evidence right now.".to_string(),
+            )
+        })?;
+    if !valid_downloaded_evidence_bytes(
+        account_id,
+        application,
+        selected,
+        expected_media_type,
+        expected_size,
+        &stored.content_type,
+        &stored.bytes,
+    ) {
+        return Err(evidence_download_integrity_error(
+            &application.id,
+            &selected.id,
+            "object read-back did not match immutable evidence",
+        ));
+    }
+
+    Ok(stored.bytes)
+}
+
+fn evidence_download_media_type(kind: &str) -> Option<&'static str> {
+    match kind {
+        "resume" | "cover_letter" | "attachment" => Some("application/pdf"),
+        "application_receipt" => Some("application/json"),
+        "submission_confirmation" => Some("image/png"),
+        _ => None,
+    }
+}
+
+/// Validate persisted submission provenance without contacting the ATS or storage.
+pub(super) fn validate_stored_interview_prep_receipt(
+    account_id: &str,
+    application: &JobApplication,
+    resume: &ResumeVersion,
+    resume_evidence: &ApplicationEvidence,
+    evidence: &[ApplicationEvidence],
+) -> Result<(), ApiError> {
+    let reject = || {
+        (
+            StatusCode::CONFLICT,
+            "The stored submission receipt does not match the approved resume and evidence."
+                .to_string(),
+        )
+    };
+    let frozen = jobs::validated_submitted_pre_submission_application(account_id, application)
+        .map_err(|_| reject())?;
+    if frozen
+        .receipt
+        .pointer("/approved_execution/packet/resumeContent")
+        != Some(&resume.content)
+        || resume_evidence
+            .metadata
+            .get("structured_resume_checksum")
+            .and_then(Value::as_str)
+            != Some(resume.checksum.as_str())
+    {
+        return Err(reject());
+    }
+    // The proof reader uses the submitted record to resolve the nested snapshot.
+    validate_receipt_final_submit_proof(application, &application.receipt).map_err(|_| reject())?;
+    validate_evidence_download_binding(
+        account_id,
+        application,
+        resume_evidence,
+        evidence,
+        "application/pdf",
+    )
+    .map_err(|_| reject())?;
+    Ok(())
+}
+
+pub(super) fn validate_certified_interview_prep_authority(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<(), ApiError> {
+    let receipt = &application.receipt;
+    // The stored-receipt validator already checked run and runner against the frozen snapshot.
+    validate_receipt_ats_certification_authority(
+        pool,
+        application,
+        receipt,
+        account_id,
+        &application.id,
+        receipt
+            .get("runId")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        receipt
+            .get("runner")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+    .map(|_| ())
+}
+
+fn validate_evidence_download_binding(
+    account_id: &str,
+    application: &JobApplication,
+    selected: &ApplicationEvidence,
+    evidence: &[ApplicationEvidence],
+    expected_media_type: &str,
+) -> Result<usize, ApiError> {
+    let failure = || {
+        evidence_download_integrity_error(
+            &application.id,
+            &selected.id,
+            "evidence record did not match submitted application authority",
+        )
+    };
+    if application.state != "submitted"
+        || application.submitted_at_ms.is_none_or(|value| value <= 0)
+        || selected.application_id != application.id
+        || selected.media_type != expected_media_type
+        || selected.storage_key.trim().is_empty()
+        || selected.sha256 != selected.sha256.to_ascii_lowercase()
+        || !valid_sha256(&selected.sha256)
+    {
+        return Err(failure());
+    }
+    let resume_version_id = application
+        .resume_version_id
+        .as_deref()
+        .ok_or_else(failure)?;
+    let expected_resume_version_id = match selected.kind.as_str() {
+        "resume" | "application_receipt" | "submission_confirmation" => Some(resume_version_id),
+        "cover_letter" | "attachment" => None,
+        _ => return Err(failure()),
+    };
+    if selected.resume_version_id.as_deref() != expected_resume_version_id {
+        return Err(failure());
+    }
+    let expected_size = selected
+        .metadata
+        .get("size_bytes")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(failure)?;
+
+    let mut receipt_records = evidence
+        .iter()
+        .filter(|item| item.kind == "application_receipt");
+    let receipt_record = receipt_records.next().ok_or_else(failure)?;
+    if receipt_records.next().is_some() {
+        return Err(failure());
+    }
+    let confirmation_records = evidence
+        .iter()
+        .filter(|item| item.kind == "submission_confirmation")
+        .collect::<Vec<_>>();
+    if !(1..=MAX_RECEIPT_SCREENSHOTS).contains(&confirmation_records.len()) {
+        return Err(failure());
+    }
+    let receipt_id = receipt_record
+        .metadata
+        .get("receipt_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(failure)?;
+    if application.receipt.get("receiptId").and_then(Value::as_str) != Some(receipt_id)
+        || application.receipt.get("accountId").and_then(Value::as_str) != Some(account_id)
+        || application
+            .receipt
+            .get("applicationId")
+            .and_then(Value::as_str)
+            != Some(application.id.as_str())
+        || receipt_record.application_id != application.id
+        || receipt_record.resume_version_id.as_deref() != Some(resume_version_id)
+        || receipt_record.provider.trim().is_empty()
+        || selected.provider != receipt_record.provider
+        || confirmation_records.iter().any(|confirmation| {
+            confirmation.application_id != application.id
+                || confirmation.resume_version_id.as_deref() != Some(resume_version_id)
+                || confirmation.provider != receipt_record.provider
+                || confirmation
+                    .metadata
+                    .get("receipt_id")
+                    .and_then(Value::as_str)
+                    != Some(receipt_id)
+        })
+    {
+        return Err(failure());
+    }
+    validate_receipt_evidence_record(application, receipt_record, receipt_id)
+        .map_err(|_| failure())?;
+    validate_confirmation_evidence_records(application, &confirmation_records, receipt_id)
+        .map_err(|_| failure())?;
+    if matches!(
+        selected.kind.as_str(),
+        "resume" | "cover_letter" | "attachment"
+    ) {
+        validate_document_evidence_record(application, selected, receipt_id, resume_version_id)
+            .map_err(|_| failure())?;
+    }
+    Ok(expected_size)
+}
+
+fn validate_document_evidence_record(
+    application: &JobApplication,
+    evidence: &ApplicationEvidence,
+    receipt_id: &str,
+    resume_version_id: &str,
+) -> Result<(), ()> {
+    let size_bytes = evidence
+        .metadata
+        .get("size_bytes")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or(())?;
+    if !matches!(
+        evidence.kind.as_str(),
+        "resume" | "cover_letter" | "attachment"
+    ) || evidence.media_type != "application/pdf"
+        || !evidence.file_name.to_ascii_lowercase().ends_with(".pdf")
+        || evidence
+            .metadata
+            .get("attached_to_submission")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || evidence.metadata.get("receipt_id").and_then(Value::as_str) != Some(receipt_id)
+    {
+        return Err(());
+    }
+    if evidence.kind == "resume" {
+        if evidence.resume_version_id.as_deref() != Some(resume_version_id) {
+            return Err(());
+        }
+    } else if evidence.resume_version_id.is_some() {
+        return Err(());
+    }
+
+    let mut documents = application
+        .receipt
+        .get("documents")
+        .and_then(Value::as_array)
+        .ok_or(())?
+        .iter()
+        .filter(|document| {
+            document.get("storageKey").and_then(Value::as_str)
+                == Some(evidence.storage_key.as_str())
+        });
+    let document = documents.next().ok_or(())?;
+    if documents.next().is_some()
+        || document.get("kind").and_then(Value::as_str) != Some(evidence.kind.as_str())
+        || document.get("sha256").and_then(Value::as_str) != Some(evidence.sha256.as_str())
+        || document.get("mediaType").and_then(Value::as_str) != Some("application/pdf")
+        || (evidence.kind == "resume"
+            && document.get("versionId").and_then(Value::as_str) != Some(resume_version_id))
+    {
+        return Err(());
+    }
+
+    let mut manifest_items = application
+        .receipt
+        .get("evidenceObjects")
+        .and_then(Value::as_array)
+        .ok_or(())?
+        .iter()
+        .filter(|item| {
+            item.get("storageKey").and_then(Value::as_str) == Some(evidence.storage_key.as_str())
+        });
+    let manifest = manifest_items.next().ok_or(())?;
+    if manifest_items.next().is_some()
+        || manifest.get("kind").and_then(Value::as_str) != Some(evidence.kind.as_str())
+        || manifest.get("sha256").and_then(Value::as_str) != Some(evidence.sha256.as_str())
+        || manifest.get("mediaType").and_then(Value::as_str) != Some("application/pdf")
+        || manifest.get("sizeBytes").and_then(Value::as_i64) != Some(size_bytes)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_receipt_evidence_record(
+    application: &JobApplication,
+    evidence: &ApplicationEvidence,
+    receipt_id: &str,
+) -> Result<(), ()> {
+    let size_bytes = evidence
+        .metadata
+        .get("size_bytes")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or(())?;
+    let receipt_object = application
+        .receipt
+        .get("receiptObject")
+        .and_then(Value::as_object)
+        .ok_or(())?;
+    let receipt_schema_version = application
+        .receipt
+        .get("schemaVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| matches!(*version, 1 | 2))
+        .ok_or(())?;
+    if evidence.media_type != "application/json"
+        || !evidence.file_name.to_ascii_lowercase().ends_with(".json")
+        || evidence.storage_key.trim().is_empty()
+        || evidence.sha256 != evidence.sha256.to_ascii_lowercase()
+        || !valid_sha256(&evidence.sha256)
+        || evidence.metadata.get("immutable").and_then(Value::as_bool) != Some(true)
+        || evidence
+            .metadata
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            != Some(RECEIPT_BUNDLE_SCHEMA_VERSION)
+        || evidence.metadata.get("receipt_id").and_then(Value::as_str) != Some(receipt_id)
+        || receipt_object.get("storageKey").and_then(Value::as_str)
+            != Some(evidence.storage_key.as_str())
+        || receipt_object.get("sha256").and_then(Value::as_str) != Some(evidence.sha256.as_str())
+        || receipt_object.get("mediaType").and_then(Value::as_str) != Some("application/json")
+        || receipt_object.get("schemaVersion").and_then(Value::as_i64)
+            != Some(receipt_schema_version)
+        || receipt_object.get("sizeBytes").and_then(Value::as_i64) != Some(size_bytes)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_confirmation_evidence_records(
+    application: &JobApplication,
+    evidence: &[&ApplicationEvidence],
+    receipt_id: &str,
+) -> Result<(), ()> {
+    let screenshot_keys = application
+        .receipt
+        .get("screenshotKeys")
+        .and_then(Value::as_array)
+        .filter(|keys| !keys.is_empty() && keys.len() <= MAX_RECEIPT_SCREENSHOTS)
+        .ok_or(())?;
+    if screenshot_keys.len() != evidence.len() {
+        return Err(());
+    }
+    let screenshot_keys = screenshot_keys
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .ok_or(())?;
+    if screenshot_keys.iter().any(|key| key.trim().is_empty())
+        || screenshot_keys.iter().collect::<BTreeSet<_>>().len() != screenshot_keys.len()
+    {
+        return Err(());
+    }
+    let manifest = application
+        .receipt
+        .get("evidenceObjects")
+        .and_then(Value::as_array)
+        .ok_or(())?;
+    let screenshot_manifest = manifest
+        .iter()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("screenshot"))
+        .collect::<Vec<_>>();
+    if screenshot_manifest.len() != screenshot_keys.len()
+        || screenshot_keys.iter().any(|key| {
+            screenshot_manifest
+                .iter()
+                .filter(|item| item.get("storageKey").and_then(Value::as_str) == Some(*key))
+                .count()
+                != 1
+        })
+    {
+        return Err(());
+    }
+
+    let mut seen_indexes = BTreeSet::new();
+    let mut seen_storage_keys = BTreeSet::new();
+    let mut seen_file_names = BTreeSet::new();
+    for record in evidence {
+        let size_bytes = record
+            .metadata
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or(())?;
+        let metadata_keys = record
+            .metadata
+            .get("screenshot_keys")
+            .and_then(Value::as_array)
+            .ok_or(())?;
+        if metadata_keys.len() != screenshot_keys.len()
+            || metadata_keys
+                .iter()
+                .zip(&screenshot_keys)
+                .any(|(actual, expected)| actual.as_str() != Some(*expected))
+        {
+            return Err(());
+        }
+        let index = match (
+            record.metadata.get("screenshot_index"),
+            record.metadata.get("screenshot_count"),
+        ) {
+            (None, None)
+                if screenshot_keys.len() == 1 && record.metadata.get("immutable").is_none() =>
+            {
+                0
+            }
+            (Some(index), Some(count))
+                if count.as_u64() == Some(screenshot_keys.len() as u64)
+                    && index.as_u64().is_some_and(|index| {
+                        (1..=screenshot_keys.len() as u64).contains(&index)
+                    })
+                    && record.metadata.get("immutable").and_then(Value::as_bool) == Some(true) =>
+            {
+                usize::try_from(index.as_u64().ok_or(())? - 1).map_err(|_| ())?
+            }
+            _ => return Err(()),
+        };
+        let mut manifest_items = screenshot_manifest.iter().filter(|item| {
+            item.get("storageKey").and_then(Value::as_str) == Some(record.storage_key.as_str())
+        });
+        let manifest_item = manifest_items.next().ok_or(())?;
+        if manifest_items.next().is_some()
+            || record.media_type != "image/png"
+            || !record.file_name.to_ascii_lowercase().ends_with(".png")
+            || record.storage_key != screenshot_keys[index]
+            || record.sha256 != record.sha256.to_ascii_lowercase()
+            || !valid_sha256(&record.sha256)
+            || record.metadata.get("receipt_id").and_then(Value::as_str) != Some(receipt_id)
+            || record
+                .metadata
+                .get("evidence_strength")
+                .and_then(Value::as_str)
+                != Some("browser_confirmed")
+            || record
+                .metadata
+                .get("confirmation")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            || manifest_item.get("sha256").and_then(Value::as_str) != Some(record.sha256.as_str())
+            || manifest_item.get("mediaType").and_then(Value::as_str) != Some("image/png")
+            || manifest_item.get("sizeBytes").and_then(Value::as_i64) != Some(size_bytes)
+            || !seen_indexes.insert(index)
+            || !seen_storage_keys.insert(record.storage_key.as_str())
+            || !seen_file_names.insert(record.file_name.as_str())
+        {
+            return Err(());
+        }
+    }
+    if seen_indexes.len() != screenshot_keys.len()
+        || seen_storage_keys.len() != screenshot_keys.len()
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn valid_downloaded_evidence_bytes(
+    account_id: &str,
+    application: &JobApplication,
+    evidence: &ApplicationEvidence,
+    expected_media_type: &str,
+    expected_size: usize,
+    content_type: &str,
+    bytes: &[u8],
+) -> bool {
+    let stored_media_type = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    bytes.len() == expected_size
+        && sha256_hex(bytes) == evidence.sha256
+        && stored_media_type.eq_ignore_ascii_case(expected_media_type)
+        && valid_downloaded_evidence_structure(account_id, application, evidence, bytes)
+}
+
+fn valid_downloaded_evidence_structure(
+    account_id: &str,
+    application: &JobApplication,
+    evidence: &ApplicationEvidence,
+    bytes: &[u8],
+) -> bool {
+    match evidence.kind.as_str() {
+        "application_receipt" => {
+            let Ok(bundle) = serde_json::from_slice::<Value>(bytes) else {
+                return false;
+            };
+            let receipt_id = evidence.metadata.get("receipt_id").and_then(Value::as_str);
+            let fingerprint = application
+                .receipt
+                .get(SUBMISSION_FINGERPRINT_KEY)
+                .and_then(Value::as_str);
+            let mut expected_receipt = application.receipt.clone();
+            let Some(expected_receipt) = expected_receipt.as_object_mut() else {
+                return false;
+            };
+            expected_receipt.remove("receiptObject");
+            let expected_job = expected_receipt.get("job");
+            bundle.get("schemaVersion").and_then(Value::as_i64)
+                == Some(RECEIPT_BUNDLE_SCHEMA_VERSION)
+                && bundle.get("bundleId").and_then(Value::as_str) == fingerprint
+                && fingerprint
+                    .is_some_and(|value| value == value.to_ascii_lowercase() && valid_sha256(value))
+                && bundle.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && bundle.get("applicationId").and_then(Value::as_str)
+                    == Some(application.id.as_str())
+                && bundle.get("receiptId").and_then(Value::as_str) == receipt_id
+                && expected_job.is_some()
+                && bundle.get("job") == expected_job
+                && bundle
+                    .pointer("/receipt/packet/jobId")
+                    .and_then(Value::as_str)
+                    == Some(application.job_id.as_str())
+                && bundle.pointer("/resume/id").and_then(Value::as_str)
+                    == application.resume_version_id.as_deref()
+                && bundle.get("receipt") == Some(&Value::Object(expected_receipt.clone()))
+        }
+        "resume" | "cover_letter" | "attachment" => valid_pdf(bytes),
+        "submission_confirmation" => valid_png(bytes),
+        _ => false,
+    }
+}
+
+fn evidence_download_file_name(evidence: &ApplicationEvidence) -> String {
+    let (fallback, extension) = match evidence.kind.as_str() {
+        "resume" => ("bluey-submitted-resume", "pdf"),
+        "cover_letter" => ("bluey-submitted-cover-letter", "pdf"),
+        "attachment" => ("bluey-submitted-attachment", "pdf"),
+        "application_receipt" => ("bluey-application-receipt", "json"),
+        "submission_confirmation" => ("bluey-submission-confirmation", "png"),
+        _ => ("bluey-application-evidence", "bin"),
+    };
+    let leaf = evidence.file_name.replace('\\', "/");
+    let leaf = leaf.rsplit('/').next().unwrap_or_default().trim();
+    let stem = leaf.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(leaf);
+    let stem = safe_file_part(stem);
+    format!(
+        "{}.{}",
+        if stem.is_empty() { fallback } else { &stem },
+        extension
+    )
+}
+
+fn evidence_download_integrity_error(
+    application_id: &str,
+    evidence_id: &str,
+    reason: &'static str,
+) -> ApiError {
+    tracing::warn!(
+        application_id_hash = %sha256_hex(application_id.as_bytes()),
+        evidence_id_hash = %sha256_hex(evidence_id.as_bytes()),
+        reason,
+        "application evidence download failed closed"
+    );
+    (
+        StatusCode::CONFLICT,
+        "Stored application evidence did not pass integrity verification.".to_string(),
+    )
+}
+
 pub async fn commit_application_packet(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -1622,14 +3199,10 @@ pub async fn commit_application_packet(
     jobs::commit_packet(&state.pool, &account.id, &application_id)
         .map(Json)
         .map_err(|error| {
-            if error.to_string().contains("insufficient Bluey balance") {
-                (
-                    StatusCode::PAYMENT_REQUIRED,
-                    "Add to your Bluey balance to complete this application packet.".to_string(),
-                )
-            } else {
-                internal(error)
-            }
+            packet_commit_error(
+                error,
+                "Add to your Bluey balance to complete this application packet.",
+            )
         })
 }
 
@@ -1646,6 +3219,8 @@ pub struct QueueApplicationRunResponse {
     pub workflow_id: String,
     pub run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_command: Option<WorkflowCommandAdmissionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_url: Option<String>,
 }
 
@@ -1654,13 +3229,31 @@ pub async fn queue_application_run(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(application_id): Path<String>,
     Json(req): Json<QueueApplicationRunRequest>,
-) -> Result<Json<QueueApplicationRunResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     if !matches!(req.runner.as_str(), "local" | "cloud") {
         return bad_request("Choose the local or cloud runner.");
     }
-    let mut application = jobs::get_application(&state.pool, &account.id, &application_id)
+    let current_authority = jobs::current_application_approval_authority(
+        &state.pool,
+        &account.id,
+        &account.email,
+        &application_id,
+    )
+    .map_err(domain_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    if jobs::application_job_integrity_receipt(&current_authority.application)
         .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+        .as_ref()
+        != Some(&current_authority.job_integrity)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "The approved packet no longer matches current signed job authority. Prepare or approve it again."
+                .to_string(),
+        ));
+    }
+    let mut application = current_authority.application;
+    let posting = current_authority.posting;
     if application.state == "awaiting_review" {
         return Err((
             StatusCode::CONFLICT,
@@ -1677,11 +3270,7 @@ pub async fn queue_application_run(
         ));
     }
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-    let runners = build_runner_availability(
-        &entitlement,
-        jobs_local_browser_distribution_enabled(),
-        jobs_cloud_browser_distribution_enabled(),
-    );
+    let runners = account_runner_availability(&state.pool, &account.id, &entitlement)?;
     let channel = if req.runner == "local" {
         &runners.local
     } else {
@@ -1698,9 +3287,6 @@ pub async fn queue_application_run(
             format!("{} {}", channel.reason, channel.next_action),
         ));
     }
-    let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
     let resume_id = application.resume_version_id.clone().ok_or((
         StatusCode::CONFLICT,
         "Create the tailored resume before starting this application.".to_string(),
@@ -1711,14 +3297,10 @@ pub async fn queue_application_run(
             StatusCode::CONFLICT,
             "Tailored resume not found.".to_string(),
         ))?;
-    let eligibility = jobs::evaluate_job_eligibility(
-        &state.pool,
-        &account.id,
-        &posting,
-        true,
-        Some(&application.id),
-    )
-    .map_err(internal)?;
+    let eligibility = posting.eligibility.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "Current signed job eligibility is unavailable. Prepare the packet again.".to_string(),
+    ))?;
     let runner_allowed = if req.runner == "cloud" {
         eligibility.can_queue_cloud
     } else {
@@ -1733,26 +3315,26 @@ pub async fn queue_application_run(
             .unwrap_or_else(|| "This site is not eligible for that runner.".to_string());
         return Err((StatusCode::CONFLICT, message));
     }
-    let (identity_id, identity_email) = approved_application_identity(&application)?;
-    let existing_run = if matches!(
+    let existing_run_id = if matches!(
         application.state.as_str(),
         "queued" | "running" | "needs_input"
     ) {
-        if let Some(run_id) = application.run_id.clone() {
-            jobs::list_browser_sessions(&state.pool, &account.id)
-                .map_err(internal)?
-                .into_iter()
-                .find(|session| session.id == run_id)
-                .map(|session| (run_id, session))
-        } else {
-            None
-        }
+        application.run_id.clone()
     } else {
         None
     };
-    if existing_run
+    let existing_session = if let Some(run_id) = existing_run_id.as_deref() {
+        let cloud_session_id = format!("cloud-{}", application.id);
+        jobs::list_browser_sessions(&state.pool, &account.id)
+            .map_err(internal)?
+            .into_iter()
+            .find(|session| session.id == run_id || session.id == cloud_session_id)
+    } else {
+        None
+    };
+    if existing_session
         .as_ref()
-        .is_some_and(|(_, session)| session.runner != req.runner)
+        .is_some_and(|session| session.runner != req.runner)
     {
         return Err((
             StatusCode::CONFLICT,
@@ -1766,121 +3348,32 @@ pub async fn queue_application_run(
             "This listing needs a reviewed handoff before cloud automation.".to_string(),
         ));
     }
-    let run_id = existing_run
-        .as_ref()
-        .map(|(run_id, _)| run_id.clone())
-        .unwrap_or_else(|| {
-            application_run_id(
-                &account.id,
-                &application.id,
-                &resume.id,
-                application.updated_at_ms,
-            )
-        });
-    let cloud_gateway = if req.runner == "cloud" {
-        let origin = std::env::var("BLUEY_JOBS_WORKFLOW_ORIGIN")
-            .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-        let token = std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN").unwrap_or_default();
-        if token.is_empty() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The cloud runner is temporarily unavailable.".to_string(),
-            ));
-        }
-        Some((origin, token))
-    } else {
-        None
-    };
-    jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, &req.runner)
-        .map_err(domain_error)?;
-    jobs::commit_packet(&state.pool, &account.id, &application.id).map_err(|error| {
-        let _ = jobs::update_attempt_reservation_status(
-            &state.pool,
+    let run_id = existing_run_id.unwrap_or_else(|| {
+        application_run_id(
             &account.id,
             &application.id,
-            "released",
-        );
-        domain_error(error)
-    })?;
-    if application.state != "queued" {
-        application = jobs::update_application(
-            &state.pool,
-            &account.id,
-            &application.id,
-            "queued",
-            Some(&application.submission_mode),
+            &resume.id,
+            application.updated_at_ms,
         )
-        .map_err(domain_error)?
-        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-    }
-
-    let (mut frozen_packet, frozen_job, approved_packet_checksum) =
-        approved_execution_snapshot(&application)?;
-    validate_approved_execution_matches(
+    });
+    let private_workflow_input = approved_workflow_input(
+        &account.id,
         &application,
         &posting,
         &resume,
-        &identity_id,
-        &identity_email,
-        &frozen_packet,
-        &frozen_job,
+        &req.runner,
+        &run_id,
     )?;
-    let browser_profile_id = browser_profile_id(&account.id, &identity_id);
-    frozen_packet
-        .as_object_mut()
-        .expect("approved packet is an object")
-        .insert(
-            "approvedPacketChecksum".to_string(),
-            Value::String(approved_packet_checksum),
-        );
-    let workflow_input = json!({
-        "accountId": account.id,
-        "applicationId": application.id,
-        "jobId": posting.id,
-        "canonicalJobKey": posting.canonical_key,
-        "packetId": resume.id,
-        "applicationIdentityId": identity_id,
-        "browserProfileId": browser_profile_id,
-        "packet": frozen_packet,
-        "job": frozen_job,
-        "runner": req.runner,
-        "url": posting.canonical_url,
-        "idempotencyKey": run_id,
-        "runId": run_id,
-        "browserSessionId": format!("{}-{}", req.runner, application.id),
-    });
-    if let Some((gateway_origin, gateway_token)) = cloud_gateway.as_ref() {
-        let response = reqwest::Client::new()
-            .post(format!(
-                "{}/workflows/applications",
-                gateway_origin.trim_end_matches('/')
-            ))
-            .bearer_auth(gateway_token)
-            .json(&workflow_input)
-            .send()
-            .await
-            .map_err(|error| {
-                tracing::error!(error = %error, "Bluey Jobs workflow gateway failed");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "Bluey could not start the cloud application. Try again.".to_string(),
-                )
-            })?;
-        if !response.status().is_success() && response.status() != StatusCode::CONFLICT {
-            tracing::error!(status = %response.status(), "Bluey Jobs workflow gateway rejected run");
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "Bluey could not start the cloud application. Try again.".to_string(),
-            ));
-        }
-    }
-
-    let mut browser_session =
-        existing_run
-            .map(|(_, session)| session)
+    if req.runner == "cloud" {
+        let workflow_id = workflow_id_for_run(&run_id);
+        let browser_session_id = format!("cloud-{}", application.id);
+        let browser_session = existing_session
+            .as_ref()
+            .filter(|session| session.id == browser_session_id)
+            .cloned()
             .unwrap_or_else(|| BrowserSession {
-                id: run_id.clone(),
-                runner: req.runner.clone(),
+                id: browser_session_id.clone(),
+                runner: "cloud".to_string(),
                 status: "queued".to_string(),
                 current_company: posting.company.clone(),
                 current_step: "Waiting for a browser".to_string(),
@@ -1889,52 +3382,144 @@ pub async fn queue_application_run(
                 created_at_ms: 0,
                 updated_at_ms: 0,
             });
-    browser_session = jobs::upsert_browser_session(&state.pool, &account.id, &browser_session)
-        .map_err(internal)?;
-    application = jobs::assign_application_run(&state.pool, &account.id, &application.id, &run_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-
-    if req.runner == "local" {
-        let ticket = if let Some(existing) =
-            jobs::get_local_run_ticket(&state.pool, &account.id, &run_id).map_err(internal)?
-        {
-            existing
-        } else {
-            let secret = random_local_run_ticket();
-            let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-            jobs::save_local_run_ticket(
-                &state.pool,
-                &account.id,
-                &application.id,
-                &run_id,
-                &hash,
-                &secret,
-                workflow_input,
-                jobs::now_ms() + 24 * 60 * 60 * 1_000,
-            )
+        let admission = jobs::stage_cloud_workflow_start(
+            &state.pool,
+            &jobs::StageCloudWorkflowStart {
+                account_id: account.id.clone(),
+                application_id: application.id.clone(),
+                run_id: run_id.clone(),
+                workflow_id: workflow_id.clone(),
+                idempotency_key: run_id.clone(),
+                workflow_input: private_workflow_input,
+                browser_session,
+                now_ms: jobs::now_ms(),
+            },
+        )
+        .map_err(domain_error)?;
+        application = jobs::get_application(&state.pool, &account.id, &application.id)
             .map_err(internal)?
-        };
-        return Ok(Json(QueueApplicationRunResponse {
-            application,
-            browser_session,
-            workflow_id: String::new(),
-            run_id: run_id.clone(),
-            launch_url: Some(format!(
-                "bluey-jobs://run/{run_id}?ticket={}",
-                ticket.ticket_secret
-            )),
-        }));
+            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+        let browser_session = jobs::list_browser_sessions(&state.pool, &account.id)
+            .map_err(internal)?
+            .into_iter()
+            .find(|session| session.id == browser_session_id)
+            .ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The queued cloud browser session is unavailable.".to_string(),
+            ))?;
+        return Ok(private_queue_application_run_response(
+            QueueApplicationRunResponse {
+                application,
+                browser_session,
+                workflow_id,
+                run_id,
+                workflow_command: Some(WorkflowCommandAdmissionResponse::from_admission(
+                    &admission,
+                )),
+                launch_url: None,
+            },
+        ));
     }
 
-    let workflow_id = format!("bluey-jobs:{}:{}", account.id, run_id);
-    Ok(Json(QueueApplicationRunResponse {
-        application,
-        browser_session,
-        workflow_id,
-        run_id,
-        launch_url: None,
-    }))
+    jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, "local")
+        .map_err(domain_error)?;
+    // Reservation and packet metering are durable, idempotent presteps, not part
+    // of publication. A blind release could erase a competing request's attempt.
+    jobs::commit_packet(&state.pool, &account.id, &application.id).map_err(domain_error)?;
+    let browser_session = existing_session.unwrap_or_else(|| BrowserSession {
+        id: run_id.clone(),
+        runner: "local".to_string(),
+        status: "queued".to_string(),
+        current_company: posting.company.clone(),
+        current_step: "Waiting for a browser".to_string(),
+        application_id: Some(application.id.clone()),
+        takeover_url: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    });
+    let local_workflow_input = json!({
+        "accountId": private_workflow_input["accountId"].clone(),
+        "applicationId": private_workflow_input["applicationId"].clone(),
+        "jobId": private_workflow_input["jobId"].clone(),
+        "canonicalJobKey": private_workflow_input["canonicalJobKey"].clone(),
+        "packetId": private_workflow_input["packetId"].clone(),
+        "applicationIdentityId": private_workflow_input["applicationIdentityId"].clone(),
+        "browserProfileId": private_workflow_input["browserProfileId"].clone(),
+        "packet": private_workflow_input["packet"].clone(),
+        "job": private_workflow_input["job"].clone(),
+        "runner": "local",
+        "url": private_workflow_input["url"].clone(),
+        "idempotencyKey": run_id,
+        "runId": run_id,
+        "browserSessionId": browser_session.id,
+    });
+    let secret = random_local_run_ticket();
+    let hash = hex::encode(Sha256::digest(secret.as_bytes()));
+    let published = jobs::publish_local_application_run(
+        &state.pool,
+        &jobs::PublishLocalApplicationRun {
+            account_id: account.id.clone(),
+            expected_application: application,
+            run_id: run_id.clone(),
+            workflow_input: local_workflow_input,
+            browser_session,
+            ticket_hash: hash,
+            ticket_secret: secret,
+            expires_at_ms: jobs::now_ms() + 24 * 60 * 60 * 1_000,
+        },
+    )
+    .map_err(local_run_publication_error)?;
+    Ok(private_queue_application_run_response(
+        QueueApplicationRunResponse {
+            application: published.application,
+            browser_session: published.browser_session,
+            workflow_id: String::new(),
+            run_id: run_id.clone(),
+            workflow_command: None,
+            launch_url: Some(format!(
+                "bluey-jobs://run/{run_id}?ticket={}",
+                published.ticket.ticket_secret
+            )),
+        },
+    ))
+}
+
+fn private_queue_application_run_response(value: QueueApplicationRunResponse) -> Response {
+    let mut response = Json(value).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
+fn local_run_publication_error(error: anyhow::Error) -> ApiError {
+    if let Some(error) = error.downcast_ref::<jobs::LocalRunPublicationError>() {
+        return match error {
+            jobs::LocalRunPublicationError::InvalidRequest => (
+                StatusCode::BAD_REQUEST,
+                "The local browser request is invalid.".to_string(),
+            ),
+            jobs::LocalRunPublicationError::Missing => {
+                (StatusCode::NOT_FOUND, "Application not found.".to_string())
+            }
+            jobs::LocalRunPublicationError::Conflict => (
+                StatusCode::CONFLICT,
+                "The application or local browser authority changed. Refresh and review it again."
+                    .to_string(),
+            ),
+        };
+    }
+    match error.downcast_ref::<UploadControlError>() {
+        Some(UploadControlError::AccountDeleting) => (
+            StatusCode::CONFLICT,
+            "Account deletion has fenced new local browser runs.".to_string(),
+        ),
+        Some(UploadControlError::SessionNotOwned) => {
+            (StatusCode::NOT_FOUND, "Application not found.".to_string())
+        }
+        _ => domain_error(error),
+    }
 }
 
 fn application_run_id(
@@ -1948,6 +3533,54 @@ fn application_run_id(
         account_id, application_id, resume_version_id, application_updated_at_ms
     );
     hex::encode(Sha256::digest(input.as_bytes()))[..40].to_string()
+}
+
+fn workflow_id_for_run(run_id: &str) -> String {
+    format!("bluey-jobs-v2-{run_id}")
+}
+
+fn approved_workflow_input(
+    account_id: &str,
+    application: &JobApplication,
+    posting: &JobPosting,
+    resume: &ResumeVersion,
+    runner: &str,
+    run_id: &str,
+) -> Result<Value, ApiError> {
+    if !matches!(runner, "local" | "cloud") {
+        return bad_request("Choose the local or cloud runner.");
+    }
+    let (identity_id, identity_email) = approved_application_identity(application)?;
+    let (mut packet, job, approved_packet_checksum) = approved_execution_snapshot(application)?;
+    validate_approved_execution_matches(
+        application,
+        posting,
+        resume,
+        &identity_id,
+        &identity_email,
+        &packet,
+        &job,
+    )?;
+    let exact_destination = job
+        .get("canonicalUrl")
+        .and_then(Value::as_str)
+        .expect("validated approved job has an exact canonical URL")
+        .to_string();
+    attach_approved_execution_transport(application, &mut packet, approved_packet_checksum)?;
+    Ok(json!({
+        "accountId": account_id,
+        "applicationId": application.id,
+        "jobId": posting.id,
+        "canonicalJobKey": posting.canonical_key,
+        "packetId": resume.id,
+        "applicationIdentityId": identity_id,
+        "browserProfileId": browser_profile_id(account_id, &identity_id),
+        "packet": packet,
+        "job": job,
+        "runner": runner,
+        "url": exact_destination,
+        "idempotencyKey": run_id,
+    }))
 }
 
 fn browser_profile_id(account_id: &str, identity_id: &str) -> String {
@@ -1990,14 +3623,24 @@ fn freeze_approved_execution(
     state: &AppState,
     account_id: &str,
     account_email: &str,
-    application: &JobApplication,
-    posting: &JobPosting,
+    authority: &jobs::CurrentApplicationApprovalAuthority,
     resume: &ResumeVersion,
 ) -> Result<JobApplication, ApiError> {
+    let application = &authority.application;
+    let posting = &authority.posting;
     let (identity_id, identity_email) = approved_application_identity(application)?;
     if application.receipt.get("approved_execution").is_some() {
+        if application.submission_mode == "auto_submit"
+            && !jobs::application_has_frozen_ats_certification(application)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "This Auto-submit packet predates exact ATS certification. Prepare and approve it again."
+                    .to_string(),
+            ));
+        }
         let (packet, job, _) = approved_execution_snapshot(application)?;
-        validate_approved_execution_matches(
+        if validate_approved_execution_matches(
             application,
             posting,
             resume,
@@ -2005,8 +3648,15 @@ fn freeze_approved_execution(
             &identity_email,
             &packet,
             &job,
-        )?;
-        return Ok(application.clone());
+        )
+        .is_ok()
+            && jobs::application_job_integrity_receipt(application)
+                .map_err(internal)?
+                .as_ref()
+                == Some(&authority.job_integrity)
+        {
+            return Ok(application.clone());
+        }
     }
 
     let profile = jobs::get_profile(&state.pool, account_id, account_email).map_err(internal)?;
@@ -2035,46 +3685,73 @@ fn freeze_approved_execution(
         "source": ats_kind(&posting.canonical_url),
         "compensation": posting.compensation,
     });
-    let admission = if application.submission_mode == "auto_submit" {
+    let approved_at_ms = jobs::now_ms();
+    let (schema_version, admission) = if application.submission_mode == "auto_submit" {
         let authorization = jobs::require_valid_auto_submit_authorization(
             &state.pool,
             account_id,
             account_email,
             &posting.track_id,
         )
-        .map_err(domain_error)?;
-        json!({
-            "kind": "track_auto_submit",
-            "authorization_id": authorization.id,
-            "career_track_id": authorization.career_track_id,
-            "revision_no": authorization.revision_no,
-            "authority_fingerprint": authorization.authority_fingerprint,
-        })
+        .map_err(auto_submit_authorization_error)?;
+        let binding = authority
+            .ats_certification
+            .active_binding
+            .as_ref()
+            .filter(|_| authority.ats_certification.status.status == "active")
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "This exact ATS target does not have current server-owned certification. Review the packet or try again after certification is restored."
+                        .to_string(),
+                )
+            })?;
+        let ats_certification = jobs::ats_frozen_certification_admission_projection(binding)
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "This exact ATS certification cannot be frozen into the approved packet. Review the packet or prepare it again."
+                        .to_string(),
+                )
+            })?;
+        (
+            3,
+            json!({
+                "kind": "track_auto_submit",
+                "authorization_id": authorization.id,
+                "career_track_id": authorization.career_track_id,
+                "revision_no": authorization.revision_no,
+                "authority_fingerprint": authorization.authority_fingerprint,
+                "ats_certification": ats_certification,
+            }),
+        )
     } else {
-        json!({
-            "kind": "review_approval",
-        })
+        (
+            2,
+            json!({
+                "kind": "review_approval",
+            }),
+        )
     };
-    let checksum = approved_execution_checksum_v2(&packet, &job, &admission)?;
+    let checksum =
+        approved_execution_checksum_with_admission(schema_version, &packet, &job, &admission)?;
     let approved_execution = json!({
-        "schema_version": 2,
-        "approved_at_ms": jobs::now_ms(),
+        "schema_version": schema_version,
+        "approved_at_ms": approved_at_ms,
         "checksum": checksum,
         "admission": admission,
         "packet": packet,
         "job": job,
     });
-    let mut receipt = application.receipt.clone();
-    if !receipt.is_object() {
-        receipt = json!({});
-    }
-    receipt
-        .as_object_mut()
-        .expect("application receipt is an object")
-        .insert("approved_execution".to_string(), approved_execution);
-    jobs::replace_application_receipt(&state.pool, account_id, &application.id, receipt)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
+    jobs::persist_current_application_approval(
+        &state.pool,
+        account_id,
+        account_email,
+        authority,
+        &approved_execution,
+    )
+    .map_err(domain_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
 }
 
 fn approved_execution_snapshot(
@@ -2092,7 +3769,7 @@ fn approved_execution_snapshot(
         .get("schema_version")
         .and_then(Value::as_i64)
         .unwrap_or_default();
-    if !matches!(schema_version, 1 | 2) {
+    if !matches!(schema_version, 1..=3) {
         return Err((
             StatusCode::CONFLICT,
             "This approved packet uses an unsupported version. Prepare it again.".to_string(),
@@ -2135,8 +3812,8 @@ fn approved_execution_snapshot(
                 StatusCode::CONFLICT,
                 "The application approval proof is incomplete. Prepare it again.".to_string(),
             ))?;
-        validate_approved_execution_admission(application, admission)?;
-        approved_execution_checksum_v2(&packet, &job, admission)?
+        validate_approved_execution_admission(application, schema_version, admission)?;
+        approved_execution_checksum_with_admission(schema_version, &packet, &job, admission)?
     };
     if checksum.len() != 64 || expected_checksum != checksum {
         return Err((
@@ -2147,49 +3824,142 @@ fn approved_execution_snapshot(
     Ok((packet, job, checksum))
 }
 
+fn attach_approved_execution_transport(
+    application: &JobApplication,
+    packet: &mut Value,
+    checksum: String,
+) -> Result<(), ApiError> {
+    let approved = application
+        .receipt
+        .get("approved_execution")
+        .and_then(Value::as_object)
+        .ok_or((
+            StatusCode::CONFLICT,
+            "The approved application packet is incomplete. Prepare it again.".to_string(),
+        ))?;
+    let schema_version = approved
+        .get("schema_version")
+        .and_then(Value::as_i64)
+        .filter(|value| matches!(*value, 1..=3))
+        .ok_or((
+            StatusCode::CONFLICT,
+            "This approved packet uses an unsupported version. Prepare it again.".to_string(),
+        ))?;
+    let fields = packet.as_object_mut().ok_or((
+        StatusCode::CONFLICT,
+        "The approved application packet is incomplete. Prepare it again.".to_string(),
+    ))?;
+    fields.insert(
+        "approvedPacketChecksum".to_string(),
+        Value::String(checksum),
+    );
+    fields.insert(
+        "approvedExecutionSchemaVersion".to_string(),
+        Value::Number(schema_version.into()),
+    );
+    if matches!(schema_version, 2 | 3) {
+        fields.insert(
+            "approvedExecutionAdmission".to_string(),
+            approved
+                .get("admission")
+                .filter(|value| value.is_object())
+                .cloned()
+                .ok_or((
+                    StatusCode::CONFLICT,
+                    "The application approval proof is incomplete. Prepare it again.".to_string(),
+                ))?,
+        );
+    }
+    Ok(())
+}
+
 fn approved_execution_checksum(packet: &Value, job: &Value) -> Result<String, ApiError> {
     let canonical = canonical_json_value(&json!({
         "schema_version": 1,
         "packet": packet,
         "job": job,
-    }));
+    }))?;
     let bytes = serde_json::to_vec(&canonical).map_err(|error| internal(error.into()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+#[cfg(test)]
 fn approved_execution_checksum_v2(
     packet: &Value,
     job: &Value,
     admission: &Value,
 ) -> Result<String, ApiError> {
+    approved_execution_checksum_with_admission(2, packet, job, admission)
+}
+
+fn approved_execution_checksum_with_admission(
+    schema_version: i64,
+    packet: &Value,
+    job: &Value,
+    admission: &Value,
+) -> Result<String, ApiError> {
+    if !matches!(schema_version, 2 | 3) {
+        return Err((
+            StatusCode::CONFLICT,
+            "This approved packet uses an unsupported version. Prepare it again.".to_string(),
+        ));
+    }
     let canonical = canonical_json_value(&json!({
-        "schema_version": 2,
+        "schema_version": schema_version,
         "admission": admission,
         "packet": packet,
         "job": job,
-    }));
+    }))?;
     let bytes = serde_json::to_vec(&canonical).map_err(|error| internal(error.into()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn validate_approved_execution_admission(
     application: &JobApplication,
+    schema_version: i64,
     admission: &Value,
 ) -> Result<(), ApiError> {
+    let Some(admission) = admission.as_object() else {
+        return Err((
+            StatusCode::CONFLICT,
+            "The application approval proof is incomplete. Prepare it again.".to_string(),
+        ));
+    };
     let kind = admission
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or_default();
     if application.submission_mode == "auto_submit" {
         let complete = kind == "track_auto_submit"
+            && approved_execution_object_has_keys(
+                admission,
+                if schema_version == 3 {
+                    &[
+                        "ats_certification",
+                        "authority_fingerprint",
+                        "authorization_id",
+                        "career_track_id",
+                        "kind",
+                        "revision_no",
+                    ]
+                } else {
+                    &[
+                        "authority_fingerprint",
+                        "authorization_id",
+                        "career_track_id",
+                        "kind",
+                        "revision_no",
+                    ]
+                },
+            )
             && admission
                 .get("authorization_id")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_some_and(valid_approved_execution_identifier)
             && admission
                 .get("career_track_id")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_some_and(valid_approved_execution_identifier)
             && admission
                 .get("revision_no")
                 .and_then(Value::as_i64)
@@ -2197,7 +3967,11 @@ fn validate_approved_execution_admission(
             && admission
                 .get("authority_fingerprint")
                 .and_then(Value::as_str)
-                .is_some_and(|value| value.len() == 64);
+                .is_some_and(valid_approved_execution_sha256)
+            && (schema_version != 3
+                || admission
+                    .get("ats_certification")
+                    .is_some_and(valid_ats_certification_admission));
         if !complete {
             return Err((
                 StatusCode::CONFLICT,
@@ -2205,7 +3979,8 @@ fn validate_approved_execution_admission(
                     .to_string(),
             ));
         }
-    } else if kind != "review_approval" {
+    } else if kind != "review_approval" || !approved_execution_object_has_keys(admission, &["kind"])
+    {
         return Err((
             StatusCode::CONFLICT,
             "Approve this exact application packet before starting a browser runner.".to_string(),
@@ -2214,17 +3989,153 @@ fn validate_approved_execution_admission(
     Ok(())
 }
 
-fn canonical_json_value(value: &Value) -> Value {
+fn valid_ats_certification_admission(value: &Value) -> bool {
+    let Some(certification) = value.as_object() else {
+        return false;
+    };
+    if !approved_execution_object_has_keys(
+        certification,
+        &[
+            "activation_generation",
+            "activation_sha256",
+            "adapter_bundle_sha256",
+            "adapter_version",
+            "expires_at_ms",
+            "layout_contract_version",
+            "layout_set_sha256",
+            "manifest_sha256",
+            "provider",
+            "runner_target_sha256s",
+            "schema_version",
+            "surface_sha256",
+            "target_key_sha256",
+            "variant_key",
+        ],
+    ) || certification.get("schema_version").and_then(Value::as_i64) != Some(1)
+    {
+        return false;
+    }
+    let provider = certification
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let adapter_version = certification
+        .get("adapter_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        (provider, adapter_version),
+        ("greenhouse", "2026.07.1-beta.1") | ("lever", "2026.07.0-beta.1")
+    ) || certification
+        .get("variant_key")
+        .and_then(Value::as_str)
+        .is_none_or(|value| !valid_approved_execution_identifier(value))
+        || certification
+            .get("layout_contract_version")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+        || certification
+            .get("activation_generation")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+        || certification
+            .get("expires_at_ms")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+    {
+        return false;
+    }
+    for key in [
+        "activation_sha256",
+        "adapter_bundle_sha256",
+        "layout_set_sha256",
+        "manifest_sha256",
+        "surface_sha256",
+        "target_key_sha256",
+    ] {
+        if !certification
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(valid_approved_execution_sha256)
+        {
+            return false;
+        }
+    }
+    let Some(targets) = certification
+        .get("runner_target_sha256s")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if targets.is_empty() || targets.len() > 2 {
+        return false;
+    }
+    let mut previous: Option<&str> = None;
+    for target in targets {
+        let Some(target) = target.as_str().filter(|value| {
+            valid_approved_execution_sha256(value)
+                && previous.is_none_or(|previous| previous < *value)
+        }) else {
+            return false;
+        };
+        previous = Some(target);
+    }
+    true
+}
+
+fn approved_execution_object_has_keys(
+    value: &serde_json::Map<String, Value>,
+    expected: &[&str],
+) -> bool {
+    value.len() == expected.len() && expected.iter().all(|key| value.contains_key(*key))
+}
+
+fn valid_approved_execution_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 240
+        && value.trim() == value
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn valid_approved_execution_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_json_value(value: &Value) -> Result<Value, ApiError> {
+    const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
     match value {
-        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        Value::Array(values) => values
+            .iter()
+            .map(canonical_json_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
         Value::Object(values) => {
             let sorted = values
                 .iter()
-                .map(|(key, value)| (key.clone(), canonical_json_value(value)))
-                .collect::<BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect())
+                .map(|(key, value)| Ok((key.clone(), canonical_json_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>, ApiError>>()?;
+            Ok(Value::Object(sorted.into_iter().collect()))
         }
-        other => other.clone(),
+        Value::Number(number) => {
+            let interoperable = number
+                .as_i64()
+                .is_some_and(|value| (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&value))
+                || number
+                    .as_u64()
+                    .is_some_and(|value| value <= MAX_SAFE_INTEGER as u64);
+            if !interoperable {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "The approved application packet contains a non-interoperable number. Prepare it again."
+                        .to_string(),
+                ));
+            }
+            Ok(value.clone())
+        }
+        other => Ok(other.clone()),
     }
 }
 
@@ -2249,6 +4160,34 @@ fn validate_approved_execution_matches(
         return Err((
             StatusCode::CONFLICT,
             "The approved packet no longer matches this job, resume, or application email. Prepare it again."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_frozen_approved_execution_matches(
+    application: &JobApplication,
+    resume: &ResumeVersion,
+    identity_id: &str,
+    identity_email: &str,
+    packet: &Value,
+    job: &Value,
+) -> Result<(), ApiError> {
+    let matches = packet.get("applicationId").and_then(Value::as_str)
+        == Some(application.id.as_str())
+        && packet.get("jobId").and_then(Value::as_str) == Some(application.job_id.as_str())
+        && packet.get("resumeVersionId").and_then(Value::as_str) == Some(resume.id.as_str())
+        && packet.get("applicationIdentityId").and_then(Value::as_str) == Some(identity_id)
+        && packet.get("applicationEmail").and_then(Value::as_str) == Some(identity_email)
+        && job
+            .get("canonicalUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    if !matches {
+        return Err((
+            StatusCode::CONFLICT,
+            "The frozen approved packet does not match this application, resume, or application email."
                 .to_string(),
         ));
     }
@@ -2312,11 +4251,7 @@ pub async fn save_browser_session(
         }
     }
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-    let runners = build_runner_availability(
-        &entitlement,
-        jobs_local_browser_distribution_enabled(),
-        jobs_cloud_browser_distribution_enabled(),
-    );
+    let runners = account_runner_availability(&state.pool, &account.id, &entitlement)?;
     let channel = if session.runner == "local" {
         &runners.local
     } else {
@@ -2373,6 +4308,8 @@ pub struct ResolveInterventionRequest {
     pub scope: String,
     #[serde(default)]
     pub scope_id: Option<String>,
+    #[serde(default)]
+    pub expected_company_scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2382,6 +4319,8 @@ pub struct InterventionResolutionResult {
     pub application: Option<JobApplication>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_resume: Option<jobs::LocalRunResumeAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_command: Option<WorkflowCommandAdmissionResponse>,
 }
 
 pub async fn update_intervention(
@@ -2397,7 +4336,7 @@ pub async fn update_intervention(
         .ok_or((StatusCode::NOT_FOUND, "Intervention not found.".to_string()))?;
     let mut updated = intervention;
     let action = req.action.trim().to_ascii_lowercase();
-    let mut remembered_answer = None;
+    let remembered_answer = None;
     let original_status = updated.status.clone();
     updated.status = req.status.trim().to_ascii_lowercase();
     if action == "approve_email_otp" {
@@ -2422,7 +4361,7 @@ pub async fn update_intervention(
             }
         }
     } else if action == "approve_submission" {
-        if original_status != "open" {
+        if !matches!(original_status.as_str(), "open" | "approved") {
             return Err((
                 StatusCode::CONFLICT,
                 "This intervention has already been resolved.".to_string(),
@@ -2432,6 +4371,7 @@ pub async fn update_intervention(
             || req.remember
             || !req.scope.trim().is_empty()
             || req.scope_id.is_some()
+            || req.expected_company_scope.is_some()
         {
             return bad_request("Submission approval cannot include answer data.");
         }
@@ -2480,35 +4420,49 @@ pub async fn update_intervention(
         if answer.len() > 10_000 {
             return bad_request("That answer is too long.");
         }
-        let answered_at_ms = jobs::now_ms();
-        let metadata = updated.metadata.as_object_mut().ok_or((
-            StatusCode::BAD_REQUEST,
-            "This intervention cannot be answered.".to_string(),
-        ))?;
-        metadata.insert("resolved_answer".to_string(), serde_json::json!(answer));
-        metadata.insert(
-            "answered_at_ms".to_string(),
-            serde_json::json!(answered_at_ms),
-        );
-        updated.status = "resolved".to_string();
+        let scope = if req.scope.trim().is_empty() {
+            "account".to_string()
+        } else {
+            req.scope.trim().to_ascii_lowercase()
+        };
+        let scope_id = req
+            .scope_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         if req.remember {
-            let question = updated
-                .metadata
-                .pointer("/receipt/intervention/field")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(&updated.title);
+            if !matches!(scope.as_str(), "account" | "track" | "company") {
+                return bad_request("Choose where this answer should be reused.");
+            }
+            if scope == "track" && scope_id.is_none() {
+                return bad_request("Choose where this answer should be reused.");
+            }
+            if scope == "track"
+                && !jobs::list_tracks(&state.pool, &account.id)
+                    .map_err(internal)?
+                    .iter()
+                    .any(|track| Some(track.id.as_str()) == scope_id.as_deref())
+            {
+                return bad_request("Career track not found.");
+            }
+        }
+
+        let revision = jobs::resolve_intervention_answer_for_review(
+            &state.pool,
+            &account.id,
+            &intervention_id,
+            answer,
+        )
+        .map_err(intervention_answer_revision_error)?;
+        let remembered_answer = if req.remember {
             let memory = AnswerMemory {
                 id: String::new(),
                 key: String::new(),
-                question: question.to_string(),
+                question: revision.question.clone(),
                 value: answer.to_string(),
-                scope: if req.scope.trim().is_empty() {
-                    "account".to_string()
-                } else {
-                    req.scope.clone()
-                },
-                scope_id: req.scope_id.clone(),
+                scope,
+                scope_id,
                 confirmed: true,
                 source: "intervention".to_string(),
                 created_at_ms: 0,
@@ -2516,10 +4470,162 @@ pub async fn update_intervention(
                 last_used_at_ms: None,
                 use_count: 0,
             };
-            remembered_answer = Some(
+            let saved = if memory.scope == "company" {
+                match req.expected_company_scope.as_deref() {
+                    Some(expected) => jobs::save_verified_company_answer_memory(
+                        &state.pool,
+                        &account.id,
+                        &revision.application.job_id,
+                        expected,
+                        &memory,
+                    ),
+                    None => Err(anyhow::anyhow!("verified employer confirmation required")),
+                }
+            } else {
                 jobs::save_answer_memory(&state.pool, &account.id, &memory)
-                    .map_err(domain_error)?,
-            );
+            };
+            match saved {
+                Ok(memory) => Some(memory),
+                Err(error) => {
+                    tracing::error!(
+                        application_id = %revision.application.id,
+                        intervention_id = %revision.intervention.id,
+                        error = %error,
+                        "Bluey Jobs saved an intervention answer but could not update answer memory"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        return Ok(Json(InterventionResolutionResult {
+            intervention: revision.intervention,
+            answer_memory: remembered_answer,
+            application: Some(revision.application),
+            local_resume: None,
+            workflow_command: None,
+        }));
+    }
+    let resumes_runner = matches!(action.as_str(), "approve_email_otp" | "approve_submission")
+        && updated.resume_after_resolution
+        && matches!(updated.status.as_str(), "approved" | "resolved");
+    if resumes_runner {
+        if let Some(application_id) = updated.application_id.as_deref() {
+            let application = jobs::get_application(&state.pool, &account.id, application_id)
+                .map_err(internal)?
+                .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+            let run_id = application.run_id.as_deref().ok_or((
+                StatusCode::CONFLICT,
+                "This application has no active browser run.".to_string(),
+            ))?;
+            let sessions =
+                jobs::list_browser_sessions(&state.pool, &account.id).map_err(internal)?;
+            let local_session = action == "approve_submission"
+                && sessions
+                    .iter()
+                    .any(|session| session.id == run_id && session.runner == "local");
+            if !local_session {
+                let current_authority = jobs::current_application_approval_authority(
+                    &state.pool,
+                    &account.id,
+                    &account.email,
+                    &application.id,
+                )
+                .map_err(domain_error)?
+                .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+                if current_authority.application.run_id.as_deref() != Some(run_id)
+                    || jobs::application_job_integrity_receipt(&current_authority.application)
+                        .map_err(internal)?
+                        .as_ref()
+                        != Some(&current_authority.job_integrity)
+                    || !current_authority
+                        .posting
+                        .eligibility
+                        .as_ref()
+                        .is_some_and(|eligibility| eligibility.can_queue_cloud)
+                {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "The approved packet no longer has current signed cloud-runner authority."
+                            .to_string(),
+                    ));
+                }
+                let application = current_authority.application;
+                let posting = current_authority.posting;
+                let resume_id = application.resume_version_id.as_deref().ok_or((
+                    StatusCode::CONFLICT,
+                    "The approved application resume is unavailable.".to_string(),
+                ))?;
+                let resume = jobs::get_resume_version(&state.pool, &account.id, resume_id)
+                    .map_err(internal)?
+                    .ok_or((
+                        StatusCode::CONFLICT,
+                        "The approved application resume is unavailable.".to_string(),
+                    ))?;
+                let workflow_id = workflow_id_for_run(run_id);
+                let browser_session_id = format!("cloud-{}", application.id);
+                if !sessions.iter().any(|session| {
+                    session.id == browser_session_id
+                        && session.runner == "cloud"
+                        && session.application_id.as_deref() == Some(application.id.as_str())
+                }) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "The cloud browser run is not waiting for this approval.".to_string(),
+                    ));
+                }
+                let field = updated
+                    .metadata
+                    .pointer("/receipt/intervention/field")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let workflow_input = approved_workflow_input(
+                    &account.id,
+                    &application,
+                    &posting,
+                    &resume,
+                    "cloud",
+                    run_id,
+                )?;
+                let admission = jobs::stage_cloud_workflow_resume(
+                    &state.pool,
+                    &jobs::StageCloudWorkflowResume {
+                        account_id: account.id.clone(),
+                        application_id: application.id.clone(),
+                        run_id: run_id.to_string(),
+                        workflow_id,
+                        intervention_id: updated.id.clone(),
+                        idempotency_key: updated.id.clone(),
+                        workflow_input,
+                        browser_session_id,
+                        resolution: json!({
+                            "action": action,
+                            "field": field,
+                            "answer": "",
+                        }),
+                        now_ms: jobs::now_ms(),
+                    },
+                )
+                .map_err(domain_error)?;
+                let saved = jobs::list_interventions(&state.pool, &account.id)
+                    .map_err(internal)?
+                    .into_iter()
+                    .find(|item| item.id == intervention_id)
+                    .ok_or((StatusCode::NOT_FOUND, "Intervention not found.".to_string()))?;
+                let application = jobs::get_application(&state.pool, &account.id, application_id)
+                    .map_err(internal)?
+                    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+                return Ok(Json(InterventionResolutionResult {
+                    intervention: saved,
+                    answer_memory: remembered_answer,
+                    application: Some(application),
+                    local_resume: None,
+                    workflow_command: Some(WorkflowCommandAdmissionResponse::from_admission(
+                        &admission,
+                    )),
+                }));
+            }
         }
     }
     let mut saved = if action == "approve_submission" {
@@ -2527,10 +4633,7 @@ pub async fn update_intervention(
     } else {
         None
     };
-    let resumed_application = if !action.is_empty()
-        && updated.resume_after_resolution
-        && matches!(updated.status.as_str(), "approved" | "resolved")
-    {
+    let resumed_application = if resumes_runner {
         if let Some(application_id) = updated.application_id.as_deref() {
             jobs::update_application(&state.pool, &account.id, application_id, "queued", None)
                 .map_err(domain_error)?
@@ -2547,11 +4650,6 @@ pub async fn update_intervention(
     let mut local_resume = None;
     if let Some(application) = resumed_application.as_ref() {
         if let Some(run_id) = application.run_id.as_deref() {
-            let field = saved
-                .metadata
-                .pointer("/receipt/intervention/field")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
             let local_session = if action == "approve_submission" {
                 jobs::list_browser_sessions(&state.pool, &account.id)
                     .map_err(internal)?
@@ -2586,26 +4684,10 @@ pub async fn update_intervention(
                 };
                 local_resume = Some(approved);
             } else {
-                let answer = if action == "approve_submission" {
-                    ""
-                } else {
-                    req.answer.trim()
-                };
-                if let Err(error) =
-                    signal_workflow_resume(&account.id, run_id, &action, field, answer).await
-                {
-                    tracing::error!(error = %error.1, "Bluey Jobs workflow resume failed");
-                    saved.status = "open".to_string();
-                    jobs::save_intervention(&state.pool, &account.id, &saved).map_err(internal)?;
-                    let _ = jobs::update_application(
-                        &state.pool,
-                        &account.id,
-                        &application.id,
-                        "needs_input",
-                        None,
-                    );
-                    return Err(error);
-                }
+                return Err((
+                    StatusCode::CONFLICT,
+                    "The browser run is not waiting for this approval.".to_string(),
+                ));
             }
         }
     }
@@ -2614,6 +4696,7 @@ pub async fn update_intervention(
         answer_memory: remembered_answer,
         application: resumed_application,
         local_resume,
+        workflow_command: None,
     }))
 }
 
@@ -2687,48 +4770,6 @@ fn is_provider_final_review_intervention(
     }
 }
 
-async fn signal_workflow_resume(
-    account_id: &str,
-    run_id: &str,
-    action: &str,
-    field: &str,
-    answer: &str,
-) -> Result<(), ApiError> {
-    let origin = std::env::var("BLUEY_JOBS_WORKFLOW_ORIGIN")
-        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let token = std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN").unwrap_or_default();
-    if token.is_empty() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The application runner is temporarily unavailable.".to_string(),
-        ));
-    }
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}/workflows/applications/{}/{}/resume",
-            origin.trim_end_matches('/'),
-            account_id,
-            run_id
-        ))
-        .bearer_auth(token)
-        .json(&json!({ "action": action, "field": field, "answer": answer }))
-        .send()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Bluey could not resume the application. Try again.".to_string(),
-            )
-        })?;
-    if !response.status().is_success() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "Bluey could not resume the application. Try again.".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 pub async fn answer_memory(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -2738,21 +4779,99 @@ pub async fn answer_memory(
         .map_err(internal)
 }
 
+pub async fn application_answer_revision(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(revision_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let revision = jobs::get_application_answer_revision(&state.pool, &account.id, &revision_id)
+        .map_err(internal)?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "Answer revision not found.".to_string(),
+        ))?;
+    let mut response = Json(revision).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
+pub async fn answer_memory_company_scope(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(job_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let scope = jobs::lookup_answer_memory_company_scope(&state.pool, &account.id, &job_id)
+        .map_err(answer_memory_employer_error)?;
+    let mut response = Json(scope).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SaveAnswerMemoryRequest {
+    #[serde(flatten)]
+    pub answer: AnswerMemory,
+    #[serde(default)]
+    pub company_job_id: Option<String>,
+    #[serde(default)]
+    pub expected_company_scope: Option<String>,
+}
+
+fn save_requested_answer_memory(
+    state: &AppState,
+    account_id: &str,
+    request: &SaveAnswerMemoryRequest,
+) -> Result<AnswerMemory, ApiError> {
+    match (&request.company_job_id, &request.expected_company_scope) {
+        (None, None) => jobs::save_answer_memory(&state.pool, account_id, &request.answer),
+        (Some(job_id), Some(expected)) => jobs::save_verified_company_answer_memory(
+            &state.pool,
+            account_id,
+            job_id,
+            expected,
+            &request.answer,
+        ),
+        _ => return bad_request("Choose and confirm a verified employer."),
+    }
+    .map_err(answer_memory_employer_error)
+}
+
+fn answer_memory_employer_error(error: anyhow::Error) -> ApiError {
+    match error.downcast_ref::<jobs::AnswerMemoryEmployerError>() {
+        Some(jobs::AnswerMemoryEmployerError::MissingJob) => {
+            (StatusCode::NOT_FOUND, "Verified job not found.".into())
+        }
+        Some(jobs::AnswerMemoryEmployerError::AuthorityChanged) => (
+            StatusCode::CONFLICT,
+            "Current verified employer must be confirmed again.".into(),
+        ),
+        Some(jobs::AnswerMemoryEmployerError::InvalidConfirmation) => (
+            StatusCode::BAD_REQUEST,
+            "Choose and confirm a verified employer.".into(),
+        ),
+        None => domain_error(error),
+    }
+}
+
 pub async fn save_answer_memory(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-    Json(answer): Json<AnswerMemory>,
+    Json(request): Json<SaveAnswerMemoryRequest>,
 ) -> Result<Json<AnswerMemory>, ApiError> {
-    jobs::save_answer_memory(&state.pool, &account.id, &answer)
-        .map(Json)
-        .map_err(domain_error)
+    save_requested_answer_memory(&state, &account.id, &request).map(Json)
 }
 
 pub async fn update_answer_memory(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(answer_id): Path<String>,
-    Json(mut answer): Json<AnswerMemory>,
+    Json(mut request): Json<SaveAnswerMemoryRequest>,
 ) -> Result<Json<AnswerMemory>, ApiError> {
     if !jobs::list_answer_memory(&state.pool, &account.id)
         .map_err(internal)?
@@ -2761,10 +4880,8 @@ pub async fn update_answer_memory(
     {
         return Err((StatusCode::NOT_FOUND, "Saved answer not found.".to_string()));
     }
-    answer.id = answer_id;
-    jobs::save_answer_memory(&state.pool, &account.id, &answer)
-        .map(Json)
-        .map_err(domain_error)
+    request.answer.id = answer_id;
+    save_requested_answer_memory(&state, &account.id, &request).map(Json)
 }
 
 pub async fn delete_answer_memory(
@@ -3076,8 +5193,11 @@ pub async fn run_events(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LocalRunClaimRequest {
     ticket: String,
+    claim_nonce: String,
+    build_proof: jobs::BrowserBuildProof,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3086,6 +5206,15 @@ struct LocalRunAccessRequest {
     capability: String,
     #[serde(default)]
     ticket: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalRunSubmitAccessRequest {
+    #[serde(default)]
+    capability: String,
+    #[serde(default)]
+    ticket: String,
+    final_submit_proof: jobs::FinalSubmitProof,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3105,133 +5234,208 @@ async fn claim_local_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunClaimRequest>,
-) -> Result<Json<Value>, ApiError> {
-    if !jobs_local_browser_distribution_enabled() {
+) -> Result<Response, ApiError> {
+    if req.claim_nonce.len() != 64
+        || req.claim_nonce != req.claim_nonce.to_ascii_lowercase()
+        || !req.claim_nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || req.claim_nonce != local_browser_claim_nonce(&run_id, &req.ticket, &req.build_proof)
+    {
         return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser local runs are currently paused.".to_string(),
+            StatusCode::BAD_REQUEST,
+            "Invalid Browser claim nonce.".to_string(),
         ));
     }
+    let descriptor =
+        jobs::parse_browser_build_proof_for_claim(&req.build_proof).map_err(|error| {
+            tracing::warn!(error = %error, "rejected invalid Bluey Browser build proof");
+            (
+                StatusCode::UPGRADE_REQUIRED,
+                "Install an authorized Bluey Browser release and try again.".to_string(),
+            )
+        })?;
     let hash = local_run_ticket_hash(&req.ticket)?;
-    let ticket = jobs::claim_authorized_local_run_ticket(&state.pool, &run_id, &hash)
-        .map_err(internal)?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
-        ))?;
-    jobs::update_application(
+    let server_release_id = browser_server_release_id()?;
+    let disposition = jobs::claim_local_run_with_browser_release_for_distribution(
         &state.pool,
-        &ticket.account_id,
-        &ticket.application_id,
-        "running",
-        None,
-    )
-    .map_err(domain_error)?
-    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-    update_worker_browser_session(
-        &state,
-        &ticket.account_id,
-        &ticket.application_id,
-        "running",
-    )?;
-    jobs::save_run_event(
-        &state.pool,
-        &ticket.account_id,
-        &ticket.id,
-        "local_browser_claimed",
-        json!({ "application_id": ticket.application_id }),
+        jobs::BrowserLocalRunDistributionClaim {
+            run_id: &run_id,
+            ticket_hash: &hash,
+            claim_nonce: &req.claim_nonce,
+            descriptor: &descriptor,
+            server_release_id: &server_release_id,
+            distribution_enabled: jobs_local_browser_distribution_flag_enabled(),
+        },
+        |ticket, binding| {
+            let browser_profile_id = ticket
+                .payload
+                .get("browserProfileId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("local Browser claim has no browser profile"))?;
+            let release = local_capability_release(binding);
+            let result_capability = super::jobs_local_capability::issue(
+                &ticket.account_id,
+                &ticket.application_id,
+                &run_id,
+                browser_profile_id,
+                "result",
+                ticket.expires_at_ms,
+                &release,
+            )?;
+            let resume_capability = super::jobs_local_capability::issue(
+                &ticket.account_id,
+                &ticket.application_id,
+                &run_id,
+                browser_profile_id,
+                "resume",
+                ticket.expires_at_ms,
+                &release,
+            )?;
+            let submit_capability = super::jobs_local_capability::issue(
+                &ticket.account_id,
+                &ticket.application_id,
+                &run_id,
+                browser_profile_id,
+                "submit",
+                ticket.expires_at_ms,
+                &release,
+            )?;
+            let mut payload = ticket
+                .payload
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("local Browser claim payload is invalid"))?;
+            payload.insert(
+                "_blueyCapabilities".to_string(),
+                json!({
+                    "result": result_capability,
+                    "resume": resume_capability,
+                    "submit": submit_capability,
+                    "expiresAtMs": ticket.expires_at_ms,
+                }),
+            );
+            payload.insert("_blueyRelease".to_string(), serde_json::to_value(release)?);
+            Ok(Value::Object(payload))
+        },
     )
     .map_err(internal)?;
-    let browser_profile_id = ticket
-        .payload
-        .get("browserProfileId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or((
+    match disposition {
+        jobs::BrowserLocalRunClaimDisposition::Success(success) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(success.response_json))
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Bluey Browser could not start securely. Try again.".to_string(),
+                )
+            }),
+        jobs::BrowserLocalRunClaimDisposition::ReleaseUnavailable => Err((
+            StatusCode::UPGRADE_REQUIRED,
+            "Install the active Bluey Browser release for this account and try again.".to_string(),
+        )),
+        jobs::BrowserLocalRunClaimDisposition::DistributionUnavailable => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser local runs are currently paused.".to_string(),
+        )),
+        jobs::BrowserLocalRunClaimDisposition::ConflictingReplay => Err((
             StatusCode::CONFLICT,
-            "This Bluey Browser launch is missing its browser profile.".to_string(),
-        ))?;
-    let result_capability = super::jobs_local_capability::issue(
-        &ticket.account_id,
-        &ticket.application_id,
-        &run_id,
-        browser_profile_id,
-        "result",
-        ticket.expires_at_ms,
-    )
-    .map_err(|error| {
-        tracing::error!(error = %error, "could not issue local result capability");
+            "This Browser launch was already claimed by a different request.".to_string(),
+        )),
+        jobs::BrowserLocalRunClaimDisposition::Rejected => Err((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        )),
+    }
+}
+
+fn local_browser_claim_nonce(
+    run_id: &str,
+    ticket: &str,
+    proof: &jobs::BrowserBuildProof,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bluey-jobs-browser-claim-v1\0");
+    digest.update(run_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(ticket.as_bytes());
+    digest.update(b"\0");
+    digest.update(proof.descriptor.as_bytes());
+    digest.update(b"\0");
+    digest.update(proof.signature.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn browser_server_release_id() -> Result<String, ApiError> {
+    let value = std::env::var("BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID").map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser could not start securely. Try again.".to_string(),
+            "Bluey Browser release verification is unavailable.".to_string(),
         )
     })?;
-    let resume_capability = super::jobs_local_capability::issue(
-        &ticket.account_id,
-        &ticket.application_id,
-        &run_id,
-        browser_profile_id,
-        "resume",
-        ticket.expires_at_ms,
-    )
-    .map_err(|error| {
-        tracing::error!(error = %error, "could not issue local resume capability");
-        (
+    if value.len() < 3
+        || value.len() > 128
+        || value.trim() != value
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser could not start securely. Try again.".to_string(),
-        )
-    })?;
-    let submit_capability = super::jobs_local_capability::issue(
-        &ticket.account_id,
-        &ticket.application_id,
-        &run_id,
-        browser_profile_id,
-        "submit",
-        ticket.expires_at_ms,
-    )
-    .map_err(|error| {
-        tracing::error!(error = %error, "could not issue local submit capability");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser could not start securely. Try again.".to_string(),
-        )
-    })?;
-    let mut payload = ticket.payload.as_object().cloned().ok_or((
-        StatusCode::CONFLICT,
-        "This Bluey Browser launch is invalid.".to_string(),
-    ))?;
-    payload.insert(
-        "_blueyCapabilities".to_string(),
-        json!({
-            "result": result_capability,
-            "resume": resume_capability,
-            "submit": submit_capability,
-            "expiresAtMs": ticket.expires_at_ms,
-        }),
-    );
-    Ok(Json(Value::Object(payload)))
+            "Bluey Browser release verification is unavailable.".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+fn local_capability_release(
+    binding: &jobs::BrowserReleaseClaimBinding,
+) -> super::jobs_local_capability::LocalRunReleaseClaims {
+    super::jobs_local_capability::LocalRunReleaseClaims {
+        descriptor_sha256: binding.build_descriptor_sha256.clone(),
+        manifest_sha256: binding.manifest_sha256.clone(),
+        activation_sha256: binding.activation_sha256.clone(),
+        artifact_id: binding.artifact_id.clone(),
+        artifact_sha256: binding.artifact_sha256.clone(),
+        automation_bundle_sha256: binding.automation_bundle_sha256.clone(),
+        chromium_executable_sha256: binding.chromium_executable_sha256.clone(),
+        release_id: binding.release_id.clone(),
+        build_id: binding.build_id.clone(),
+        app_version: binding.app_version.clone(),
+        protocol_version: binding.protocol_version,
+        platform: binding.platform.clone(),
+        architecture: binding.architecture.clone(),
+        channel: binding.channel.clone(),
+        trust_generation: binding.trust_generation,
+        activation_generation: binding.activation_generation,
+        channel_sequence: binding.channel_sequence,
+    }
 }
 
 async fn authorize_local_run_submit(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
-    Json(req): Json<LocalRunAccessRequest>,
+    Json(req): Json<LocalRunSubmitAccessRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    if !jobs_local_browser_distribution_enabled() {
+    let authorization = authorize_local_run_operation(
+        &state,
+        &run_id,
+        &req.capability,
+        &req.ticket,
+        "submit",
+        None,
+    )?;
+    let exact_click_started_replay = authorization.capability_version
+        == Some(super::jobs_local_capability::TOKEN_VERSION)
+        && authorization.ticket.status == "click_started";
+    let ticket = authorization.ticket;
+    if !local_submit_distribution_allowed(
+        exact_click_started_replay,
+        jobs_local_browser_distribution_enabled(&state.pool),
+    ) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "Bluey Browser local runs are currently paused.".to_string(),
-        ));
-    }
-    let ticket =
-        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "submit")?;
-    if !jobs::local_run_submit_authorized(&state.pool, &run_id, &ticket.ticket_hash)
-        .map_err(internal)?
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            "This application is no longer authorized to submit. Return to Bluey Jobs to review it."
-                .to_string(),
         ));
     }
     let (application, _) = local_result_binding(&state, &ticket, &run_id)?;
@@ -3239,6 +5443,7 @@ async fn authorize_local_run_submit(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
     if matches!(ats_kind(&posting.canonical_url), "greenhouse" | "lever")
+        && !jobs::application_has_frozen_ats_certification(&application)
         && !jobs::local_submission_approval_consumed(
             &state.pool,
             &ticket.account_id,
@@ -3252,10 +5457,130 @@ async fn authorize_local_run_submit(
             "Final submission has not been approved for this local run.".to_string(),
         ));
     }
+    let capacity = local_submission_evidence_capacity(
+        &state,
+        &ticket.account_id,
+        &ticket.application_id,
+        &run_id,
+        exact_click_started_replay,
+    )?;
+    let server_release_id = browser_server_release_id()?;
+    let authorization = jobs::local_run_submit_authorization_for_distribution(
+        &state.pool,
+        &run_id,
+        &ticket.ticket_hash,
+        &server_release_id,
+        &req.final_submit_proof,
+        &capacity,
+    )
+    .map_err(|error| {
+        if error.downcast_ref::<UploadControlError>().is_some() {
+            evidence_upload_control_error(error)
+        } else {
+            internal(error)
+        }
+    })?;
+    let Some(authorization) = authorization else {
+        return Err((
+            StatusCode::CONFLICT,
+            "This application is no longer authorized to submit. Return to Bluey Jobs to review it."
+                .to_string(),
+        ));
+    };
+    if let Some(authority) = authorization.ats_certified_receipt_authority {
+        let authorized_at_ms = authority.binding_consumed_at_ms;
+        return Ok(Json(json!({
+            "authorized": true,
+            "authorizedAtMs": authorized_at_ms,
+            "atsCertifiedReceiptAuthority": authority,
+        })));
+    }
     Ok(Json(json!({
         "authorized": true,
-        "authorizedAtMs": jobs::now_ms(),
+        "authorizedAtMs": authorization.authorized_at_ms,
     })))
+}
+
+fn local_submission_evidence_capacity(
+    state: &AppState,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    exact_click_started_replay: bool,
+) -> Result<NewSubmissionEvidenceCapacity, ApiError> {
+    let storage_config = state.config.object_storage.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Application evidence storage is not configured.".to_string(),
+    ))?;
+    let storage = ObjectStorage::new(storage_config);
+    let now_ms = jobs::now_ms();
+    if exact_click_started_replay {
+        let durable = object_uploads::get_submission_evidence_capacity(
+            &state.pool,
+            account_id,
+            application_id,
+            run_id,
+        )
+        .map_err(internal)?;
+        return local_durable_recovery_evidence_capacity(
+            durable,
+            account_id,
+            application_id,
+            run_id,
+            now_ms,
+            storage.upload_limits(),
+        )
+        .ok_or((
+            StatusCode::CONFLICT,
+            "This application is no longer authorized to submit. Return to Bluey Jobs to review it."
+                .to_string(),
+        ));
+    }
+    let bundle_capacity_bytes = storage.max_object_bytes().min(MAX_RECEIPT_BUNDLE_BYTES) as i64;
+    Ok(NewSubmissionEvidenceCapacity {
+        account_id: account_id.to_string(),
+        application_id: application_id.to_string(),
+        run_id: run_id.to_string(),
+        runner: "local".to_string(),
+        reserved_bytes: MAX_RECEIPT_EVIDENCE_BYTES as i64 + bundle_capacity_bytes,
+        reserved_objects: MAX_SUBMISSION_EVIDENCE_OBJECTS,
+        expires_at_ms: now_ms.saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS),
+        now_ms,
+        limits: storage.upload_limits(),
+    })
+}
+
+fn local_durable_recovery_evidence_capacity(
+    durable: Option<object_uploads::SubmissionEvidenceCapacity>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    now_ms: i64,
+    limits: crate::object_storage::UploadLimits,
+) -> Option<NewSubmissionEvidenceCapacity> {
+    let durable = durable?;
+    if durable.account_id != account_id
+        || durable.application_id != application_id
+        || durable.run_id != run_id
+        || durable.runner != "local"
+        || durable.state != "active"
+        || durable.expires_at_ms <= now_ms
+        || durable.reserved_bytes <= 0
+        || durable.reserved_objects <= 0
+    {
+        return None;
+    }
+    Some(NewSubmissionEvidenceCapacity {
+        account_id: durable.account_id,
+        application_id: durable.application_id,
+        run_id: durable.run_id,
+        runner: durable.runner,
+        reserved_bytes: durable.reserved_bytes,
+        reserved_objects: durable.reserved_objects,
+        expires_at_ms: durable.expires_at_ms,
+        now_ms,
+        limits,
+    })
 }
 
 async fn consume_local_run_resume(
@@ -3263,8 +5588,15 @@ async fn consume_local_run_resume(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunAccessRequest>,
 ) -> Result<Json<jobs::LocalRunResumeAction>, ApiError> {
-    let ticket =
-        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "resume")?;
+    let ticket = authorize_local_run_operation(
+        &state,
+        &run_id,
+        &req.capability,
+        &req.ticket,
+        "resume",
+        None,
+    )?
+    .ticket;
     let action = jobs::consume_local_run_resume_action(&state.pool, &run_id, &ticket.ticket_hash)
         .map_err(internal)?
         .ok_or((
@@ -3306,31 +5638,67 @@ async fn consume_local_run_resume(
 async fn save_local_run_result(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
-    Json(req): Json<LocalRunResultRequest>,
+    Json(mut req): Json<LocalRunResultRequest>,
 ) -> Result<Json<JobApplication>, ApiError> {
-    let ticket =
-        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "result")?;
-    if ticket.expires_at_ms <= jobs::now_ms() {
-        return Err((
-            StatusCode::GONE,
-            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
-        ));
-    }
-    let status = req
+    let reported_status = req
         .receipt
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    if reported_status == "submitted" {
+        if let Some(application) =
+            replay_submitted_local_run_result(&state, &run_id, &mut req).await?
+        {
+            return Ok(Json(application));
+        }
+    }
+    let authorization = authorize_local_run_operation(
+        &state,
+        &run_id,
+        &req.capability,
+        &req.ticket,
+        "result",
+        Some(reported_status.as_str()),
+    )?;
+    let capability_version = authorization.capability_version;
+    let ticket = authorization.ticket;
+    let mut status = reported_status;
+    if ticket.status == "click_started" && matches!(status.as_str(), "failed" | "needs_input") {
+        status = "side_effect_unknown".to_string();
+        if let Some(receipt) = req.receipt.as_object_mut() {
+            receipt.insert("status".to_string(), Value::String(status.clone()));
+            receipt.insert(
+                "issues".to_string(),
+                json!([{
+                    "field": "submission",
+                    "message": "The local browser crossed Submit but could not prove the employer outcome."
+                }]),
+            );
+        }
+    }
+    if ticket.expires_at_ms <= jobs::now_ms()
+        && !((matches!(status.as_str(), "submitted" | "side_effect_unknown"))
+            && matches!(
+                ticket.status.as_str(),
+                "click_started" | "side_effect_unknown" | "complete"
+            )
+            && ticket
+                .expires_at_ms
+                .saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS)
+                > jobs::now_ms())
+    {
+        return Err((
+            StatusCode::GONE,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ));
+    }
     let (bound_application, bound_session) = local_result_binding(&state, &ticket, &run_id)?;
     match ticket.status.as_str() {
-        "failed" if status == "failed" && bound_application.state == "failed" => {
-            return Ok(Json(bound_application));
-        }
         "side_effect_unknown"
             if status == "side_effect_unknown"
-                && bound_application.state == "side_effect_unknown" =>
-        {
+                && bound_application.state == "side_effect_unknown" => {}
+        "complete" if status == "side_effect_unknown" && bound_application.state == "submitted" => {
             return Ok(Json(bound_application));
         }
         "complete" if status != "submitted" => {
@@ -3339,6 +5707,7 @@ async fn save_local_run_result(
                 "This local run already has a different terminal result.".to_string(),
             ));
         }
+        "side_effect_unknown" if status == "submitted" => {}
         "failed" | "side_effect_unknown" => {
             return Err((
                 StatusCode::CONFLICT,
@@ -3349,35 +5718,19 @@ async fn save_local_run_result(
     }
     let application = match status.as_str() {
         "needs_input" => {
-            create_intervention_from_receipt(
-                &state,
-                &ticket.account_id,
-                &ticket.application_id,
-                req.receipt,
-            )?;
-            let application = jobs::update_application(
-                &state.pool,
-                &ticket.account_id,
-                &ticket.application_id,
-                "needs_input",
-                None,
-            )
-            .map_err(domain_error)?
-            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-            update_worker_browser_session(
-                &state,
-                &ticket.account_id,
-                &ticket.application_id,
-                "needs_input",
-            )?;
-            jobs::update_local_run_ticket_status(
+            let (intervention, takeover_url) =
+                intervention_from_receipt(&ticket.application_id, req.receipt)?;
+            jobs::commit_local_run_result(
                 &state.pool,
                 &run_id,
                 &ticket.ticket_hash,
-                "needs_input",
+                jobs::LocalRunResultCommitInput {
+                    status: "needs_input".to_string(),
+                    intervention: Some(intervention),
+                    takeover_url,
+                },
             )
-            .map_err(internal)?;
-            application
+            .map_err(submission_domain_error)?
         }
         "submitted" => {
             let application =
@@ -3388,6 +5741,7 @@ async fn save_local_run_result(
                 .map_err(internal)?
                 .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
             if matches!(ats_kind(&posting.canonical_url), "greenhouse" | "lever")
+                && !jobs::application_has_frozen_ats_certification(&application)
                 && !jobs::local_submission_approval_consumed(
                     &state.pool,
                     &ticket.account_id,
@@ -3405,6 +5759,7 @@ async fn save_local_run_result(
                 StatusCode::BAD_REQUEST,
                 "The local browser did not return its submission receipt.".to_string(),
             ))?;
+            let result_capability = req.capability;
             let application = persist_submission_receipt(
                 &state,
                 &ticket.account_id,
@@ -3412,37 +5767,33 @@ async fn save_local_run_result(
                 bundle,
                 req.evidence_objects,
                 "local",
+                None,
                 Some(&ticket.ticket_hash),
+                Some(&result_capability),
+                capability_version,
             )
             .await?;
             application
         }
-        "failed" => {
-            let application = jobs::update_application(
-                &state.pool,
-                &ticket.account_id,
-                &ticket.application_id,
-                "failed",
-                None,
-            )
-            .map_err(domain_error)?
-            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-            update_worker_browser_session(
+        "failed" => jobs::commit_local_run_result(
+            &state.pool,
+            &run_id,
+            &ticket.ticket_hash,
+            jobs::LocalRunResultCommitInput {
+                status: "failed".to_string(),
+                intervention: None,
+                takeover_url: None,
+            },
+        )
+        .map_err(submission_domain_error)?,
+        "side_effect_unknown" => {
+            let capacity = local_submission_evidence_capacity(
                 &state,
                 &ticket.account_id,
                 &ticket.application_id,
-                "failed",
-            )?;
-            jobs::update_local_run_ticket_status(
-                &state.pool,
                 &run_id,
-                &ticket.ticket_hash,
-                "failed",
-            )
-            .map_err(internal)?;
-            application
-        }
-        "side_effect_unknown" => {
+                local_result_uses_durable_submission_evidence_capacity(&ticket.status),
+            )?;
             let mut reconciliation_receipt = req.receipt;
             if let Some(receipt) = reconciliation_receipt.as_object_mut() {
                 receipt.remove("screenshotPath");
@@ -3463,14 +5814,82 @@ async fn save_local_run_result(
                 &ticket.application_id,
                 &run_id,
                 &ticket.ticket_hash,
+                &capacity,
                 reconciliation_receipt,
                 &session,
             )
-            .map_err(submission_domain_error)?
+            .map_err(|error| {
+                if error.downcast_ref::<UploadControlError>().is_some() {
+                    evidence_upload_control_error(error)
+                } else {
+                    submission_domain_error(error)
+                }
+            })?
         }
         _ => return bad_request("Bluey Browser returned an invalid application result."),
     };
     Ok(Json(application))
+}
+
+async fn replay_submitted_local_run_result(
+    state: &AppState,
+    run_id: &str,
+    req: &mut LocalRunResultRequest,
+) -> Result<Option<JobApplication>, ApiError> {
+    let Some(receipt) = req.receipt_bundle.as_ref() else {
+        return Ok(None);
+    };
+    let Some(account_id) = receipt_replay_identifier(receipt.get("accountId")) else {
+        return Ok(None);
+    };
+    let Some(application_id) = receipt_replay_identifier(receipt.get("applicationId")) else {
+        return Ok(None);
+    };
+    if receipt.get("runner").and_then(Value::as_str) != Some("local")
+        || receipt.get("runId").and_then(Value::as_str) != Some(run_id)
+    {
+        return Ok(None);
+    }
+    let account_id = account_id.to_string();
+    let application_id = application_id.to_string();
+    let Some(application) =
+        jobs::get_application(&state.pool, &account_id, &application_id).map_err(internal)?
+    else {
+        return Ok(None);
+    };
+    if !jobs::submitted_local_receipt_replay_authorized(&application, run_id, &req.capability) {
+        return Ok(None);
+    }
+
+    let result_capability = req.capability.clone();
+    let receipt = req
+        .receipt_bundle
+        .take()
+        .expect("submitted replay candidate has a receipt bundle");
+    let evidence_objects = std::mem::take(&mut req.evidence_objects);
+    persist_submission_receipt(
+        state,
+        &account_id,
+        &application_id,
+        receipt,
+        evidence_objects,
+        "local",
+        None,
+        None,
+        Some(&result_capability),
+        None,
+    )
+    .await
+    .map(Some)
+}
+
+fn receipt_replay_identifier(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).filter(|value| {
+        !value.is_empty()
+            && value.len() <= 240
+            && value.trim() == *value
+            && value.bytes().all(|byte| !byte.is_ascii_control())
+    })
 }
 
 fn local_result_binding(
@@ -3509,32 +5928,70 @@ fn local_result_binding(
     Ok((application, session))
 }
 
+struct AuthorizedLocalRunOperation {
+    ticket: jobs::LocalRunTicket,
+    capability_version: Option<u8>,
+}
+
 fn authorize_local_run_operation(
     state: &AppState,
     run_id: &str,
     capability: &str,
     _legacy_ticket: &str,
     operation: &str,
-) -> Result<jobs::LocalRunTicket, ApiError> {
+    reconciliation_status: Option<&str>,
+) -> Result<AuthorizedLocalRunOperation, ApiError> {
+    let now = jobs::now_ms();
+    let allow_late_reconciliation = operation == "result"
+        && matches!(
+            reconciliation_status,
+            Some("submitted" | "side_effect_unknown")
+        );
     #[cfg(debug_assertions)]
     if capability.is_empty() && !_legacy_ticket.is_empty() {
         let hash = local_run_ticket_hash(_legacy_ticket)?;
-        return jobs::get_local_run_ticket_by_hash(&state.pool, run_id, &hash)
+        let ticket = jobs::get_local_run_ticket_by_hash(&state.pool, run_id, &hash)
             .map_err(internal)?
             .ok_or((
                 StatusCode::NOT_FOUND,
                 "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+            ))?;
+        if !legacy_local_run_capability_status_allowed(&ticket.status, operation) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
             ));
+        }
+        if !local_run_operation_expiry_allowed(
+            operation,
+            reconciliation_status,
+            None,
+            &ticket.status,
+            ticket.expires_at_ms,
+            now,
+        ) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+            ));
+        }
+        return Ok(AuthorizedLocalRunOperation {
+            ticket,
+            capability_version: None,
+        });
     }
 
-    let claims =
-        super::jobs_local_capability::verify(capability, run_id, operation, jobs::now_ms())
-            .map_err(|_| {
-                (
-                    StatusCode::NOT_FOUND,
-                    "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
-                )
-            })?;
+    let claims = if allow_late_reconciliation || operation == "submit" {
+        super::jobs_local_capability::verify_for_reconciliation(capability, run_id, operation, now)
+    } else {
+        super::jobs_local_capability::verify(capability, run_id, operation, now)
+    }
+    .map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        )
+    })?;
     let ticket = jobs::get_local_run_ticket(&state.pool, &claims.account_id, run_id)
         .map_err(internal)?
         .filter(|ticket| {
@@ -3550,7 +6007,85 @@ fn authorize_local_run_operation(
             StatusCode::NOT_FOUND,
             "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
         ))?;
-    Ok(ticket)
+    if claims.version == 1 && !legacy_local_run_capability_status_allowed(&ticket.status, operation)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ));
+    }
+    if !local_run_operation_expiry_allowed(
+        operation,
+        reconciliation_status,
+        Some(claims.version),
+        &ticket.status,
+        ticket.expires_at_ms,
+        now,
+    ) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ));
+    }
+    Ok(AuthorizedLocalRunOperation {
+        ticket,
+        capability_version: Some(claims.version),
+    })
+}
+
+fn local_run_operation_expiry_allowed(
+    operation: &str,
+    reconciliation_status: Option<&str>,
+    capability_version: Option<u8>,
+    ticket_status: &str,
+    expires_at_ms: i64,
+    now_ms: i64,
+) -> bool {
+    if expires_at_ms > now_ms {
+        return true;
+    }
+    if expires_at_ms.saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS) <= now_ms
+    {
+        return false;
+    }
+    let result_reconciliation = operation == "result"
+        && matches!(
+            reconciliation_status,
+            Some("submitted" | "side_effect_unknown")
+        )
+        && (matches!(ticket_status, "side_effect_unknown" | "complete")
+            || (capability_version.is_some() && ticket_status == "click_started"));
+    let submit_replay = operation == "submit"
+        && capability_version == Some(super::jobs_local_capability::TOKEN_VERSION)
+        && ticket_status == "click_started";
+    result_reconciliation || submit_replay
+}
+
+fn local_submit_distribution_allowed(
+    exact_click_started_replay: bool,
+    distribution_enabled: bool,
+) -> bool {
+    distribution_enabled || exact_click_started_replay
+}
+
+fn local_result_uses_durable_submission_evidence_capacity(ticket_status: &str) -> bool {
+    matches!(ticket_status, "click_started" | "side_effect_unknown")
+}
+
+fn legacy_local_run_capability_status_allowed(ticket_status: &str, operation: &str) -> bool {
+    match operation {
+        "result" => matches!(
+            ticket_status,
+            "claimed"
+                | "needs_input"
+                | "click_started"
+                | "side_effect_unknown"
+                | "complete"
+                | "failed"
+        ),
+        "resume" => matches!(ticket_status, "needs_input" | "claimed"),
+        _ => false,
+    }
 }
 
 fn local_run_ticket_hash(ticket: &str) -> Result<String, ApiError> {
@@ -3564,15 +6099,33 @@ fn local_run_ticket_hash(ticket: &str) -> Result<String, ApiError> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerExecutionLeaseClaimRequest {
     account_id: String,
     application_id: String,
     run_id: String,
     browser_profile_id: String,
     owner_id: String,
+    volume_id: String,
+    enrollment_epoch: i64,
+    process_instance_id: String,
+    runtime_grant_id: String,
+    runtime_sha256: String,
+    #[serde(default)]
+    workflow_request_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    #[serde(default)]
+    managed_cloud_release_sha256: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_epoch: Option<i64>,
+    volume_proof: jobs::RunnerVolumeAuthorityProof,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerExecutionLeaseAccessRequest {
     account_id: String,
     application_id: String,
@@ -3581,15 +6134,47 @@ struct WorkerExecutionLeaseAccessRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerManagedExecutionEffectRequest {
+    account_id: String,
+    application_id: String,
+    lease_token: String,
+    fence: i64,
+    #[serde(default)]
+    workflow_request_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    #[serde(default)]
+    managed_cloud_release_sha256: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_epoch: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerIrreversibleExecutionRequest {
     account_id: String,
     application_id: String,
     lease_token: String,
     fence: i64,
     action: String,
+    final_submit_proof: jobs::FinalSubmitProof,
+    #[serde(default)]
+    workflow_request_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    #[serde(default)]
+    managed_cloud_release_sha256: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_epoch: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerFinishExecutionRequest {
     account_id: String,
     application_id: String,
@@ -3598,23 +6183,1143 @@ struct WorkerFinishExecutionRequest {
     outcome: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerCheckpointReconciliationRequest {
+    account_id: String,
+    application_id: String,
+    owner_id: String,
+    #[serde(default)]
+    lease_token: Option<String>,
+    fence: i64,
+    checkpoint_version: i64,
+    checkpoint_phase: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerBrowserProfileSnapshotAccessRequest {
+    account_id: String,
+    application_id: String,
+    browser_profile_id: String,
+    lease_token: String,
+    fence: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerBrowserProfileSnapshotStoreRequest {
+    account_id: String,
+    application_id: String,
+    browser_profile_id: String,
+    lease_token: String,
+    fence: i64,
+    expected_generation: i64,
+    envelope_version: i64,
+    sha256: String,
+    size_bytes: i64,
+    encrypted_snapshot_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerBrowserProfileSnapshotStoreResponse {
+    browser_profile_id: String,
+    generation: i64,
+    sha256: String,
+    size_bytes: i64,
+    envelope_version: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerBrowserProfileSnapshotRestoreResponse {
+    browser_profile_id: String,
+    generation: i64,
+    sha256: String,
+    size_bytes: i64,
+    envelope_version: i64,
+    encrypted_snapshot_base64: String,
+}
+
+fn authenticated_execution_lease_owner<'a>(
+    worker: &'a JobsWorkerIdentity,
+    requested_owner_id: &'a str,
+) -> Result<&'a str, ApiError> {
+    #[cfg(debug_assertions)]
+    if worker.scope == "debug" {
+        return Ok(requested_owner_id);
+    }
+
+    if requested_owner_id != worker.worker_id {
+        return bad_request("Execution lease owner does not match the authenticated worker.");
+    }
+    Ok(worker.worker_id.as_str())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkflowCommandMaterializeRequest {
+    Start {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        #[serde(default)]
+        managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    },
+    Resume {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+        #[serde(default)]
+        managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum WorkflowCommandMaterializeResponse {
+    Start {
+        schema_version: i64,
+        request_id: String,
+        workflow_id: String,
+        payload_digest: String,
+        workflow_input: Value,
+        browser_session_id: String,
+        result_request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    },
+    Resume {
+        schema_version: i64,
+        request_id: String,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+        workflow_input: Value,
+        browser_session_id: String,
+        result_request_id: String,
+        resolution: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkflowCommandInterventionPrepareRequest {
+    Start {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        receipt: Value,
+    },
+    Resume {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+        receipt: Value,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkflowCommandAuthorityRequest {
+    Start {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+    },
+    Resume {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowCommandTerminalState {
+    Failed,
+    SideEffectUnknown,
+}
+
+impl WorkflowCommandTerminalState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::SideEffectUnknown => "side_effect_unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowCommandTerminalReason {
+    RunnerFailed,
+    RunnerAmbiguous,
+    InterventionTimeout,
+    InterventionLimit,
+}
+
+impl WorkflowCommandTerminalReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RunnerFailed => "runner_failed",
+            Self::RunnerAmbiguous => "runner_ambiguous",
+            Self::InterventionTimeout => "intervention_timeout",
+            Self::InterventionLimit => "intervention_limit",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkflowCommandFinalizeRequest {
+    Start {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        terminal_state: WorkflowCommandTerminalState,
+        reason_code: WorkflowCommandTerminalReason,
+        #[serde(default, deserialize_with = "deserialize_present_string")]
+        open_intervention_id: Option<String>,
+    },
+    Resume {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+        terminal_state: WorkflowCommandTerminalState,
+        reason_code: WorkflowCommandTerminalReason,
+        #[serde(default, deserialize_with = "deserialize_present_string")]
+        open_intervention_id: Option<String>,
+    },
+}
+
+fn deserialize_present_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowCommandInterventionMutationResponse {
+    schema_version: i64,
+    request_id: String,
+    workflow_id: String,
+    payload_digest: String,
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_intervention_id: Option<String>,
+    intervention_id: String,
+    replayed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowCommandFinalizationResponse {
+    schema_version: i64,
+    request_id: String,
+    workflow_id: String,
+    payload_digest: String,
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_intervention_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_intervention_id: Option<String>,
+    terminal_state: &'static str,
+    reason_code: &'static str,
+    replayed: bool,
+}
+
+async fn worker_prepare_workflow_intervention(
+    State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
+    Path(request_id): Path<String>,
+    request: Result<Json<WorkflowCommandInterventionPrepareRequest>, JsonRejection>,
+) -> Response {
+    if !workflow_command_opaque_identifier(&request_id, 128) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return workflow_command_json_rejection_response(rejection),
+    };
+    let (schema_version, workflow_id, payload_digest, command_kind, intervention_id, receipt) =
+        match request {
+            WorkflowCommandInterventionPrepareRequest::Start {
+                schema_version,
+                workflow_id,
+                payload_digest,
+                receipt,
+            } => (
+                schema_version,
+                workflow_id,
+                payload_digest,
+                jobs::JobsWorkflowCommandKind::Start,
+                None,
+                receipt,
+            ),
+            WorkflowCommandInterventionPrepareRequest::Resume {
+                schema_version,
+                workflow_id,
+                payload_digest,
+                intervention_id,
+                receipt,
+            } => (
+                schema_version,
+                workflow_id,
+                payload_digest,
+                jobs::JobsWorkflowCommandKind::Resume,
+                Some(intervention_id),
+                receipt,
+            ),
+        };
+    if !valid_workflow_command_authority(
+        schema_version,
+        &workflow_id,
+        &payload_digest,
+        intervention_id.as_deref(),
+    ) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let prepared = match jobs::prepare_jobs_workflow_intervention(
+        &state.pool,
+        &jobs::PrepareJobsWorkflowIntervention {
+            request_id: request_id.clone(),
+            payload_hmac_sha256: payload_digest.clone(),
+            workflow_id: workflow_id.clone(),
+            command_kind,
+            intervention_id: intervention_id.clone(),
+            receipt,
+            now_ms: jobs::now_ms(),
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return workflow_command_database_error_response(error),
+    };
+    if prepared.request_id != request_id || prepared.payload_hmac_sha256 != payload_digest {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+    workflow_command_serialized_response(
+        StatusCode::OK,
+        WorkflowCommandInterventionMutationResponse {
+            schema_version: 2,
+            request_id,
+            workflow_id,
+            payload_digest,
+            operation: workflow_command_operation(command_kind),
+            command_intervention_id: intervention_id,
+            intervention_id: prepared.intervention_id,
+            replayed: prepared.replayed,
+        },
+    )
+}
+
+async fn worker_publish_workflow_intervention(
+    State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
+    Path((request_id, prepared_intervention_id)): Path<(String, String)>,
+    request: Result<Json<WorkflowCommandAuthorityRequest>, JsonRejection>,
+) -> Response {
+    if !workflow_command_opaque_identifier(&request_id, 128)
+        || !workflow_command_opaque_identifier(&prepared_intervention_id, 128)
+    {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return workflow_command_json_rejection_response(rejection),
+    };
+    let (schema_version, workflow_id, payload_digest, command_kind, intervention_id) =
+        workflow_command_authority_parts(request);
+    if !valid_workflow_command_authority(
+        schema_version,
+        &workflow_id,
+        &payload_digest,
+        intervention_id.as_deref(),
+    ) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let published = match jobs::publish_jobs_workflow_intervention(
+        &state.pool,
+        &jobs::PublishJobsWorkflowIntervention {
+            request_id: request_id.clone(),
+            payload_hmac_sha256: payload_digest.clone(),
+            workflow_id: workflow_id.clone(),
+            command_kind,
+            command_intervention_id: intervention_id.clone(),
+            intervention_id: prepared_intervention_id.clone(),
+            now_ms: jobs::now_ms(),
+        },
+    ) {
+        Ok(published) => published,
+        Err(error) => return workflow_command_database_error_response(error),
+    };
+    if published.intervention.id != prepared_intervention_id {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+    workflow_command_serialized_response(
+        StatusCode::OK,
+        WorkflowCommandInterventionMutationResponse {
+            schema_version: 2,
+            request_id,
+            workflow_id,
+            payload_digest,
+            operation: workflow_command_operation(command_kind),
+            command_intervention_id: intervention_id,
+            intervention_id: prepared_intervention_id,
+            replayed: published.replayed,
+        },
+    )
+}
+
+async fn worker_finalize_workflow_execution(
+    State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
+    Path(request_id): Path<String>,
+    request: Result<Json<WorkflowCommandFinalizeRequest>, JsonRejection>,
+) -> Response {
+    if !workflow_command_opaque_identifier(&request_id, 128) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return workflow_command_json_rejection_response(rejection),
+    };
+    let parts = workflow_command_finalization_parts(request);
+    if !valid_workflow_command_authority(
+        parts.schema_version,
+        &parts.workflow_id,
+        &parts.payload_digest,
+        parts.intervention_id.as_deref(),
+    ) || parts
+        .open_intervention_id
+        .as_deref()
+        .is_some_and(|value| !workflow_command_opaque_identifier(value, 128))
+    {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Some(outcome) = workflow_command_terminal_outcome(
+        parts.terminal_state,
+        parts.reason_code,
+        parts.open_intervention_id.as_deref(),
+    ) else {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    };
+    let finalized = match jobs::finalize_jobs_workflow_execution(
+        &state.pool,
+        &jobs::FinalizeJobsWorkflowExecution {
+            request_id: request_id.clone(),
+            payload_hmac_sha256: parts.payload_digest.clone(),
+            workflow_id: parts.workflow_id.clone(),
+            command_kind: parts.command_kind,
+            intervention_id: parts.intervention_id.clone(),
+            outcome,
+            open_intervention_id: parts.open_intervention_id.clone(),
+            now_ms: jobs::now_ms(),
+        },
+    ) {
+        Ok(finalized) => finalized,
+        Err(error) => return workflow_command_database_error_response(error),
+    };
+    if finalized.request_id != request_id || finalized.outcome != outcome {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+    workflow_command_serialized_response(
+        StatusCode::OK,
+        WorkflowCommandFinalizationResponse {
+            schema_version: 2,
+            request_id,
+            workflow_id: parts.workflow_id,
+            payload_digest: parts.payload_digest,
+            operation: workflow_command_operation(parts.command_kind),
+            command_intervention_id: parts.intervention_id,
+            open_intervention_id: parts.open_intervention_id,
+            terminal_state: parts.terminal_state.as_str(),
+            reason_code: parts.reason_code.as_str(),
+            replayed: finalized.replayed,
+        },
+    )
+}
+
+fn workflow_command_authority_parts(
+    request: WorkflowCommandAuthorityRequest,
+) -> (
+    i64,
+    String,
+    String,
+    jobs::JobsWorkflowCommandKind,
+    Option<String>,
+) {
+    match request {
+        WorkflowCommandAuthorityRequest::Start {
+            schema_version,
+            workflow_id,
+            payload_digest,
+        } => (
+            schema_version,
+            workflow_id,
+            payload_digest,
+            jobs::JobsWorkflowCommandKind::Start,
+            None,
+        ),
+        WorkflowCommandAuthorityRequest::Resume {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            intervention_id,
+        } => (
+            schema_version,
+            workflow_id,
+            payload_digest,
+            jobs::JobsWorkflowCommandKind::Resume,
+            Some(intervention_id),
+        ),
+    }
+}
+
+struct WorkflowCommandFinalizationParts {
+    schema_version: i64,
+    workflow_id: String,
+    payload_digest: String,
+    command_kind: jobs::JobsWorkflowCommandKind,
+    intervention_id: Option<String>,
+    terminal_state: WorkflowCommandTerminalState,
+    reason_code: WorkflowCommandTerminalReason,
+    open_intervention_id: Option<String>,
+}
+
+fn workflow_command_finalization_parts(
+    request: WorkflowCommandFinalizeRequest,
+) -> WorkflowCommandFinalizationParts {
+    match request {
+        WorkflowCommandFinalizeRequest::Start {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            terminal_state,
+            reason_code,
+            open_intervention_id,
+        } => WorkflowCommandFinalizationParts {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            command_kind: jobs::JobsWorkflowCommandKind::Start,
+            intervention_id: None,
+            terminal_state,
+            reason_code,
+            open_intervention_id,
+        },
+        WorkflowCommandFinalizeRequest::Resume {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            intervention_id,
+            terminal_state,
+            reason_code,
+            open_intervention_id,
+        } => WorkflowCommandFinalizationParts {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            command_kind: jobs::JobsWorkflowCommandKind::Resume,
+            intervention_id: Some(intervention_id),
+            terminal_state,
+            reason_code,
+            open_intervention_id,
+        },
+    }
+}
+
+fn workflow_command_terminal_outcome(
+    state: WorkflowCommandTerminalState,
+    reason: WorkflowCommandTerminalReason,
+    open_intervention_id: Option<&str>,
+) -> Option<jobs::JobsWorkflowTerminalOutcome> {
+    use jobs::{JobsWorkflowTerminalOutcome as Outcome, JobsWorkflowTerminalReason as Reason};
+
+    match (state, reason, open_intervention_id) {
+        (
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::RunnerFailed,
+            None,
+        ) => Some(Outcome::Failed(Reason::RunnerFailed)),
+        (
+            WorkflowCommandTerminalState::SideEffectUnknown,
+            WorkflowCommandTerminalReason::RunnerAmbiguous,
+            None,
+        ) => Some(Outcome::SideEffectUnknown(Reason::RunnerAmbiguous)),
+        (
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::InterventionTimeout,
+            Some(_),
+        ) => Some(Outcome::Failed(Reason::InterventionTimeout)),
+        (
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::InterventionLimit,
+            None,
+        ) => Some(Outcome::Failed(Reason::InterventionLimit)),
+        _ => None,
+    }
+}
+
+fn workflow_command_operation(kind: jobs::JobsWorkflowCommandKind) -> &'static str {
+    match kind {
+        jobs::JobsWorkflowCommandKind::Start => "start",
+        jobs::JobsWorkflowCommandKind::Resume => "resume",
+    }
+}
+
+fn valid_workflow_command_authority(
+    schema_version: i64,
+    workflow_id: &str,
+    payload_digest: &str,
+    intervention_id: Option<&str>,
+) -> bool {
+    schema_version == 2
+        && workflow_command_opaque_identifier(workflow_id, 192)
+        && workflow_command_digest(payload_digest)
+        && intervention_id.is_none_or(|value| workflow_command_opaque_identifier(value, 128))
+}
+
+async fn worker_materialize_workflow_command(
+    State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
+    Path(request_id): Path<String>,
+    request: Result<Json<WorkflowCommandMaterializeRequest>, JsonRejection>,
+) -> Response {
+    if !workflow_command_opaque_identifier(&request_id, 128) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Json(req) = match request {
+        Ok(request) => request,
+        Err(rejection) => return workflow_command_json_rejection_response(rejection),
+    };
+    if !valid_workflow_command_materialize_request(&req) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let command = match jobs::get_materializable_jobs_workflow_command_by_request_id(
+        &state.pool,
+        &request_id,
+    ) {
+        Ok(Some(command)) => command,
+        Ok(None) => {
+            return workflow_command_error_response(StatusCode::NOT_FOUND, "rejected", "not_found")
+        }
+        Err(error) => return workflow_command_database_error_response(error),
+    };
+    let exact_authority = match &req {
+        WorkflowCommandMaterializeRequest::Start {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            ..
+        } => {
+            *schema_version == 2
+                && command.protocol_version == 2
+                && command.command_kind == jobs::JobsWorkflowCommandKind::Start
+                && workflow_id == &command.workflow_id
+                && payload_digest == &command.payload_hmac_sha256
+                && command.intervention_id.is_none()
+        }
+        WorkflowCommandMaterializeRequest::Resume {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            intervention_id,
+            ..
+        } => {
+            *schema_version == 2
+                && command.protocol_version == 2
+                && command.command_kind == jobs::JobsWorkflowCommandKind::Resume
+                && workflow_id == &command.workflow_id
+                && payload_digest == &command.payload_hmac_sha256
+                && command.intervention_id.as_ref() == Some(intervention_id)
+        }
+    };
+    if !exact_authority {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+
+    let expected_managed_cloud_release =
+        match jobs::get_managed_cloud_workflow_release_memo(&state.pool, &command) {
+            Ok(authority) => authority,
+            Err(jobs::ManagedCloudRegistryError::Storage(error)) => {
+                return workflow_command_database_error_response(error)
+            }
+            Err(jobs::ManagedCloudRegistryError::NotFound) => {
+                return workflow_command_error_response(
+                    StatusCode::NOT_FOUND,
+                    "rejected",
+                    "not_found",
+                )
+            }
+            Err(_) => {
+                return workflow_command_error_response(
+                    StatusCode::CONFLICT,
+                    "identity_conflict",
+                    "identity_conflict",
+                )
+            }
+        };
+    let requested_managed_cloud_release = match &req {
+        WorkflowCommandMaterializeRequest::Start {
+            managed_cloud_release,
+            ..
+        }
+        | WorkflowCommandMaterializeRequest::Resume {
+            managed_cloud_release,
+            ..
+        } => managed_cloud_release,
+    };
+    if requested_managed_cloud_release != &expected_managed_cloud_release {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+
+    let response = match (req, command.envelope.payload) {
+        (
+            WorkflowCommandMaterializeRequest::Start { .. },
+            jobs::JobsWorkflowCommandPayload::Start(material),
+        ) => WorkflowCommandMaterializeResponse::Start {
+            schema_version: 2,
+            request_id: command.request_id,
+            workflow_id: command.workflow_id,
+            payload_digest: command.payload_hmac_sha256,
+            workflow_input: material.workflow_input,
+            browser_session_id: material.browser_session_id,
+            result_request_id: material.result_request_id,
+            managed_cloud_release: expected_managed_cloud_release,
+        },
+        (
+            WorkflowCommandMaterializeRequest::Resume {
+                intervention_id, ..
+            },
+            jobs::JobsWorkflowCommandPayload::Resume(material),
+        ) => WorkflowCommandMaterializeResponse::Resume {
+            schema_version: 2,
+            request_id: command.request_id,
+            workflow_id: command.workflow_id,
+            payload_digest: command.payload_hmac_sha256,
+            intervention_id,
+            workflow_input: material.workflow_input,
+            browser_session_id: material.browser_session_id,
+            result_request_id: material.result_request_id,
+            resolution: material.resolution,
+            managed_cloud_release: expected_managed_cloud_release,
+        },
+        _ => {
+            return workflow_command_error_response(
+                StatusCode::CONFLICT,
+                "identity_conflict",
+                "identity_conflict",
+            )
+        }
+    };
+    match serde_json::to_value(response) {
+        Ok(value) => workflow_command_json_response(StatusCode::OK, value),
+        Err(_) => workflow_command_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rejected",
+            "internal_error",
+        ),
+    }
+}
+
+fn valid_workflow_command_materialize_request(req: &WorkflowCommandMaterializeRequest) -> bool {
+    let (schema_version, workflow_id, payload_digest, intervention_id) = match req {
+        WorkflowCommandMaterializeRequest::Start {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            ..
+        } => (*schema_version, workflow_id, payload_digest, None),
+        WorkflowCommandMaterializeRequest::Resume {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            intervention_id,
+            ..
+        } => (
+            *schema_version,
+            workflow_id,
+            payload_digest,
+            Some(intervention_id),
+        ),
+    };
+    schema_version == 2
+        && workflow_command_opaque_identifier(workflow_id, 192)
+        && workflow_command_digest(payload_digest)
+        && intervention_id.is_none_or(|value| workflow_command_opaque_identifier(value, 128))
+}
+
+fn workflow_command_opaque_identifier(value: &str, max_bytes: usize) -> bool {
+    (20..=max_bytes).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn workflow_command_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn workflow_command_database_error_response(error: anyhow::Error) -> Response {
+    if error
+        .downcast_ref::<UploadControlError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                UploadControlError::AccountDeleting | UploadControlError::SessionNotOwned
+            )
+        })
+    {
+        return workflow_command_error_response(StatusCode::NOT_FOUND, "rejected", "not_found");
+    }
+    if let Some(error) = error.downcast_ref::<jobs::JobsWorkflowCommandError>() {
+        return match error {
+            jobs::JobsWorkflowCommandError::InvalidRequest => workflow_command_error_response(
+                StatusCode::BAD_REQUEST,
+                "rejected",
+                "invalid_request",
+            ),
+            jobs::JobsWorkflowCommandError::IdentityConflict => workflow_command_error_response(
+                StatusCode::CONFLICT,
+                "identity_conflict",
+                "identity_conflict",
+            ),
+            jobs::JobsWorkflowCommandError::NotFound
+            | jobs::JobsWorkflowCommandError::InvalidState
+            | jobs::JobsWorkflowCommandError::RequestNotStarted
+            | jobs::JobsWorkflowCommandError::CleanupFenced => {
+                workflow_command_error_response(StatusCode::NOT_FOUND, "rejected", "not_found")
+            }
+            jobs::JobsWorkflowCommandError::StaleLease
+            | jobs::JobsWorkflowCommandError::LeaseExpired => workflow_command_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rejected",
+                "internal_error",
+            ),
+        };
+    }
+    tracing::warn!(
+        reason_code = "workflow_command_internal_database_error",
+        "Jobs workflow command internal request could not complete"
+    );
+    workflow_command_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "rejected",
+        "internal_error",
+    )
+}
+
+fn workflow_command_serialized_response<T: Serialize>(status: StatusCode, value: T) -> Response {
+    match serde_json::to_value(value) {
+        Ok(value) => workflow_command_json_response(status, value),
+        Err(_) => workflow_command_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rejected",
+            "internal_error",
+        ),
+    }
+}
+
+fn workflow_command_error_response(
+    status: StatusCode,
+    outcome: &'static str,
+    reason: &'static str,
+) -> Response {
+    workflow_command_json_response(
+        status,
+        json!({
+            "schema_version": 2,
+            "outcome": outcome,
+            "reason": reason,
+        }),
+    )
+}
+
+fn workflow_command_json_rejection_response(rejection: JsonRejection) -> Response {
+    let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    workflow_command_error_response(status, "rejected", "invalid_request")
+}
+
+fn workflow_command_json_response(status: StatusCode, value: Value) -> Response {
+    let mut response = (status, Json(value)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 async fn worker_claim_execution_lease(
     State(state): State<AppState>,
+    Extension(worker): Extension<JobsWorkerIdentity>,
     Json(req): Json<WorkerExecutionLeaseClaimRequest>,
-) -> Result<Json<jobs::ExecutionLeaseGrant>, ApiError> {
+) -> Result<Response, ApiError> {
     if req.run_id.trim().is_empty() {
         return bad_request("Invalid execution lease request.");
     }
-    jobs::claim_execution_lease(
+    let owner_id = authenticated_execution_lease_owner(&worker, &req.owner_id)?;
+    if req.volume_proof.volume_id != req.volume_id
+        || req.volume_proof.enrollment_epoch != req.enrollment_epoch
+        || req.volume_proof.process_instance_id != req.process_instance_id
+    {
+        return bad_request("Runner-volume lease proof does not match the claim.");
+    }
+    let managed_cloud = managed_execution_lease_authority_input(
+        req.workflow_request_id.as_deref(),
+        req.managed_cloud_release.as_ref(),
+        req.managed_cloud_release_sha256.as_deref(),
+        req.managed_cloud_runtime_instance_id.as_deref(),
+        req.managed_cloud_runtime_instance_epoch,
+    )?;
+    if managed_cloud.is_some() && worker.scope == "debug" {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let server_now_ms = jobs::now_ms();
+    let payload_sha256 =
+        super::jobs_runner_volumes::runner_volume_execution_lease_claim_payload_sha256(
+            &super::jobs_runner_volumes::RunnerVolumeExecutionLeaseClaimPayload {
+                worker_id: &worker.worker_id,
+                account_id: &req.account_id,
+                application_id: &req.application_id,
+                run_id: &req.run_id,
+                browser_profile_id: &req.browser_profile_id,
+                owner_id,
+                volume_id: &req.volume_id,
+                enrollment_epoch: req.enrollment_epoch,
+                process_instance_id: &req.process_instance_id,
+                runtime_grant_id: &req.runtime_grant_id,
+                runtime_sha256: &req.runtime_sha256,
+                managed_cloud: managed_cloud.as_ref().map(|managed_cloud| {
+                    super::jobs_runner_volumes::RunnerVolumeManagedExecutionLeaseClaimPayload {
+                        workflow_request_id: &managed_cloud.workflow_request_id,
+                        managed_cloud_release_sha256: &managed_cloud.managed_cloud_release_sha256,
+                        runtime_instance_id: &managed_cloud.managed_cloud_runtime_instance_id,
+                        runtime_instance_epoch: managed_cloud.managed_cloud_runtime_instance_epoch,
+                    }
+                }),
+            },
+        );
+    let authority = jobs::verify_runner_volume_authority_proof(
+        &state.pool,
+        &req.volume_proof,
+        "execution_lease_claim",
+        &payload_sha256,
+        server_now_ms,
+        super::jobs_runner_volumes::RUNNER_VOLUME_AUTHORITY_MAX_CLOCK_SKEW_MS,
+    )
+    .map_err(super::jobs_runner_volumes::runner_volume_api_error)?;
+    if authority.volume().worker_id != worker.worker_id {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Runner-volume authority is invalid.".to_string(),
+        ));
+    }
+    let binding = jobs::BindRunnerVolumeResidencyRequest {
+        account_id: req.account_id.clone(),
+        run_id: req.run_id.clone(),
+        worker_id: worker.worker_id.clone(),
+        volume_id: req.volume_id.clone(),
+        enrollment_epoch: req.enrollment_epoch,
+        process_instance_id: req.process_instance_id.clone(),
+        now_ms: server_now_ms,
+    };
+    jobs::claim_managed_execution_lease_for_runner_volume_authorized(
         &state.pool,
         &req.account_id,
         &req.application_id,
         &req.run_id,
         &req.browser_profile_id,
-        &req.owner_id,
+        owner_id,
+        &binding,
+        &req.runtime_grant_id,
+        &req.runtime_sha256,
+        &authority,
+        managed_cloud.as_ref(),
+        &worker.worker_id,
+        &binding.worker_id,
     )
-    .map(Json)
+    .map(worker_execution_lease_json_response)
     .map_err(execution_lease_error)
+}
+
+fn worker_execution_lease_json_response(value: impl Serialize) -> Response {
+    let mut response = Json(value).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn managed_execution_lease_authority_input(
+    workflow_request_id: Option<&str>,
+    release: Option<&jobs::ManagedCloudReleaseMemoAuthority>,
+    release_sha256: Option<&str>,
+    runtime_instance_id: Option<&str>,
+    runtime_instance_epoch: Option<i64>,
+) -> Result<Option<jobs::ManagedCloudExecutionLeaseClaimInput>, ApiError> {
+    let authority = match (
+        workflow_request_id,
+        release,
+        release_sha256,
+        runtime_instance_id,
+        runtime_instance_epoch,
+    ) {
+        (None, None, None, None, None) => None,
+        (
+            Some(workflow_request_id),
+            Some(release),
+            Some(release_sha256),
+            Some(runtime_instance_id),
+            Some(runtime_instance_epoch),
+        ) => {
+            let exact_sha256 = jobs::managed_cloud_release_memo_sha256(release).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid managed-cloud execution authority.".to_string(),
+                )
+            })?;
+            if exact_sha256 != release_sha256
+                || !valid_managed_workflow_request_id(workflow_request_id)
+                || runtime_instance_epoch <= 0
+                || !(20..=128).contains(&runtime_instance_id.len())
+                || !runtime_instance_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid managed-cloud execution authority.".to_string(),
+                ));
+            }
+            Some(jobs::ManagedCloudExecutionLeaseClaimInput {
+                workflow_request_id: workflow_request_id.to_string(),
+                managed_cloud_release: release.clone(),
+                managed_cloud_release_sha256: release_sha256.to_string(),
+                managed_cloud_runtime_instance_id: runtime_instance_id.to_string(),
+                managed_cloud_runtime_instance_epoch: runtime_instance_epoch,
+            })
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Managed-cloud execution authority must be complete.".to_string(),
+            ));
+        }
+    };
+    Ok(authority)
+}
+
+fn required_managed_execution_lease_authority_input(
+    workflow_request_id: Option<&str>,
+    release: Option<&jobs::ManagedCloudReleaseMemoAuthority>,
+    release_sha256: Option<&str>,
+    runtime_instance_id: Option<&str>,
+    runtime_instance_epoch: Option<i64>,
+) -> Result<jobs::ManagedCloudExecutionLeaseClaimInput, ApiError> {
+    managed_execution_lease_authority_input(
+        workflow_request_id,
+        release,
+        release_sha256,
+        runtime_instance_id,
+        runtime_instance_epoch,
+    )?
+    .ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Managed-cloud execution authority is required.".to_string(),
+        )
+    })
+}
+
+fn valid_managed_workflow_request_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("wfreq-v2-") else {
+        return false;
+    };
+    uuid::Uuid::parse_str(suffix).is_ok_and(|request_id| {
+        request_id.get_version_num() == 5
+            && request_id.get_variant() == uuid::Variant::RFC4122
+            && request_id.hyphenated().to_string() == suffix
+    })
 }
 
 async fn worker_heartbeat_execution_lease(
@@ -3634,23 +7339,86 @@ async fn worker_heartbeat_execution_lease(
     .map_err(execution_lease_error)
 }
 
-async fn worker_start_irreversible_submission(
+async fn worker_authorize_managed_execution_effect(
     State(state): State<AppState>,
+    Extension(worker): Extension<JobsWorkerIdentity>,
     Path(run_id): Path<String>,
-    Json(req): Json<WorkerIrreversibleExecutionRequest>,
-) -> Result<Json<jobs::ExecutionLeaseRecord>, ApiError> {
-    if req.action != "submit" {
-        return bad_request("Invalid irreversible execution action.");
+    Json(req): Json<WorkerManagedExecutionEffectRequest>,
+) -> Result<Response, ApiError> {
+    if worker.scope == "debug" {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
     }
-    jobs::start_irreversible_submission(
+    let managed_cloud = required_managed_execution_lease_authority_input(
+        req.workflow_request_id.as_deref(),
+        req.managed_cloud_release.as_ref(),
+        req.managed_cloud_release_sha256.as_deref(),
+        req.managed_cloud_runtime_instance_id.as_deref(),
+        req.managed_cloud_runtime_instance_epoch,
+    )?;
+    jobs::authorize_managed_execution_effect(
         &state.pool,
         &req.account_id,
         &req.application_id,
         &run_id,
         &req.lease_token,
         req.fence,
+        &managed_cloud,
+        &worker.worker_id,
     )
-    .map(Json)
+    .map(worker_execution_lease_json_response)
+    .map_err(execution_lease_error)
+}
+
+async fn worker_start_irreversible_submission(
+    State(state): State<AppState>,
+    Extension(worker): Extension<JobsWorkerIdentity>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerIrreversibleExecutionRequest>,
+) -> Result<Response, ApiError> {
+    if req.action != "submit" {
+        return bad_request("Invalid irreversible execution action.");
+    }
+    let managed_cloud = managed_execution_lease_authority_input(
+        req.workflow_request_id.as_deref(),
+        req.managed_cloud_release.as_ref(),
+        req.managed_cloud_release_sha256.as_deref(),
+        req.managed_cloud_runtime_instance_id.as_deref(),
+        req.managed_cloud_runtime_instance_epoch,
+    )?;
+    if managed_cloud.is_some() && worker.scope == "debug" {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let storage_config = state.config.object_storage.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Application evidence storage is not configured.".to_string(),
+    ))?;
+    let storage = ObjectStorage::new(storage_config);
+    let now_ms = jobs::now_ms();
+    let bundle_capacity_bytes = storage.max_object_bytes().min(MAX_RECEIPT_BUNDLE_BYTES) as i64;
+    let capacity = NewSubmissionEvidenceCapacity {
+        account_id: req.account_id.clone(),
+        application_id: req.application_id.clone(),
+        run_id: run_id.clone(),
+        runner: "cloud".to_string(),
+        reserved_bytes: MAX_RECEIPT_EVIDENCE_BYTES as i64 + bundle_capacity_bytes,
+        reserved_objects: MAX_SUBMISSION_EVIDENCE_OBJECTS,
+        expires_at_ms: now_ms.saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS),
+        now_ms,
+        limits: storage.upload_limits(),
+    };
+    jobs::start_irreversible_submission_authorized(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.lease_token,
+        req.fence,
+        &req.final_submit_proof,
+        &capacity,
+        managed_cloud.as_ref(),
+        &worker.worker_id,
+    )
+    .map(worker_execution_lease_json_response)
     .map_err(execution_lease_error)
 }
 
@@ -3670,6 +7438,383 @@ async fn worker_finish_execution_lease(
     )
     .map(|()| StatusCode::NO_CONTENT)
     .map_err(execution_lease_error)
+}
+
+async fn worker_reconcile_execution_checkpoint(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerCheckpointReconciliationRequest>,
+) -> Result<Json<jobs::ExecutionLeaseRecord>, ApiError> {
+    jobs::reconcile_execution_lease_checkpoint(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.owner_id,
+        req.lease_token.as_deref(),
+        req.fence,
+        req.checkpoint_version,
+        &req.checkpoint_phase,
+    )
+    .map(Json)
+    .map_err(execution_lease_error)
+}
+
+async fn worker_restore_browser_profile_snapshot(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerBrowserProfileSnapshotAccessRequest>,
+) -> Result<Response, ApiError> {
+    let _object_lifecycle_guard =
+        crate::db::account_data::acquire_account_object_writer(&state.pool, &req.account_id)
+            .await
+            .map_err(internal)?;
+    let snapshot = jobs::get_browser_profile_snapshot_for_lease(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.browser_profile_id,
+        &req.lease_token,
+        req.fence,
+    )
+    .map_err(execution_lease_error)?;
+    let Some(snapshot) = snapshot else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let storage = browser_profile_object_storage(&state)?;
+    if !storage.key_belongs_to_account(&snapshot.object_key, &req.account_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "The saved browser profile is unavailable.".to_string(),
+        ));
+    }
+    let stored = storage
+        .get(&snapshot.object_key)
+        .await
+        .map_err(browser_profile_storage_error)?;
+    if let Err(error) = verify_browser_profile_snapshot_bytes(
+        &stored.bytes,
+        &snapshot.sha256,
+        snapshot.size_bytes,
+        storage.max_object_bytes(),
+    ) {
+        tracing::error!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&req.account_id),
+            browser_profile_id = %req.browser_profile_id,
+            generation = snapshot.generation,
+            error = %error.1,
+            "Bluey Jobs stored browser profile snapshot failed integrity verification"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The saved browser profile is unavailable.".to_string(),
+        ));
+    }
+    Ok(Json(WorkerBrowserProfileSnapshotRestoreResponse {
+        browser_profile_id: snapshot.browser_profile_id,
+        generation: snapshot.generation,
+        sha256: snapshot.sha256,
+        size_bytes: snapshot.size_bytes,
+        envelope_version: snapshot.envelope_version,
+        encrypted_snapshot_base64: base64::engine::general_purpose::STANDARD.encode(stored.bytes),
+    })
+    .into_response())
+}
+
+async fn worker_store_browser_profile_snapshot(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerBrowserProfileSnapshotStoreRequest>,
+) -> Result<Json<WorkerBrowserProfileSnapshotStoreResponse>, ApiError> {
+    let storage = browser_profile_object_storage(&state)?;
+    if req.envelope_version <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid browser profile envelope version.".to_string(),
+        ));
+    }
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(req.encrypted_snapshot_base64.as_bytes())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Invalid encrypted browser profile snapshot.".to_string(),
+            )
+        })?;
+    verify_browser_profile_snapshot_bytes(
+        &encrypted,
+        &req.sha256,
+        req.size_bytes,
+        storage.max_object_bytes(),
+    )?;
+    let _object_writer =
+        crate::db::account_data::acquire_account_object_writer(&state.pool, &req.account_id)
+            .await
+            .map_err(internal)?;
+    let next_generation = req.expected_generation.checked_add(1).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Invalid browser profile generation.".to_string(),
+    ))?;
+    let object_key = storage.browser_profile_snapshot_key(
+        &req.account_id,
+        &req.browser_profile_id,
+        next_generation,
+        &req.sha256,
+    );
+    let current = jobs::authorize_browser_profile_snapshot_store(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.browser_profile_id,
+        &req.lease_token,
+        req.fence,
+        req.expected_generation,
+        &object_key,
+        &req.sha256,
+        req.size_bytes,
+        req.envelope_version,
+    )
+    .map_err(execution_lease_error)?;
+    let exact_replay = current.as_ref().is_some_and(|current| {
+        current.generation == next_generation
+            && current.object_key == object_key
+            && current.sha256 == req.sha256
+            && current.size_bytes == req.size_bytes
+            && current.envelope_version == req.envelope_version
+            && current.writer_run_id == run_id
+            && current.writer_fence == req.fence
+    });
+    if !exact_replay
+        && current.as_ref().map_or(0, |snapshot| snapshot.generation) != req.expected_generation
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "A newer browser profile snapshot is already available.".to_string(),
+        ));
+    }
+    let reservation = object_uploads::reserve_account_object_upload(
+        &state.pool,
+        &NewObjectUpload {
+            account_id: req.account_id.clone(),
+            object_kind: ObjectKind::Artifact,
+            logical_id: format!(
+                "jobs-browser-profile:{}:{next_generation}:{}:{}",
+                req.browser_profile_id, req.envelope_version, req.sha256
+            ),
+            session_id: None,
+            storage_scope: StorageScope::Artifact,
+            object_key: object_key.clone(),
+            size_bytes: req.size_bytes,
+            sha256: req.sha256.clone(),
+            content_type: jobs::BROWSER_PROFILE_SNAPSHOT_CONTENT_TYPE.to_string(),
+            expires_at_ms: i64::MAX,
+            metadata_json: json!({
+                "artifact_class": "jobs_browser_profile_snapshot",
+                "jobs_browser_profile_id": req.browser_profile_id,
+                "jobs_application_id": req.application_id,
+                "jobs_run_id": run_id,
+                "generation": next_generation,
+                "expected_generation": req.expected_generation,
+                "writer_fence": req.fence,
+                "envelope_version": req.envelope_version,
+                "retention_policy": "account_lifetime_until_deletion",
+            }),
+            now_ms: jobs::now_ms(),
+            limits: storage.upload_limits(),
+        },
+    )
+    .map_err(browser_profile_upload_control_error)?;
+    let encrypted = bytes::Bytes::from(encrypted);
+    if reservation.needs_put {
+        object_uploads::begin_upload_put(&state.pool, &reservation.upload.id, jobs::now_ms())
+            .map_err(browser_profile_upload_control_error)?;
+        if let Err(error) = storage
+            .put(
+                &object_key,
+                encrypted.clone(),
+                jobs::BROWSER_PROFILE_SNAPSHOT_CONTENT_TYPE,
+            )
+            .await
+        {
+            let _ = object_uploads::record_put_failure(
+                &state.pool,
+                &reservation.upload.id,
+                &error.to_string(),
+                jobs::now_ms(),
+            );
+            return Err(browser_profile_storage_error(error));
+        }
+    }
+    let read_back = storage.get(&object_key).await.map_err(|error| {
+        let _ = object_uploads::record_put_failure(
+            &state.pool,
+            &reservation.upload.id,
+            &error.to_string(),
+            jobs::now_ms(),
+        );
+        browser_profile_storage_error(error)
+    })?;
+    let valid_content_type = read_back
+        .content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case(jobs::BROWSER_PROFILE_SNAPSHOT_CONTENT_TYPE)
+        });
+    let valid_payload = verify_browser_profile_snapshot_bytes(
+        &read_back.bytes,
+        &req.sha256,
+        req.size_bytes,
+        storage.max_object_bytes(),
+    )
+    .is_ok();
+    if !valid_content_type || read_back.bytes != encrypted || !valid_payload {
+        let _ = object_uploads::record_put_failure(
+            &state.pool,
+            &reservation.upload.id,
+            "browser profile read-back verification failed",
+            jobs::now_ms(),
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "The saved browser profile failed integrity verification.".to_string(),
+        ));
+    }
+    if reservation.needs_put {
+        object_uploads::release_verified_upload_put(
+            &state.pool,
+            &reservation.upload.id,
+            jobs::now_ms(),
+        )
+        .map_err(browser_profile_upload_control_error)?;
+    }
+    let committed = jobs::publish_browser_profile_snapshot_for_lease(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.browser_profile_id,
+        &req.lease_token,
+        req.fence,
+        req.expected_generation,
+        &object_key,
+        &req.sha256,
+        req.size_bytes,
+        req.envelope_version,
+        &reservation.upload.id,
+    );
+    let committed = committed.map_err(|error| {
+        // The verified upload stays pending unless the pointer transaction
+        // commits it ready. This avoids a check-then-delete race with an
+        // uncertain commit; exact retries reconcile pending bytes, while the
+        // stale-upload worker removes a definite loser.
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&req.account_id),
+            browser_profile_id = %req.browser_profile_id,
+            generation = next_generation,
+            object_key = %object_key,
+            "Bluey Jobs browser profile metadata commit lost its lease or generation race"
+        );
+        execution_lease_error(error)
+    })?;
+    Ok(Json(browser_profile_snapshot_store_response(&committed)))
+}
+
+fn browser_profile_snapshot_store_response(
+    snapshot: &jobs::BrowserProfileSnapshotRecord,
+) -> WorkerBrowserProfileSnapshotStoreResponse {
+    WorkerBrowserProfileSnapshotStoreResponse {
+        browser_profile_id: snapshot.browser_profile_id.clone(),
+        generation: snapshot.generation,
+        sha256: snapshot.sha256.clone(),
+        size_bytes: snapshot.size_bytes,
+        envelope_version: snapshot.envelope_version,
+    }
+}
+
+fn browser_profile_object_storage(state: &AppState) -> Result<ObjectStorage, ApiError> {
+    state
+        .config
+        .object_storage
+        .clone()
+        .map(ObjectStorage::new)
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Browser profile recovery storage is unavailable.".to_string(),
+        ))
+}
+
+fn verify_browser_profile_snapshot_bytes(
+    bytes: &[u8],
+    expected_sha256: &str,
+    expected_size_bytes: i64,
+    maximum_bytes: usize,
+) -> Result<(), ApiError> {
+    let actual_size = i64::try_from(bytes.len()).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Encrypted browser profile snapshot is too large.".to_string(),
+        )
+    })?;
+    if bytes.is_empty()
+        || bytes.len() > maximum_bytes
+        || expected_size_bytes <= 0
+        || actual_size != expected_size_bytes
+        || expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || sha256_hex(bytes) != expected_sha256
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Encrypted browser profile snapshot did not pass integrity checks.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn browser_profile_storage_error(error: anyhow::Error) -> ApiError {
+    tracing::error!(error = %error, "Bluey Jobs browser profile storage failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Browser profile recovery storage is unavailable.".to_string(),
+    )
+}
+
+fn browser_profile_upload_control_error(error: anyhow::Error) -> ApiError {
+    match error.downcast_ref::<UploadControlError>() {
+        Some(UploadControlError::ObjectTooLarge) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Encrypted browser profile snapshot is too large.".to_string(),
+        ),
+        Some(
+            UploadControlError::AccountBytesQuotaExceeded
+            | UploadControlError::AccountObjectQuotaExceeded,
+        ) => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Browser profile recovery storage quota is unavailable.".to_string(),
+        ),
+        Some(UploadControlError::DailyQuotaExceeded) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Browser profile recovery upload capacity is temporarily unavailable.".to_string(),
+        ),
+        Some(UploadControlError::AccountDeleting) => (
+            StatusCode::CONFLICT,
+            "Account deletion has fenced new browser profile snapshots.".to_string(),
+        ),
+        Some(
+            UploadControlError::IdempotencyConflict
+            | UploadControlError::UploadInProgress
+            | UploadControlError::UploadGone,
+        ) => (
+            StatusCode::CONFLICT,
+            "This browser profile generation is already being stored differently.".to_string(),
+        ),
+        _ => internal(error),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3928,9 +8073,31 @@ fn create_intervention_from_receipt(
     state: &AppState,
     account_id: &str,
     application_id: &str,
-    mut receipt: Value,
+    receipt: Value,
 ) -> Result<Intervention, ApiError> {
     ensure_worker_application(state, account_id, application_id)?;
+    let (intervention, takeover_url) = intervention_from_receipt(application_id, receipt)?;
+    let saved =
+        jobs::save_intervention(&state.pool, account_id, &intervention).map_err(internal)?;
+    if let Some(takeover_url) = takeover_url {
+        if let Some(mut session) = jobs::list_browser_sessions(&state.pool, account_id)
+            .map_err(internal)?
+            .into_iter()
+            .find(|session| session.application_id.as_deref() == saved.application_id.as_deref())
+        {
+            session.status = "needs_input".to_string();
+            session.current_step = saved.title.clone();
+            session.takeover_url = Some(takeover_url);
+            jobs::upsert_browser_session(&state.pool, account_id, &session).map_err(internal)?;
+        }
+    }
+    Ok(saved)
+}
+
+fn intervention_from_receipt(
+    application_id: &str,
+    mut receipt: Value,
+) -> Result<(Intervention, Option<String>), ApiError> {
     if let Some(receipt) = receipt.as_object_mut() {
         receipt.remove("screenshotPath");
     }
@@ -3983,31 +8150,16 @@ fn create_intervention_from_receipt(
         created_at_ms: 0,
         resolved_at_ms: None,
     };
-    let saved =
-        jobs::save_intervention(&state.pool, account_id, &intervention).map_err(internal)?;
-    if let Some(takeover_url) = takeover_url {
-        if takeover_url.starts_with("https://") || takeover_url.starts_with("bluey-jobs://") {
-            if let Some(mut session) = jobs::list_browser_sessions(&state.pool, account_id)
-                .map_err(internal)?
-                .into_iter()
-                .find(|session| {
-                    session.application_id.as_deref() == saved.application_id.as_deref()
-                })
-            {
-                session.status = "needs_input".to_string();
-                session.current_step = saved.title.clone();
-                session.takeover_url = Some(takeover_url);
-                jobs::upsert_browser_session(&state.pool, account_id, &session)
-                    .map_err(internal)?;
-            }
-        }
-    }
-    Ok(saved)
+    let takeover_url =
+        takeover_url.filter(|url| url.starts_with("https://") || url.starts_with("bluey-jobs://"));
+    Ok((intervention, takeover_url))
 }
 
 #[derive(Debug, Deserialize)]
 struct WorkerReceiptRequest {
     account_id: String,
+    lease_token: String,
+    fence: i64,
     receipt: Value,
     #[serde(default)]
     evidence_objects: Vec<ReceiptEvidenceObject>,
@@ -4024,22 +8176,101 @@ struct ReceiptEvidenceObject {
 
 async fn worker_receipt(
     State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
     Path(application_id): Path<String>,
     Json(req): Json<WorkerReceiptRequest>,
-) -> Result<Json<JobApplication>, ApiError> {
-    persist_submission_receipt(
+) -> Result<Response, ApiError> {
+    let run_id = req
+        .receipt
+        .get("runId")
+        .and_then(Value::as_str)
+        .filter(|id| valid_approved_execution_identifier(id))
+        .map(str::to_owned);
+    let result = persist_submission_receipt(
         &state,
         &req.account_id,
         &application_id,
         req.receipt,
         req.evidence_objects,
         "cloud",
+        Some(CloudReceiptAccess {
+            lease_token: req.lease_token,
+            fence: req.fence,
+        }),
+        None,
+        None,
         None,
     )
-    .await
-    .map(Json)
+    .await;
+    match result {
+        Ok(application) => Ok(worker_receipt_success_response(application)),
+        Err(error) => match run_id {
+            Some(run_id) => worker_receipt_error_response(error, &application_id, &run_id),
+            None => Err(error),
+        },
+    }
 }
 
+fn worker_receipt_error_response(
+    error: ApiError,
+    application_id: &str,
+    run_id: &str,
+) -> Result<Response, ApiError> {
+    let reason = match error.0 {
+        StatusCode::BAD_REQUEST => "invalid_request",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::CONFLICT => "identity_conflict",
+        _ => return Err(error),
+    };
+    Ok(workflow_command_json_response(
+        error.0,
+        json!({
+            "schema_version": 1,
+            "outcome": "rejected",
+            "reason": reason,
+            "application_id": application_id,
+            "run_id": run_id,
+        }),
+    ))
+}
+
+fn worker_receipt_success_response(application: JobApplication) -> Response {
+    let mut response = Json(application).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+struct CloudReceiptAccess {
+    lease_token: String,
+    fence: i64,
+}
+
+fn receipt_has_frozen_certification(
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<bool, ApiError> {
+    if application.state == "submitted" {
+        // The final receipt stores the approved execution in its authenticated
+        // pre-submission envelope, not at the live application's old path.
+        let frozen = jobs::validated_submitted_pre_submission_application(account_id, application)
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "This application already has a different final receipt.".to_string(),
+                )
+            })?;
+        return Ok(jobs::application_has_frozen_ats_certification(&frozen));
+    }
+    Ok(jobs::application_has_frozen_ats_certification(application))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn persist_submission_receipt(
     state: &AppState,
     account_id: &str,
@@ -4047,32 +8278,29 @@ async fn persist_submission_receipt(
     mut receipt: Value,
     evidence_objects: Vec<ReceiptEvidenceObject>,
     expected_runner: &str,
+    cloud_access: Option<CloudReceiptAccess>,
     local_ticket_hash: Option<&str>,
+    local_result_capability: Option<&str>,
+    local_capability_version: Option<u8>,
 ) -> Result<JobApplication, ApiError> {
-    if receipt.get(SUBMISSION_FINGERPRINT_KEY).is_some() {
+    if receipt.get(SUBMISSION_FINGERPRINT_KEY).is_some()
+        || receipt.get(jobs::SERVER_SUBMISSION_AUTHORITY_KEY).is_some()
+        || receipt.get("receiptObject").is_some()
+        || receipt.get("evidenceObjects").is_some()
+    {
         return bad_request("Submission receipt contains a reserved server field.");
     }
-    let request_fingerprint = submission_request_fingerprint(&receipt, &evidence_objects)?;
     let application = jobs::get_application(&state.pool, account_id, application_id)
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
     let receipt_id = required_receipt_string(&receipt, "receiptId")?;
-    if application.state == "submitted" {
-        if application
-            .receipt
-            .get(SUBMISSION_FINGERPRINT_KEY)
-            .and_then(Value::as_str)
-            == Some(request_fingerprint.as_str())
-        {
-            return Ok(application);
-        }
-        return Err((
-            StatusCode::CONFLICT,
-            "This application already has a different final receipt.".to_string(),
-        ));
-    }
-    if receipt.get("schemaVersion").and_then(Value::as_i64) != Some(1) {
+    let certified_execution = receipt_has_frozen_certification(account_id, &application)?;
+    let expected_receipt_schema = if certified_execution { 2 } else { 1 };
+    if receipt.get("schemaVersion").and_then(Value::as_i64) != Some(expected_receipt_schema) {
         return bad_request("Unsupported submission receipt version.");
+    }
+    if !certified_execution && receipt.get("atsCertifiedReceiptAuthority").is_some() {
+        return bad_request("Review submission receipts cannot carry certified authority.");
     }
     if receipt.get("accountId").and_then(Value::as_str) != Some(account_id) {
         return bad_request("Receipt does not match this account.");
@@ -4087,6 +8315,17 @@ async fn persist_submission_receipt(
     if application.run_id.as_deref() != Some(run_id.as_str()) {
         return bad_request("Receipt does not match this browser run.");
     }
+    if certified_execution {
+        validate_receipt_ats_certification_authority(
+            &state.pool,
+            &application,
+            &receipt,
+            account_id,
+            application_id,
+            &run_id,
+            expected_runner,
+        )?;
+    }
     let result = receipt.get("result").and_then(Value::as_object).ok_or((
         StatusCode::BAD_REQUEST,
         "Submission result is missing.".to_string(),
@@ -4094,6 +8333,7 @@ async fn persist_submission_receipt(
     if result.get("status").and_then(Value::as_str) != Some("submitted") {
         return bad_request("Only a confirmed submission can create a final receipt.");
     }
+    let submit_http_status = successful_submit_http_status(result)?;
     let confirmation_text = result
         .get("confirmationText")
         .and_then(Value::as_str)
@@ -4114,6 +8354,158 @@ async fn persist_submission_receipt(
         .or_else(|| confirmation_url.clone())
         .expect("confirmation checked above");
     let submitted_at = result.get("submittedAt").cloned();
+    if application.state == "submitted" {
+        let stored_execution_authority = application
+            .receipt
+            .pointer(&format!(
+                "/{}/executionAuthority",
+                jobs::SERVER_SUBMISSION_AUTHORITY_KEY
+            ))
+            .ok_or((
+                StatusCode::CONFLICT,
+                "This application already has a different final receipt.".to_string(),
+            ))?;
+        let authority_matches = match (
+            expected_runner,
+            cloud_access.as_ref(),
+            local_ticket_hash,
+            local_result_capability,
+        ) {
+            ("cloud", Some(access), None, None) => jobs::submitted_cloud_receipt_replay_authorized(
+                &application,
+                &run_id,
+                &access.lease_token,
+                access.fence,
+            ),
+            ("local", None, _, Some(result_capability)) => {
+                jobs::submitted_local_receipt_replay_authorized(
+                    &application,
+                    &run_id,
+                    result_capability,
+                )
+            }
+            _ => false,
+        };
+        if !authority_matches {
+            return Err((
+                StatusCode::CONFLICT,
+                "This application already has a different final receipt.".to_string(),
+            ));
+        }
+        let request_fingerprint = submission_request_fingerprint(
+            &receipt,
+            &evidence_objects,
+            stored_execution_authority,
+        )?;
+        return match submission_finalize_error_disposition(
+            account_id,
+            Some(&application),
+            &request_fingerprint,
+        ) {
+            SubmissionFinalizeErrorDisposition::Replay => mark_submitted_cloud_workflow_terminal(
+                &state.pool,
+                application,
+                account_id,
+                application_id,
+                &run_id,
+                expected_runner,
+            ),
+            SubmissionFinalizeErrorDisposition::Conflict
+            | SubmissionFinalizeErrorDisposition::NotCommitted => Err((
+                StatusCode::CONFLICT,
+                "This application already has a different final receipt.".to_string(),
+            )),
+        };
+    }
+
+    let (execution_authority, authorized_session_id) = match (
+        expected_runner,
+        cloud_access,
+        local_ticket_hash,
+        local_result_capability,
+        local_capability_version,
+    ) {
+        ("cloud", Some(access), None, None, None) => {
+            let authority = jobs::execution_receipt_authority(
+                &state.pool,
+                account_id,
+                application_id,
+                &run_id,
+                &access.lease_token,
+                access.fence,
+            )
+            .map_err(submission_receipt_authority_error)?;
+            let session_id = jobs::execution_receipt_browser_session_id(
+                &state.pool,
+                account_id,
+                application_id,
+                &run_id,
+                &authority,
+            )
+            .map_err(submission_receipt_authority_error)?;
+            (
+                json!({
+                    "kind": "cloud_execution_lease",
+                    "ownerId": authority.owner_id,
+                    "leaseTokenSha256": authority.lease_token_sha256,
+                    "fence": authority.fence,
+                    "phase": authority.phase,
+                }),
+                session_id,
+            )
+        }
+        ("local", None, Some(ticket_hash), Some(result_capability), Some(capability_version)) => {
+            let result_capability_sha256 =
+                jobs::local_result_replay_credential_sha256(result_capability).ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "Submission receipt runner authority is invalid.".to_string(),
+                ))?;
+            let mut authority = json!({
+                "kind": "local_run_ticket",
+                "ticketHash": ticket_hash,
+                "runId": run_id,
+                "resultCapabilitySha256": result_capability_sha256,
+            });
+            match capability_version {
+                super::jobs_local_capability::LEGACY_TOKEN_VERSION => {}
+                super::jobs_local_capability::TOKEN_VERSION => {
+                    let release = jobs::get_local_run_browser_release_binding(
+                        &state.pool,
+                        account_id,
+                        &run_id,
+                    )
+                    .map_err(internal)?
+                    .ok_or((
+                        StatusCode::CONFLICT,
+                        "This local Browser run has no immutable release binding.".to_string(),
+                    ))?;
+                    authority["browserRelease"] = jobs::browser_release_receipt_authority(&release);
+                }
+                _ => return bad_request("Submission receipt runner authority is invalid."),
+            }
+            (authority, run_id.clone())
+        }
+        _ => {
+            return bad_request("Submission receipt runner authority is invalid.");
+        }
+    };
+    if expected_runner == "cloud"
+        && !matches!(
+            execution_authority.get("phase").and_then(Value::as_str),
+            Some("submitted" | "side_effect_unknown")
+        )
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "A matching cloud execution lease cannot accept this receipt.".to_string(),
+        ));
+    }
+    let request_fingerprint =
+        submission_request_fingerprint(&receipt, &evidence_objects, &execution_authority)?;
+    let verified_claim_ids = frozen_submission_claim_ids(&application)?;
+    validate_receipt_verified_claim_ids(&receipt, &verified_claim_ids)?;
+    validate_provider_submission_proof(&application, &receipt)?;
+    validate_receipt_final_submit_proof(&application, &receipt)?;
     let resume_id = application.resume_version_id.as_deref().ok_or((
         StatusCode::CONFLICT,
         "The submitted resume version is missing.".to_string(),
@@ -4124,35 +8516,16 @@ async fn persist_submission_receipt(
             StatusCode::CONFLICT,
             "The submitted resume version is missing.".to_string(),
         ))?;
-    let posting = jobs::get_posting(&state.pool, account_id, &application.job_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
-    let verified_claim_ids = confirmed_resume_claim_ids(state, account_id, &resume)?;
-    validate_receipt_verified_claim_ids(&receipt, &verified_claim_ids)?;
-    if expected_runner == "cloud" {
-        match jobs::execution_lease_phase_for_application(
-            &state.pool,
-            account_id,
-            application_id,
-            &run_id,
-        )
-        .map_err(internal)?
-        .as_deref()
-        {
-            Some("submitted") => {}
-            Some(_) | None => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "A matching cloud execution lease is not terminal submitted.".to_string(),
-                ));
-            }
-        }
-    }
+    let (_, approved_job, _) = approved_execution_snapshot(&application)?;
     let storage_config = state.config.object_storage.clone().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Application evidence storage is not configured.".to_string(),
     ))?;
     let storage = ObjectStorage::new(storage_config);
+    let _object_writer =
+        crate::db::account_data::acquire_account_object_writer(&state.pool, account_id)
+            .await
+            .map_err(internal)?;
     let prepared_objects =
         preflight_receipt_evidence(&receipt, evidence_objects, storage.max_object_bytes())?;
     let preflight_verified = prepared_objects
@@ -4162,58 +8535,103 @@ async fn persist_submission_receipt(
     validate_receipt_bundle(
         account_id,
         &application,
-        &posting,
         &resume,
         &receipt,
         &preflight_verified,
+        false,
     )?;
-    let terminal_session =
-        submission_terminal_session(state, account_id, application_id, &run_id, expected_runner)?;
-    receipt
+    let terminal_session = submission_terminal_session(
+        state,
+        account_id,
+        application_id,
+        &authorized_session_id,
+        expected_runner,
+    )?;
+    let submission_authority = submission_authority_snapshot(&application, execution_authority)?;
+    let receipt_object = receipt
         .as_object_mut()
-        .expect("validated receipt fields require an object")
-        .insert(
-            SUBMISSION_FINGERPRINT_KEY.to_string(),
-            Value::String(request_fingerprint.clone()),
-        );
-    let uploaded = upload_receipt_evidence(
+        .expect("validated receipt fields require an object");
+    receipt_object.insert(
+        SUBMISSION_FINGERPRINT_KEY.to_string(),
+        Value::String(request_fingerprint.clone()),
+    );
+    receipt_object.insert(
+        jobs::SERVER_SUBMISSION_AUTHORITY_KEY.to_string(),
+        submission_authority,
+    );
+    let mut uploaded = match upload_receipt_evidence(
+        &state.pool,
         &storage,
         account_id,
         application_id,
+        &run_id,
+        expected_runner,
+        &request_fingerprint,
         &mut receipt,
         prepared_objects,
     )
-    .await?;
-    if let Err(error) = validate_receipt_bundle(
+    .await
+    {
+        Ok(uploaded) => uploaded,
+        Err(error) => {
+            return reconcile_submission_precommit_error(
+                &state.pool,
+                account_id,
+                application_id,
+                &request_fingerprint,
+                error,
+            )
+        }
+    };
+    if let Err(error) = upload_immutable_receipt_bundle(
+        &state.pool,
+        &storage,
+        account_id,
+        application_id,
+        &run_id,
+        expected_runner,
+        &request_fingerprint,
+        &receipt_id,
+        &approved_job,
+        &resume,
+        &mut receipt,
+        &mut uploaded,
+    )
+    .await
+    {
+        return reconcile_submission_precommit_error(
+            &state.pool,
+            account_id,
+            application_id,
+            &request_fingerprint,
+            error,
+        );
+    }
+    validate_receipt_bundle(
         account_id,
         &application,
-        &posting,
         &resume,
         &receipt,
         &uploaded.verified,
-    ) {
-        cleanup_uploaded_objects(&storage, &uploaded.created_keys).await;
-        return Err(error);
-    }
+        true,
+    )?;
     let provider = required_receipt_string(&receipt, "adapter")?;
     let evidence = match submission_evidence_records(
         application_id,
         &receipt_id,
         &provider,
-        &posting,
+        &approved_job,
         &resume,
         &receipt,
         &uploaded.verified,
+        submit_http_status,
         confirmation,
         confirmation_url,
         confirmation_text,
         submitted_at,
     ) {
         Ok(evidence) => evidence,
-        Err(error) => {
-            cleanup_uploaded_objects(&storage, &uploaded.created_keys).await;
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     let finalized = jobs::finalize_submission(
         &state.pool,
@@ -4224,18 +8642,166 @@ async fn persist_submission_receipt(
         receipt,
         &request_fingerprint,
         &evidence,
+        &uploaded.uploads,
         &terminal_session,
         local_ticket_hash,
     );
-    match finalized {
-        Ok(jobs::SubmissionFinalizeResult::Committed(application)) => Ok(application),
-        Ok(jobs::SubmissionFinalizeResult::Replayed(application)) => {
-            cleanup_uploaded_objects(&storage, &uploaded.created_keys).await;
-            Ok(application)
-        }
+    let finalized_application = match finalized {
+        Ok(jobs::SubmissionFinalizeResult::Committed(application))
+        | Ok(jobs::SubmissionFinalizeResult::Replayed(application)) => Ok(application),
         Err(error) => {
-            cleanup_uploaded_objects(&storage, &uploaded.created_keys).await;
-            Err(submission_domain_error(error))
+            // A PostgreSQL COMMIT can take effect even when the client receives
+            // a transport error. Never delete evidence on an uncertain result:
+            // first reconcile against the primary application authority. If
+            // that read also fails, pending objects remain in the durable
+            // ledger for the stale-upload cleanup worker, while committed
+            // ready objects remain attached to Submitted.
+            match jobs::get_application(&state.pool, account_id, application_id) {
+                Ok(application) => match submission_finalize_error_disposition(
+                    account_id,
+                    application.as_ref(),
+                    &request_fingerprint,
+                ) {
+                    SubmissionFinalizeErrorDisposition::Replay => {
+                        Ok(application.expect("replay disposition requires an application"))
+                    }
+                    SubmissionFinalizeErrorDisposition::Conflict => Err((
+                        StatusCode::CONFLICT,
+                        "This application already has a different final receipt.".to_string(),
+                    )),
+                    SubmissionFinalizeErrorDisposition::NotCommitted => {
+                        Err(submission_domain_error(error))
+                    }
+                },
+                Err(reconcile_error) => {
+                    tracing::error!(
+                        error = %reconcile_error,
+                        application_id_hash = %sha256_hex(application_id.as_bytes()),
+                        "submission commit result is uncertain; durable evidence was retained"
+                    );
+                    Err(submission_domain_error(error))
+                }
+            }
+        }
+    }?;
+    mark_submitted_cloud_workflow_terminal(
+        &state.pool,
+        finalized_application,
+        account_id,
+        application_id,
+        &run_id,
+        expected_runner,
+    )
+}
+
+fn mark_submitted_cloud_workflow_terminal(
+    pool: &crate::db::DbPool,
+    application: JobApplication,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    expected_runner: &str,
+) -> Result<JobApplication, ApiError> {
+    jobs::validated_submitted_pre_submission_application(account_id, &application).map_err(
+        |error| {
+            tracing::warn!(
+                application_id_hash = %sha256_hex(application_id.as_bytes()),
+                error = %error,
+                "submitted application final envelope failed authentication"
+            );
+            (
+                StatusCode::CONFLICT,
+                "This application already has a different final receipt.".to_string(),
+            )
+        },
+    )?;
+    if expected_runner != "cloud" {
+        return Ok(application);
+    }
+    jobs::mark_jobs_workflow_execution_submitted(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        &workflow_id_for_run(run_id),
+        jobs::now_ms(),
+    )
+    .map_err(|_| {
+        tracing::warn!(
+            reason_code = "workflow_submission_terminal_evidence_failed",
+            "Submitted Jobs workflow terminal evidence could not be persisted"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Jobs is still finalizing this submitted application. Please retry.".to_string(),
+        )
+    })?;
+    Ok(application)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionFinalizeErrorDisposition {
+    Replay,
+    Conflict,
+    NotCommitted,
+}
+
+fn submission_finalize_error_disposition(
+    account_id: &str,
+    application: Option<&JobApplication>,
+    request_fingerprint: &str,
+) -> SubmissionFinalizeErrorDisposition {
+    let Some(application) = application else {
+        return SubmissionFinalizeErrorDisposition::NotCommitted;
+    };
+    if application.state != "submitted" {
+        return SubmissionFinalizeErrorDisposition::NotCommitted;
+    }
+    if application
+        .receipt
+        .get(SUBMISSION_FINGERPRINT_KEY)
+        .and_then(Value::as_str)
+        != Some(request_fingerprint)
+    {
+        return SubmissionFinalizeErrorDisposition::Conflict;
+    }
+    if jobs::validated_submitted_pre_submission_application(account_id, application).is_err() {
+        return SubmissionFinalizeErrorDisposition::Conflict;
+    }
+    SubmissionFinalizeErrorDisposition::Replay
+}
+
+fn reconcile_submission_precommit_error(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    application_id: &str,
+    request_fingerprint: &str,
+    original_error: ApiError,
+) -> Result<JobApplication, ApiError> {
+    match jobs::get_application(pool, account_id, application_id) {
+        Ok(application) => {
+            match submission_finalize_error_disposition(
+                account_id,
+                application.as_ref(),
+                request_fingerprint,
+            ) {
+                SubmissionFinalizeErrorDisposition::Replay => {
+                    Ok(application.expect("replay disposition requires an application"))
+                }
+                SubmissionFinalizeErrorDisposition::Conflict => Err((
+                    StatusCode::CONFLICT,
+                    "This application already has a different final receipt.".to_string(),
+                )),
+                SubmissionFinalizeErrorDisposition::NotCommitted => Err(original_error),
+            }
+        }
+        Err(reconcile_error) => {
+            tracing::error!(
+                error = %reconcile_error,
+                application_id_hash = %sha256_hex(application_id.as_bytes()),
+                "submission upload error could not be reconciled; durable evidence was retained"
+            );
+            Err(original_error)
         }
     }
 }
@@ -4243,13 +8809,34 @@ async fn persist_submission_receipt(
 fn submission_request_fingerprint(
     receipt: &Value,
     evidence_objects: &[ReceiptEvidenceObject],
+    execution_authority: &Value,
 ) -> Result<String, ApiError> {
     let encoded = serde_json::to_vec(&json!({
         "receipt": receipt,
         "evidence_objects": evidence_objects,
+        "execution_authority": execution_authority,
     }))
     .map_err(|error| internal(error.into()))?;
     Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+fn submission_authority_snapshot(
+    application: &JobApplication,
+    execution_authority: Value,
+) -> Result<Value, ApiError> {
+    // Re-run the checksum/admission validator before copying any authority into
+    // the immutable receipt. The complete pre-submission receipt preserves the
+    // exact approved packet, Auto-submit admission, identity/evidence binding,
+    // metering state, and intervention-driven packet revision history.
+    approved_execution_snapshot(application)?;
+    let pre_submission_receipt_sha256 =
+        jobs::submission_pre_receipt_sha256(&application.receipt).map_err(internal)?;
+    Ok(json!({
+        "schemaVersion": 1,
+        "preSubmissionReceipt": application.receipt,
+        "preSubmissionReceiptSha256": pre_submission_receipt_sha256,
+        "executionAuthority": execution_authority,
+    }))
 }
 
 fn confirmed_resume_claim_ids(
@@ -4272,6 +8859,598 @@ fn confirmed_resume_claim_ids(
     claim_ids.sort();
     claim_ids.dedup();
     Ok(claim_ids)
+}
+
+fn frozen_submission_claim_ids(application: &JobApplication) -> Result<Vec<String>, ApiError> {
+    let claims = if application.state == "submitted" {
+        application.receipt.pointer("/packet/verifiedClaimIds")
+    } else {
+        application
+            .receipt
+            .pointer("/approved_execution/packet/verifiedClaimIds")
+    }
+    .and_then(Value::as_array)
+    .ok_or((
+        StatusCode::CONFLICT,
+        "The approved submission claims are missing.".to_string(),
+    ))?;
+    let mut claim_ids = claims
+        .iter()
+        .map(|claim| {
+            claim.as_str().map(str::to_string).ok_or((
+                StatusCode::CONFLICT,
+                "The approved submission claims are invalid.".to_string(),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let original_len = claim_ids.len();
+    claim_ids.sort();
+    claim_ids.dedup();
+    if claim_ids.len() != original_len {
+        return Err((
+            StatusCode::CONFLICT,
+            "The approved submission claims are invalid.".to_string(),
+        ));
+    }
+    Ok(claim_ids)
+}
+
+fn validate_provider_submission_proof(
+    application: &JobApplication,
+    receipt: &Value,
+) -> Result<(), ApiError> {
+    let frozen_url = if application.state == "submitted" {
+        application.receipt.pointer("/job/canonicalUrl")
+    } else {
+        application
+            .receipt
+            .pointer("/approved_execution/job/canonicalUrl")
+    }
+    .and_then(Value::as_str)
+    .ok_or((
+        StatusCode::CONFLICT,
+        "The approved application provider is missing.".to_string(),
+    ))?;
+    let (adapter, adapter_version, event_type) = match ats_kind(frozen_url) {
+        "greenhouse" => (
+            "greenhouse",
+            GREENHOUSE_SUBMISSION_ADAPTER_VERSION,
+            "greenhouse_state_transition",
+        ),
+        "lever" => (
+            "lever",
+            LEVER_SUBMISSION_ADAPTER_VERSION,
+            "lever_state_changed",
+        ),
+        _ => {
+            return Err((
+                StatusCode::CONFLICT,
+                "This application provider is not authorized for final submission.".to_string(),
+            ));
+        }
+    };
+    let final_submit_proof = jobs::stored_final_submit_proof(application).map_err(|error| {
+        tracing::warn!(
+            application_id_hash = %sha256_hex(application.id.as_bytes()),
+            error = %error,
+            "submitted receipt is missing its exact provider target proof"
+        );
+        (
+            StatusCode::CONFLICT,
+            "The pre-click provider target proof is missing or invalid.".to_string(),
+        )
+    })?;
+    let approved_job_key = jobs::final_submit_provider_job_key(
+        adapter,
+        &final_submit_proof.job.approved_canonical_url,
+    )
+    .map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "The pre-click provider target proof is missing or invalid.".to_string(),
+        )
+    })?;
+    let target_job_key =
+        jobs::final_submit_provider_job_key(adapter, &final_submit_proof.target.action_url)
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "The pre-click provider target proof is missing or invalid.".to_string(),
+                )
+            })?;
+    let expected_proof_schema = if jobs::application_has_frozen_ats_certification(application) {
+        4
+    } else {
+        3
+    };
+    if final_submit_proof.schema_version != expected_proof_schema
+        || final_submit_proof.adapter != adapter
+        || final_submit_proof.job.approved_canonical_url != frozen_url
+        || target_job_key != approved_job_key
+        || final_submit_proof.target.provider_job_key != approved_job_key
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "The pre-click provider target proof is missing or invalid.".to_string(),
+        ));
+    }
+    if receipt.get("adapter").and_then(Value::as_str) != Some(adapter)
+        || receipt.get("adapterVersion").and_then(Value::as_str) != Some(adapter_version)
+    {
+        return bad_request("Receipt provider implementation does not match the approved adapter.");
+    }
+    let result = receipt.get("result").and_then(Value::as_object).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Submission result is missing.".to_string(),
+    ))?;
+    if result
+        .get("issues")
+        .and_then(Value::as_array)
+        .is_none_or(|issues| !issues.is_empty())
+    {
+        return bad_request("A submitted receipt cannot contain unresolved browser issues.");
+    }
+    successful_submit_http_status(result)?;
+    let confirmation_text = result
+        .get("confirmationText")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "A submitted receipt needs explicit employer confirmation text.".to_string(),
+        ))?;
+    if !has_explicit_submission_confirmation(confirmation_text) {
+        return bad_request("Employer confirmation text does not prove a successful submission.");
+    }
+    let confirmation_url = result
+        .get("confirmationUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "A submitted receipt needs an employer confirmation URL.".to_string(),
+        ))?;
+    let final_url = receipt
+        .get("finalUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "A submitted receipt needs the final employer URL.".to_string(),
+        ))?;
+    let confirmation_target = parse_provider_application_target(
+        confirmation_url,
+        ProviderApplicationTargetPurpose::Confirmation,
+    )
+    .filter(|target| target.provider == adapter)
+    .ok_or((
+        StatusCode::BAD_REQUEST,
+        "Receipt confirmation is not bound to the approved provider job.".to_string(),
+    ))?;
+    if final_url != confirmation_url || confirmation_target.provider_job_key != approved_job_key {
+        return bad_request("Receipt confirmation is not bound to the approved provider page.");
+    }
+    let generated_at = receipt
+        .get("generatedAt")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt generation time is invalid.".to_string(),
+        ))?;
+    let submitted_at = result
+        .get("submittedAt")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt submission time is invalid.".to_string(),
+        ))?;
+    if submitted_at > generated_at + chrono::Duration::minutes(5)
+        || submitted_at < generated_at - chrono::Duration::minutes(30)
+    {
+        return bad_request("Receipt confirmation timing is not bound to this browser run.");
+    }
+    let provider_event = receipt
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|event| {
+            if event.get("type").and_then(Value::as_str) != Some(event_type) {
+                return false;
+            }
+            let detail = event.get("detail").and_then(Value::as_object);
+            match adapter {
+                "greenhouse" => {
+                    detail
+                        .and_then(|value| value.get("state"))
+                        .and_then(Value::as_str)
+                        == Some("receipt")
+                        && detail
+                            .and_then(|value| value.get("status"))
+                            .and_then(Value::as_str)
+                            == Some("submitted")
+                        && detail
+                            .and_then(|value| value.get("capability"))
+                            .and_then(Value::as_str)
+                            == Some("beta_review")
+                }
+                "lever" => {
+                    detail
+                        .and_then(|value| value.get("state"))
+                        .and_then(Value::as_str)
+                        == Some("receipt")
+                        && detail
+                            .and_then(|value| value.get("outcome"))
+                            .and_then(Value::as_str)
+                            == Some("submitted")
+                        && detail
+                            .and_then(|value| value.get("page_kind"))
+                            .and_then(Value::as_str)
+                            == Some("confirmation")
+                        && detail
+                            .and_then(|value| value.get("mode"))
+                            .and_then(Value::as_str)
+                            == Some("review_only")
+                }
+                _ => false,
+            }
+        })
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt is missing the provider final-state transition.".to_string(),
+        ))?;
+    let provider_event_at = provider_event
+        .get("occurredAt")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt provider final-state time is invalid.".to_string(),
+        ))?;
+    if provider_event_at < submitted_at - chrono::Duration::minutes(1)
+        || provider_event_at > generated_at + chrono::Duration::minutes(5)
+    {
+        return bad_request("Receipt provider proof is not bound to the submission time.");
+    }
+    Ok(())
+}
+
+fn successful_submit_http_status(result: &serde_json::Map<String, Value>) -> Result<i64, ApiError> {
+    result
+        .get("submitHttpStatus")
+        .and_then(Value::as_i64)
+        .filter(|status| {
+            (200..=299).contains(status) || matches!(*status, 301 | 302 | 303 | 307 | 308)
+        })
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "A submitted receipt needs a successful exact POST HTTP status.".to_string(),
+        ))
+}
+
+fn validate_receipt_final_submit_proof(
+    application: &JobApplication,
+    receipt: &Value,
+) -> Result<(), ApiError> {
+    let proof = jobs::stored_final_submit_proof(application).map_err(|error| {
+        tracing::warn!(
+            application_id_hash = %sha256_hex(application.id.as_bytes()),
+            error = %error,
+            "submitted receipt is missing its pre-click document proof"
+        );
+        (
+            StatusCode::CONFLICT,
+            "The pre-click submission proof is missing or invalid.".to_string(),
+        )
+    })?;
+    if receipt.get("adapter").and_then(Value::as_str) != Some(proof.adapter.as_str())
+        || receipt.get("adapterVersion").and_then(Value::as_str)
+            != Some(proof.adapter_version.as_str())
+    {
+        return bad_request("Receipt provider does not match its pre-click proof.");
+    }
+    let documents = receipt.get("documents").and_then(Value::as_array).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Receipt documents are missing.".to_string(),
+    ))?;
+    if documents.len() != proof.documents.len() {
+        return bad_request("Receipt documents do not match the pre-click proof.");
+    }
+    let mut actual = BTreeMap::new();
+    for document in documents {
+        let kind = document
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|kind| matches!(*kind, "resume" | "cover_letter"))
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "Receipt contains a document that was not bound before Submit.".to_string(),
+            ))?;
+        let version_id = document
+            .get("versionId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let sha256 = document
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| valid_sha256(value))
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "Receipt document checksum is invalid.".to_string(),
+            ))?;
+        if actual
+            .insert(kind.to_string(), (version_id, sha256.to_ascii_lowercase()))
+            .is_some()
+        {
+            return bad_request("Receipt contains duplicate submitted documents.");
+        }
+    }
+    for expected in &proof.documents {
+        let Some((version_id, sha256)) = actual.get(&expected.kind) else {
+            return bad_request("Receipt documents do not match the pre-click proof.");
+        };
+        if version_id != &expected.version_id || sha256 != &expected.sha256 {
+            return bad_request("Receipt documents do not match the pre-click proof.");
+        }
+    }
+    Ok(())
+}
+
+fn validate_receipt_ats_certification_authority(
+    pool: &crate::db::DbPool,
+    application: &JobApplication,
+    receipt: &Value,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    expected_runner: &str,
+) -> Result<jobs::AtsCertifiedReceiptAuthority, ApiError> {
+    let authority = receipt
+        .get("atsCertifiedReceiptAuthority")
+        .cloned()
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Certified submission receipt authority is missing.".to_string(),
+        ))?;
+    let authority = serde_json::from_value::<jobs::AtsCertifiedReceiptAuthority>(authority)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Certified submission receipt authority is invalid.".to_string(),
+            )
+        })?;
+    let proof = jobs::stored_final_submit_proof(application).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "The certified pre-click authority is missing or invalid.".to_string(),
+        )
+    })?;
+    let certification = proof.certification.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "The certified pre-click authority is missing or invalid.".to_string(),
+    ))?;
+    let observed_surface = proof.observed_surface.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "The certified layout authority is missing or invalid.".to_string(),
+    ))?;
+    let generated_at_ms = receipt
+        .get("generatedAt")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Certified submission receipt time is invalid.".to_string(),
+        ))?;
+    let ids_are_valid = [
+        authority.application_attempt_id.as_str(),
+        authority.phase_b_request_id.as_str(),
+    ]
+    .into_iter()
+    .all(valid_approved_execution_identifier);
+    let digests_are_valid = [
+        authority.binding_sha256.as_str(),
+        authority.canary_reservation_sha256.as_str(),
+        authority.layout_observation_sha256.as_str(),
+        authority.metering_reservation_sha256.as_str(),
+        authority.observed_surface_sha256.as_str(),
+    ]
+    .into_iter()
+    .all(valid_approved_execution_sha256);
+    let exact = authority.schema_version == 1
+        && authority.account_id == account_id
+        && authority.application_id == application_id
+        && authority.run_id == run_id
+        && authority.provider == proof.adapter
+        && authority.adapter == proof.adapter
+        && authority.adapter_version == proof.adapter_version
+        && authority.manifest_sha256 == certification.manifest_sha256
+        && authority.activation_sha256 == certification.activation_sha256
+        && authority.activation_generation == certification.activation_generation
+        && authority.target_key_sha256 == certification.target_key_sha256
+        && authority.layout_set_sha256 == certification.layout_set_sha256
+        && authority.observed_surface_sha256 == observed_surface.surface_sha256
+        && authority.adapter_bundle_sha256 == certification.adapter_bundle_sha256
+        && authority.runner_kind == expected_runner
+        && certification
+            .runner_target_sha256s
+            .contains(&authority.runner_target_sha256)
+        && authority.binding_fence > 0
+        && authority.binding_consumed_at_ms > 0
+        && authority.binding_consumed_at_ms <= generated_at_ms
+        && authority.binding_consumed_at_ms <= certification.expires_at_ms
+        && matches!(authority.rollout_channel.as_str(), "canary" | "general")
+        && ids_are_valid
+        && digests_are_valid;
+    if !exact {
+        return bad_request(
+            "Certified submission receipt authority does not match the frozen execution.",
+        );
+    }
+    jobs::lookup_ats_certification_terminal_receipt_authority(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        &authority,
+    )
+    .map_err(|error| match error {
+        jobs::AtsCertificationAuthorityError::Storage(error) => internal(error),
+        _ => (
+            StatusCode::CONFLICT,
+            "Certified submission receipt authority is not the exact terminal server record."
+                .to_string(),
+        ),
+    })
+}
+
+fn has_explicit_submission_confirmation(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let words = normalized
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let contains_phrase = |phrase: &[&str]| {
+        !phrase.is_empty() && words.windows(phrase.len()).any(|window| window == phrase)
+    };
+    let followed_by_application = |phrase: &[&str], determiners: &[&str]| {
+        words
+            .windows(phrase.len())
+            .enumerate()
+            .any(|(index, window)| {
+                if window != phrase {
+                    return false;
+                }
+                let next = index + phrase.len();
+                words.get(next) == Some(&"application")
+                    || (words
+                        .get(next)
+                        .is_some_and(|word| determiners.contains(word))
+                        && words.get(next + 1) == Some(&"application"))
+            })
+    };
+    let followed_by_optional_yet_successful_outcome = |phrase: &[&str]| {
+        words
+            .windows(phrase.len())
+            .enumerate()
+            .any(|(index, window)| {
+                if window != phrase {
+                    return false;
+                }
+                let mut next = index + phrase.len();
+                if words.get(next) == Some(&"yet") {
+                    next += 1;
+                }
+                if words.get(next) == Some(&"successfully") {
+                    next += 1;
+                }
+                words
+                    .get(next)
+                    .is_some_and(|outcome| matches!(*outcome, "submitted" | "received"))
+            })
+    };
+
+    let negative_application_outcome = contains_phrase(&["already", "applied"])
+        || followed_by_application(&["already", "submitted"], &["an", "the", "your"])
+        || contains_phrase(&["application", "already", "submitted"])
+        || contains_phrase(&["application", "was", "already", "submitted"])
+        || contains_phrase(&["application", "has", "been", "already", "submitted"])
+        || contains_phrase(&["application", "had", "been", "already", "submitted"])
+        || contains_phrase(&["application", "has", "already", "been", "submitted"])
+        || contains_phrase(&["application", "had", "already", "been", "submitted"])
+        || [
+            &["unable", "to", "submit"][..],
+            &["failed", "to", "submit"],
+            &["could", "not", "submit"],
+            &["couldn", "t", "submit"],
+            &["cannot", "submit"],
+            &["can", "t", "submit"],
+        ]
+        .iter()
+        .any(|phrase| followed_by_application(phrase, &["the", "your"]))
+        || [
+            &["could", "not", "be", "submitted"][..],
+            &["couldn", "t", "be", "submitted"],
+            &["cannot", "be", "submitted"],
+            &["can", "t", "be", "submitted"],
+            &["unable", "to", "be", "submitted"],
+        ]
+        .iter()
+        .any(|phrase| contains_phrase(phrase))
+        || [
+            &["have", "not", "submitted"][..],
+            &["have", "not", "yet", "submitted"],
+            &["haven", "t", "submitted"],
+            &["haven", "t", "yet", "submitted"],
+            &["has", "not", "submitted"],
+            &["has", "not", "yet", "submitted"],
+            &["hasn", "t", "submitted"],
+            &["hasn", "t", "yet", "submitted"],
+            &["had", "not", "submitted"],
+            &["had", "not", "yet", "submitted"],
+            &["hadn", "t", "submitted"],
+            &["hadn", "t", "yet", "submitted"],
+            &["did", "not", "submit"],
+            &["did", "not", "yet", "submit"],
+            &["didn", "t", "submit"],
+            &["didn", "t", "yet", "submit"],
+        ]
+        .iter()
+        .any(|phrase| followed_by_application(phrase, &["an", "the", "your"]))
+        || [
+            &["was", "not"][..],
+            &["wasn", "t"],
+            &["was", "not", "yet"],
+            &["wasn", "t", "yet"],
+            &["has", "not", "been"],
+            &["hasn", "t", "been"],
+            &["has", "not", "yet", "been"],
+            &["hasn", "t", "yet", "been"],
+            &["had", "not", "been"],
+            &["hadn", "t", "been"],
+            &["had", "not", "yet", "been"],
+            &["hadn", "t", "yet", "been"],
+            &["is", "not"],
+            &["isn", "t"],
+            &["is", "not", "yet"],
+            &["isn", "t", "yet"],
+        ]
+        .iter()
+        .any(|phrase| followed_by_optional_yet_successful_outcome(phrase))
+        || contains_phrase(&["not", "submitted"])
+        || contains_phrase(&["not", "yet", "submitted"])
+        || contains_phrase(&["not", "successfully", "submitted"])
+        || contains_phrase(&["not", "yet", "successfully", "submitted"])
+        || [
+            &["did", "not", "receive"][..],
+            &["didn", "t", "receive"],
+            &["have", "not", "received"],
+            &["haven", "t", "received"],
+        ]
+        .iter()
+        .any(|phrase| followed_by_application(phrase, &["the", "your"]))
+        || contains_phrase(&["application", "was", "not", "received"])
+        || contains_phrase(&["application", "wasn", "t", "received"])
+        || contains_phrase(&["application", "has", "not", "been", "received"])
+        || contains_phrase(&["application", "hasn", "t", "been", "received"])
+        || contains_phrase(&["application", "is", "not", "received"])
+        || contains_phrase(&["application", "isn", "t", "received"])
+        || contains_phrase(&["submission", "failed"])
+        || contains_phrase(&["submission", "was", "unsuccessful"])
+        || contains_phrase(&["submission", "was", "not", "successful"]);
+    if negative_application_outcome {
+        return false;
+    }
+    contains_phrase(&["thank", "you", "for", "applying"])
+        || contains_phrase(&["thanks", "for", "applying"])
+        || contains_phrase(&["received", "your", "application"])
+        || (words.contains(&"application")
+            && (words.contains(&"submitted") || words.contains(&"received")))
 }
 
 fn validate_receipt_verified_claim_ids(
@@ -4327,7 +9506,27 @@ struct PreparedReceiptEvidence {
 #[derive(Debug)]
 struct UploadedReceiptEvidence {
     verified: BTreeMap<String, String>,
-    created_keys: Vec<String>,
+    uploads: Vec<ApplicationObjectBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StoredEvidenceObject {
+    kind: String,
+    storage_key: String,
+    sha256: String,
+    media_type: String,
+    size_bytes: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredReceiptObject {
+    storage_key: String,
+    sha256: String,
+    media_type: &'static str,
+    size_bytes: usize,
+    schema_version: i64,
 }
 
 fn preflight_receipt_evidence(
@@ -4513,85 +9712,380 @@ fn expected_evidence_media_type(kind: &str) -> &'static str {
 }
 
 fn valid_pdf(bytes: &[u8]) -> bool {
-    if !bytes.starts_with(b"%PDF-") {
-        return false;
-    }
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    bytes[..end].ends_with(b"%%EOF")
+    bytes.starts_with(b"%PDF-")
+        && lopdf::Document::load_mem(bytes)
+            .ok()
+            .is_some_and(|document| !document.get_pages().is_empty())
 }
 
 fn valid_png(bytes: &[u8]) -> bool {
-    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    bytes.len() >= 33
-        && &bytes[..8] == PNG_SIGNATURE
-        && u32::from_be_bytes(bytes[8..12].try_into().expect("four-byte PNG chunk length")) == 13
-        && &bytes[12..16] == b"IHDR"
-        && u32::from_be_bytes(bytes[16..20].try_into().expect("four-byte PNG width")) > 0
-        && u32::from_be_bytes(bytes[20..24].try_into().expect("four-byte PNG height")) > 0
+    const MAX_DECODED_SCREENSHOT_BYTES: usize = 64 * 1024 * 1024;
+    let decoder = png::Decoder::new_with_limits(
+        std::io::Cursor::new(bytes),
+        png::Limits {
+            bytes: MAX_DECODED_SCREENSHOT_BYTES,
+        },
+    );
+    let Ok(mut reader) = decoder.read_info() else {
+        return false;
+    };
+    if reader.info().width == 0 || reader.info().height == 0 {
+        return false;
+    }
+    let Some(buffer_size) = reader.output_buffer_size() else {
+        return false;
+    };
+    if buffer_size == 0 || buffer_size > MAX_DECODED_SCREENSHOT_BYTES {
+        return false;
+    }
+    let mut decoded = vec![0; buffer_size];
+    reader.next_frame(&mut decoded).is_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_receipt_evidence(
+    pool: &crate::db::DbPool,
     storage: &ObjectStorage,
     account_id: &str,
     application_id: &str,
+    run_id: &str,
+    runner: &str,
+    request_fingerprint: &str,
     receipt: &mut Value,
     evidence_objects: Vec<PreparedReceiptEvidence>,
 ) -> Result<UploadedReceiptEvidence, ApiError> {
     let mut verified = BTreeMap::new();
-    let mut created_keys = Vec::new();
-    let request_id = uuid::Uuid::new_v4();
-    for object in evidence_objects {
+    let mut uploads = Vec::new();
+    let mut manifest = Vec::new();
+    // The fingerprint-stable rows may be shared by an exact concurrent replay.
+    // A losing request must never delete them. Failed sets remain pending for
+    // exact retry and are reclaimed only after their protected capacity ends.
+    for (index, object) in evidence_objects.into_iter().enumerate() {
         let artifact_id = format!(
-            "jobs/{application_id}/receipts/{request_id}/{}-{}",
+            "jobs/{application_id}/receipts/{request_fingerprint}/{index}-{}-{}",
             safe_file_part(&object.kind),
             &object.sha256[..20]
         );
         let storage_key = storage.artifact_key(account_id, &artifact_id);
-        if let Err(error) = storage
-            .put(
-                &storage_key,
-                bytes::Bytes::from(object.bytes),
-                object.media_type,
-            )
-            .await
-        {
-            cleanup_uploaded_objects(storage, &created_keys).await;
-            return Err(evidence_storage_error(error));
-        }
-        created_keys.push(storage_key.clone());
-        let stored = match storage.get(&storage_key).await {
-            Ok(stored) => stored,
-            Err(error) => {
-                cleanup_uploaded_objects(storage, &created_keys).await;
-                return Err(evidence_storage_error(error));
-            }
+        let (binding, needs_put) = match reserve_submission_object(
+            pool,
+            storage,
+            account_id,
+            application_id,
+            run_id,
+            runner,
+            &artifact_id,
+            &storage_key,
+            object.bytes.len(),
+            &object.sha256,
+            object.media_type,
+            &format!("Submission {}", object.kind.replace('_', " ")),
+            &object.kind,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => return Err(error),
         };
-        if sha256_hex(&stored.bytes) != object.sha256 {
-            cleanup_uploaded_objects(storage, &created_keys).await;
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "Stored application evidence failed checksum verification.".to_string(),
-            ));
-        }
-        replace_receipt_storage_key(receipt, &object.original_key, &storage_key);
-        verified.insert(storage_key, object.sha256);
+        let durable_key = binding.object_key.clone();
+        uploads.push(binding.clone());
+        let bytes = bytes::Bytes::from(object.bytes);
+        put_and_verify_submission_object(
+            pool,
+            storage,
+            &binding,
+            bytes,
+            object.media_type,
+            needs_put,
+        )
+        .await?;
+        replace_receipt_storage_key(receipt, &object.original_key, &durable_key);
+        verified.insert(durable_key.clone(), object.sha256.clone());
+        manifest.push(StoredEvidenceObject {
+            kind: object.kind,
+            storage_key: durable_key,
+            sha256: object.sha256,
+            media_type: object.media_type.to_string(),
+            size_bytes: binding.size_bytes,
+        });
     }
+    manifest.sort_by(|left, right| left.storage_key.cmp(&right.storage_key));
+    receipt
+        .as_object_mut()
+        .expect("validated receipt fields require an object")
+        .insert(
+            "evidenceObjects".to_string(),
+            serde_json::to_value(manifest).map_err(|error| internal(error.into()))?,
+        );
     if let Some(result) = receipt.get_mut("result").and_then(Value::as_object_mut) {
         result.remove("screenshotPath");
     }
-    Ok(UploadedReceiptEvidence {
-        verified,
-        created_keys,
-    })
+    Ok(UploadedReceiptEvidence { verified, uploads })
 }
 
-async fn cleanup_uploaded_objects(storage: &ObjectStorage, created_keys: &[String]) {
-    for key in created_keys.iter().rev() {
-        let _ = storage.delete(key).await;
+#[allow(clippy::too_many_arguments)]
+async fn upload_immutable_receipt_bundle(
+    pool: &crate::db::DbPool,
+    storage: &ObjectStorage,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+    request_fingerprint: &str,
+    receipt_id: &str,
+    approved_job: &Value,
+    resume: &ResumeVersion,
+    receipt: &mut Value,
+    uploaded: &mut UploadedReceiptEvidence,
+) -> Result<(), ApiError> {
+    let receipt_schema_version = receipt
+        .get("schemaVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| matches!(*version, 1 | 2))
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Application receipt schema is invalid.".to_string(),
+        ))?;
+    let bundle_id = request_fingerprint.to_string();
+    let encoded = serde_json::to_vec(&json!({
+        "schemaVersion": RECEIPT_BUNDLE_SCHEMA_VERSION,
+        "bundleId": bundle_id,
+        "accountId": account_id,
+        "applicationId": application_id,
+        "receiptId": receipt_id,
+        "job": approved_job,
+        "resume": resume,
+        "receipt": receipt,
+    }))
+    .map_err(|error| internal(error.into()))?;
+    if encoded.len() > MAX_RECEIPT_BUNDLE_BYTES || encoded.len() > storage.max_object_bytes() {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Application receipt bundle is too large.".to_string(),
+        ));
+    }
+    let sha256 = sha256_hex(&encoded);
+    let storage_key = storage.jobs_submission_bundle_key(
+        account_id,
+        application_id,
+        receipt_id,
+        &bundle_id,
+        &sha256,
+    );
+    let logical_id = format!(
+        "jobs-submission-bundle:{}",
+        sha256_hex(format!("{application_id}\0{receipt_id}\0{bundle_id}"))
+    );
+    let (binding, needs_put) = reserve_submission_object(
+        pool,
+        storage,
+        account_id,
+        application_id,
+        run_id,
+        runner,
+        &logical_id,
+        &storage_key,
+        encoded.len(),
+        &sha256,
+        "application/json",
+        "Application receipt bundle",
+        "application_receipt",
+    )?;
+    let durable_key = binding.object_key.clone();
+    uploaded.uploads.push(binding.clone());
+    put_and_verify_submission_object(
+        pool,
+        storage,
+        &binding,
+        bytes::Bytes::from(encoded.clone()),
+        "application/json",
+        needs_put,
+    )
+    .await?;
+    uploaded
+        .verified
+        .insert(durable_key.clone(), sha256.clone());
+    receipt
+        .as_object_mut()
+        .expect("validated receipt fields require an object")
+        .insert(
+            "receiptObject".to_string(),
+            serde_json::to_value(StoredReceiptObject {
+                storage_key: durable_key,
+                sha256,
+                media_type: "application/json",
+                size_bytes: encoded.len(),
+                schema_version: receipt_schema_version,
+            })
+            .map_err(|error| internal(error.into()))?,
+        );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reserve_submission_object(
+    pool: &crate::db::DbPool,
+    storage: &ObjectStorage,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+    logical_id: &str,
+    storage_key: &str,
+    size_bytes: usize,
+    sha256: &str,
+    content_type: &str,
+    title: &str,
+    evidence_kind: &str,
+) -> Result<(ApplicationObjectBinding, bool), ApiError> {
+    let size_bytes = i64::try_from(size_bytes).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Application evidence is too large.".to_string(),
+        )
+    })?;
+    let reservation = object_uploads::reserve_application_object_upload(
+        pool,
+        application_id,
+        &NewObjectUpload {
+            account_id: account_id.to_string(),
+            object_kind: ObjectKind::Artifact,
+            logical_id: logical_id.to_string(),
+            session_id: None,
+            storage_scope: StorageScope::Artifact,
+            object_key: storage_key.to_string(),
+            size_bytes,
+            sha256: sha256.to_string(),
+            content_type: content_type.to_string(),
+            expires_at_ms: SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRY_MS,
+            metadata_json: json!({
+                "artifact_class": "jobs_submission_evidence",
+                "jobs_application_id": application_id,
+                "jobs_run_id": run_id,
+                "jobs_runner": runner,
+                "evidence_kind": evidence_kind,
+                "title": title,
+                "retention_policy": "account_lifetime_until_deletion",
+            }),
+            now_ms: jobs::now_ms(),
+            limits: storage.upload_limits(),
+        },
+    )
+    .map_err(evidence_upload_control_error)?;
+    Ok((
+        ApplicationObjectBinding {
+            upload_id: reservation.upload.id,
+            object_key: reservation.upload.object_key,
+            size_bytes: reservation.upload.size_bytes,
+            sha256: reservation.upload.sha256,
+            content_type: reservation.upload.content_type,
+        },
+        reservation.needs_put,
+    ))
+}
+
+async fn put_and_verify_submission_object(
+    pool: &crate::db::DbPool,
+    storage: &ObjectStorage,
+    binding: &ApplicationObjectBinding,
+    bytes: bytes::Bytes,
+    content_type: &str,
+    needs_put: bool,
+) -> Result<(), ApiError> {
+    let size_bytes = i64::try_from(bytes.len()).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Application evidence is too large.".to_string(),
+        )
+    })?;
+    if binding.size_bytes != size_bytes || binding.content_type != content_type {
+        return bad_request("Application evidence does not match its durable reservation.");
+    }
+    if needs_put {
+        object_uploads::begin_upload_put(pool, &binding.upload_id, jobs::now_ms())
+            .map_err(evidence_upload_control_error)?;
+        if let Err(error) = storage
+            .put(&binding.object_key, bytes.clone(), content_type)
+            .await
+        {
+            let _ = object_uploads::record_put_failure(
+                pool,
+                &binding.upload_id,
+                &error.to_string(),
+                jobs::now_ms(),
+            );
+            return Err(evidence_storage_error(error));
+        }
+    }
+    let stored = match storage
+        .get_complete_exact(&binding.object_key, bytes.len())
+        .await
+    {
+        Ok(stored) => stored,
+        Err(error) => {
+            let _ = object_uploads::record_put_failure(
+                pool,
+                &binding.upload_id,
+                &error.to_string(),
+                jobs::now_ms(),
+            );
+            return Err(evidence_storage_error(error));
+        }
+    };
+    if stored.bytes != bytes
+        || sha256_hex(&stored.bytes) != binding.sha256
+        || !stored
+            .content_type
+            .split(';')
+            .next()
+            .is_some_and(|stored_type| stored_type.eq_ignore_ascii_case(content_type))
+    {
+        let _ = object_uploads::record_put_failure(
+            pool,
+            &binding.upload_id,
+            "object read-back verification failed",
+            jobs::now_ms(),
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Stored application evidence failed verification.".to_string(),
+        ));
+    }
+    if needs_put {
+        object_uploads::release_verified_upload_put(pool, &binding.upload_id, jobs::now_ms())
+            .map_err(evidence_upload_control_error)?;
+    }
+    Ok(())
+}
+
+fn evidence_upload_control_error(error: anyhow::Error) -> ApiError {
+    match error.downcast_ref::<UploadControlError>() {
+        Some(UploadControlError::ObjectTooLarge) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Application evidence is too large.".to_string(),
+        ),
+        Some(
+            UploadControlError::AccountBytesQuotaExceeded
+            | UploadControlError::AccountObjectQuotaExceeded,
+        ) => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Application evidence storage quota is unavailable.".to_string(),
+        ),
+        Some(UploadControlError::DailyQuotaExceeded) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Application evidence upload capacity is temporarily unavailable.".to_string(),
+        ),
+        Some(UploadControlError::AccountDeleting) => (
+            StatusCode::CONFLICT,
+            "Account deletion has already fenced new application evidence.".to_string(),
+        ),
+        Some(UploadControlError::SubmissionEvidenceCapacityUnavailable) => (
+            StatusCode::CONFLICT,
+            "The protected submission evidence reservation is no longer active.".to_string(),
+        ),
+        Some(UploadControlError::SubmissionEvidenceCapacityExceeded) => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Application evidence exceeded its protected reservation.".to_string(),
+        ),
+        _ => evidence_storage_error(error),
     }
 }
 
@@ -4639,14 +10133,13 @@ fn submission_terminal_session(
     state: &AppState,
     account_id: &str,
     application_id: &str,
-    run_id: &str,
+    authorized_session_id: &str,
     runner: &str,
 ) -> Result<BrowserSession, ApiError> {
-    let mut session = jobs::list_browser_sessions(&state.pool, account_id)
+    let mut session = jobs::get_browser_session(&state.pool, account_id, authorized_session_id)
         .map_err(internal)?
-        .into_iter()
-        .find(|session| {
-            session.id == run_id
+        .filter(|session| {
+            session.id == authorized_session_id
                 && session.runner == runner
                 && session.application_id.as_deref() == Some(application_id)
         })
@@ -4665,20 +10158,49 @@ fn submission_evidence_records(
     application_id: &str,
     receipt_id: &str,
     provider: &str,
-    posting: &JobPosting,
+    approved_job: &Value,
     resume: &ResumeVersion,
     receipt: &Value,
     verified_objects: &BTreeMap<String, String>,
+    submit_http_status: i64,
     confirmation: String,
     confirmation_url: Option<String>,
     confirmation_text: Option<String>,
     submitted_at: Option<Value>,
 ) -> Result<Vec<ApplicationEvidence>, ApiError> {
+    let approved_company = approved_job
+        .get("company")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or((
+            StatusCode::CONFLICT,
+            "The approved job company is missing.".to_string(),
+        ))?;
+    let approved_title = approved_job
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or((
+            StatusCode::CONFLICT,
+            "The approved job title is missing.".to_string(),
+        ))?;
+    let evidence_manifest = validate_stored_evidence_manifest(receipt, verified_objects)?;
     let documents = receipt.get("documents").and_then(Value::as_array).ok_or((
         StatusCode::BAD_REQUEST,
         "Receipt is missing uploaded application documents.".to_string(),
     ))?;
-    let mut evidence = Vec::with_capacity(documents.len() + 1);
+    let screenshot_keys = receipt
+        .get("screenshotKeys")
+        .and_then(Value::as_array)
+        .filter(|screenshots| {
+            !screenshots.is_empty() && screenshots.len() <= MAX_RECEIPT_SCREENSHOTS
+        })
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt has an invalid number of confirmation screenshots.".to_string(),
+        ))?;
+    let screenshot_count = screenshot_keys.len();
+    let mut evidence = Vec::with_capacity(documents.len() + screenshot_count + 1);
     for (index, document) in documents.iter().enumerate() {
         let kind = document
             .get("kind")
@@ -4692,21 +10214,28 @@ fn submission_evidence_records(
             StatusCode::BAD_REQUEST,
             "Receipt document was not uploaded and verified.".to_string(),
         ))?;
+        let size_bytes = evidence_manifest
+            .get(storage_key)
+            .map(|object| object.size_bytes)
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "Receipt document is missing from its evidence manifest.".to_string(),
+            ))?;
         let (label, file_name) = match kind {
             "resume" => (
                 "Resume submitted".to_string(),
                 format!(
                     "{}-{}-resume.pdf",
-                    safe_file_part(&posting.company),
-                    safe_file_part(&posting.title)
+                    safe_file_part(approved_company),
+                    safe_file_part(approved_title)
                 ),
             ),
             "cover_letter" => (
                 "Cover letter submitted".to_string(),
                 format!(
                     "{}-{}-cover-letter.pdf",
-                    safe_file_part(&posting.company),
-                    safe_file_part(&posting.title)
+                    safe_file_part(approved_company),
+                    safe_file_part(approved_title)
                 ),
             ),
             "attachment" => (
@@ -4732,59 +10261,230 @@ fn submission_evidence_records(
                 "receipt_id": receipt_id,
                 "application_identity_id": receipt.get("applicationIdentityId"),
                 "structured_resume_checksum": (kind == "resume").then_some(&resume.checksum),
+                "size_bytes": size_bytes,
             }),
             created_at_ms: 0,
         });
     }
-    let screenshot_key = receipt
-        .get("screenshotKeys")
-        .and_then(Value::as_array)
-        .and_then(|screenshots| screenshots.first())
+    let receipt_object = receipt
+        .get("receiptObject")
+        .and_then(Value::as_object)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt is missing its immutable receipt object.".to_string(),
+        ))?;
+    let receipt_storage_key = receipt_object
+        .get("storageKey")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let screenshot_sha256 = verified_objects.get(screenshot_key).cloned().ok_or((
-        StatusCode::BAD_REQUEST,
-        "Receipt confirmation screenshot was not uploaded and verified.".to_string(),
-    ))?;
+    let receipt_sha256 = receipt_object
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let verified_receipt_sha256 = verified_objects
+        .get(receipt_storage_key)
+        .filter(|verified| verified.as_str() == receipt_sha256)
+        .cloned()
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt bundle was not uploaded and verified.".to_string(),
+        ))?;
     evidence.push(ApplicationEvidence {
         id: String::new(),
         application_id: application_id.to_string(),
-        kind: "submission_confirmation".to_string(),
-        label: confirmation.clone(),
+        kind: "application_receipt".to_string(),
+        label: "Application receipt bundle".to_string(),
         provider: provider.to_string(),
-        file_name: "submission-confirmation.png".to_string(),
-        media_type: "image/png".to_string(),
-        storage_key: screenshot_key.to_string(),
-        sha256: screenshot_sha256,
+        file_name: format!("{}.json", safe_file_part(receipt_id)),
+        media_type: "application/json".to_string(),
+        storage_key: receipt_storage_key.to_string(),
+        sha256: verified_receipt_sha256,
         resume_version_id: Some(resume.id.clone()),
         occurred_at_ms: 0,
         metadata: json!({
-            "confirmation": confirmation,
-            "confirmation_url": confirmation_url,
-            "confirmation_text": confirmation_text,
-            "submitted_at": submitted_at,
-            "screenshot_keys": receipt.get("screenshotKeys"),
-            "evidence_strength": "browser_confirmed",
+            "immutable": true,
             "receipt_id": receipt_id,
+            // The file is a v1 bundle even when it contains a certified v2 receipt.
+            "schema_version": RECEIPT_BUNDLE_SCHEMA_VERSION,
+            "size_bytes": receipt_object.get("sizeBytes"),
+            "runner": receipt.get("runner"),
+            "run_id": receipt.get("runId"),
+            "submit_http_status": submit_http_status,
         }),
         created_at_ms: 0,
     });
+    for (index, screenshot) in screenshot_keys.iter().enumerate() {
+        let screenshot_key = screenshot.as_str().unwrap_or_default();
+        let screenshot_sha256 = verified_objects.get(screenshot_key).cloned().ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt confirmation screenshot was not uploaded and verified.".to_string(),
+        ))?;
+        let screenshot_size_bytes = evidence_manifest
+            .get(screenshot_key)
+            .map(|object| object.size_bytes)
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "Receipt confirmation is missing from its evidence manifest.".to_string(),
+            ))?;
+        evidence.push(ApplicationEvidence {
+            id: String::new(),
+            application_id: application_id.to_string(),
+            kind: "submission_confirmation".to_string(),
+            label: confirmation.clone(),
+            provider: provider.to_string(),
+            file_name: format!(
+                "submission-confirmation-{}-of-{screenshot_count}.png",
+                index + 1
+            ),
+            media_type: "image/png".to_string(),
+            storage_key: screenshot_key.to_string(),
+            sha256: screenshot_sha256,
+            resume_version_id: Some(resume.id.clone()),
+            occurred_at_ms: 0,
+            metadata: json!({
+                "immutable": true,
+                "confirmation": confirmation,
+                "confirmation_url": confirmation_url,
+                "confirmation_text": confirmation_text,
+                "submit_http_status": submit_http_status,
+                "submitted_at": submitted_at,
+                "screenshot_keys": receipt.get("screenshotKeys"),
+                "screenshot_index": index + 1,
+                "screenshot_count": screenshot_count,
+                "evidence_strength": "browser_confirmed",
+                "receipt_id": receipt_id,
+                "size_bytes": screenshot_size_bytes,
+            }),
+            created_at_ms: 0,
+        });
+    }
     Ok(evidence)
+}
+
+fn validate_stored_evidence_manifest(
+    receipt: &Value,
+    verified_objects: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, StoredEvidenceObject>, ApiError> {
+    let manifest = receipt.get("evidenceObjects").cloned().ok_or((
+        StatusCode::BAD_REQUEST,
+        "Receipt is missing its immutable evidence manifest.".to_string(),
+    ))?;
+    let manifest = serde_json::from_value::<Vec<StoredEvidenceObject>>(manifest).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Receipt evidence manifest is invalid.".to_string(),
+        )
+    })?;
+    if manifest.is_empty() || manifest.len() > MAX_RECEIPT_EVIDENCE_OBJECTS {
+        return bad_request("Receipt evidence manifest is invalid.");
+    }
+
+    let mut expected = BTreeMap::<String, (String, Option<String>, &'static str)>::new();
+    for document in receipt
+        .get("documents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = document
+            .get("storageKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let kind = document
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sha256 = document
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if key.is_empty()
+            || !matches!(kind, "resume" | "cover_letter" | "attachment")
+            || !valid_sha256(sha256)
+            || expected
+                .insert(
+                    key.to_string(),
+                    (
+                        kind.to_string(),
+                        Some(sha256.to_ascii_lowercase()),
+                        "application/pdf",
+                    ),
+                )
+                .is_some()
+        {
+            return bad_request("Receipt evidence manifest does not match its documents.");
+        }
+    }
+    for screenshot in receipt
+        .get("screenshotKeys")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let key = screenshot.as_str().unwrap_or_default();
+        if key.is_empty()
+            || expected
+                .insert(
+                    key.to_string(),
+                    ("screenshot".to_string(), None, "image/png"),
+                )
+                .is_some()
+        {
+            return bad_request("Receipt evidence manifest does not match its screenshots.");
+        }
+    }
+    if manifest.len() != expected.len() {
+        return bad_request("Receipt evidence manifest is incomplete.");
+    }
+
+    let mut objects = BTreeMap::new();
+    let mut previous_key: Option<&str> = None;
+    for object in &manifest {
+        let Some((expected_kind, expected_sha256, expected_media_type)) =
+            expected.get(&object.storage_key)
+        else {
+            return bad_request("Receipt evidence manifest contains an unreferenced object.");
+        };
+        if previous_key.is_some_and(|previous| previous >= object.storage_key.as_str())
+            || object.kind != *expected_kind
+            || object.media_type != *expected_media_type
+            || object.size_bytes <= 0
+            || !valid_sha256(&object.sha256)
+            || expected_sha256
+                .as_deref()
+                .is_some_and(|expected| !expected.eq_ignore_ascii_case(&object.sha256))
+            || verified_objects
+                .get(&object.storage_key)
+                .is_none_or(|verified| !verified.eq_ignore_ascii_case(&object.sha256))
+        {
+            return bad_request("Receipt evidence manifest failed exact verification.");
+        }
+        previous_key = Some(&object.storage_key);
+        objects.insert(object.storage_key.clone(), object.clone());
+    }
+    Ok(objects)
 }
 
 fn validate_receipt_bundle(
     account_id: &str,
     application: &JobApplication,
-    posting: &JobPosting,
     resume: &ResumeVersion,
     receipt: &Value,
     verified_objects: &BTreeMap<String, String>,
+    require_receipt_object: bool,
 ) -> Result<(), ApiError> {
+    let receipt_schema_version = receipt
+        .get("schemaVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| matches!(*version, 1 | 2))
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Application receipt schema is invalid.".to_string(),
+        ))?;
     let (approved_packet, approved_job, approved_checksum) =
         approved_execution_snapshot(application)?;
-    validate_approved_execution_matches(
+    validate_frozen_approved_execution_matches(
         application,
-        posting,
         resume,
         application
             .receipt
@@ -4823,6 +10523,64 @@ fn validate_receipt_bundle(
     }
     required_receipt_string(receipt, "adapter")?;
     required_receipt_string(receipt, "adapterVersion")?;
+    if require_receipt_object {
+        let authority = receipt
+            .get(jobs::SERVER_SUBMISSION_AUTHORITY_KEY)
+            .and_then(Value::as_object)
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "Receipt is missing its server submission authority.".to_string(),
+            ))?;
+        let expected_pre_submission_receipt_sha256 =
+            jobs::submission_pre_receipt_sha256(&application.receipt).map_err(internal)?;
+        if authority.get("schemaVersion").and_then(Value::as_i64) != Some(1)
+            || authority.get("preSubmissionReceipt") != Some(&application.receipt)
+            || authority
+                .get("preSubmissionReceiptSha256")
+                .and_then(Value::as_str)
+                != Some(expected_pre_submission_receipt_sha256.as_str())
+        {
+            return bad_request("Receipt submission authority does not match the approved packet.");
+        }
+        validate_stored_evidence_manifest(receipt, verified_objects)?;
+    }
+    let receipt_object = receipt.get("receiptObject");
+    if require_receipt_object && receipt_object.is_none() {
+        return bad_request("Receipt is missing its immutable receipt object.");
+    }
+    if let Some(receipt_object) = receipt_object {
+        let receipt_object = receipt_object.as_object().ok_or((
+            StatusCode::BAD_REQUEST,
+            "Receipt bundle reference is invalid.".to_string(),
+        ))?;
+        let storage_key = receipt_object
+            .get("storageKey")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "Receipt bundle reference is invalid.".to_string(),
+            ))?;
+        let sha256 = receipt_object
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| valid_sha256(value))
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                "Receipt bundle checksum is invalid.".to_string(),
+            ))?;
+        if receipt_object.get("mediaType").and_then(Value::as_str) != Some("application/json")
+            || receipt_object.get("schemaVersion").and_then(Value::as_i64)
+                != Some(receipt_schema_version)
+            || receipt_object
+                .get("sizeBytes")
+                .and_then(Value::as_u64)
+                .is_none_or(|size| size == 0)
+            || verified_objects.get(storage_key).map(String::as_str) != Some(sha256)
+        {
+            return bad_request("Receipt bundle was not uploaded and verified.");
+        }
+    }
     let packet = receipt.get("packet").and_then(Value::as_object).ok_or((
         StatusCode::BAD_REQUEST,
         "Receipt is missing its exact application packet.".to_string(),
@@ -4838,15 +10596,37 @@ fn validate_receipt_bundle(
     if packet.get("approvedPacketChecksum").and_then(Value::as_str)
         != Some(approved_checksum.as_str())
         || packet.get("answers") != approved_packet.get("answers")
+        || packet.get("verifiedClaimIds") != approved_packet.get("verifiedClaimIds")
     {
         return bad_request(
             "Receipt answers do not match the exact application packet that was approved.",
         );
     }
-    if receipt.pointer("/job/canonicalUrl").and_then(Value::as_str)
-        != Some(posting.canonical_url.as_str())
-    {
-        return bad_request("Receipt job does not match the approved posting.");
+    let receipt_admission = packet.get("approvedExecutionAdmission");
+    let receipt_admission_schema = packet
+        .get("approvedExecutionSchemaVersion")
+        .and_then(Value::as_i64);
+    if receipt_schema_version == 2 {
+        let frozen_admission = application
+            .receipt
+            .pointer("/approved_execution/admission")
+            .ok_or((
+                StatusCode::CONFLICT,
+                "The certified frozen admission is missing.".to_string(),
+            ))?;
+        if !jobs::application_has_frozen_ats_certification(application)
+            || receipt_admission_schema != Some(3)
+            || receipt_admission != Some(frozen_admission)
+        {
+            return bad_request(
+                "Receipt certification admission does not match the frozen execution.",
+            );
+        }
+    } else if receipt_admission_schema.is_some() || receipt_admission.is_some() {
+        return bad_request("Review submission receipt contains certified admission fields.");
+    }
+    if receipt.get("job") != Some(&approved_job) {
+        return bad_request("Receipt job snapshot does not match the exact approved posting.");
     }
     let documents = receipt.get("documents").and_then(Value::as_array).ok_or((
         StatusCode::BAD_REQUEST,
@@ -4920,6 +10700,7 @@ fn update_worker_browser_session(
     let session_status = match status {
         "submitted" => "complete",
         "needs_input" => "needs_input",
+        "side_effect_unknown" => "needs_input",
         "failed" => "failed",
         "running" => "running",
         other => other,
@@ -4932,6 +10713,9 @@ fn update_worker_browser_session(
         session.status = session_status.to_string();
         session.current_step = match session_status {
             "complete" => "Application submitted",
+            "needs_input" if status == "side_effect_unknown" => {
+                "Submission outcome needs reconciliation"
+            }
             "needs_input" => "Waiting for your input",
             "failed" => "Run stopped",
             "running" => "Filling application",
@@ -4983,6 +10767,18 @@ fn validate_preferences(preferences: &JobPreferences) -> Result<(), ApiError> {
     ) {
         return bad_request("Choose how Bluey should handle job locations.");
     }
+    if !matches!(
+        preferences.remote_preference.as_str(),
+        "remote_only" | "remote_or_hybrid" | "hybrid_ok" | "onsite_ok" | "any"
+    ) {
+        return bad_request("Choose a supported workplace preference.");
+    }
+    if !matches!(
+        preferences.sponsorship.as_str(),
+        "ask" | "required" | "not_required" | "any"
+    ) {
+        return bad_request("Choose how Bluey should handle sponsorship.");
+    }
     if !(1..=50).contains(&preferences.daily_limit) {
         return bad_request("Choose a daily application limit from 1 to 50.");
     }
@@ -5007,8 +10803,31 @@ fn validate_preferences(preferences: &JobPreferences) -> Result<(), ApiError> {
 }
 
 fn validate_track(track: &CareerTrack) -> Result<(), ApiError> {
+    if track.id.trim().is_empty() {
+        return bad_request(
+            "This Career Track is missing its retry-safe ID. Refresh Bluey Jobs and try again.",
+        );
+    }
     if track.name.trim().is_empty() || track.role.trim().is_empty() {
         return bad_request("Give this Career Track a name and target role.");
+    }
+    if !matches!(
+        track.remote_preference.as_str(),
+        "remote_only" | "remote_or_hybrid" | "hybrid_ok" | "onsite_ok" | "any"
+    ) {
+        return bad_request("Choose a supported Career Track workplace preference.");
+    }
+    if let crate::jobs_taxonomy::TargetRoleResolution::Ambiguous {
+        candidate_role_ids, ..
+    } = crate::jobs_taxonomy::resolve_target_role(&track.role)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Choose a full target role; this abbreviation could mean {}.",
+                candidate_role_ids.join(", ")
+            ),
+        ));
     }
     if track
         .policy
@@ -5046,6 +10865,22 @@ fn enforce_track_limit(
         ));
     }
     Ok(())
+}
+
+fn track_write_error(error: anyhow::Error, entitlement: &JobsEntitlement) -> ApiError {
+    if error
+        .downcast_ref::<jobs::CareerTrackLimitExceeded>()
+        .is_some()
+    {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            format!(
+                "Your {} plan includes {} Career Track Agent(s).",
+                entitlement.plan, entitlement.track_limit
+            ),
+        );
+    }
+    internal(error)
 }
 
 fn validate_posting(posting: &JobPosting) -> Result<(), ApiError> {
@@ -5162,16 +10997,17 @@ fn add_answer(answers: &mut BTreeMap<String, String>, key: &str, value: &str) {
 }
 
 fn ats_kind(raw_url: &str) -> &'static str {
+    if let Some(target) =
+        parse_provider_application_target(raw_url, ProviderApplicationTargetPurpose::Submit)
+    {
+        return target.provider;
+    }
     let host = reqwest::Url::parse(raw_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .unwrap_or_default();
-    if host.contains("myworkdayjobs.com") {
+    if host.ends_with(".myworkdayjobs.com") {
         "workday"
-    } else if host == "boards.greenhouse.io" || host == "job-boards.greenhouse.io" {
-        "greenhouse"
-    } else if host == "jobs.lever.co" || host == "jobs.eu.lever.co" {
-        "lever"
     } else if host == "jobs.ashbyhq.com" {
         "ashby"
     } else if host == "jobs.smartrecruiters.com" || host.ends_with(".smartrecruiters.com") {
@@ -5240,7 +11076,101 @@ fn validation_or_internal(error: anyhow::Error, validation_message: &str) -> Api
     }
 }
 
+fn intervention_answer_revision_error(error: anyhow::Error) -> ApiError {
+    match error.downcast_ref::<UploadControlError>() {
+        Some(UploadControlError::AccountDeleting) => (
+            StatusCode::CONFLICT,
+            "Account deletion has fenced application answer changes.".to_string(),
+        ),
+        Some(UploadControlError::SessionNotOwned) => {
+            (StatusCode::NOT_FOUND, "Intervention not found.".to_string())
+        }
+        _ => domain_error(error),
+    }
+}
+
+fn packet_commit_track_conflict(error: &anyhow::Error) -> Option<ApiError> {
+    matches!(
+        error.downcast_ref::<jobs::ApplicationAttemptAdmissionError>(),
+        Some(jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code })
+            if reason_code == jobs::PACKET_COMMIT_TRACK_ACTIVE_NONCANONICAL
+    )
+    .then(|| {
+        (
+            StatusCode::CONFLICT,
+            "Review this Career Track before completing the application packet.".to_string(),
+        )
+    })
+}
+
+fn packet_commit_error(error: anyhow::Error, payment_copy: &str) -> ApiError {
+    if let Some(conflict) = packet_commit_track_conflict(&error) {
+        conflict
+    } else if error.to_string().contains("insufficient Bluey balance") {
+        (StatusCode::PAYMENT_REQUIRED, payment_copy.to_string())
+    } else {
+        internal(error)
+    }
+}
+
+const AUTO_SUBMIT_AUTHORIZATION_MISSING_MESSAGE: &str =
+    "Enable Auto-submit on this Career Track before queuing applications.";
+const AUTO_SUBMIT_AUTHORIZATION_STALE_MESSAGE: &str = concat!(
+    "Career Track details changed. Review the identity and resume, ",
+    "then enable Auto-submit again."
+);
+
+fn auto_submit_authorization_error(error: jobs::AutoSubmitAuthorizationError) -> ApiError {
+    match error {
+        jobs::AutoSubmitAuthorizationError::Missing => (
+            StatusCode::CONFLICT,
+            AUTO_SUBMIT_AUTHORIZATION_MISSING_MESSAGE.to_string(),
+        ),
+        jobs::AutoSubmitAuthorizationError::Stale => (
+            StatusCode::CONFLICT,
+            AUTO_SUBMIT_AUTHORIZATION_STALE_MESSAGE.to_string(),
+        ),
+        jobs::AutoSubmitAuthorizationError::Internal(error) => internal(error),
+    }
+}
+
 pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
+    if let Some(conflict) = packet_commit_track_conflict(&error) {
+        return conflict;
+    }
+    if let Some(admission) = error.downcast_ref::<jobs::ApplicationAttemptAdmissionError>() {
+        let copy = match admission {
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code }
+                if reason_code == jobs::C2C_SUBMISSION_REVIEW_REASON =>
+                Some(jobs::C2C_SUBMISSION_REVIEW_MESSAGE),
+            jobs::ApplicationAttemptAdmissionError::Blocked { reason_code }
+                if reason_code == "company_application_exists" =>
+                Some("An application is already in progress or submitted for this company. Another Career Track or application email does not create a second candidate."),
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code }
+                if reason_code == "legacy_company_identity_review_required" =>
+                Some("Existing application history needs employer identity review before another application can start."),
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code }
+                if reason_code == "canonical_employer_mapping_conflict" =>
+                Some("The employer identity conflicts with existing application history. Review it before applying."),
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code }
+                if reason_code == "attempt_employer_identity_review_required" =>
+                Some("This application's employer evidence is incomplete or changed. Review the application history before starting execution."),
+            _ => None,
+        };
+        if let Some(copy) = copy {
+            return (StatusCode::CONFLICT, copy.to_string());
+        }
+    }
+    if matches!(
+        error.downcast_ref::<jobs::OperationalHoldError>(),
+        Some(jobs::OperationalHoldError::Held(_))
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            "This Bluey Jobs action is temporarily held. Review the active operational hold before retrying."
+                .to_string(),
+        );
+    }
     let message = error.to_string();
     let status = if message.contains("another Bluey Jobs account")
         || message.contains("dedicated confirmation flow")
@@ -5251,6 +11181,26 @@ pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("daily application limit")
         || message.contains("active application attempt")
         || message.contains("application attempt")
+        || message
+            .contains("Bluey already has an in-progress or submitted application for this company")
+        || message.contains("Review the employer identity of existing application history")
+        || message
+            .contains("Verify this job's employer identity against existing application history")
+        || message.contains("Review conflicting employer identity records")
+        || message.contains("current application employer binding does not permit packet commit")
+        || message.contains("already been resolved")
+        || message.contains("no longer waiting for an answer")
+        || message.contains("awaiting reconciliation")
+        || message.contains("execution authority changed")
+        || message.contains("application approval authority")
+        || message.contains("original-source authority changed after application preparation")
+        || message.contains("current signed job-integrity authority does not permit")
+        || message.contains("current original-source destination is unavailable")
+        || message.contains("current ATS certification is unavailable")
+        || message.contains("current signed job-integrity receipt is unavailable")
+        || message.contains("application packet revision history is invalid")
+        || message.contains("communication action cannot")
+        || message.contains("communication action idempotency key was reused")
     {
         StatusCode::CONFLICT
     } else if message.contains("monthly packet limit")
@@ -5282,6 +11232,8 @@ pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("application issue")
         || message.contains("application outcome")
         || message.contains("does not belong to this job")
+        || message.contains("communication action")
+        || message.contains("calendar action")
     {
         StatusCode::BAD_REQUEST
     } else {
@@ -5294,8 +11246,17 @@ fn submission_domain_error(error: anyhow::Error) -> ApiError {
     let message = error.to_string();
     if message.contains("different final receipt")
         || message.contains("execution lease is not terminal submitted")
+        || message.contains("execution lease cannot accept this receipt")
+        || message.contains("execution lease cannot accept receipt")
+        || message.contains("execution lease changed")
         || message.contains("invalid application state transition")
         || message.contains("local run ticket is not active")
+        || message.contains("awaiting reconciliation")
+        || message.contains("execution authority changed")
+        || message.contains("attempt reservation changed")
+        || message.contains("browser session changed")
+        || message.contains("submission outcome changed")
+        || message.contains("does not match this application")
     {
         (StatusCode::CONFLICT, message)
     } else if message.contains("application not found") {
@@ -5336,7 +11297,23 @@ fn execution_lease_error(error: jobs::ExecutionLeaseError) -> ApiError {
             StatusCode::CONFLICT,
             "Execution lease is not available.".to_string(),
         ),
-        jobs::ExecutionLeaseError::Storage(error) => internal(error),
+        jobs::ExecutionLeaseError::Storage(error) => {
+            if error.downcast_ref::<UploadControlError>().is_some() {
+                evidence_upload_control_error(error)
+            } else {
+                internal(error)
+            }
+        }
+    }
+}
+
+fn submission_receipt_authority_error(error: jobs::ExecutionLeaseError) -> ApiError {
+    match error {
+        jobs::ExecutionLeaseError::NotFound | jobs::ExecutionLeaseError::Conflict => (
+            StatusCode::CONFLICT,
+            "A matching cloud execution lease cannot accept this receipt.".to_string(),
+        ),
+        other => execution_lease_error(other),
     }
 }
 
@@ -5352,6 +11329,1168 @@ pub(super) fn internal(error: anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use crate::db::jobs::CareerTrackPolicy;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tower::ServiceExt;
+
+    #[test]
+    fn prepare_application_request_accepts_only_its_closed_fields() {
+        let default: PrepareApplicationRequest =
+            serde_json::from_value(json!({"job_id":"job-test"})).expect("prepare defaults");
+        assert_eq!(default.job_id, "job-test");
+        assert_eq!(default.mode, "factual");
+        assert_eq!(default.submission_mode, "review_first");
+
+        let explicit: PrepareApplicationRequest = serde_json::from_value(json!({
+            "job_id":"job-test",
+            "mode":"enhance",
+            "submission_mode":"auto_submit"
+        }))
+        .expect("known explicit fields");
+        assert_eq!(explicit.mode, "enhance");
+        assert_eq!(explicit.submission_mode, "auto_submit");
+
+        for extra in ["approval", "account_id", "track_id", "resume_version_id"] {
+            let mut payload = json!({
+                "job_id":"job-test",
+                "mode":"factual",
+                "submission_mode":"review_first"
+            });
+            payload[extra] = json!("unexpected");
+            let error = serde_json::from_value::<PrepareApplicationRequest>(payload)
+                .expect_err("unknown prepare field must not be ignored");
+            assert!(error.to_string().contains("unknown field"));
+        }
+        assert!(serde_json::from_str::<PrepareApplicationRequest>(
+            r#"{"job_id":"job-test","mode":"factual","mode":"enhance"}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn packet_commit_noncanonical_track_has_closed_conflict_copy() {
+        let error = || {
+            anyhow::Error::new(jobs::ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: jobs::PACKET_COMMIT_TRACK_ACTIVE_NONCANONICAL.to_string(),
+            })
+            .context("private packet fixture context")
+        };
+        let expected = (
+            StatusCode::CONFLICT,
+            "Review this Career Track before completing the application packet.".to_string(),
+        );
+        assert_eq!(domain_error(error()), expected);
+        for payment_copy in [
+            "Add to your Bluey balance before Auto-submit can queue this packet.",
+            "Add to your Bluey balance before approving this packet.",
+            "Add to your Bluey balance to complete this application packet.",
+        ] {
+            assert_eq!(packet_commit_error(error(), payment_copy), expected);
+            assert_eq!(
+                packet_commit_error(anyhow::anyhow!("insufficient Bluey balance"), payment_copy),
+                (StatusCode::PAYMENT_REQUIRED, payment_copy.to_string())
+            );
+        }
+        assert!(packet_commit_track_conflict(&anyhow::anyhow!(
+            jobs::PACKET_COMMIT_TRACK_ACTIVE_NONCANONICAL
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn packet_commit_routes_use_the_conflict_mapping() {
+        let source = include_str!("jobs.rs");
+        for (start, end) in [
+            (
+                "pub async fn prepare_application(",
+                "pub async fn update_application(",
+            ),
+            (
+                "pub async fn approve_application_packet(",
+                "pub async fn application_evidence(",
+            ),
+            (
+                "pub async fn commit_application_packet(",
+                "pub struct QueueApplicationRunRequest",
+            ),
+        ] {
+            let route = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            let after_commit = route.split_once("jobs::commit_packet(").unwrap().1;
+            assert!(after_commit.contains("packet_commit_error("), "{start}");
+        }
+    }
+
+    #[test]
+    fn local_publication_errors_are_typed_and_redacted() {
+        for (error, status) in [
+            (
+                jobs::LocalRunPublicationError::InvalidRequest,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                jobs::LocalRunPublicationError::Missing,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                jobs::LocalRunPublicationError::Conflict,
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            let response =
+                local_run_publication_error(anyhow::Error::new(error).context("private packet"));
+            assert_eq!(response.0, status);
+            assert!(!response.1.contains("private packet"));
+        }
+        assert_eq!(
+            local_run_publication_error(UploadControlError::AccountDeleting.into()).0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            local_run_publication_error(UploadControlError::SessionNotOwned.into()).0,
+            StatusCode::NOT_FOUND
+        );
+        let unexpected = local_run_publication_error(anyhow::anyhow!("private storage failure"));
+        assert_eq!(unexpected.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!unexpected.1.contains("private storage failure"));
+    }
+
+    #[test]
+    fn local_queue_response_is_private_no_store() {
+        let response = private_queue_application_run_response(QueueApplicationRunResponse {
+            application: serde_json::from_value(json!({"id":"synthetic","job_id":"synthetic-job"}))
+                .unwrap(),
+            browser_session: serde_json::from_value(json!({})).unwrap(),
+            workflow_id: String::new(),
+            run_id: "synthetic-run".into(),
+            workflow_command: None,
+            launch_url: Some("bluey-jobs://run/synthetic-run?ticket=synthetic-not-real".into()),
+        });
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+    }
+
+    #[test]
+    fn local_queue_route_publishes_through_one_transaction_boundary() {
+        let source = include_str!("jobs.rs");
+        let body = source
+            .split_once("pub async fn queue_application_run(\n")
+            .unwrap()
+            .1
+            .split_once("fn private_queue_application_run_response(")
+            .unwrap()
+            .0;
+        assert_eq!(
+            body.matches("jobs::publish_local_application_run(").count(),
+            1
+        );
+        for old_writer in [
+            "jobs::assign_application_run(",
+            "jobs::save_local_run_ticket(",
+            "jobs::get_local_run_ticket(",
+            "jobs::upsert_browser_session(",
+            "jobs::update_application(",
+            "jobs::update_attempt_reservation_status(",
+        ] {
+            assert!(!body.contains(old_writer));
+        }
+        assert!(body.contains("expected_application: application"));
+        assert!(body.contains("\"browserSessionId\": browser_session.id"));
+        assert!(body.contains("jobs::reserve_application_attempt("));
+        assert!(body.contains("jobs::commit_packet("));
+    }
+
+    #[test]
+    fn intervention_answer_account_fence_errors_have_fixed_http_status() {
+        for (error, status, copy) in [
+            (
+                UploadControlError::AccountDeleting,
+                StatusCode::CONFLICT,
+                "Account deletion has fenced application answer changes.",
+            ),
+            (
+                UploadControlError::SessionNotOwned,
+                StatusCode::NOT_FOUND,
+                "Intervention not found.",
+            ),
+        ] {
+            assert_eq!(
+                intervention_answer_revision_error(
+                    anyhow::Error::new(error).context("private context")
+                ),
+                (status, copy.into())
+            );
+        }
+        assert_eq!(
+            intervention_answer_revision_error(anyhow::anyhow!("intervention not found")).0,
+            StatusCode::NOT_FOUND
+        );
+        let unexpected =
+            intervention_answer_revision_error(anyhow::anyhow!("private storage failure"));
+        assert_eq!(unexpected.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!unexpected.1.contains("private storage failure"));
+    }
+
+    #[test]
+    fn company_memory_typed_errors_have_fixed_http_status() {
+        for (error, status, copy) in [
+            (
+                jobs::AnswerMemoryEmployerError::MissingJob,
+                StatusCode::NOT_FOUND,
+                "Verified job not found.",
+            ),
+            (
+                jobs::AnswerMemoryEmployerError::AuthorityChanged,
+                StatusCode::CONFLICT,
+                "Current verified employer must be confirmed again.",
+            ),
+            (
+                jobs::AnswerMemoryEmployerError::InvalidConfirmation,
+                StatusCode::BAD_REQUEST,
+                "Choose and confirm a verified employer.",
+            ),
+        ] {
+            assert_eq!(
+                answer_memory_employer_error(error.into()),
+                (status, copy.into())
+            );
+        }
+        let legacy = answer_memory_employer_error(anyhow::anyhow!("answer memory is too long"));
+        assert_eq!(legacy.0, StatusCode::BAD_REQUEST);
+        assert_eq!(legacy.1, "answer memory is too long");
+        let storage = answer_memory_employer_error(anyhow::anyhow!("synthetic storage failure"));
+        assert_eq!(storage.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!storage.1.contains("synthetic storage failure"));
+    }
+
+    #[test]
+    fn employer_admission_conflicts_have_actionable_non_private_copy() {
+        let errors = [
+            jobs::ApplicationAttemptAdmissionError::Blocked {
+                reason_code: "company_application_exists".to_string(),
+            },
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: "legacy_company_identity_review_required".to_string(),
+            },
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: "canonical_employer_mapping_conflict".to_string(),
+            },
+            jobs::ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: "attempt_employer_identity_review_required".to_string(),
+            },
+        ];
+        for error in errors {
+            let reason = match &error {
+                jobs::ApplicationAttemptAdmissionError::Blocked { reason_code }
+                | jobs::ApplicationAttemptAdmissionError::ReviewRequired { reason_code } => {
+                    reason_code
+                }
+            }
+            .clone();
+            let response = domain_error(error.into());
+            assert_eq!(response.0, StatusCode::CONFLICT);
+            assert!(!response.1.contains(&reason));
+            assert!(!response.1.contains("@"));
+            assert!(response.1.contains("application") || response.1.contains("employer"));
+        }
+    }
+
+    #[test]
+    fn employer_eligibility_conflicts_are_not_reported_as_server_failures() {
+        for message in [
+            "Bluey already has an in-progress or submitted application for this company",
+            "Review the employer identity of existing application history",
+            "Verify this job's employer identity against existing application history",
+            "Review conflicting employer identity records",
+            "current application employer binding does not permit packet commit",
+        ] {
+            assert_eq!(
+                domain_error(anyhow::anyhow!(message)).0,
+                StatusCode::CONFLICT
+            );
+        }
+        let unexpected = domain_error(anyhow::anyhow!("malformed internal employer binding"));
+        assert_eq!(unexpected.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!unexpected.1.contains("malformed"));
+    }
+
+    #[test]
+    fn matches_page_cursor_failures_are_one_generic_bad_request() {
+        let expected = "Jobs match cursor is invalid or expired; refresh the workspace";
+        for cursor_failure in [
+            "Jobs match cursor is invalid or expired; refresh the workspace",
+            "Jobs match cursor key rotation could not decrypt opaque data",
+        ] {
+            let error = matches_page_error(anyhow::anyhow!(cursor_failure));
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert_eq!(error.1, expected);
+        }
+
+        let page_size = matches_page_error(anyhow::anyhow!(
+            "Jobs match page size must be between 1 and 100"
+        ));
+        assert_eq!(page_size.0, StatusCode::BAD_REQUEST);
+        assert!(page_size.1.contains("between 1 and 100"));
+    }
+
+    #[test]
+    fn continuation_route_loads_only_the_page_representation() {
+        let source = include_str!("jobs.rs");
+        let handler = source
+            .split_once("pub async fn matches_page(")
+            .expect("matches continuation handler")
+            .1
+            .split_once("fn matches_page_error(")
+            .expect("matches continuation handler boundary")
+            .0;
+        assert!(handler.contains("load_current_posting_representation_page"));
+        assert!(!handler.contains("workspace_page("));
+        assert!(!handler.contains("account_runner_availability"));
+        assert!(!handler.contains("list_application_evidence"));
+        assert!(!handler.contains("Query("));
+        assert!(handler.contains("Json(request): Json<MatchesPageRequest>"));
+        let continuation_log = handler
+            .split_once("tracing::info!(")
+            .expect("continuation aggregate log")
+            .1
+            .split_once("\n    );")
+            .expect("continuation aggregate log boundary")
+            .0;
+        assert!(!continuation_log.contains("cursor"));
+        assert!(!continuation_log.contains("job_id"));
+
+        let request = serde_json::from_value::<MatchesPageRequest>(json!({
+            "limit": 50,
+            "cursor": "opaque-cursor"
+        }))
+        .expect("decode deny-unknown continuation request");
+        assert_eq!(request.limit, Some(50));
+        assert_eq!(request.cursor.as_deref(), Some("opaque-cursor"));
+        assert!(serde_json::from_value::<MatchesPageRequest>(json!({
+            "limit": 50,
+            "cursor": "opaque-cursor",
+            "unexpected": true
+        }))
+        .is_err());
+
+        let response = matches_page_response(JobsMatchesPage {
+            matches: Vec::new(),
+            page: jobs::JobsMatchesPageInfo::default(),
+        });
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+
+        let routes = source
+            .split_once("pub fn router(")
+            .expect("Jobs router")
+            .1
+            .split_once("pub async fn")
+            .expect("Jobs router boundary")
+            .0;
+        assert!(routes.contains(".route(\"/api/jobs/matches/page\", post(matches_page))"));
+        assert!(!routes.contains(".route(\"/api/jobs/matches/page\", get(matches_page))"));
+    }
+
+    #[tokio::test]
+    async fn workspace_response_is_private_never_cacheable_and_reports_capability() {
+        let pool = discovery_enrollment_test_pool();
+        let mut workspace = jobs::workspace(&pool, "acct-one", "one@example.com")
+            .expect("build empty Jobs workspace");
+        let receipt = json!({"receiptId":"synthetic", "schemaVersion":1});
+        for (id, state) in [
+            ("submitted-fixture", "submitted"),
+            ("prepared-fixture", "awaiting_review"),
+        ] {
+            let app =
+                serde_json::from_value(json!({ "id":id, "job_id":"fixture-job", "state":state,
+                "receipt":receipt }))
+                .expect("create synthetic workspace application");
+            workspace.applications.push(app);
+        }
+        let response = workspace_response(workspace, false, false);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read workspace response");
+        let payload: Value = serde_json::from_slice(&body).expect("workspace JSON");
+        assert_eq!(
+            payload["selected_curated_verification_available"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            payload["smartrecruiters_requirements_load_available"],
+            Value::Bool(false)
+        );
+        assert_eq!(
+            payload["interview_prep_receipts"],
+            json!({
+                "submitted-fixture": super::super::jobs_interview_prep::receipt_fingerprint(&receipt),
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_matches_requires_pagination_without_reporting_an_internal_failure() {
+        let error = legacy_matches_error(anyhow::anyhow!(
+            "Jobs legacy matches require the paginated matches endpoint above 500 postings"
+        ));
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("paginated matches endpoint"));
+    }
+
+    #[test]
+    fn verified_import_background_logs_only_bounded_aggregate_state() {
+        let source = include_str!("jobs.rs");
+        let schedule = source
+            .split_once("fn schedule_verified_import_discovery_backfill(")
+            .expect("verified-import repair scheduler")
+            .1
+            .split_once("pub async fn workspace(")
+            .expect("verified-import repair scheduler boundary")
+            .0;
+        let claim = schedule
+            .find("claim_verified_import_backfill")
+            .expect("repair claim before scheduling");
+        let spawn = schedule
+            .find("spawn_blocking")
+            .expect("one claimed background repair");
+        assert!(claim < spawn);
+        assert_eq!(schedule.matches("spawn_blocking").count(), 1);
+        assert!(schedule.contains("scanned_count"));
+        assert!(schedule.contains("repaired_count"));
+        assert!(schedule.contains("checkpoint_advanced"));
+        for forbidden in ["error =", "job_id", "source_fingerprint", "cursor"] {
+            assert!(
+                !schedule.contains(forbidden),
+                "repair logs must not expose {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn operational_hold_domain_error_is_redacted_conflict_and_storage_stays_internal() {
+        let scope_secret = "acct-secret-never-return";
+        let reason_secret = "incident-secret-never-return";
+        let held = domain_error(anyhow::Error::new(jobs::OperationalHoldError::Held(
+            jobs::OperationalHoldBlock {
+                capability: jobs::OperationalCapability::ApplicationQueue,
+                scope_kind: jobs::OperationalHoldScopeKind::Account,
+                scope_id: scope_secret.to_string(),
+                reason_code: jobs::OperationalHoldReasonCode::SecurityReview,
+                reason_ref: Some(reason_secret.to_string()),
+                head_revision: 7,
+            },
+        )));
+        assert_eq!(held.0, StatusCode::CONFLICT);
+        assert!(!held.1.contains(scope_secret));
+        assert!(!held.1.contains(reason_secret));
+        assert!(!held.1.contains("security_review"));
+
+        let storage = domain_error(anyhow::Error::new(jobs::OperationalHoldError::Storage(
+            anyhow::anyhow!("database-secret-never-return"),
+        )));
+        assert_eq!(storage.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!storage.1.contains("database-secret-never-return"));
+    }
+
+    #[test]
+    fn local_needs_input_and_failed_results_use_one_atomic_database_commit() {
+        let source = include_str!("jobs.rs");
+        let handler = source
+            .split("async fn save_local_run_result(")
+            .nth(1)
+            .expect("local result handler")
+            .split("async fn replay_submitted_local_run_result(")
+            .next()
+            .expect("bounded local result handler");
+        assert_eq!(handler.matches("jobs::commit_local_run_result(").count(), 2);
+        for forbidden in [
+            "create_intervention_from_receipt(",
+            "jobs::update_local_run_ticket_status(",
+            "object_uploads::release_submission_evidence_capacity(",
+        ] {
+            assert!(
+                !handler.contains(forbidden),
+                "local result handler retains non-atomic {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_submit_prepare_has_no_post_commit_approval_freeze() {
+        let prepare = include_str!("jobs.rs")
+            .split_once("pub async fn prepare_application(")
+            .expect("prepare application API implementation")
+            .1
+            .split_once("pub async fn update_application(")
+            .expect("bounded prepare application API implementation")
+            .0;
+        let finalized = prepare
+            .find("jobs::finalize_prepared_application_kit(")
+            .expect("authoritative prepared application finalization");
+        let reservation = prepare
+            .find("jobs::reserve_application_attempt(")
+            .expect("post-finalization attempt reservation");
+
+        assert!(finalized < reservation);
+        assert!(!prepare.contains("freeze_approved_execution("));
+    }
+
+    #[test]
+    fn approval_queue_and_cloud_resume_use_current_composed_authority() {
+        let source = include_str!("jobs.rs");
+        let approval = source
+            .split_once("pub async fn approve_application_packet(")
+            .expect("application approval endpoint")
+            .1
+            .split_once("pub async fn application_evidence(")
+            .expect("bounded application approval endpoint")
+            .0;
+        for required in [
+            "jobs::current_application_approval_authority(",
+            "approval_authority.posting.eligibility.as_ref()",
+            "freeze_approved_execution(",
+            "jobs::reserve_application_attempt(",
+            "jobs::update_application(",
+        ] {
+            assert!(approval.contains(required), "approval missing {required}");
+        }
+        assert!(!approval.contains("evaluate_job_eligibility("));
+        assert!(!approval.contains("jobs::get_posting("));
+
+        let queue = source
+            .split_once("pub async fn queue_application_run(")
+            .expect("application runner queue endpoint")
+            .1
+            .split_once("fn application_run_id(")
+            .expect("bounded application runner queue endpoint")
+            .0;
+        for required in [
+            "jobs::current_application_approval_authority(",
+            "jobs::application_job_integrity_receipt(&current_authority.application)",
+            "let posting = current_authority.posting",
+            "let eligibility = posting.eligibility.as_ref()",
+            "approved_workflow_input(",
+        ] {
+            assert!(queue.contains(required), "queue missing {required}");
+        }
+        assert!(!queue.contains("evaluate_job_eligibility("));
+        assert!(!queue.contains("jobs::get_posting("));
+
+        let intervention = source
+            .split_once("pub async fn update_intervention(")
+            .expect("intervention endpoint")
+            .1
+            .split_once("fn is_provider_final_review_intervention(")
+            .expect("bounded intervention endpoint")
+            .0;
+        let cloud_resume = intervention
+            .split_once("if !local_session {")
+            .expect("cloud intervention resume branch")
+            .1
+            .split_once("let mut saved = if action == \"approve_submission\"")
+            .expect("bounded cloud intervention resume branch")
+            .0;
+        for required in [
+            "jobs::current_application_approval_authority(",
+            "jobs::application_job_integrity_receipt(&current_authority.application)",
+            ".eligibility",
+            "approved_workflow_input(",
+        ] {
+            assert!(cloud_resume.contains(required), "resume missing {required}");
+        }
+        assert!(!cloud_resume.contains("evaluate_job_eligibility("));
+
+        let workflow = source
+            .split_once("fn approved_workflow_input(")
+            .expect("approved workflow input")
+            .1
+            .split_once("fn browser_profile_id(")
+            .expect("bounded approved workflow input")
+            .0;
+        assert!(workflow.contains("let exact_destination = job"));
+        assert!(workflow.contains("\"url\": exact_destination"));
+        assert!(!workflow.contains("\"url\": posting.canonical_url"));
+    }
+
+    #[test]
+    fn career_track_writes_require_the_exact_taxonomy_binding() {
+        let missing = require_current_taxonomy_write(&HeaderMap::new()).unwrap_err();
+        assert_eq!(missing.0, StatusCode::CONFLICT);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            JOBS_TAXONOMY_VERSION_HEADER,
+            HeaderValue::from_static(crate::jobs_taxonomy::taxonomy_version()),
+        );
+        headers.insert(
+            JOBS_TAXONOMY_SHA256_HEADER,
+            HeaderValue::from_str(&crate::jobs_taxonomy::taxonomy_sha256()).unwrap(),
+        );
+        require_current_taxonomy_write(&headers).unwrap();
+
+        headers.insert(
+            JOBS_TAXONOMY_SHA256_HEADER,
+            HeaderValue::from_static(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        );
+        let stale = require_current_taxonomy_write(&headers).unwrap_err();
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+        assert!(stale.1.contains("review"));
+    }
+
+    #[test]
+    fn taxonomy_response_uses_the_authenticated_portal_contract() {
+        let response = JobsTaxonomyResponse {
+            taxonomy_version: crate::jobs_taxonomy::taxonomy_version(),
+            taxonomy_sha256: crate::jobs_taxonomy::taxonomy_sha256(),
+            registry: crate::jobs_taxonomy::registry_json().unwrap(),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            value.get("taxonomyVersion").and_then(Value::as_str),
+            Some(crate::jobs_taxonomy::taxonomy_version())
+        );
+        assert_eq!(
+            value.get("taxonomySha256").and_then(Value::as_str),
+            Some(crate::jobs_taxonomy::taxonomy_sha256().as_str())
+        );
+        assert!(value.get("registry").is_some());
+        assert!(value.get("taxonomy_version").is_none());
+    }
+
+    #[test]
+    fn execution_lease_success_responses_are_private_and_non_sniffable() {
+        let response = worker_execution_lease_json_response(json!({"lease_token": "secret"}));
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+    }
+
+    #[test]
+    fn managed_execution_lease_requires_the_canonical_workflow_request_id() {
+        assert!(valid_managed_workflow_request_id(
+            "wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"
+        ));
+        for invalid in [
+            "wfreq-v2-01234567-89ab-4cde-8f01-23456789abcd",
+            "wfreq-v2-01234567-89AB-5CDE-8F01-23456789ABCD",
+            "wfreq-v2-01234567-89ab-5cde-7f01-23456789abcd",
+            "wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd\nextra",
+        ] {
+            assert!(!valid_managed_workflow_request_id(invalid));
+        }
+    }
+
+    #[test]
+    fn managed_execution_effect_requires_complete_http_authority() {
+        let missing =
+            required_managed_execution_lease_authority_input(None, None, None, None, None)
+                .unwrap_err();
+        assert_eq!(missing.0, StatusCode::BAD_REQUEST);
+        assert_eq!(missing.1, "Managed-cloud execution authority is required.");
+
+        let incomplete = required_managed_execution_lease_authority_input(
+            Some("wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(incomplete.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            incomplete.1,
+            "Managed-cloud execution authority must be complete."
+        );
+    }
+
+    #[test]
+    fn irreversible_submit_handler_preserves_managed_unmanaged_input_pairing() {
+        let source = include_str!("jobs.rs");
+        let handler = source
+            .split("async fn worker_start_irreversible_submission(")
+            .nth(1)
+            .expect("managed irreversible-submit handler")
+            .split("async fn worker_finish_execution_lease(")
+            .next()
+            .expect("bounded managed irreversible-submit handler");
+        assert!(handler.contains("let managed_cloud = managed_execution_lease_authority_input("));
+        assert!(handler.contains("managed_cloud.as_ref()"));
+
+        assert!(
+            managed_execution_lease_authority_input(None, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        let incomplete = managed_execution_lease_authority_input(
+            Some("wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(incomplete.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            incomplete.1,
+            "Managed-cloud execution authority must be complete."
+        );
+    }
+
+    #[test]
+    fn managed_execution_effect_preserves_complete_http_authority() {
+        let release = jobs::ManagedCloudReleaseMemoAuthority {
+            version: 1,
+            execution: jobs::ManagedCloudExecutionAuthority {
+                binding_sha256: "2".repeat(64),
+                admission: jobs::ManagedCloudAdmissionAuthority {
+                    scope: jobs::ManagedCloudScope {
+                        environment: "production".to_string(),
+                        region: "us-east-1".to_string(),
+                        channel: "canary".to_string(),
+                    },
+                    head_revision: 1,
+                    transition_sha256: "a".repeat(64),
+                    activation_sha256: "b".repeat(64),
+                    manifest_sha256: "c".repeat(64),
+                    cohort_sha256: "d".repeat(64),
+                    trust_generation: 1,
+                    channel_sequence: 1,
+                    release_id: "release-611".to_string(),
+                    release_sequence: 1,
+                    task_queue_sha256: "e".repeat(64),
+                    failure_converter_sha256: "f".repeat(64),
+                    readiness_sha256: "1".repeat(64),
+                    activation_expires_at_ms: 2_000,
+                    resolved_at_ms: 1_000,
+                },
+            },
+        };
+        let release_sha256 = jobs::managed_cloud_release_memo_sha256(&release).unwrap();
+        let authority = required_managed_execution_lease_authority_input(
+            Some("wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"),
+            Some(&release),
+            Some(&release_sha256),
+            Some("runtime-instance-123456789"),
+            Some(7),
+        )
+        .unwrap();
+
+        assert_eq!(
+            authority.workflow_request_id,
+            "wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"
+        );
+        assert_eq!(authority.managed_cloud_release, release);
+        assert_eq!(authority.managed_cloud_release_sha256, release_sha256);
+        assert_eq!(
+            authority.managed_cloud_runtime_instance_id,
+            "runtime-instance-123456789"
+        );
+        assert_eq!(authority.managed_cloud_runtime_instance_epoch, 7);
+    }
+
+    #[test]
+    fn workflow_finalization_accepts_only_closed_state_reason_prompt_pairs() {
+        use jobs::{JobsWorkflowTerminalOutcome as Outcome, JobsWorkflowTerminalReason as Reason};
+
+        assert_eq!(
+            workflow_command_terminal_outcome(
+                WorkflowCommandTerminalState::Failed,
+                WorkflowCommandTerminalReason::RunnerFailed,
+                None,
+            ),
+            Some(Outcome::Failed(Reason::RunnerFailed))
+        );
+        assert_eq!(
+            workflow_command_terminal_outcome(
+                WorkflowCommandTerminalState::SideEffectUnknown,
+                WorkflowCommandTerminalReason::RunnerAmbiguous,
+                None,
+            ),
+            Some(Outcome::SideEffectUnknown(Reason::RunnerAmbiguous))
+        );
+        assert_eq!(
+            workflow_command_terminal_outcome(
+                WorkflowCommandTerminalState::Failed,
+                WorkflowCommandTerminalReason::InterventionTimeout,
+                Some("wfint-v2-1234567890"),
+            ),
+            Some(Outcome::Failed(Reason::InterventionTimeout))
+        );
+        assert_eq!(
+            workflow_command_terminal_outcome(
+                WorkflowCommandTerminalState::Failed,
+                WorkflowCommandTerminalReason::InterventionLimit,
+                None,
+            ),
+            Some(Outcome::Failed(Reason::InterventionLimit))
+        );
+        assert!(workflow_command_terminal_outcome(
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::InterventionLimit,
+            Some("wfint-v2-1234567890"),
+        )
+        .is_none());
+        assert!(workflow_command_terminal_outcome(
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::InterventionTimeout,
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn workflow_finalization_rejects_explicit_null_optional_authority() {
+        let request = json!({
+            "schema_version": 2,
+            "workflow_id": "bluey-jobs-v2-1234567890",
+            "payload_digest": "a".repeat(64),
+            "operation": "start",
+            "terminal_state": "failed",
+            "reason_code": "runner_failed",
+            "open_intervention_id": null,
+        });
+        assert!(
+            serde_json::from_value::<WorkflowCommandFinalizeRequest>(request).is_err(),
+            "optional authority must be omitted rather than supplied as null"
+        );
+    }
+
+    #[test]
+    fn workflow_command_identifiers_require_twenty_closed_characters() {
+        assert!(!workflow_command_opaque_identifier(
+            "wfreq-v2-123456789",
+            128
+        ));
+        assert!(workflow_command_opaque_identifier(
+            "wfreq-v2-12345678901",
+            128
+        ));
+        assert!(!workflow_command_opaque_identifier(
+            "wfreq-v2-12345678901.",
+            128
+        ));
+    }
+
+    #[test]
+    fn expired_v2_submit_capability_is_limited_to_click_started_replay() {
+        let expires_at_ms = 10_000;
+        let now_ms = expires_at_ms + 1;
+        assert!(local_run_operation_expiry_allowed(
+            "submit",
+            None,
+            Some(super::super::jobs_local_capability::TOKEN_VERSION),
+            "click_started",
+            expires_at_ms,
+            now_ms,
+        ));
+        assert!(!local_run_operation_expiry_allowed(
+            "submit",
+            None,
+            Some(super::super::jobs_local_capability::LEGACY_TOKEN_VERSION),
+            "click_started",
+            expires_at_ms,
+            now_ms,
+        ));
+        assert!(!local_run_operation_expiry_allowed(
+            "submit",
+            None,
+            Some(super::super::jobs_local_capability::TOKEN_VERSION),
+            "click_started",
+            expires_at_ms,
+            expires_at_ms
+                .saturating_add(super::super::jobs_local_capability::RECONCILIATION_GRACE_MS),
+        ));
+    }
+
+    #[test]
+    fn expired_claimed_submit_capability_remains_denied() {
+        assert!(!local_run_operation_expiry_allowed(
+            "submit",
+            None,
+            Some(super::super::jobs_local_capability::TOKEN_VERSION),
+            "claimed",
+            10_000,
+            10_001,
+        ));
+    }
+
+    #[test]
+    fn legacy_result_reconciliation_expiry_contract_is_preserved() {
+        let expires_at_ms = 10_000;
+        let within_grace_ms = expires_at_ms + 1;
+        let legacy_v1 = Some(super::super::jobs_local_capability::LEGACY_TOKEN_VERSION);
+
+        assert!(!local_run_operation_expiry_allowed(
+            "result",
+            Some("submitted"),
+            None,
+            "click_started",
+            expires_at_ms,
+            within_grace_ms,
+        ));
+        assert!(local_run_operation_expiry_allowed(
+            "result",
+            Some("submitted"),
+            legacy_v1,
+            "click_started",
+            expires_at_ms,
+            within_grace_ms,
+        ));
+        for terminal_status in ["side_effect_unknown", "complete"] {
+            assert!(local_run_operation_expiry_allowed(
+                "result",
+                Some("side_effect_unknown"),
+                None,
+                terminal_status,
+                expires_at_ms,
+                within_grace_ms,
+            ));
+            assert!(local_run_operation_expiry_allowed(
+                "result",
+                Some("submitted"),
+                legacy_v1,
+                terminal_status,
+                expires_at_ms,
+                within_grace_ms,
+            ));
+        }
+        assert!(!local_run_operation_expiry_allowed(
+            "result",
+            Some("failed"),
+            legacy_v1,
+            "click_started",
+            expires_at_ms,
+            within_grace_ms,
+        ));
+        assert!(!local_run_operation_expiry_allowed(
+            "result",
+            Some("submitted"),
+            legacy_v1,
+            "claimed",
+            expires_at_ms,
+            within_grace_ms,
+        ));
+        assert!(!local_run_operation_expiry_allowed(
+            "result",
+            Some("submitted"),
+            legacy_v1,
+            "click_started",
+            expires_at_ms,
+            expires_at_ms
+                .saturating_add(super::super::jobs_local_capability::RECONCILIATION_GRACE_MS),
+        ));
+    }
+
+    #[test]
+    fn disabled_distribution_denies_claimed_submit_but_allows_click_started_replay() {
+        assert!(!local_submit_distribution_allowed(false, false));
+        assert!(local_submit_distribution_allowed(true, false));
+        assert!(local_submit_distribution_allowed(false, true));
+    }
+
+    fn durable_local_submission_capacity() -> object_uploads::SubmissionEvidenceCapacity {
+        object_uploads::SubmissionEvidenceCapacity {
+            account_id: "account-1".to_string(),
+            application_id: "application-1".to_string(),
+            run_id: "run-1".to_string(),
+            runner: "local".to_string(),
+            reserved_bytes: 384,
+            reserved_objects: 3,
+            consumed_bytes: 0,
+            consumed_objects: 0,
+            state: "active".to_string(),
+            expires_at_ms: 20_000,
+            created_at_ms: 9_000,
+            updated_at_ms: 9_000,
+            completed_at_ms: None,
+        }
+    }
+
+    fn reduced_upload_limits() -> crate::object_storage::UploadLimits {
+        crate::object_storage::UploadLimits {
+            max_object_bytes: 64,
+            max_account_bytes: 128,
+            max_daily_bytes: 128,
+            max_account_objects: 2,
+        }
+    }
+
+    #[test]
+    fn click_started_replay_preserves_durable_capacity_across_config_drift() {
+        let capacity = local_durable_recovery_evidence_capacity(
+            Some(durable_local_submission_capacity()),
+            "account-1",
+            "application-1",
+            "run-1",
+            10_000,
+            reduced_upload_limits(),
+        )
+        .expect("active exact capacity");
+
+        assert_eq!(capacity.reserved_bytes, 384);
+        assert_eq!(capacity.reserved_objects, 3);
+        assert_eq!(capacity.expires_at_ms, 20_000);
+        assert_eq!(capacity.now_ms, 10_000);
+        assert_eq!(capacity.limits, reduced_upload_limits());
+    }
+
+    #[test]
+    fn result_reconciliation_uses_durable_capacity_only_after_the_click_boundary() {
+        for durable_status in ["click_started", "side_effect_unknown"] {
+            assert!(local_result_uses_durable_submission_evidence_capacity(
+                durable_status
+            ));
+            let capacity = local_durable_recovery_evidence_capacity(
+                Some(durable_local_submission_capacity()),
+                "account-1",
+                "application-1",
+                "run-1",
+                10_000,
+                reduced_upload_limits(),
+            )
+            .expect("recovery keeps the durable capacity identity despite current config drift");
+            assert_eq!(capacity.reserved_bytes, 384);
+            assert_eq!(capacity.reserved_objects, 3);
+        }
+        for new_reservation_status in ["claimed", "needs_input"] {
+            assert!(!local_result_uses_durable_submission_evidence_capacity(
+                new_reservation_status
+            ));
+        }
+    }
+
+    #[test]
+    fn click_started_replay_rejects_missing_inactive_expired_or_wrong_run_capacity() {
+        let limits = reduced_upload_limits();
+        let rebuild = |durable| {
+            local_durable_recovery_evidence_capacity(
+                durable,
+                "account-1",
+                "application-1",
+                "run-1",
+                10_000,
+                limits,
+            )
+        };
+        assert!(rebuild(None).is_none());
+
+        let mut inactive = durable_local_submission_capacity();
+        inactive.state = "released".to_string();
+        assert!(rebuild(Some(inactive)).is_none());
+
+        let mut expired = durable_local_submission_capacity();
+        expired.expires_at_ms = 10_000;
+        assert!(rebuild(Some(expired)).is_none());
+
+        let mut wrong_runner = durable_local_submission_capacity();
+        wrong_runner.runner = "cloud".to_string();
+        assert!(rebuild(Some(wrong_runner)).is_none());
+
+        let mut wrong_run = durable_local_submission_capacity();
+        wrong_run.run_id = "run-2".to_string();
+        assert!(rebuild(Some(wrong_run)).is_none());
+    }
+
+    #[test]
+    fn local_submit_distribution_gate_defers_only_durable_replay_to_database_authority() {
+        let source = include_str!("jobs.rs");
+        let submit = source
+            .split("async fn authorize_local_run_submit")
+            .nth(1)
+            .expect("local submit route")
+            .split("fn local_submission_evidence_capacity")
+            .next()
+            .expect("bounded local submit route");
+        let ticket = submit
+            .find("authorize_local_run_operation")
+            .expect("ticket capability authority");
+        let durable_replay = submit
+            .find("local_submit_distribution_allowed")
+            .expect("durable replay distribution exception");
+        let distribution = submit
+            .find("jobs_local_browser_distribution_enabled")
+            .expect("local distribution flag");
+        let database = submit
+            .find("local_run_submit_authorization_for_distribution")
+            .expect("atomic database submit authority");
+        assert!(
+            ticket < durable_replay && durable_replay < distribution && distribution < database
+        );
+    }
+
+    #[test]
+    fn ats_kind_matches_shared_exact_target_vectors() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../jobs/automation/tests/fixtures/ats-target-vectors.json"
+        ))
+        .unwrap();
+        for vector in vectors.as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let url = vector["url"].as_str().unwrap();
+            let expected = vector["expectedDetection"].as_str().unwrap();
+            assert_eq!(ats_kind(url), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn ats_kind_rejects_workday_lookalikes() {
+        assert_eq!(
+            ats_kind("https://myworkdayjobs.com/acme/job/123"),
+            "semantic"
+        );
+        assert_eq!(
+            ats_kind("https://myworkdayjobs.com.attacker.example/acme/job/123"),
+            "semantic"
+        );
+    }
+
+    #[test]
+    fn execution_lease_owner_is_bound_to_authenticated_worker() {
+        let worker = JobsWorkerIdentity {
+            worker_id: "signed-execution-worker".to_string(),
+            scope: "execution".to_string(),
+        };
+        assert_eq!(
+            authenticated_execution_lease_owner(&worker, "signed-execution-worker").unwrap(),
+            "signed-execution-worker"
+        );
+        let error = authenticated_execution_lease_owner(&worker, "forged-owner").unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+
+        #[cfg(debug_assertions)]
+        {
+            let debug_worker = JobsWorkerIdentity {
+                worker_id: "debug-legacy-worker".to_string(),
+                scope: "debug".to_string(),
+            };
+            assert_eq!(
+                authenticated_execution_lease_owner(&debug_worker, "legacy-body-owner").unwrap(),
+                "legacy-body-owner"
+            );
+        }
+    }
 
     fn test_entitlement(track_limit: i64) -> JobsEntitlement {
         JobsEntitlement {
@@ -5395,6 +12534,97 @@ mod tests {
         assert!(entitlement.cloud_browser);
     }
 
+    fn ready_runner_volume_fleet() -> jobs::RunnerVolumeFleetStatus {
+        jobs::RunnerVolumeFleetStatus {
+            enrollment_generation: 4,
+            purge_generation: 7,
+            tombstone_generation: 6,
+            destruction_generation: 2,
+            legacy_reconciliation_generation: 3,
+            storage_attestation_generation: 8,
+            storage_attestation_count: 2,
+            storage_attestation_set_sha256: "c".repeat(64),
+            legacy_inventory_state: "ready".to_string(),
+            legacy_inventory_generation: 5,
+            legacy_inventory_reconciliation_id: Some("legacy-reconciliation".to_string()),
+            legacy_inventory_authority_id: Some("legacy-authority".to_string()),
+            legacy_inventory_authority_sha256: Some("b".repeat(64)),
+            legacy_inventory_root_count: Some(0),
+            legacy_inventory_root_set_sha256: Some(
+                jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256.to_string(),
+            ),
+            cutover_state: "ready".to_string(),
+            unresolved_legacy_volume_count: 0,
+            cutover_enrollment_generation: Some(4),
+            cutover_purge_generation: Some(7),
+            cutover_tombstone_generation: Some(6),
+            cutover_destruction_generation: Some(2),
+            cutover_legacy_reconciliation_generation: Some(3),
+            cutover_storage_attestation_generation: Some(8),
+            cutover_storage_attestation_count: Some(2),
+            cutover_storage_attestation_set_sha256: Some("c".repeat(64)),
+            cutover_legacy_inventory_generation: Some(5),
+            cutover_legacy_inventory_reconciliation_id: Some("legacy-reconciliation".to_string()),
+            cutover_legacy_inventory_authority_id: Some("legacy-authority".to_string()),
+            cutover_legacy_inventory_authority_sha256: Some("b".repeat(64)),
+            cutover_legacy_inventory_root_count: Some(0),
+            cutover_legacy_inventory_root_set_sha256: Some(
+                jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256.to_string(),
+            ),
+            cutover_non_destroyed_volume_count: Some(2),
+            cutover_destruction_count: Some(1),
+            cutover_unresolved_legacy_volume_count: Some(0),
+            cutover_evidence_ref: Some("fleet-evidence".to_string()),
+            cutover_evidence_sha256: Some("a".repeat(64)),
+            cutover_authorized_by: Some("operator".to_string()),
+            cutover_at_ms: Some(100),
+            non_destroyed_volume_count: 2,
+            destruction_count: 1,
+            attested_reconciled_volume_count: 2,
+            updated_at_ms: 100,
+        }
+    }
+
+    #[test]
+    fn distribution_requires_exact_live_runner_volume_cutover_snapshot() {
+        let ready = ready_runner_volume_fleet();
+        assert!(runner_volume_fleet_is_distribution_ready(&ready));
+
+        let mut generation_drift = ready.clone();
+        generation_drift.purge_generation += 1;
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &generation_drift
+        ));
+
+        let mut legacy_unresolved = ready.clone();
+        legacy_unresolved.unresolved_legacy_volume_count = 1;
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &legacy_unresolved
+        ));
+
+        let mut inactive_volume = ready.clone();
+        inactive_volume.attested_reconciled_volume_count = 1;
+        assert!(!runner_volume_fleet_is_distribution_ready(&inactive_volume));
+
+        let mut legacy_inventory_drift = ready.clone();
+        legacy_inventory_drift.legacy_inventory_generation += 1;
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &legacy_inventory_drift
+        ));
+
+        let mut nonempty_legacy_inventory = ready.clone();
+        nonempty_legacy_inventory.legacy_inventory_root_count = Some(1);
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &nonempty_legacy_inventory
+        ));
+
+        let mut missing_evidence = ready;
+        missing_evidence.cutover_evidence_sha256 = None;
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &missing_evidence
+        ));
+    }
+
     #[test]
     fn free_plan_explains_that_auto_submit_needs_runner_access() {
         let entitlement = test_entitlement(1);
@@ -5409,17 +12639,19 @@ mod tests {
     }
 
     #[test]
-    fn included_but_undistributed_runner_is_truthfully_invited_beta() {
+    fn included_but_undistributed_runner_is_truthfully_limited_beta() {
         let mut entitlement = test_entitlement(3);
         entitlement.plan = "pro".to_string();
         entitlement.local_browser = true;
         let availability = build_runner_availability(&entitlement, false, false);
 
-        assert_eq!(availability.local.status, "invited_beta");
+        assert_eq!(availability.local.status, "limited_beta");
         assert!(availability.local.plan_included);
         assert!(!availability.local.available);
         assert!(!availability.auto_submit_available);
-        assert!(availability.auto_submit_reason.contains("invited beta"));
+        assert!(availability
+            .auto_submit_reason
+            .contains("limited public beta"));
     }
 
     #[test]
@@ -5433,6 +12665,41 @@ mod tests {
         assert!(availability.local.available);
         assert!(availability.cloud.available);
         assert!(availability.auto_submit_available);
+    }
+
+    #[test]
+    fn runner_availability_serializes_signed_release_origin_in_snake_case() {
+        let mut entitlement = test_entitlement(5);
+        entitlement.plan = "pro".to_string();
+        entitlement.local_browser = true;
+        let mut availability = build_runner_availability(&entitlement, true, false);
+        availability.local.release = Some(jobs::LocalBrowserReleaseAvailability::Available {
+            reason: "The active beta release is available for this account.".to_string(),
+            channel: "beta".to_string(),
+            release_id: "browser-release-603-1".to_string(),
+            artifact_origin: "https://bluey.sh".to_string(),
+            manifest_sha256: "a".repeat(64),
+            release_sequence: 1,
+            build_id: "browser-603.1".to_string(),
+            app_version: "0.1.5".to_string(),
+            protocol_version: 1,
+            released_at_ms: 1,
+            artifacts: Vec::new(),
+        });
+
+        let serialized = serde_json::to_value(availability).unwrap();
+        assert_eq!(
+            serialized.pointer("/local/release/release_id"),
+            Some(&json!("browser-release-603-1"))
+        );
+        assert_eq!(
+            serialized.pointer("/local/release/artifact_origin"),
+            Some(&json!("https://bluey.sh"))
+        );
+        assert!(serialized.pointer("/local/release/releaseId").is_none());
+        assert!(serialized
+            .pointer("/local/release/artifactOrigin")
+            .is_none());
     }
 
     fn test_eligibility(capability: &str, can_auto_submit: bool) -> JobEligibilityDecision {
@@ -5469,7 +12736,153 @@ mod tests {
         let runner = auto_submit_request_error(&test_eligibility("certified", true), &unavailable)
             .expect("undistributed runner must block auto submit");
         assert_eq!(runner.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(runner.1.contains("invited beta"));
+        assert!(runner.1.contains("limited public beta"));
+    }
+
+    #[test]
+    fn c2c_candidate_submission_error_is_a_safe_conflict() {
+        let error = anyhow::Error::new(jobs::ApplicationAttemptAdmissionError::ReviewRequired {
+            reason_code: jobs::C2C_SUBMISSION_REVIEW_REASON.to_string(),
+        });
+        assert_eq!(
+            domain_error(error),
+            (
+                StatusCode::CONFLICT,
+                concat!(
+                    "Bluey does not submit C2C applications. ",
+                    "Confirm the arrangement with the employer before applying yourself."
+                )
+                .to_string(),
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn c2c_prepare_route_refuses_auto_submit_but_allows_candidate_review() {
+        const ACCOUNT: &str = "acct-jobs";
+        const EMAIL: &str = "jobs@example.com";
+        let (pool, config) = crate::api::provisioning_router_tests::fixture();
+        crate::db::run_migrations(&pool).unwrap();
+        let (posting, track) = jobs::seed_c2c_candidate_submission_for_router(&pool);
+        jobs::require_valid_auto_submit_authorization(&pool, ACCOUNT, EMAIL, &track).unwrap();
+        let token = crate::auth::jwt::issue(
+            &config.jwt_secret,
+            ACCOUNT,
+            crate::auth::jwt::TokenKind::Access,
+        )
+        .unwrap();
+        let app = crate::api::build_jobs_router(pool.clone(), config);
+        let request = |mode, authenticated| {
+            let mut request = axum::http::Request::post("/api/jobs/applications")
+                .header(header::CONTENT_TYPE, "application/json");
+            if authenticated {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            request
+                .body(Body::from(
+                    json!({"job_id": posting.id, "mode": "factual", "submission_mode": mode})
+                        .to_string(),
+                ))
+                .unwrap()
+        };
+        let count = |query| {
+            pool.get()
+                .unwrap()
+                .query_row(query, [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        let worker_effects = || {
+            let mut snapshot = jobs::authenticated_worker_submit_snapshot(&pool);
+            snapshot.as_object_mut().unwrap().remove("application");
+            snapshot
+        };
+        let charges = || {
+            [
+                "SELECT COUNT(*) FROM jobs_packet_metering",
+                "SELECT COUNT(*) FROM jobs_generation_allowance_reservations",
+                "SELECT COUNT(*) FROM jobs_provider_cost_holds",
+            ]
+            .map(count)
+        };
+
+        let before = worker_effects();
+        assert_eq!(charges(), [0, 0, 0]);
+        assert_eq!(
+            app.clone()
+                .oneshot(request("auto_submit", false))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let refusal = app
+            .clone()
+            .oneshot(request("auto_submit", true))
+            .await
+            .unwrap();
+        assert_eq!(refusal.status(), StatusCode::CONFLICT);
+        let message = axum::body::to_bytes(refusal.into_body(), 4_096)
+            .await
+            .unwrap();
+        assert_eq!(
+            message.as_ref(),
+            jobs::C2C_SUBMISSION_REVIEW_MESSAGE.as_bytes()
+        );
+        assert_eq!(worker_effects(), before);
+        assert_eq!(charges(), [0, 0, 0]);
+        assert!(jobs::list_applications(&pool, ACCOUNT).unwrap().is_empty());
+        assert!(jobs::list_resume_versions(&pool, ACCOUNT)
+            .unwrap()
+            .is_empty());
+        assert_eq!(count("SELECT COUNT(*) FROM jobs_resume_generations"), 0);
+
+        let review = app.oneshot(request("review_first", true)).await.unwrap();
+        assert_eq!(review.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(review.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let applications = jobs::list_applications(&pool, ACCOUNT).unwrap();
+        assert_eq!(applications.len(), 1);
+        assert_eq!(body["application"]["id"], applications[0].id);
+        assert_eq!(body["application"]["state"], "awaiting_review");
+        assert_eq!(applications[0].job_id, posting.id);
+        assert_eq!(applications[0].state, "awaiting_review");
+        assert!(applications[0].receipt.get("approved_execution").is_none());
+        assert!(body.get("metering").is_none());
+        assert_eq!(worker_effects(), before);
+        assert_eq!(charges(), [0, 0, 0]);
+    }
+
+    #[test]
+    fn auto_submit_authorization_refusals_are_safe_and_actionable() {
+        assert_eq!(
+            auto_submit_authorization_error(jobs::AutoSubmitAuthorizationError::Missing),
+            (
+                StatusCode::CONFLICT,
+                AUTO_SUBMIT_AUTHORIZATION_MISSING_MESSAGE.to_string(),
+            ),
+        );
+        assert_eq!(
+            auto_submit_authorization_error(jobs::AutoSubmitAuthorizationError::Stale),
+            (
+                StatusCode::CONFLICT,
+                AUTO_SUBMIT_AUTHORIZATION_STALE_MESSAGE.to_string(),
+            ),
+        );
+
+        let response =
+            auto_submit_authorization_error(jobs::AutoSubmitAuthorizationError::Internal(
+                anyhow::anyhow!("private database failure"),
+            ));
+        assert_eq!(response.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.1,
+            "Bluey Jobs could not finish that request. Please try again."
+        );
+        assert!(!response.1.contains("database"));
     }
 
     fn test_track(id: &str) -> CareerTrack {
@@ -5508,8 +12921,1009 @@ mod tests {
         pool
     }
 
+    fn seed_router_smartrecruiters_summary(
+        pool: &crate::db::DbPool,
+        account_id: &str,
+        track_id: &str,
+        worker_id: &str,
+    ) -> JobPosting {
+        let tenant = "ExactTenant";
+        let external_id = "stable-record-42";
+        jobs::upsert_track(pool, account_id, &test_track(track_id)).unwrap();
+        let source = jobs::upsert_discovery_source(
+            pool,
+            account_id,
+            &jobs::DiscoverySourceInput {
+                track_id: track_id.to_string(),
+                provider: "smartrecruiters".to_string(),
+                source_key: tenant.to_string(),
+                company: "Fixture Systems".to_string(),
+                run_interval_ms: 0,
+            },
+        )
+        .unwrap();
+        let lease = jobs::lease_due_discovery_source_for_test(pool, worker_id, &source.id)
+            .unwrap()
+            .unwrap();
+        jobs::complete_discovery_run(
+            pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[jobs::DiscoveredJobInput {
+                external_id: external_id.to_string(),
+                canonical_url: "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42"
+                    .to_string(),
+                title: "Platform Engineer".to_string(),
+                company: String::new(),
+                source_catalog_id: String::new(),
+                requires_original_revalidation: false,
+                location: "Remote".to_string(),
+                workplace: "remote".to_string(),
+                description: String::new(),
+                compensation: String::new(),
+                employment_type: "full_time".to_string(),
+                engagement_type: "w2".to_string(),
+                posted_at_ms: None,
+            }],
+            true,
+        )
+        .unwrap();
+        jobs::list_postings(pool, account_id)
+            .unwrap()
+            .into_iter()
+            .find(|posting| posting.external_id == external_id)
+            .unwrap()
+    }
+
+    fn smartrecruiters_route_request(
+        token: Option<&str>,
+        uri: &str,
+        body: &[u8],
+    ) -> axum::http::Request<Body> {
+        let mut request = axum::http::Request::post(uri);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request.body(Body::from(body.to_vec())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn smartrecruiters_requirements_real_router_enforces_auth_scope_and_effect_fences() {
+        let (pool, config) = crate::api::provisioning_router_tests::fixture();
+        crate::db::run_migrations(&pool).unwrap();
+        let owner = crate::db::accounts::Account::create(
+            &pool,
+            "requirements-owner@example.invalid",
+            "unused-test-hash",
+        )
+        .unwrap();
+        let foreign = crate::db::accounts::Account::create(
+            &pool,
+            "requirements-foreign@example.invalid",
+            "unused-test-hash",
+        )
+        .unwrap();
+        let deleting = crate::db::accounts::Account::create(
+            &pool,
+            "requirements-deleting@example.invalid",
+            "unused-test-hash",
+        )
+        .unwrap();
+        let admin = crate::db::accounts::Account::create_with_admin(
+            &pool,
+            "requirements-admin@example.invalid",
+            "unused-test-hash",
+            true,
+        )
+        .unwrap();
+        for account in [&owner, &foreign, &deleting, &admin] {
+            assert_eq!(
+                crate::db::accounts::Account::mark_email_verified(&pool, &account.id).unwrap(),
+                1
+            );
+        }
+        let cohort = crate::db::jobs_beta_access::get_public_beta_cohort(&pool).unwrap();
+        let cohort = crate::db::jobs_beta_access::update_public_beta_cohort_audited(
+            &pool,
+            crate::db::jobs_beta_access::PublicBetaCohortUpdate {
+                expected_revision: cohort.revision,
+                state: crate::db::jobs_beta_access::PublicBetaCohortState::ClosedToNew,
+                opens_at_ms: None,
+                closes_at_ms: None,
+                hard_cap: 3,
+            },
+            &admin.id,
+        )
+        .unwrap();
+        for account in [&owner, &foreign, &deleting] {
+            let access = crate::db::jobs_beta_access::grant_public_beta_access_audited(
+                &pool,
+                &account.id,
+                cohort.revision,
+                &admin.id,
+            )
+            .unwrap();
+            assert_eq!(
+                access.reason,
+                crate::db::jobs_beta_access::PublicBetaAccessReason::Admitted
+            );
+        }
+        let original = seed_router_smartrecruiters_summary(
+            &pool,
+            &owner.id,
+            "router-owner-track",
+            "requirements-router-owner",
+        );
+        let deleting_posting = seed_router_smartrecruiters_summary(
+            &pool,
+            &deleting.id,
+            "router-deleting-track",
+            "requirements-router-deleting",
+        );
+        let owner_token = crate::auth::jwt::issue(
+            &config.jwt_secret,
+            &owner.id,
+            crate::auth::jwt::TokenKind::Access,
+        )
+        .unwrap();
+        let foreign_token = crate::auth::jwt::issue(
+            &config.jwt_secret,
+            &foreign.id,
+            crate::auth::jwt::TokenKind::Access,
+        )
+        .unwrap();
+        let deleting_token = crate::auth::jwt::issue(
+            &config.jwt_secret,
+            &deleting.id,
+            crate::auth::jwt::TokenKind::Access,
+        )
+        .unwrap();
+        crate::db::account_data::begin_account_deletion(
+            &pool,
+            &deleting.id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .expect("fixture account must establish a deletion fence");
+
+        let expected_target =
+            "https://api.smartrecruiters.com/v1/companies/ExactTenant/postings/stable-record-42";
+        let payload = json!({
+            "id": "stable-record-42",
+            "active": true,
+            "company": {"identifier": "ExactTenant", "name": "Fixture Systems"},
+            "name": "Platform Engineer",
+            "location": {"city": "Remote", "remote": true},
+            "workplaceType": "remote",
+            "typeOfEmployment": {"id": "full_time"},
+            "postingUrl": "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer",
+            "applyUrl": "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer?oga=true",
+            "ref": null,
+            "jobAd": {"sections": {
+                "description": {"text": "Build reliable synthetic APIs."},
+                "qualifications": {"description": "Know Rust and SQL."}
+            }}
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let harness = SmartRecruitersRequirementsRouteTestHarness {
+            enabled: true,
+            expected_target: expected_target.to_string(),
+            payload,
+            calls: calls.clone(),
+        };
+        let app = crate::api::build_jobs_router(pool.clone(), config.clone())
+            .layer(Extension(harness.clone()));
+        let disabled_app = crate::api::build_jobs_router(pool.clone(), config.clone()).layer(
+            Extension(SmartRecruitersRequirementsRouteTestHarness {
+                enabled: false,
+                ..harness
+            }),
+        );
+        let path = format!("/api/jobs/matches/{}/load-requirements", original.id);
+
+        assert_eq!(
+            app.clone()
+                .oneshot(smartrecruiters_route_request(None, &path, b""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            disabled_app
+                .oneshot(smartrecruiters_route_request(
+                    Some(&owner_token),
+                    &path,
+                    b"",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(smartrecruiters_route_request(
+                    Some(&foreign_token),
+                    &path,
+                    b"",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(smartrecruiters_route_request(
+                    Some(&owner_token),
+                    &format!("{path}?url=https%3A%2F%2Fexample.invalid"),
+                    b"",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(smartrecruiters_route_request(
+                    Some(&owner_token),
+                    &path,
+                    b"x",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(smartrecruiters_route_request(
+                    Some(&owner_token),
+                    &path,
+                    b"xx",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let deleting_path = format!(
+            "/api/jobs/matches/{}/load-requirements",
+            deleting_posting.id
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(smartrecruiters_route_request(
+                    Some(&deleting_token),
+                    &deleting_path,
+                    b"",
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let allowance_before = jobs::get_entitlement(&pool, &owner.id)
+            .unwrap()
+            .used_packets;
+        let response = app
+            .clone()
+            .oneshot(smartrecruiters_route_request(
+                Some(&owner_token),
+                &path,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let represented: JobPosting = serde_json::from_slice(&body).unwrap();
+        assert_eq!(represented.id, original.id);
+        assert_eq!(represented.track_id, original.track_id);
+        assert_eq!(represented.source, original.source);
+        assert_eq!(represented.canonical_url, original.canonical_url);
+        assert_eq!(
+            represented.description,
+            "Build reliable synthetic APIs. Know Rust and SQL."
+        );
+        let eligibility = represented.eligibility.unwrap();
+        assert!(!eligibility.can_prepare);
+        assert!(!eligibility.can_queue_local);
+        assert!(!eligibility.can_queue_cloud);
+        assert!(!eligibility.can_auto_submit);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let reloaded = jobs::get_posting(&pool, &owner.id, &original.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.description, represented.description);
+        assert_eq!(reloaded.source, original.source);
+        assert_eq!(reloaded.canonical_url, original.canonical_url);
+        assert_ne!(
+            reloaded.discovery_evidence.original_source_status,
+            "verified_open"
+        );
+        assert_eq!(
+            reloaded.discovery_evidence.original_source_evidence_hash,
+            None
+        );
+        assert_eq!(reloaded.eligibility, None);
+        assert!(jobs::list_applications(&pool, &owner.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            jobs::get_entitlement(&pool, &owner.id)
+                .unwrap()
+                .used_packets,
+            allowance_before
+        );
+
+        let retry = app
+            .oneshot(smartrecruiters_route_request(
+                Some(&owner_token),
+                &path,
+                b"",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::NOT_FOUND);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn smartrecruiters_saved_summary_hydration_is_private_and_description_only() {
+        let pool = discovery_enrollment_test_pool();
+        let account_id = "acct-one";
+        let tenant = "ExactTenant";
+        let external_id = "stable-record-42";
+        let canonical_url = "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42";
+        let detail_url =
+            "https://api.smartrecruiters.com/v1/companies/ExactTenant/postings/stable-record-42";
+        let posting_url =
+            "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer";
+        let apply_url =
+            "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer?oga=true";
+
+        jobs::upsert_track(&pool, account_id, &test_track("smartrecruiters-track")).unwrap();
+        let source = jobs::upsert_discovery_source(
+            &pool,
+            account_id,
+            &jobs::DiscoverySourceInput {
+                track_id: "smartrecruiters-track".to_string(),
+                provider: "smartrecruiters".to_string(),
+                source_key: tenant.to_string(),
+                company: "Fixture Systems".to_string(),
+                run_interval_ms: 0,
+            },
+        )
+        .unwrap();
+        let lease = jobs::lease_due_discovery_source_for_test(
+            &pool,
+            "smartrecruiters-hydration-fixture",
+            &source.id,
+        )
+        .unwrap()
+        .unwrap();
+        jobs::complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[jobs::DiscoveredJobInput {
+                external_id: external_id.to_string(),
+                canonical_url: canonical_url.to_string(),
+                title: "Platform Engineer".to_string(),
+                company: String::new(),
+                source_catalog_id: String::new(),
+                requires_original_revalidation: false,
+                location: "Remote".to_string(),
+                workplace: "remote".to_string(),
+                description: String::new(),
+                compensation: String::new(),
+                employment_type: "full_time".to_string(),
+                engagement_type: "w2".to_string(),
+                posted_at_ms: None,
+            }],
+            true,
+        )
+        .unwrap();
+        let original = jobs::list_postings(&pool, account_id).unwrap().remove(0);
+        let original_subject = jobs::original_source_subject_sha256(&original).unwrap();
+        let coordinates = |posting: &JobPosting| {
+            vec![
+                posting.id.clone(),
+                posting.canonical_key.clone(),
+                posting.source.clone(),
+                posting.external_id.clone(),
+                posting.company.clone(),
+                posting.title.clone(),
+                posting.location.clone(),
+                posting.workplace.clone(),
+                posting.canonical_url.clone(),
+                posting.track_id.clone(),
+            ]
+        };
+        let original_coordinates = coordinates(&original);
+        let stored_row = || {
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT posting_json, updated_at_ms FROM jobs_postings
+                      WHERE account_id = ?1 AND id = ?2",
+                    rusqlite::params![account_id, &original.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap()
+        };
+
+        let foreign_reader_calls = std::cell::Cell::new(0);
+        assert!(jobs_import::hydrate_saved_smartrecruiters_using(
+            &pool,
+            "acct-two",
+            &original.id,
+            |_| async {
+                foreign_reader_calls.set(foreign_reader_calls.get() + 1);
+                Ok(json!({}))
+            },
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(foreign_reader_calls.get(), 0);
+
+        let before_wrong_detail = stored_row();
+        let wrong_reader_calls = std::cell::Cell::new(0);
+        let wrong_reader_counter = &wrong_reader_calls;
+        let wrong_detail = json!({
+            "id": "different-stable-record",
+            "company": {"identifier": tenant, "name": "Fixture Systems"},
+            "name": "Platform Engineer",
+            "applyUrl": apply_url,
+            "ref": detail_url,
+            "jobAd": {"sections": {
+                "description": {"text": "Build reliable synthetic APIs."},
+                "qualifications": {"description": "Know Rust and SQL."}
+            }}
+        });
+        let wrong = jobs_import::hydrate_saved_smartrecruiters_using(
+            &pool,
+            account_id,
+            &original.id,
+            |url| async move {
+                wrong_reader_counter.set(wrong_reader_counter.get() + 1);
+                assert_eq!(url.as_str(), detail_url);
+                Ok(wrong_detail)
+            },
+        )
+        .await;
+        assert!(matches!(
+            wrong,
+            Err(jobs_import::SmartRecruitersHydrationError::DetailUnavailable)
+        ));
+        assert_eq!(wrong_reader_calls.get(), 1);
+        assert_eq!(stored_row(), before_wrong_detail);
+
+        let before_wrong_destination = stored_row();
+        let destination_reader_calls = std::cell::Cell::new(0);
+        let destination_reader_counter = &destination_reader_calls;
+        let wrong_destination = json!({
+            "id": external_id,
+            "company": {"identifier": tenant, "name": "Fixture Systems"},
+            "name": "Platform Engineer",
+            "applyUrl": "https://www.smartrecruiters.com/OtherTenant/stable-record-42-platform-engineer",
+            "ref": detail_url,
+            "jobAd": {"sections": {
+                "description": {"text": "Build reliable synthetic APIs."},
+                "qualifications": {"description": "Know Rust and SQL."}
+            }}
+        });
+        let wrong_destination_result = jobs_import::hydrate_saved_smartrecruiters_using(
+            &pool,
+            account_id,
+            &original.id,
+            |url| async move {
+                destination_reader_counter.set(destination_reader_counter.get() + 1);
+                assert_eq!(url.as_str(), detail_url);
+                Ok(wrong_destination)
+            },
+        );
+        assert!(matches!(
+            wrong_destination_result.await,
+            Err(jobs_import::SmartRecruitersHydrationError::DetailUnavailable)
+        ));
+        assert_eq!(destination_reader_calls.get(), 1);
+        assert_eq!(stored_row(), before_wrong_destination);
+
+        let matching_detail = json!({
+            "id": external_id,
+            "active": true,
+            "company": {"identifier": tenant, "name": "Fixture Systems"},
+            "name": "Platform Engineer",
+            "location": {"city": "Remote", "remote": true},
+            "workplaceType": "remote",
+            "typeOfEmployment": {"id": "full_time"},
+            "postingUrl": posting_url,
+            "applyUrl": apply_url,
+            "ref": null,
+            "jobAd": {"sections": {
+                "description": {"text": "Build reliable synthetic APIs."},
+                "qualifications": {"description": "Know Rust and SQL."}
+            }}
+        });
+        let refused_destinations = [
+            (
+                "apply identity drift",
+                posting_url,
+                "https://jobs.smartrecruiters.com/ExactTenant/other-record-platform-engineer?oga=true",
+            ),
+            (
+                "posting query",
+                "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer?source=feed",
+                apply_url,
+            ),
+            (
+                "duplicate apply query",
+                posting_url,
+                "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer?oga=true&oga=true",
+            ),
+            (
+                "extra path",
+                "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer/extra",
+                "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer/extra?oga=true",
+            ),
+            (
+                "normalized dot path",
+                "https://jobs.smartrecruiters.com/ExactTenant/./stable-record-42-platform-engineer",
+                "https://jobs.smartrecruiters.com/ExactTenant/./stable-record-42-platform-engineer?oga=true",
+            ),
+            (
+                "credentials",
+                "https://reader@jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer",
+                "https://reader@jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer?oga=true",
+            ),
+            (
+                "explicit port",
+                "https://jobs.smartrecruiters.com:443/ExactTenant/stable-record-42-platform-engineer",
+                "https://jobs.smartrecruiters.com:443/ExactTenant/stable-record-42-platform-engineer?oga=true",
+            ),
+            (
+                "fragment",
+                "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer#details",
+                "https://jobs.smartrecruiters.com/ExactTenant/stable-record-42-platform-engineer?oga=true#apply",
+            ),
+        ];
+        for (label, rejected_posting_url, rejected_apply_url) in refused_destinations {
+            let before_refusal = stored_row();
+            let calls = std::cell::Cell::new(0);
+            let call_counter = &calls;
+            let mut rejected = matching_detail.clone();
+            rejected["postingUrl"] = json!(rejected_posting_url);
+            rejected["applyUrl"] = json!(rejected_apply_url);
+            let result = jobs_import::hydrate_saved_smartrecruiters_using(
+                &pool,
+                account_id,
+                &original.id,
+                |url| async move {
+                    call_counter.set(call_counter.get() + 1);
+                    assert_eq!(url.as_str(), detail_url);
+                    Ok(rejected)
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(jobs_import::SmartRecruitersHydrationError::DetailUnavailable)
+                ),
+                "{label} must be unavailable"
+            );
+            assert_eq!(calls.get(), 1, "{label} must perform one bounded read");
+            assert_eq!(stored_row(), before_refusal, "{label} must not write");
+        }
+
+        let before_wrong_reference = stored_row();
+        let wrong_reference_calls = std::cell::Cell::new(0);
+        let wrong_reference_counter = &wrong_reference_calls;
+        let mut wrong_reference = matching_detail.clone();
+        wrong_reference["ref"] =
+            json!("https://api.smartrecruiters.com/v1/companies/ExactTenant/postings/other-record");
+        let wrong_reference_result = jobs_import::hydrate_saved_smartrecruiters_using(
+            &pool,
+            account_id,
+            &original.id,
+            |url| async move {
+                wrong_reference_counter.set(wrong_reference_counter.get() + 1);
+                assert_eq!(url.as_str(), detail_url);
+                Ok(wrong_reference)
+            },
+        )
+        .await;
+        assert!(matches!(
+            wrong_reference_result,
+            Err(jobs_import::SmartRecruitersHydrationError::DetailUnavailable)
+        ));
+        assert_eq!(wrong_reference_calls.get(), 1);
+        assert_eq!(stored_row(), before_wrong_reference);
+
+        for (label, active) in [
+            ("inactive detail", json!(false)),
+            ("non-boolean active detail", json!("true")),
+        ] {
+            let before_refusal = stored_row();
+            let calls = std::cell::Cell::new(0);
+            let call_counter = &calls;
+            let mut rejected = matching_detail.clone();
+            rejected["active"] = active;
+            let result = jobs_import::hydrate_saved_smartrecruiters_using(
+                &pool,
+                account_id,
+                &original.id,
+                |url| async move {
+                    call_counter.set(call_counter.get() + 1);
+                    assert_eq!(url.as_str(), detail_url);
+                    Ok(rejected)
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(jobs_import::SmartRecruitersHydrationError::DetailUnavailable)
+                ),
+                "{label} must be unavailable"
+            );
+            assert_eq!(calls.get(), 1, "{label} must perform one bounded read");
+            assert_eq!(stored_row(), before_refusal, "{label} must not write");
+        }
+
+        let before_missing_pair = stored_row();
+        let missing_pair_calls = std::cell::Cell::new(0);
+        let missing_pair_counter = &missing_pair_calls;
+        let mut missing_pair = matching_detail.clone();
+        missing_pair.as_object_mut().unwrap().remove("postingUrl");
+        let missing_pair_result = jobs_import::hydrate_saved_smartrecruiters_using(
+            &pool,
+            account_id,
+            &original.id,
+            |url| async move {
+                missing_pair_counter.set(missing_pair_counter.get() + 1);
+                assert_eq!(url.as_str(), detail_url);
+                Ok(missing_pair)
+            },
+        )
+        .await;
+        assert!(matches!(
+            missing_pair_result,
+            Err(jobs_import::SmartRecruitersHydrationError::DetailUnavailable)
+        ));
+        assert_eq!(missing_pair_calls.get(), 1);
+        assert_eq!(stored_row(), before_missing_pair);
+
+        let matching_reader_calls = std::cell::Cell::new(0);
+        let matching_reader_counter = &matching_reader_calls;
+        let hydrated = jobs_import::hydrate_saved_smartrecruiters_using(
+            &pool,
+            account_id,
+            &original.id,
+            |url| async move {
+                matching_reader_counter.set(matching_reader_counter.get() + 1);
+                assert_eq!(url.as_str(), detail_url);
+                Ok(matching_detail)
+            },
+        )
+        .await
+        .unwrap()
+        .expect("owned active summary must hydrate");
+        assert_eq!(matching_reader_calls.get(), 1);
+        assert_eq!(
+            hydrated.description,
+            "Build reliable synthetic APIs. Know Rust and SQL."
+        );
+        let owner = crate::db::accounts::Account::fetch_by_id(&pool, account_id)
+            .unwrap()
+            .unwrap();
+        let response = smartrecruiters_requirements_response(&pool, &owner, &original.id).unwrap();
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let represented: JobPosting = serde_json::from_slice(&body).unwrap();
+        assert_eq!(represented.id, original.id);
+        assert_eq!(represented.track_id, original.track_id);
+        assert_eq!(represented.description, hydrated.description);
+        let eligibility = represented.eligibility.unwrap();
+        assert!(!eligibility.can_prepare);
+        assert!(!eligibility.can_queue_local);
+        assert!(!eligibility.can_queue_cloud);
+        assert!(!eligibility.can_auto_submit);
+
+        let repeat_reads = std::cell::Cell::new(0);
+        let repeat_reader = &repeat_reads;
+        assert!(jobs_import::hydrate_saved_smartrecruiters_using(
+            &pool,
+            account_id,
+            &original.id,
+            |_| async move {
+                repeat_reader.set(repeat_reader.get() + 1);
+                Err(jobs_import::SmartRecruitersHydrationError::DetailUnavailable)
+            },
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(repeat_reads.get(), 0);
+
+        let reloaded = jobs::get_posting(&pool, account_id, &original.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.description, hydrated.description);
+        assert_eq!(coordinates(&reloaded), original_coordinates);
+        assert_ne!(
+            jobs::original_source_subject_sha256(&reloaded).unwrap(),
+            original_subject
+        );
+        assert_ne!(
+            reloaded.discovery_evidence.original_source_status,
+            "verified_open"
+        );
+        assert_eq!(
+            reloaded.discovery_evidence.original_source_evidence_hash,
+            None
+        );
+        assert_eq!(
+            reloaded.discovery_evidence.original_source_checked_at_ms,
+            None
+        );
+        assert_eq!(reloaded.last_verified_at_ms, None);
+        assert_eq!(reloaded.eligibility, None);
+        assert!(jobs::list_applications(&pool, account_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn smartrecruiters_requirements_accept_only_opt_in_and_one_saved_id() {
+        let id = "9ad08eb7-49ef-44e7-bd29-5838dc097a80";
+        for disabled in [None, Some("0"), Some("true"), Some(" 1"), Some("1\n")] {
+            assert_eq!(
+                validate_smartrecruiters_requirements_request(disabled, id, false, false)
+                    .unwrap_err()
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert!(validate_smartrecruiters_requirements_request(Some("1"), id, false, false).is_ok());
+        for bad_id in ["", "job/other", "job%2Fother", &"x".repeat(129)] {
+            assert_eq!(
+                validate_smartrecruiters_requirements_request(Some("1"), bad_id, false, false)
+                    .unwrap_err()
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        for (query, body) in [(false, true), (true, false), (true, true)] {
+            assert_eq!(
+                validate_smartrecruiters_requirements_request(Some("1"), id, query, body)
+                    .unwrap_err()
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn selected_curated_request_accepts_only_exact_opt_in_and_one_saved_id() {
+        let valid = "9ad08eb7-49ef-44e7-bd29-5838dc097a80";
+        for disabled in [None, Some("0"), Some("true"), Some(" 1"), Some("1\n")] {
+            assert_eq!(
+                validate_selected_curated_verification_request(disabled, valid, false, false)
+                    .unwrap_err()
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+        assert!(
+            validate_selected_curated_verification_request(Some("1"), valid, false, false).is_ok()
+        );
+        for (query, body) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                validate_selected_curated_verification_request(Some("1"), valid, query, body)
+                    .unwrap_err()
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        for invalid in [
+            "",
+            "https://careers.example/job",
+            "fixture%2Fother",
+            &"x".repeat(129),
+        ] {
+            assert_eq!(
+                validate_selected_curated_verification_request(Some("1"), invalid, false, false)
+                    .unwrap_err()
+                    .0,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[test]
+    fn selected_curated_verification_availability_requires_the_exact_literal_opt_in() {
+        for disabled in [None, Some("0"), Some("true"), Some(" 1"), Some("1\n")] {
+            assert!(!selected_curated_verification_enabled_for(disabled));
+        }
+        assert!(selected_curated_verification_enabled_for(Some("1")));
+    }
+
+    #[tokio::test]
+    async fn selected_curated_service_reads_only_its_own_stored_url_and_saves_one_posting() {
+        let pool = discovery_enrollment_test_pool();
+        pool.get().unwrap().execute(
+            "UPDATE accounts SET email_verified_at = '2026-08-30T00:00:00Z' WHERE id = 'acct-one'", [],
+        ).unwrap();
+        let owner = crate::db::accounts::Account::fetch_by_id(&pool, "acct-one")
+            .unwrap()
+            .unwrap();
+        let other = crate::db::accounts::Account::fetch_by_id(&pool, "acct-two")
+            .unwrap()
+            .unwrap();
+        let identity =
+            jobs::ensure_primary_application_identity(&pool, &owner.id, &owner.email).unwrap();
+        jobs::upsert_track(
+            &pool,
+            &owner.id,
+            &CareerTrack {
+                id: "verify-track".to_string(),
+                name: "Synthetic engineering".to_string(),
+                role: "Software Engineer".to_string(),
+                locations: vec!["New York, NY".to_string()],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: Some(identity.id),
+                policy: CareerTrackPolicy {
+                    role_family: "software_engineering".to_string(),
+                    ..CareerTrackPolicy::default()
+                },
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let source = jobs::ensure_managed_curated_discovery_source(&pool, &owner.id)
+            .unwrap()
+            .unwrap();
+        let lease = jobs::lease_due_discovery_source(&pool, "verify-selected-fixture")
+            .unwrap()
+            .unwrap();
+        let url = "https://jobs.lever.co/fixture/synthetic-job";
+        jobs::complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[jobs::DiscoveredJobInput {
+                external_id: "feed-fixture-hash".to_string(),
+                canonical_url: url.to_string(),
+                title: "Software Engineer".to_string(),
+                company: "Fixture".to_string(),
+                source_catalog_id: "feed-simplify-new-grad".to_string(),
+                requires_original_revalidation: true,
+                location: "New York, NY".to_string(),
+                workplace: "hybrid".to_string(),
+                description: String::new(),
+                compensation: String::new(),
+                employment_type: "full_time".to_string(),
+                engagement_type: "w2".to_string(),
+                posted_at_ms: None,
+            }],
+            true,
+        )
+        .unwrap();
+        let original = jobs::list_postings(&pool, &owner.id).unwrap().remove(0);
+        let foreign_import_calls = std::cell::Cell::new(0);
+        let err = verify_selected_curated_lead_using(&pool, &other, &original.id, |_| async {
+            foreign_import_calls.set(foreign_import_calls.get() + 1);
+            Ok(None)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(foreign_import_calls.get(), 0);
+        let err =
+            verify_selected_curated_lead_using(&pool, &owner, &original.id, |input| async move {
+                assert_eq!(input, url);
+                Ok(None)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            jobs::list_postings(&pool, &owner.id).unwrap()[0].source,
+            original.source
+        );
+
+        let imported_job = |input| jobs_import::ImportedJob {
+            source: "lever_import".to_string(),
+            external_id: "synthetic-job".to_string(),
+            company: "Fixture Systems".to_string(),
+            title: "Software Engineer".to_string(),
+            location: "New York, NY".to_string(),
+            workplace: "hybrid".to_string(),
+            canonical_url: input,
+            description: "Build reliable fictional systems.".to_string(),
+            compensation: String::new(),
+            employment_type: "full_time".to_string(),
+            posted_at_ms: None,
+            verified_at_ms: jobs::now_ms(),
+            evidence_hash: "c".repeat(64),
+        };
+        let mut changed = original.clone();
+        changed.description = "The curated posting changed during the read.".to_string();
+        // The upsert finds the existing row by canonical key rather than
+        // relying on the fixture to write a conflicting primary key.
+        changed.id.clear();
+        let original_id = &original.id;
+        let fixture_pool = &pool;
+        let fixture_owner = &owner.id;
+        let change_during_read = &changed;
+        let stale =
+            verify_selected_curated_lead_using(&pool, &owner, &original.id, |input| async move {
+                assert_eq!(input, url);
+                let updated =
+                    store_discovery_posting(fixture_pool, fixture_owner, change_during_read);
+                assert_eq!(&updated.id, original_id);
+                Ok(Some(imported_job(input)))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+        let latest = jobs::list_postings(&pool, &owner.id).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].source, original.source);
+        assert_eq!(latest[0].description, changed.description);
+        assert_eq!(
+            jobs::list_discovery_sources(&pool, &owner.id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let verified =
+            verify_selected_curated_lead_using(&pool, &owner, &original.id, |input| async move {
+                assert_eq!(input, url);
+                Ok(Some(imported_job(input)))
+            })
+            .await
+            .unwrap();
+        assert_eq!(verified.id, original.id);
+        assert_eq!(verified.source, "lever_import");
+        assert_eq!(jobs::list_postings(&pool, &owner.id).unwrap().len(), 1);
+        assert!(jobs::list_applications(&pool, &owner.id)
+            .unwrap()
+            .is_empty());
+    }
+
     fn imported_discovery_posting(source: &str, canonical_url: &str, track_id: &str) -> JobPosting {
-        JobPosting {
+        let mut posting = JobPosting {
             id: String::new(),
             canonical_key: String::new(),
             source: source.to_string(),
@@ -5532,8 +13946,21 @@ mod tests {
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: jobs::JobDiscoveryEvidence::default(),
             eligibility: None,
-        }
+        };
+        posting.canonical_key = jobs::canonical_job_key(&posting);
+        let application_domain = reqwest::Url::parse(canonical_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string));
+        posting.discovery_evidence = jobs::JobDiscoveryEvidence::verified_original_source(
+            posting.canonical_key.clone(),
+            format!("{source}:acme"),
+            application_domain,
+            jobs::now_ms(),
+            "a".repeat(64),
+        );
+        posting
     }
 
     fn store_discovery_posting(
@@ -5549,6 +13976,95 @@ mod tests {
             &JobPreferences::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn match_route_helpers_return_only_current_projected_postings_and_decisions() {
+        let pool = discovery_enrollment_test_pool();
+        let mut stored = store_discovery_posting(
+            &pool,
+            "acct-one",
+            &imported_discovery_posting(
+                "greenhouse_import",
+                "https://boards.greenhouse.io/acme/jobs/job-123",
+                "track-one",
+            ),
+        );
+        stored.discovery_evidence.provenance = "original_source".to_string();
+        stored.discovery_evidence.employer_verification_status = "verified".to_string();
+        stored.discovery_evidence.employer_id = Some("legacy-employer".to_string());
+        stored.discovery_evidence.canonical_employer_domain =
+            Some("legacy-employer.example".to_string());
+        stored.discovery_evidence.scam_risk_status = "clear".to_string();
+        stored.eligibility = Some(JobEligibilityDecision {
+            can_auto_submit: true,
+            can_queue_local: true,
+            can_queue_cloud: true,
+            ..JobEligibilityDecision::default()
+        });
+        let payload = serde_json::to_string(&stored).expect("serialize legacy route posting");
+        pool.get()
+            .expect("legacy route posting connection")
+            .execute(
+                "UPDATE jobs_postings SET posting_json = ?2
+                  WHERE account_id = ?1 AND id = ?3",
+                rusqlite::params!["acct-one", payload, stored.id],
+            )
+            .expect("inject legacy route posting");
+        let account = crate::db::accounts::Account::fetch_by_id(&pool, "acct-one")
+            .expect("fetch match-route account")
+            .expect("match-route account");
+
+        let list = current_match_representations(&pool, &account)
+            .expect("list current match representations")
+            .0;
+        let listed = list
+            .into_iter()
+            .find(|posting| posting.id == stored.id)
+            .expect("listed current match representation");
+        let detailed = current_match_representation(&pool, &account, &stored.id)
+            .expect("get current match representation")
+            .0;
+
+        for represented in [&listed, &detailed] {
+            assert_eq!(
+                represented.discovery_evidence.employer_verification_status,
+                "unknown"
+            );
+            assert_eq!(represented.discovery_evidence.employer_id, None);
+            assert_eq!(
+                represented.discovery_evidence.canonical_employer_domain,
+                None
+            );
+            assert_eq!(represented.discovery_evidence.scam_risk_status, "unknown");
+            let eligibility = represented
+                .eligibility
+                .as_ref()
+                .expect("current match eligibility");
+            assert!(!eligibility.can_auto_submit);
+            assert!(!eligibility.can_queue_local);
+            assert!(!eligibility.can_queue_cloud);
+            assert!(eligibility
+                .review_reasons
+                .iter()
+                .any(|reason| reason.code == "employer_identity_unverified"));
+            assert!(eligibility
+                .review_reasons
+                .iter()
+                .any(|reason| reason.code == "job_risk_review_required"));
+        }
+        assert_eq!(
+            listed
+                .eligibility
+                .as_ref()
+                .expect("listed eligibility")
+                .review_reasons,
+            detailed
+                .eligibility
+                .as_ref()
+                .expect("detailed eligibility")
+                .review_reasons
+        );
     }
 
     #[test]
@@ -5569,6 +14085,55 @@ mod tests {
             &test_entitlement(1),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn career_track_validation_rejects_unknown_workplace_values_and_ambiguous_roles() {
+        let missing_id = validate_track(&test_track("")).unwrap_err();
+        assert_eq!(missing_id.0, StatusCode::BAD_REQUEST);
+        assert!(missing_id.1.contains("retry-safe ID"));
+
+        let mut track = test_track("validated-track");
+        track.remote_preference = "Remote or hybrid".to_string();
+        let invalid_remote = validate_track(&track).unwrap_err();
+        assert_eq!(invalid_remote.0, StatusCode::BAD_REQUEST);
+        assert!(invalid_remote.1.contains("workplace preference"));
+
+        track.remote_preference = "remote_or_hybrid".to_string();
+        track.role = "PM".to_string();
+        let ambiguous_role = validate_track(&track).unwrap_err();
+        assert_eq!(ambiguous_role.0, StatusCode::BAD_REQUEST);
+        assert!(ambiguous_role.1.contains("full target role"));
+        assert!(ambiguous_role.1.contains("product-manager"));
+
+        track.role = "Founder in residence".to_string();
+        validate_track(&track).expect("unknown custom roles remain reviewable");
+    }
+
+    #[test]
+    fn preferences_default_missing_safety_policy_and_reject_unknown_values() {
+        let partial: JobPreferences = serde_json::from_value(json!({
+            "location_policy": "ask",
+            "daily_limit": 10,
+            "time_zone_offset_minutes": 0
+        }))
+        .unwrap();
+        assert_eq!(partial.remote_preference, "hybrid_ok");
+        assert_eq!(partial.sponsorship, "ask");
+        validate_preferences(&partial).unwrap();
+
+        let mut invalid = partial.clone();
+        invalid.remote_preference = String::new();
+        assert!(validate_preferences(&invalid)
+            .unwrap_err()
+            .1
+            .contains("workplace preference"));
+        invalid.remote_preference = "hybrid_ok".to_string();
+        invalid.sponsorship = String::new();
+        assert!(validate_preferences(&invalid)
+            .unwrap_err()
+            .1
+            .contains("sponsorship"));
     }
 
     #[test]
@@ -5692,6 +14257,415 @@ mod tests {
     }
 
     #[test]
+    fn durable_verified_import_repair_reaches_row_51_and_retains_failed_checkpoint() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        let mut saved = Vec::new();
+        for index in 0..51 {
+            let mut posting = imported_discovery_posting(
+                "lever_import",
+                &format!("https://jobs.lever.co/acme/job-{index:04}"),
+                "track-one",
+            );
+            posting.id = format!("legacy-import-{index:04}");
+            posting.external_id = format!("job-{index:04}");
+            posting.title = format!("Platform Engineer {index:04}");
+            posting.canonical_key = jobs::canonical_job_key(&posting);
+            saved.push(store_discovery_posting(&pool, "acct-one", &posting));
+        }
+        let query_plan_connection = pool.get().unwrap();
+        let mut query_plan_statement = query_plan_connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id,posting_json,canonical_key,source,canonical_url,company
+                   FROM jobs_postings
+                  WHERE account_id=?1 AND id > ?2 COLLATE BINARY
+                    AND substr(source,-7)='_import'
+                  ORDER BY id COLLATE BINARY ASC LIMIT ?3",
+            )
+            .unwrap();
+        let query_plan = query_plan_statement
+            .query_map(rusqlite::params!["acct-one", "", 50_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(query_plan
+            .iter()
+            .any(|detail| detail.contains("idx_jobs_postings_verified_import_backfill")));
+        drop(query_plan_statement);
+        drop(query_plan_connection);
+
+        let mut stale_embedded_id = saved[25].clone();
+        stale_embedded_id.id = "stale-embedded-id".to_string();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json=?3
+                  WHERE account_id=?1 AND id=?2",
+                rusqlite::params![
+                    "acct-one",
+                    saved[25].id,
+                    serde_json::to_string(&stale_embedded_id).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let final_payload: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT posting_json FROM jobs_postings
+                  WHERE account_id=?1 AND id=?2",
+                rusqlite::params!["acct-one", saved[50].id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json='not-json'
+                  WHERE account_id=?1 AND id=?2",
+                rusqlite::params!["acct-one", saved[50].id],
+            )
+            .unwrap();
+
+        let first_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim first durable repair batch");
+        let first = run_verified_import_discovery_backfill(
+            &pool,
+            "acct-one",
+            "one@example.com",
+            &first_lease,
+        )
+        .expect("repair first durable batch");
+        assert_eq!(first.scanned_count, 50);
+        assert_eq!(first.repaired_count, 50);
+        assert!(first.checkpoint_advanced);
+        assert!(!first.completed);
+        assert_eq!(
+            jobs::verified_import_discovery_membership_job_id(
+                &pool, "acct-one", "lever", "acme", "job-0025",
+            )
+            .unwrap(),
+            Some(saved[25].id.clone()),
+            "the relational posting ID must override stale embedded identity"
+        );
+
+        let failed_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim failing durable repair batch");
+        let failure = run_verified_import_discovery_backfill(
+            &pool,
+            "acct-one",
+            "one@example.com",
+            &failed_lease,
+        )
+        .expect_err("a parse/decrypt failure must retain the durable checkpoint");
+        assert!(failure
+            .to_string()
+            .contains("verified-import backfill posting"));
+        let retained: (String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT after_job_id,completed
+                   FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id='acct-one' AND migration_version=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("legacy-import-0049".to_string(), 0));
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json=?3
+                  WHERE account_id=?1 AND id=?2",
+                rusqlite::params!["acct-one", saved[50].id, final_payload],
+            )
+            .unwrap();
+        let resumed_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim resumed durable repair batch");
+        let resumed = run_verified_import_discovery_backfill(
+            &pool,
+            "acct-one",
+            "one@example.com",
+            &resumed_lease,
+        )
+        .expect("resume durable repair from persisted checkpoint");
+        assert_eq!(resumed.scanned_count, 1);
+        assert_eq!(resumed.repaired_count, 1);
+        assert!(resumed.checkpoint_advanced);
+        assert_eq!(
+            jobs::verified_import_discovery_membership_job_id(
+                &pool, "acct-one", "lever", "acme", "job-0050",
+            )
+            .unwrap(),
+            Some(saved[50].id.clone())
+        );
+        let completion_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim completion repair batch");
+        let completed = run_verified_import_discovery_backfill(
+            &pool,
+            "acct-one",
+            "one@example.com",
+            &completion_lease,
+        )
+        .expect("complete durable repair after the final row");
+        assert_eq!(completed.scanned_count, 0);
+        assert!(completed.completed);
+        assert!(completed.checkpoint_advanced);
+    }
+
+    #[test]
+    fn verified_import_checkpoint_rejects_non_monotonic_transitions() {
+        let pool = discovery_enrollment_test_pool();
+        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        store_discovery_posting(
+            &pool,
+            "acct-one",
+            &imported_discovery_posting(
+                "lever_import",
+                "https://jobs.lever.co/acme/checkpoint-job",
+                "track-one",
+            ),
+        );
+        let lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim initial backfill batch");
+        let batch = jobs::verified_import_backfill_batch(&pool, "acct-one", &lease, 50).unwrap();
+        assert_eq!(batch.scanned_count, 1);
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &lease,
+            &batch.expected_after_job_id,
+            false,
+        )
+        .is_err());
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &lease,
+            &batch.next_after_job_id,
+            true,
+        )
+        .is_err());
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &lease,
+            &batch.next_after_job_id,
+            false,
+        )
+        .unwrap());
+        let final_lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .unwrap()
+            .expect("claim final backfill batch");
+        let final_batch =
+            jobs::verified_import_backfill_batch(&pool, "acct-one", &final_lease, 50).unwrap();
+        assert_eq!(final_batch.scanned_count, 0);
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &final_lease,
+            "",
+            false,
+        )
+        .is_err());
+        assert!(jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-one",
+            &final_lease,
+            &final_batch.expected_after_job_id,
+            true,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn verified_import_backfill_first_sqlite_claim_uses_complete_parameter_binding() {
+        let pool = discovery_enrollment_test_pool();
+
+        let lease = jobs::claim_verified_import_backfill(&pool, "acct-one")
+            .expect("first SQLite claim must not fail parameter binding")
+            .expect("first SQLite claim owns the repair lease");
+
+        let batch = jobs::verified_import_backfill_batch(&pool, "acct-one", &lease, 1)
+            .expect("first SQLite owner can read its empty checkpoint");
+        assert!(batch.expected_after_job_id.is_empty());
+        assert_eq!(batch.scanned_count, 0);
+        let stored: (String, bool, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT after_job_id,
+                        lease_owner IS NOT NULL AND length(lease_token_sha256)=64,
+                        lease_expires_at_ms > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+                   FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id='acct-one' AND migration_version=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (String::new(), true, 1));
+    }
+
+    #[test]
+    fn verified_import_repair_claim_is_single_flight_under_burst_and_fences_expiry() {
+        let pool = discovery_enrollment_test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-claim-load', 'claim-load@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        jobs::reset_verified_import_backfill_sqlite_claim_write_tx_count();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        let claims = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let workers = (0..24)
+            .map(|_| {
+                let pool = pool.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                let claims = std::sync::Arc::clone(&claims);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if let Some(lease) =
+                        jobs::claim_verified_import_backfill(&pool, "acct-claim-load").unwrap()
+                    {
+                        claims.lock().unwrap().push(lease);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let original = claims.lock().unwrap().pop().expect("one repair owner");
+        assert!(claims.lock().unwrap().is_empty());
+
+        let write_transactions = jobs::verified_import_backfill_sqlite_claim_write_tx_count();
+        for _ in 0..120 {
+            assert!(
+                jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            jobs::verified_import_backfill_sqlite_claim_write_tx_count(),
+            write_transactions,
+            "live-lease admission must remain on the read-only fast path",
+        );
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_expires_at_ms=0
+                  WHERE account_id='acct-claim-load' AND migration_version=1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !jobs::release_verified_import_backfill_lease(&pool, "acct-claim-load", &original,)
+                .unwrap(),
+            "an expired owner cannot release an unreplaced lease"
+        );
+        let replacement = jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
+            .unwrap()
+            .expect("expired repair lease can be replaced");
+        assert!(jobs::verified_import_backfill_batch(
+            &pool,
+            "acct-claim-load",
+            &original,
+            MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS,
+        )
+        .is_err());
+        assert!(!jobs::advance_verified_import_backfill_checkpoint(
+            &pool,
+            "acct-claim-load",
+            &original,
+            "stale-owner-must-not-advance",
+            false,
+        )
+        .unwrap());
+        assert!(
+            !jobs::release_verified_import_backfill_lease(&pool, "acct-claim-load", &original,)
+                .unwrap()
+        );
+        assert!(jobs::release_verified_import_backfill_lease(
+            &pool,
+            "acct-claim-load",
+            &replacement,
+        )
+        .unwrap());
+        let invalid_completed_lease = pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET completed=1,lease_owner='invalid-completed-owner',
+                        lease_token_sha256=?1,lease_expires_at_ms=1
+                  WHERE account_id='acct-claim-load' AND migration_version=1",
+                rusqlite::params!["a".repeat(64)],
+            )
+            .expect_err("a completed checkpoint cannot retain lease material");
+        assert!(invalid_completed_lease
+            .to_string()
+            .contains("CHECK constraint failed"));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints SET completed=1
+                  WHERE account_id='acct-claim-load' AND migration_version=1",
+                [],
+            )
+            .unwrap();
+        let completed_write_transactions =
+            jobs::verified_import_backfill_sqlite_claim_write_tx_count();
+        assert!(
+            jobs::claim_verified_import_backfill(&pool, "acct-claim-load")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            jobs::verified_import_backfill_sqlite_claim_write_tx_count(),
+            completed_write_transactions,
+            "completed admission must remain on the read-only fast path",
+        );
+    }
+
+    #[test]
+    fn verified_import_backfill_lease_does_not_expose_raw_token_debug_or_clone() {
+        let source = include_str!("../db/jobs/discovery.rs");
+        let declaration_prefix = source
+            .split_once("pub struct VerifiedImportBackfillLease")
+            .expect("verified-import lease declaration")
+            .0;
+        let declaration_attribute = declaration_prefix.rsplit("\n\n").next().unwrap_or_default();
+        assert!(!declaration_attribute.contains("Debug"));
+        assert!(!declaration_attribute.contains("Clone"));
+        let release = source
+            .split_once("pub fn release_verified_import_backfill_lease(")
+            .expect("verified-import lease release")
+            .1
+            .split_once("\npub fn get_discovery_source(")
+            .expect("bounded verified-import lease release")
+            .0;
+        assert!(release.contains("AND lease_expires_at_ms>?6"));
+        assert!(release.contains("clock_timestamp()"));
+    }
+
+    #[test]
     fn workspace_backfill_repairs_a_legacy_source_without_membership() {
         let pool = discovery_enrollment_test_pool();
         jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
@@ -5732,14 +14706,25 @@ mod tests {
                 &CareerProfile::default(),
                 &JobPreferences::default(),
             ),
-            0,
+            1,
         );
         assert_eq!(
             jobs::verified_import_discovery_membership_job_id(
                 &pool, "acct-one", "lever", "acme", "job-123",
             )
             .unwrap(),
-            Some(stored.id),
+            Some(stored.id.clone()),
+        );
+        assert_eq!(
+            backfill_verified_import_discovery_sources(
+                &pool,
+                "acct-one",
+                std::slice::from_ref(&stored),
+                &CareerProfile::default(),
+                &JobPreferences::default(),
+            ),
+            0,
+            "an already repaired membership is an exact no-op",
         );
         assert_eq!(jobs::list_postings(&pool, "acct-one").unwrap().len(), 1);
     }
@@ -5748,7 +14733,7 @@ mod tests {
     fn workspace_backfill_filters_before_its_bounded_scan() {
         let pool = discovery_enrollment_test_pool();
         jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
-        let mut postings = (0..MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS)
+        let mut postings = (0..MAX_VERIFIED_IMPORT_BACKFILL_POSTINGS)
             .map(|index| {
                 imported_discovery_posting(
                     "pasted_link",
@@ -5885,8 +14870,10 @@ mod tests {
         let identity_id = "identity-test";
         let resume_key = "accounts/acct-test/jobs/app-test/resume.pdf";
         let screenshot_key = "accounts/acct-test/jobs/app-test/confirmation.png";
+        let receipt_key = "accounts/acct-test/jobs/app-test/receipt.json";
         let resume_sha = "a".repeat(64);
         let screenshot_sha = "b".repeat(64);
+        let receipt_sha = "c".repeat(64);
         let mut application = JobApplication {
             id: "app-test".to_string(),
             job_id: "job-test".to_string(),
@@ -5930,6 +14917,13 @@ mod tests {
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: jobs::JobDiscoveryEvidence::verified_original_source(
+                "job-key".to_string(),
+                "greenhouse:acme".to_string(),
+                Some("boards.greenhouse.io".to_string()),
+                jobs::now_ms(),
+                "a".repeat(64),
+            ),
             eligibility: None,
         };
         let resume = ResumeVersion {
@@ -5975,11 +14969,54 @@ mod tests {
             "packet": approved_packet,
             "job": approved_job
         });
-        let receipt = json!({
+        application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY] = json!({
+            "schemaVersion": 3,
+            "adapter": "greenhouse",
+            "adapterVersion": GREENHOUSE_SUBMISSION_ADAPTER_VERSION,
+            "control": "greenhouse_submit_application",
+            "job": {
+                "approvedCanonicalUrl": approved_job["canonicalUrl"],
+                "pageUrl": approved_job["canonicalUrl"],
+            },
+            "target": {
+                "actionUrl": approved_job["canonicalUrl"],
+                "method": "post",
+                "enctype": "multipart/form-data",
+                "formTarget": "_self",
+                "providerJobKey": "greenhouse:acme:123",
+                "formIdentity": r#"[0,"application-form","","","","",""]"#,
+            },
+            "files": [{
+                "fieldName": "resume",
+                "name": format!("resume-{resume_sha}.pdf"),
+                "byteLength": 50,
+                "sha256": resume_sha,
+            }],
+            "fields": [{
+                "fieldName": "candidate_name",
+                "valueByteLength": 0,
+                "valueSha256":
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            }],
+            "partOrder": [{
+                "kind": "field",
+                "index": 0,
+            }, {
+                "kind": "file",
+                "index": 0,
+            }],
+            "documents": [{
+                "kind": "resume",
+                "versionId": "resume-test",
+                "sha256": resume_sha,
+            }]
+        });
+        let mut receipt = json!({
+            "schemaVersion": 1,
             "applicationIdentityId": identity_id,
             "browserProfileId": browser_profile_id(account_id, identity_id),
             "adapter": "greenhouse",
-            "adapterVersion": "1.0.0",
+            "adapterVersion": GREENHOUSE_SUBMISSION_ADAPTER_VERSION,
             "packet": {
                 "jobId": "job-test",
                 "resumeVersionId": "resume-test",
@@ -5988,20 +15025,551 @@ mod tests {
                 "answers": { "email": "apply@example.com" },
                 "verifiedClaimIds": []
             },
-            "job": { "canonicalUrl": posting.canonical_url },
+            "job": approved_job.clone(),
             "documents": [{
                 "kind": "resume",
                 "versionId": "resume-test",
                 "storageKey": resume_key,
                 "sha256": resume_sha
             }],
-            "screenshotKeys": [screenshot_key]
+            "screenshotKeys": [screenshot_key],
+            "evidenceObjects": [{
+                "kind": "screenshot",
+                "storageKey": screenshot_key,
+                "sha256": screenshot_sha,
+                "mediaType": "image/png",
+                "sizeBytes": 33
+            }, {
+                "kind": "resume",
+                "storageKey": resume_key,
+                "sha256": resume_sha,
+                "mediaType": "application/pdf",
+                "sizeBytes": 50
+            }],
+            "receiptObject": {
+                "storageKey": receipt_key,
+                "sha256": receipt_sha,
+                "mediaType": "application/json",
+                "sizeBytes": 512,
+                "schemaVersion": 1
+            }
+        });
+        receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY] = json!({
+            "schemaVersion": 1,
+            "preSubmissionReceipt": application.receipt.clone(),
+            "preSubmissionReceiptSha256": jobs::submission_pre_receipt_sha256(
+                &application.receipt,
+            )
+            .unwrap(),
+            "executionAuthority": {
+                "kind": "cloud_execution_lease",
+                "ownerId": "runner-test",
+                "leaseTokenSha256": "d".repeat(64),
+                "fence": 1,
+                "phase": "submitted",
+            }
         });
         let verified_objects = BTreeMap::from([
             (resume_key.to_string(), resume_sha),
             (screenshot_key.to_string(), screenshot_sha),
+            (receipt_key.to_string(), receipt_sha),
         ]);
         (application, posting, resume, receipt, verified_objects)
+    }
+
+    #[tokio::test]
+    async fn worker_receipt_success_binds_submitted_application_in_no_store_json() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+        application.state = "submitted".to_string();
+        let response = worker_receipt_success_response(application.clone());
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read worker receipt response");
+        let body: Value = serde_json::from_slice(&body).expect("worker receipt response JSON");
+        assert_eq!(body["id"], json!(application.id));
+        assert_eq!(body["run_id"], json!(application.run_id));
+        assert_eq!(body["state"], "submitted");
+    }
+
+    #[tokio::test]
+    async fn worker_receipt_rejections_bind_the_request_and_preserve_transient_errors() {
+        for (status, reason) in [
+            (StatusCode::BAD_REQUEST, "invalid_request"),
+            (StatusCode::NOT_FOUND, "not_found"),
+            (StatusCode::CONFLICT, "identity_conflict"),
+        ] {
+            let response = worker_receipt_error_response(
+                (status, "internal detail".to_string()),
+                "app",
+                "run",
+            )
+            .expect("closed receipt rejection");
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("read receipt rejection");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).expect("receipt rejection JSON"),
+                json!({
+                    "schema_version": 1, "outcome": "rejected", "reason": reason,
+                    "application_id": "app", "run_id": "run",
+                })
+            );
+        }
+        let transient = (StatusCode::SERVICE_UNAVAILABLE, "retry".to_string());
+        assert_eq!(
+            worker_receipt_error_response(transient.clone(), "app", "run").unwrap_err(),
+            transient
+        );
+    }
+
+    fn authenticated_submitted_application_fixture(fingerprint: &str) -> JobApplication {
+        let (mut application, _, _, mut receipt, _) = strict_receipt_fixture();
+        receipt["receiptId"] = json!("receipt-authenticated-replay");
+        receipt["accountId"] = json!("acct-test");
+        receipt["applicationId"] = json!(application.id);
+        receipt["runId"] = json!("run-test");
+        receipt["runner"] = json!("cloud");
+        receipt["result"] = json!({
+            "status": "submitted",
+            "confirmationText": "Application received",
+        });
+        receipt[SUBMISSION_FINGERPRINT_KEY] = json!(fingerprint);
+        application.state = "submitted".to_string();
+        application.receipt = receipt;
+        jobs::validated_submitted_pre_submission_application("acct-test", &application)
+            .expect("authenticated submitted application fixture");
+        application
+    }
+
+    fn two_screenshot_evidence_fixture() -> (JobApplication, Vec<ApplicationEvidence>) {
+        let (mut application, _, resume, mut receipt, mut verified_objects) =
+            strict_receipt_fixture();
+        let first_screenshot_key = receipt["screenshotKeys"][0].as_str().unwrap().to_string();
+        let second_screenshot_key =
+            "accounts/acct-test/jobs/app-test/confirmation2.png".to_string();
+        let second_screenshot_sha = "d".repeat(64);
+        receipt["screenshotKeys"] = json!([first_screenshot_key, second_screenshot_key]);
+        receipt["evidenceObjects"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "kind": "screenshot",
+                "storageKey": second_screenshot_key,
+                "sha256": second_screenshot_sha,
+                "mediaType": "image/png",
+                "sizeBytes": 44,
+            }));
+        receipt["evidenceObjects"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|left, right| {
+                left["storageKey"]
+                    .as_str()
+                    .unwrap()
+                    .cmp(right["storageKey"].as_str().unwrap())
+            });
+        verified_objects.insert(second_screenshot_key, second_screenshot_sha);
+        receipt["receiptId"] = json!("receipt-multi-screenshot");
+        receipt["accountId"] = json!("acct-test");
+        receipt["applicationId"] = json!(application.id);
+        receipt[SUBMISSION_FINGERPRINT_KEY] = json!("e".repeat(64));
+        let approved_job = receipt["job"].clone();
+        let evidence = submission_evidence_records(
+            &application.id,
+            "receipt-multi-screenshot",
+            "greenhouse",
+            &approved_job,
+            &resume,
+            &receipt,
+            &verified_objects,
+            302,
+            "Application received".to_string(),
+            Some("https://boards.greenhouse.io/acme/jobs/123/confirmation".to_string()),
+            Some("Thanks for applying".to_string()),
+            Some(json!("2026-08-05T12:00:00Z")),
+        )
+        .unwrap();
+        application.receipt = receipt;
+        application.state = "submitted".to_string();
+        application.submitted_at_ms = Some(1);
+        (application, evidence)
+    }
+
+    #[test]
+    fn submission_evidence_records_materialize_every_confirmation_screenshot() {
+        let (_, evidence) = two_screenshot_evidence_fixture();
+        let confirmations = evidence
+            .iter()
+            .filter(|item| item.kind == "submission_confirmation")
+            .collect::<Vec<_>>();
+
+        assert_eq!(confirmations.len(), 2);
+        assert_eq!(
+            confirmations
+                .iter()
+                .map(|item| item.file_name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "submission-confirmation-1-of-2.png",
+                "submission-confirmation-2-of-2.png"
+            ]
+        );
+        for (index, confirmation) in confirmations.iter().enumerate() {
+            assert_eq!(confirmation.metadata["immutable"], json!(true));
+            assert_eq!(confirmation.metadata["screenshot_index"], json!(index + 1));
+            assert_eq!(confirmation.metadata["screenshot_count"], json!(2));
+            assert_eq!(confirmation.metadata["submit_http_status"], json!(302));
+            assert_eq!(
+                confirmation.storage_key,
+                confirmation.metadata["screenshot_keys"][index]
+                    .as_str()
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_object_readback_requires_exact_bytes_and_bound_application() {
+        let (mut application, mut evidence) = two_screenshot_evidence_fixture();
+        let receipt_record = evidence
+            .iter_mut()
+            .find(|item| item.kind == "application_receipt")
+            .unwrap();
+        let mut receipt = application.receipt.clone();
+        receipt.as_object_mut().unwrap().remove("receiptObject");
+        let bytes = serde_json::to_vec(&json!({
+            "schemaVersion": RECEIPT_BUNDLE_SCHEMA_VERSION,
+            "bundleId": application.receipt[SUBMISSION_FINGERPRINT_KEY],
+            "accountId": "acct-test",
+            "applicationId": application.id,
+            "receiptId": receipt_record.metadata["receipt_id"],
+            "job": receipt["job"],
+            "resume": { "id": application.resume_version_id },
+            "receipt": receipt,
+        }))
+        .unwrap();
+        receipt_record.sha256 = sha256_hex(&bytes);
+        receipt_record.metadata["size_bytes"] = json!(bytes.len());
+        application.receipt["receiptObject"]["sha256"] = json!(receipt_record.sha256);
+        application.receipt["receiptObject"]["sizeBytes"] = json!(bytes.len());
+        let receipt_record = evidence
+            .iter()
+            .find(|item| item.kind == "application_receipt")
+            .unwrap();
+        assert_eq!(
+            validate_evidence_download_binding(
+                "acct-test",
+                &application,
+                receipt_record,
+                &evidence,
+                "application/json",
+            )
+            .unwrap(),
+            bytes.len()
+        );
+        let check = |account_id, expected_size, media_type, input: &[u8]| {
+            valid_downloaded_evidence_bytes(
+                account_id,
+                &application,
+                receipt_record,
+                "application/json",
+                expected_size,
+                media_type,
+                input,
+            )
+        };
+        assert!(check(
+            "acct-test",
+            bytes.len(),
+            "application/json; charset=utf-8",
+            &bytes
+        ));
+        assert!(!check("other", bytes.len(), "application/json", &bytes));
+        assert!(!check(
+            "acct-test",
+            bytes.len() + 1,
+            "application/json",
+            &bytes
+        ));
+        assert!(!check("acct-test", bytes.len(), "text/plain", &bytes));
+        let mut changed = bytes.clone();
+        changed[0] = b'[';
+        assert!(!check(
+            "acct-test",
+            bytes.len(),
+            "application/json",
+            &changed
+        ));
+        let mut wrong_application: Value = serde_json::from_slice(&bytes).unwrap();
+        wrong_application["applicationId"] = json!("another-fixture");
+        let wrong_bytes = serde_json::to_vec(&wrong_application).unwrap();
+        let mut wrong_record = receipt_record.clone();
+        wrong_record.sha256 = sha256_hex(&wrong_bytes);
+        assert!(!valid_downloaded_evidence_bytes(
+            "acct-test",
+            &application,
+            &wrong_record,
+            "application/json",
+            wrong_bytes.len(),
+            "application/json",
+            &wrong_bytes,
+        ));
+    }
+
+    #[tokio::test]
+    async fn evidence_read_distinguishes_integrity_from_storage_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (application, evidence) = two_screenshot_evidence_fixture();
+        let receipt = evidence
+            .iter()
+            .find(|item| item.kind == "application_receipt")
+            .unwrap();
+        let size = validate_evidence_download_binding(
+            "acct-test",
+            &application,
+            receipt,
+            &evidence,
+            "application/json",
+        )
+        .unwrap();
+        for (response, expected_status, expected_message) in [
+            (
+                ResponseTemplate::new(200).set_body_bytes(vec![b'x'; size + 1]),
+                StatusCode::CONFLICT,
+                "Stored application evidence did not pass integrity verification.",
+            ),
+            (
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_bytes(vec![b'x'; size]),
+                StatusCode::CONFLICT,
+                "Stored application evidence did not pass integrity verification.",
+            ),
+            (
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", format!("bytes 0-{}/{size}", size - 1))
+                    .set_body_bytes(vec![b'x'; size]),
+                StatusCode::BAD_GATEWAY,
+                "Bluey could not load this application evidence right now.",
+            ),
+            (
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_bytes(vec![b'x'; size]),
+                StatusCode::BAD_GATEWAY,
+                "Bluey could not load this application evidence right now.",
+            ),
+            (
+                ResponseTemplate::new(503).set_body_string("private fixture provider body"),
+                StatusCode::BAD_GATEWAY,
+                "Bluey could not load this application evidence right now.",
+            ),
+        ] {
+            let peer = MockServer::start().await;
+            let storage = ObjectStorage::new(crate::config::ObjectStorageConfig {
+                endpoint_url: peer.uri(),
+                bucket: "bucket".into(),
+                access_key_id: "ak".into(),
+                secret_access_key: "sk".into(),
+                region: "auto".into(),
+                key_prefix: String::new(),
+                retention_days: 365,
+                max_object_bytes: size + 2,
+            });
+            Mock::given(method("GET"))
+                .and(path(format!("/bucket/{}", receipt.storage_key)))
+                .respond_with(response)
+                .expect(1)
+                .mount(&peer)
+                .await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                read_verified_application_evidence(
+                    &storage,
+                    "acct-test",
+                    &application,
+                    receipt,
+                    "application/json",
+                    size,
+                ),
+            )
+            .await
+            .expect("synthetic storage read timed out");
+            assert_eq!(
+                result.unwrap_err(),
+                (expected_status, expected_message.into())
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_download_requires_the_exact_complete_screenshot_set() {
+        let (application, evidence) = two_screenshot_evidence_fixture();
+        let confirmations = evidence
+            .iter()
+            .filter(|item| item.kind == "submission_confirmation")
+            .collect::<Vec<_>>();
+        assert_eq!(confirmations.len(), 2);
+        for confirmation in &confirmations {
+            assert_eq!(
+                validate_evidence_download_binding(
+                    "acct-test",
+                    &application,
+                    confirmation,
+                    &evidence,
+                    "image/png",
+                )
+                .unwrap(),
+                confirmation.metadata["size_bytes"].as_i64().unwrap() as usize
+            );
+        }
+
+        let missing = evidence
+            .iter()
+            .filter(|item| {
+                item.id != confirmations[1].id || item.storage_key != confirmations[1].storage_key
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected = missing
+            .iter()
+            .find(|item| item.kind == "submission_confirmation")
+            .unwrap();
+        assert!(validate_evidence_download_binding(
+            "acct-test",
+            &application,
+            selected,
+            &missing,
+            "image/png",
+        )
+        .is_err());
+
+        let mut duplicate = evidence.clone();
+        let last = duplicate
+            .iter_mut()
+            .rev()
+            .find(|item| item.kind == "submission_confirmation")
+            .unwrap();
+        last.metadata["screenshot_index"] = json!(1);
+        let selected = duplicate
+            .iter()
+            .find(|item| item.kind == "submission_confirmation")
+            .unwrap();
+        assert!(validate_evidence_download_binding(
+            "acct-test",
+            &application,
+            selected,
+            &duplicate,
+            "image/png",
+        )
+        .is_err());
+
+        let mut mismatched = evidence.clone();
+        let last = mismatched
+            .iter_mut()
+            .rev()
+            .find(|item| item.kind == "submission_confirmation")
+            .unwrap();
+        last.metadata["screenshot_keys"][1] = json!("unbound-screenshot.png");
+        let selected = mismatched
+            .iter()
+            .find(|item| item.kind == "submission_confirmation")
+            .unwrap();
+        assert!(validate_evidence_download_binding(
+            "acct-test",
+            &application,
+            selected,
+            &mismatched,
+            "image/png",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn evidence_download_accepts_legacy_single_screenshot_records() {
+        let (mut application, mut evidence) = two_screenshot_evidence_fixture();
+        let second_key = application.receipt["screenshotKeys"][1]
+            .as_str()
+            .unwrap()
+            .to_string();
+        application.receipt["screenshotKeys"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        application.receipt["evidenceObjects"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|item| item["storageKey"].as_str() != Some(second_key.as_str()));
+        let mut kept_confirmation = false;
+        evidence.retain(|item| {
+            if item.kind != "submission_confirmation" {
+                return true;
+            }
+            if kept_confirmation {
+                return false;
+            }
+            kept_confirmation = true;
+            true
+        });
+        let confirmation = evidence
+            .iter_mut()
+            .find(|item| item.kind == "submission_confirmation")
+            .unwrap();
+        confirmation.file_name = "submission-confirmation.png".to_string();
+        confirmation.metadata["screenshot_keys"] = application.receipt["screenshotKeys"].clone();
+        confirmation
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("screenshot_index");
+        confirmation
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("screenshot_count");
+        confirmation
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("immutable");
+        let confirmation_id = confirmation.id.clone();
+        let confirmation = evidence
+            .iter()
+            .find(|item| item.id == confirmation_id && item.kind == "submission_confirmation")
+            .unwrap();
+
+        assert!(validate_evidence_download_binding(
+            "acct-test",
+            &application,
+            confirmation,
+            &evidence,
+            "image/png",
+        )
+        .is_ok());
+
+        let confirmation_index = evidence
+            .iter()
+            .position(|item| item.kind == "submission_confirmation")
+            .unwrap();
+        evidence[confirmation_index].metadata["screenshot_index"] = json!("1");
+        assert!(validate_evidence_download_binding(
+            "acct-test",
+            &application,
+            &evidence[confirmation_index],
+            &evidence,
+            "image/png",
+        )
+        .is_err());
     }
 
     #[test]
@@ -6014,6 +15582,251 @@ mod tests {
         let error = approved_execution_snapshot(&application).unwrap_err();
         assert_eq!(error.0, StatusCode::CONFLICT);
         assert!(error.1.contains("enable Auto-submit"));
+    }
+
+    #[test]
+    fn approved_execution_checksum_matches_shared_rust_typescript_vectors() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../jobs/automation/tests/fixtures/approved-execution-vectors.json"
+        ))
+        .unwrap();
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let schema_version = vector["schemaVersion"].as_i64().unwrap();
+            let checksum = if schema_version == 1 {
+                approved_execution_checksum(&vector["packet"], &vector["job"]).unwrap()
+            } else {
+                approved_execution_checksum_with_admission(
+                    schema_version,
+                    &vector["packet"],
+                    &vector["job"],
+                    &vector["admission"],
+                )
+                .unwrap()
+            };
+            assert_eq!(checksum, vector["checksum"].as_str().unwrap(), "{name}");
+        }
+    }
+
+    #[test]
+    fn approved_execution_checksum_rejects_non_interoperable_numbers() {
+        for value in [json!(1.5), json!(-0.0), json!(9_007_199_254_740_992_u64)] {
+            let error =
+                approved_execution_checksum(&json!({ "value": value }), &json!({})).unwrap_err();
+            assert_eq!(error.0, StatusCode::CONFLICT);
+            assert!(error.1.contains("non-interoperable number"));
+        }
+    }
+
+    #[test]
+    fn runner_packet_carries_explicit_approval_schema_and_admission() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+        let mut legacy_packet = application.receipt["approved_execution"]["packet"].clone();
+        let legacy_checksum = application.receipt["approved_execution"]["checksum"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        attach_approved_execution_transport(&application, &mut legacy_packet, legacy_checksum)
+            .unwrap();
+        assert_eq!(legacy_packet["approvedExecutionSchemaVersion"], json!(1));
+        assert!(legacy_packet.get("approvedExecutionAdmission").is_none());
+
+        let packet = application.receipt["approved_execution"]["packet"].clone();
+        let job = application.receipt["approved_execution"]["job"].clone();
+        let admission = json!({ "kind": "review_approval" });
+        let checksum = approved_execution_checksum_v2(&packet, &job, &admission).unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 2,
+            "approved_at_ms": 1,
+            "checksum": checksum,
+            "admission": admission,
+            "packet": packet,
+            "job": job,
+        });
+        approved_execution_snapshot(&application).unwrap();
+        let mut runtime_packet = application.receipt["approved_execution"]["packet"].clone();
+        attach_approved_execution_transport(&application, &mut runtime_packet, checksum).unwrap();
+        assert_eq!(runtime_packet["approvedExecutionSchemaVersion"], json!(2));
+        assert_eq!(
+            runtime_packet["approvedExecutionAdmission"],
+            json!({ "kind": "review_approval" })
+        );
+    }
+
+    #[test]
+    fn certified_auto_packet_requires_and_transports_exact_schema_three_admission() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+        application.submission_mode = "auto_submit".to_string();
+        let packet = application.receipt["approved_execution"]["packet"].clone();
+        let job = application.receipt["approved_execution"]["job"].clone();
+        let admission = json!({
+            "kind": "track_auto_submit",
+            "authorization_id": "auto-auth-604",
+            "career_track_id": "track-test",
+            "revision_no": 4,
+            "authority_fingerprint": "1".repeat(64),
+            "ats_certification": {
+                "schema_version": 1,
+                "provider": "greenhouse",
+                "adapter_version": "2026.07.1-beta.1",
+                "manifest_sha256": "2".repeat(64),
+                "activation_sha256": "3".repeat(64),
+                "activation_generation": 5,
+                "target_key_sha256": "6".repeat(64),
+                "layout_set_sha256": "7".repeat(64),
+                "variant_key": "greenhouse_public",
+                "layout_contract_version": 1,
+                "surface_sha256": "4".repeat(64),
+                "adapter_bundle_sha256": "8".repeat(64),
+                "runner_target_sha256s": ["9".repeat(64)],
+                "expires_at_ms": 9_007_199_254_740_000_i64,
+            }
+        });
+        let checksum =
+            approved_execution_checksum_with_admission(3, &packet, &job, &admission).unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 3,
+            "approved_at_ms": 1,
+            "checksum": checksum,
+            "admission": admission,
+            "packet": packet,
+            "job": job,
+        });
+
+        approved_execution_snapshot(&application).unwrap();
+        let mut runtime_packet = application.receipt["approved_execution"]["packet"].clone();
+        attach_approved_execution_transport(&application, &mut runtime_packet, checksum).unwrap();
+        assert_eq!(runtime_packet["approvedExecutionSchemaVersion"], json!(3));
+        assert_eq!(
+            runtime_packet
+                .pointer("/approvedExecutionAdmission/ats_certification/manifest_sha256")
+                .and_then(Value::as_str)
+                .unwrap(),
+            "2".repeat(64)
+        );
+
+        application.receipt["approved_execution"]["admission"]["ats_certification"]
+            ["manifest_sha256"] = json!("a".repeat(64));
+        let error = approved_execution_snapshot(&application).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("changed after review"));
+    }
+
+    fn exact_destination_workflow_input(
+        exact_destination: &str,
+        source: &str,
+        auto_submit: bool,
+    ) -> Value {
+        let (mut application, mut posting, resume, _, _) = strict_receipt_fixture();
+        application.state = "queued".to_string();
+        application.submission_mode = if auto_submit {
+            "auto_submit".to_string()
+        } else {
+            "review_first".to_string()
+        };
+        posting.canonical_url = exact_destination.to_string();
+        posting.source = source.to_string();
+        let packet = application.receipt["approved_execution"]["packet"].clone();
+        let mut job = application.receipt["approved_execution"]["job"].clone();
+        job["canonicalUrl"] = json!(exact_destination);
+        job["source"] = json!(source);
+        let (schema_version, admission) = if auto_submit {
+            (
+                3,
+                json!({
+                    "kind": "track_auto_submit",
+                    "authorization_id": "auto-auth-exact-destination",
+                    "career_track_id": "track-test",
+                    "revision_no": 4,
+                    "authority_fingerprint": "1".repeat(64),
+                    "ats_certification": {
+                        "schema_version": 1,
+                        "provider": "lever",
+                        "adapter_version": "2026.07.0-beta.1",
+                        "manifest_sha256": "2".repeat(64),
+                        "activation_sha256": "3".repeat(64),
+                        "activation_generation": 5,
+                        "target_key_sha256": "6".repeat(64),
+                        "layout_set_sha256": "7".repeat(64),
+                        "variant_key": "lever_application",
+                        "layout_contract_version": 1,
+                        "surface_sha256": "4".repeat(64),
+                        "adapter_bundle_sha256": "8".repeat(64),
+                        "runner_target_sha256s": ["9".repeat(64)],
+                        "expires_at_ms": 9_007_199_254_740_000_i64,
+                    }
+                }),
+            )
+        } else {
+            (2, json!({ "kind": "review_approval" }))
+        };
+        let checksum =
+            approved_execution_checksum_with_admission(schema_version, &packet, &job, &admission)
+                .unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": schema_version,
+            "approved_at_ms": 1,
+            "checksum": checksum,
+            "admission": admission,
+            "packet": packet,
+            "job": job,
+        });
+
+        approved_workflow_input(
+            "acct-test",
+            &application,
+            &posting,
+            &resume,
+            "local",
+            "run-exact-destination",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn manual_review_workflow_preserves_projected_ashby_and_smartrecruiters_destinations() {
+        for (raw_posting_url, exact_destination, source) in [
+            (
+                "https://jobs.ashbyhq.com/acme/abc",
+                "https://jobs.ashbyhq.com/acme/abc/application",
+                "ashby",
+            ),
+            (
+                "https://jobs.smartrecruiters.com/acme/abc-platform-engineer",
+                "https://www.smartrecruiters.com/acme/abc-platform-engineer",
+                "smartrecruiters",
+            ),
+            (
+                "https://jobs.smartrecruiters.com/acme/abc-platform-engineer",
+                "https://jobs.smartrecruiters.com/acme/abc-platform-engineer?oga=true",
+                "smartrecruiters",
+            ),
+        ] {
+            let workflow = exact_destination_workflow_input(exact_destination, source, false);
+            assert_ne!(workflow["url"], json!(raw_posting_url));
+            assert_eq!(workflow["url"], json!(exact_destination));
+            assert_eq!(workflow["job"]["canonicalUrl"], json!(exact_destination));
+            assert_eq!(workflow["job"]["source"], json!(source));
+        }
+    }
+
+    #[test]
+    fn auto_submit_workflow_preserves_the_frozen_lever_application_destination() {
+        let raw_posting_url = "https://jobs.lever.co/acme/abc";
+        let exact_destination = "https://jobs.lever.co/acme/abc/apply";
+        let workflow = exact_destination_workflow_input(exact_destination, "lever", true);
+
+        assert_ne!(workflow["url"], json!(raw_posting_url));
+        assert_eq!(workflow["url"], json!(exact_destination));
+        assert_eq!(workflow["job"]["canonicalUrl"], json!(exact_destination));
+        assert_eq!(
+            workflow["packet"]["approvedExecutionSchemaVersion"],
+            json!(3)
+        );
+        assert_eq!(
+            workflow["packet"]["approvedExecutionAdmission"]["ats_certification"]["provider"],
+            json!("lever")
+        );
     }
 
     #[test]
@@ -6047,18 +15860,530 @@ mod tests {
         assert!(error.1.contains("changed after review"));
     }
 
+    #[test]
+    fn submission_authority_snapshot_preserves_auto_submit_and_packet_history() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+        application.submission_mode = "auto_submit".to_string();
+        application.cover_letter = "Dear Acme,\n\nI build reliable systems.".to_string();
+        application.receipt["approved_execution"]["packet"]["coverLetterContent"] =
+            json!(application.cover_letter);
+        application.receipt["packet_revisions"] = json!([{
+            "revision_no": 2,
+            "reason": "intervention_answer",
+            "intervention_id": "intervention-one",
+            "answer_fingerprint": "e".repeat(64)
+        }]);
+        let packet = application.receipt["approved_execution"]["packet"].clone();
+        let job = application.receipt["approved_execution"]["job"].clone();
+        let admission = json!({
+            "kind": "track_auto_submit",
+            "authorization_id": "auto-auth-one",
+            "career_track_id": "track-test",
+            "revision_no": 7,
+            "authority_fingerprint": "f".repeat(64)
+        });
+        let checksum = approved_execution_checksum_v2(&packet, &job, &admission).unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 2,
+            "approved_at_ms": 1,
+            "checksum": checksum,
+            "admission": admission,
+            "packet": packet,
+            "job": job
+        });
+
+        let authority = submission_authority_snapshot(
+            &application,
+            json!({
+                "kind": "cloud_execution_lease",
+                "ownerId": "runner-one",
+                "leaseTokenSha256": "c".repeat(64),
+                "fence": 9,
+                "phase": "submitted",
+            }),
+        )
+        .unwrap();
+        let preserved = authority.get("preSubmissionReceipt").unwrap();
+        assert_eq!(preserved, &application.receipt);
+        let expected_pre_submission_receipt_sha256 =
+            jobs::submission_pre_receipt_sha256(&application.receipt).unwrap();
+        assert_eq!(
+            authority
+                .get("preSubmissionReceiptSha256")
+                .and_then(Value::as_str),
+            Some(expected_pre_submission_receipt_sha256.as_str())
+        );
+        assert_eq!(
+            preserved
+                .pointer("/approved_execution/admission/authorization_id")
+                .and_then(Value::as_str),
+            Some("auto-auth-one")
+        );
+        assert_eq!(
+            preserved
+                .pointer("/approved_execution/admission/revision_no")
+                .and_then(Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(
+            preserved
+                .pointer("/approved_execution/packet/coverLetterContent")
+                .and_then(Value::as_str),
+            Some("Dear Acme,\n\nI build reliable systems.")
+        );
+        assert_eq!(
+            preserved
+                .pointer("/packet_revisions/0/intervention_id")
+                .and_then(Value::as_str),
+            Some("intervention-one")
+        );
+        assert_eq!(
+            authority
+                .pointer("/executionAuthority/ownerId")
+                .and_then(Value::as_str),
+            Some("runner-one")
+        );
+        assert_eq!(
+            authority
+                .pointer("/executionAuthority/fence")
+                .and_then(Value::as_i64),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn finalize_error_reconciliation_requires_an_authenticated_committed_receipt() {
+        let fingerprint = "f".repeat(64);
+        let mut application = authenticated_submitted_application_fixture(&fingerprint);
+
+        assert_eq!(
+            submission_finalize_error_disposition("acct-test", Some(&application), &fingerprint),
+            SubmissionFinalizeErrorDisposition::Replay
+        );
+
+        let mut tampered = application.clone();
+        tampered.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceiptSha256"] =
+            json!("0".repeat(64));
+        assert_eq!(
+            submission_finalize_error_disposition("acct-test", Some(&tampered), &fingerprint),
+            SubmissionFinalizeErrorDisposition::Conflict
+        );
+
+        application.receipt[SUBMISSION_FINGERPRINT_KEY] = json!("e".repeat(64));
+        assert_eq!(
+            submission_finalize_error_disposition("acct-test", Some(&application), &fingerprint),
+            SubmissionFinalizeErrorDisposition::Conflict
+        );
+
+        application.state = "running".to_string();
+        assert_eq!(
+            submission_finalize_error_disposition("acct-test", Some(&application), &fingerprint),
+            SubmissionFinalizeErrorDisposition::NotCommitted
+        );
+        assert_eq!(
+            submission_finalize_error_disposition("acct-test", None, &fingerprint),
+            SubmissionFinalizeErrorDisposition::NotCommitted
+        );
+    }
+
+    #[test]
+    fn submitted_receipt_authentication_keeps_schema_one_admission_optional_only() {
+        let fingerprint = "f".repeat(64);
+        let application = authenticated_submitted_application_fixture(&fingerprint);
+        jobs::validated_submitted_pre_submission_application("acct-test", &application).unwrap();
+
+        let mut schema_two_without_admission = application;
+        let pre_submission_receipt = schema_two_without_admission.receipt
+            [jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            .as_object_mut()
+            .expect("fixture has a pre-submission receipt");
+        pre_submission_receipt["approved_execution"]["schema_version"] = json!(2);
+        pre_submission_receipt["approved_execution"]
+            .as_object_mut()
+            .expect("fixture has approved execution")
+            .remove("admission");
+        let pre_submission_receipt = schema_two_without_admission.receipt
+            [jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            .clone();
+        schema_two_without_admission.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]
+            ["preSubmissionReceiptSha256"] =
+            json!(jobs::submission_pre_receipt_sha256(&pre_submission_receipt).unwrap());
+
+        let error = jobs::validated_submitted_pre_submission_application(
+            "acct-test",
+            &schema_two_without_admission,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("approved execution admission is missing"));
+    }
+
+    #[test]
+    fn terminal_workflow_mutation_follows_full_envelope_authentication() {
+        let source = include_str!("jobs.rs");
+        let terminal = source
+            .split_once("fn mark_submitted_cloud_workflow_terminal(")
+            .expect("submitted workflow terminal helper")
+            .1
+            .split_once("enum SubmissionFinalizeErrorDisposition")
+            .expect("bounded submitted workflow terminal helper")
+            .0;
+        let authenticated = terminal
+            .find("jobs::validated_submitted_pre_submission_application(")
+            .expect("full submitted-envelope authentication");
+        let local_return = terminal
+            .find("if expected_runner != \"cloud\"")
+            .expect("local terminal return");
+        let workflow_mutation = terminal
+            .find("jobs::mark_jobs_workflow_execution_submitted(")
+            .expect("cloud workflow terminal mutation");
+
+        assert!(authenticated < local_return);
+        assert!(local_return < workflow_mutation);
+    }
+
+    #[test]
+    fn precommit_upload_error_reconciliation_uses_authoritative_submitted_fingerprint() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-submission-reconciliation-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&path).unwrap();
+        crate::db::run_migrations(&pool).unwrap();
+        let fingerprint = "f".repeat(64);
+        let mut application = authenticated_submitted_application_fixture(&fingerprint);
+        let payload = serde_json::to_string(&application).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+             VALUES ('acct-test', 'submission-reconciliation@example.com', 'hash', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_postings (
+                id, account_id, canonical_key, posting_json, source, company, title,
+                created_at_ms, updated_at_ms
+             ) VALUES (
+                'job-test', 'acct-test', 'job-test', '{}', 'greenhouse', 'Acme',
+                'Engineer', 1, 1
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_applications (
+                id, account_id, job_id, state, application_json, created_at_ms, updated_at_ms
+             ) VALUES ('app-test', 'acct-test', 'job-test', 'submitted', ?1, 1, 1)",
+            rusqlite::params![payload],
+        )
+        .unwrap();
+        drop(conn);
+
+        let replay = reconcile_submission_precommit_error(
+            &pool,
+            "acct-test",
+            "app-test",
+            &fingerprint,
+            (
+                StatusCode::BAD_GATEWAY,
+                "original upload failure".to_string(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(replay.state, "submitted");
+
+        let valid_final_receipt = application.receipt.clone();
+        application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceiptSha256"] =
+            json!("0".repeat(64));
+        let payload = serde_json::to_string(&application).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET application_json = ?1 WHERE id = 'app-test'",
+                rusqlite::params![payload],
+            )
+            .unwrap();
+        let before_tampered_replay: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT application_json FROM jobs_applications WHERE id = 'app-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tampered = reconcile_submission_precommit_error(
+            &pool,
+            "acct-test",
+            "app-test",
+            &fingerprint,
+            (
+                StatusCode::BAD_GATEWAY,
+                "original upload failure".to_string(),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(tampered.0, StatusCode::CONFLICT);
+        let after_tampered_replay: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT application_json FROM jobs_applications WHERE id = 'app-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_tampered_replay, before_tampered_replay);
+
+        application.receipt = valid_final_receipt;
+        application.receipt[SUBMISSION_FINGERPRINT_KEY] = json!("e".repeat(64));
+        let payload = serde_json::to_string(&application).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET application_json = ?1 WHERE id = 'app-test'",
+                rusqlite::params![payload],
+            )
+            .unwrap();
+        let conflict = reconcile_submission_precommit_error(
+            &pool,
+            "acct-test",
+            "app-test",
+            &fingerprint,
+            (
+                StatusCode::BAD_GATEWAY,
+                "original upload failure".to_string(),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+
+        application.state = "running".to_string();
+        let payload = serde_json::to_string(&application).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications
+                    SET state = 'running', application_json = ?1
+                  WHERE id = 'app-test'",
+                rusqlite::params![payload],
+            )
+            .unwrap();
+        let original = reconcile_submission_precommit_error(
+            &pool,
+            "acct-test",
+            "app-test",
+            &fingerprint,
+            (
+                StatusCode::BAD_GATEWAY,
+                "original upload failure".to_string(),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            original,
+            (
+                StatusCode::BAD_GATEWAY,
+                "original upload failure".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn submitted_cloud_receipt_replay_uses_only_frozen_token_and_fence_authority() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+        let lease_token = "opaque-cloud-lease-token";
+        application.state = "submitted".to_string();
+        application.receipt = json!({
+            "runner": "cloud",
+            "runId": "run-test",
+            (jobs::SERVER_SUBMISSION_AUTHORITY_KEY): {
+                "executionAuthority": {
+                    "kind": "cloud_execution_lease",
+                    "ownerId": "runner-test",
+                    "leaseTokenSha256": hex::encode(Sha256::digest(lease_token.as_bytes())),
+                    "fence": 7,
+                    "phase": "submitted",
+                }
+            }
+        });
+
+        assert!(jobs::submitted_cloud_receipt_replay_authorized(
+            &application,
+            "run-test",
+            lease_token,
+            7,
+        ));
+        assert!(!jobs::submitted_cloud_receipt_replay_authorized(
+            &application,
+            "run-test",
+            "wrong-token",
+            7,
+        ));
+        assert!(!jobs::submitted_cloud_receipt_replay_authorized(
+            &application,
+            "run-test",
+            lease_token,
+            8,
+        ));
+
+        application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["executionAuthority"]["phase"] =
+            json!("released");
+        assert!(!jobs::submitted_cloud_receipt_replay_authorized(
+            &application,
+            "run-test",
+            lease_token,
+            7,
+        ));
+    }
+
+    #[test]
+    fn submitted_local_receipt_replay_uses_frozen_nonce_bearing_result_capability() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+        let result_capability = format!("claims-with-a-random-nonce.{}", "a".repeat(64));
+        let replay_hash = jobs::local_result_replay_credential_sha256(&result_capability).unwrap();
+        application.state = "submitted".to_string();
+        application.receipt = json!({
+            "runner": "local",
+            "runId": "run-test",
+            (jobs::SERVER_SUBMISSION_AUTHORITY_KEY): {
+                "executionAuthority": {
+                    "kind": "local_run_ticket",
+                    "ticketHash": "b".repeat(64),
+                    "runId": "run-test",
+                    "resultCapabilitySha256": replay_hash,
+                    "browserRelease": {
+                        "schemaVersion": 2,
+                        "bindingSha256": "1".repeat(64),
+                        "assignmentSha256": "2".repeat(64),
+                        "assignmentGeneration": 1,
+                        "channel": "beta",
+                        "channelHeadRevision": 1,
+                        "channelTransitionSha256": "3".repeat(64),
+                        "activationSha256": "4".repeat(64),
+                        "activationGeneration": 1,
+                        "trustGeneration": 1,
+                        "trustPolicySha256": "5".repeat(64),
+                        "channelSequence": 1,
+                        "manifestSignatureSetSha256": "6".repeat(64),
+                        "activationAuthorizationSignatureSetSha256": "7".repeat(64),
+                        "manifestSha256": "8".repeat(64),
+                        "releaseSequence": 1,
+                        "artifactId": "artifact-test",
+                        "artifactSha256": "9".repeat(64),
+                        "releaseId": "release-test",
+                        "buildId": "browser-1.0",
+                        "appVersion": "1.0.0",
+                        "protocolVersion": 1,
+                        "platform": "darwin",
+                        "architecture": "arm64",
+                        "packageKind": "darwin-dmg",
+                        "descriptorSha256": "a".repeat(64),
+                    },
+                }
+            }
+        });
+
+        assert!(jobs::submitted_local_receipt_replay_authorized(
+            &application,
+            "run-test",
+            &result_capability,
+        ));
+        assert!(!jobs::submitted_local_receipt_replay_authorized(
+            &application,
+            "run-test",
+            &format!("different-nonce.{}", "a".repeat(64)),
+        ));
+        assert!(!jobs::submitted_local_receipt_replay_authorized(
+            &application,
+            "different-run",
+            &result_capability,
+        ));
+
+        let execution = application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]
+            ["executionAuthority"]
+            .as_object_mut()
+            .unwrap();
+        execution.remove("browserRelease");
+        assert_eq!(execution.len(), 4);
+        assert!(jobs::submitted_local_receipt_replay_authorized(
+            &application,
+            "run-test",
+            &result_capability,
+        ));
+        application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["executionAuthority"]
+            ["unexpected"] = json!(true);
+        assert!(!jobs::submitted_local_receipt_replay_authorized(
+            &application,
+            "run-test",
+            &result_capability,
+        ));
+        application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["executionAuthority"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unexpected");
+
+        application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["executionAuthority"]
+            .as_object_mut()
+            .unwrap()
+            .remove("resultCapabilitySha256");
+        assert!(!jobs::submitted_local_receipt_replay_authorized(
+            &application,
+            "run-test",
+            &result_capability,
+        ));
+    }
+
+    fn pdf_fixture() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for object in [
+            b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>".as_slice(),
+        ] {
+            offsets.push(pdf.len());
+            let object_number = offsets.len();
+            pdf.extend_from_slice(format!("{object_number} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     fn png_fixture() -> Vec<u8> {
-        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
-        png.extend_from_slice(&1u32.to_be_bytes());
-        png.extend_from_slice(&1u32.to_be_bytes());
-        png.extend_from_slice(&[8, 2, 0, 0, 0]);
-        png.extend_from_slice(&[0, 0, 0, 0]);
-        png
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0, 0, 0]).unwrap();
+        }
+        bytes
     }
 
     fn receipt_preflight_fixture() -> (Value, Vec<ReceiptEvidenceObject>) {
         let (_, _, _, mut receipt, _) = strict_receipt_fixture();
-        let pdf = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nstartxref\n0\n%%EOF\n".to_vec();
+        receipt.as_object_mut().unwrap().remove("receiptObject");
+        receipt
+            .as_object_mut()
+            .unwrap()
+            .remove(jobs::SERVER_SUBMISSION_AUTHORITY_KEY);
+        receipt.as_object_mut().unwrap().remove("evidenceObjects");
+        let pdf = pdf_fixture();
         let png = png_fixture();
         let pdf_sha = sha256_hex(&pdf);
         let png_sha = sha256_hex(&png);
@@ -6142,6 +16467,356 @@ mod tests {
     }
 
     #[test]
+    fn receipt_evidence_decoders_reject_truncated_or_corrupted_files() {
+        let pdf = pdf_fixture();
+        assert!(valid_pdf(&pdf));
+        assert!(!valid_pdf(&pdf[..pdf.len() - 12]));
+        let mut corrupt_pdf = pdf.clone();
+        let xref = corrupt_pdf
+            .windows(4)
+            .position(|window| window == b"xref")
+            .expect("fixture xref");
+        corrupt_pdf[xref] = b'z';
+        assert!(!valid_pdf(&corrupt_pdf));
+
+        let png = png_fixture();
+        assert!(valid_png(&png));
+        assert!(!valid_png(&png[..png.len() - 8]));
+        let mut corrupt_png = png;
+        let pixel = corrupt_png.len() / 2;
+        corrupt_png[pixel] ^= 0x01;
+        assert!(!valid_png(&corrupt_png));
+    }
+
+    #[test]
+    fn receipt_documents_must_match_the_pre_click_hash_proof_exactly() {
+        let (application, _, _, receipt, _) = strict_receipt_fixture();
+        validate_receipt_final_submit_proof(&application, &receipt).unwrap();
+
+        let mut wrong_hash = receipt.clone();
+        wrong_hash["documents"][0]["sha256"] = json!("f".repeat(64));
+        assert!(
+            validate_receipt_final_submit_proof(&application, &wrong_hash)
+                .unwrap_err()
+                .1
+                .contains("pre-click proof")
+        );
+
+        let mut wrong_version = receipt.clone();
+        wrong_version["documents"][0]["versionId"] = json!("resume-other");
+        assert!(validate_receipt_final_submit_proof(&application, &wrong_version).is_err());
+
+        let mut extra = receipt;
+        extra["documents"].as_array_mut().unwrap().push(json!({
+            "kind": "attachment",
+            "storageKey": "accounts/acct-test/jobs/app-test/attachment.pdf",
+            "sha256": "e".repeat(64),
+        }));
+        assert!(validate_receipt_final_submit_proof(&application, &extra).is_err());
+    }
+
+    fn provider_receipt_fixture() -> (JobApplication, Value) {
+        let (application, _, _, mut receipt, _) = strict_receipt_fixture();
+        receipt["generatedAt"] = json!("2026-08-04T12:00:30Z");
+        receipt["finalUrl"] = json!("https://boards.greenhouse.io/acme/jobs/123/confirmation");
+        receipt["result"] = json!({
+            "status": "submitted",
+            "submitHttpStatus": 302,
+            "confirmationText": "Thank you for applying. Your application was received.",
+            "confirmationUrl": "https://boards.greenhouse.io/acme/jobs/123/confirmation",
+            "submittedAt": "2026-08-04T12:00:00Z",
+            "issues": [],
+        });
+        receipt["events"] = json!([{
+            "id": "provider-final-state",
+            "occurredAt": "2026-08-04T12:00:01Z",
+            "type": "greenhouse_state_transition",
+            "detail": {
+                "state": "receipt",
+                "status": "submitted",
+                "capability": "beta_review",
+            }
+        }]);
+        (application, receipt)
+    }
+
+    #[test]
+    fn explicit_submission_confirmation_requires_supported_positive_language() {
+        for confirmation in [
+            "Thank you for applying.",
+            "THANK\nYOU\tFOR APPLYING!",
+            "Thanks for applying.",
+            "We received your application.",
+            "Your application has been submitted.",
+            "Your application was received.",
+            "Thank you for applying. You haven't submitted a cover letter because it was optional.",
+            "Thanks for applying. We haven't yet reviewed your application.",
+        ] {
+            assert!(
+                has_explicit_submission_confirmation(confirmation),
+                "rejected supported confirmation: {confirmation:?}"
+            );
+        }
+
+        for unproven in [
+            "",
+            "Application pending.",
+            "Submission is still processing.",
+            "Please review the application before continuing.",
+        ] {
+            assert!(
+                !has_explicit_submission_confirmation(unproven),
+                "accepted unproven confirmation: {unproven:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_submission_confirmation_rejects_every_negative_outcome_family() {
+        for negative in [
+            "You already applied",
+            "You already submitted an application",
+            "Application already submitted",
+            "The application was already submitted",
+            "Your application has been already submitted",
+            "The application had been already submitted",
+            "Your application has already been submitted",
+            "The application had already been submitted",
+            "Unable to submit your application",
+            "Failed to submit the application",
+            "Could not submit your application",
+            "Couldn't submit your application",
+            "Cannot submit the application",
+            "Can't submit your application",
+            "Your application could not be submitted",
+            "Your application couldn't be submitted",
+            "Your application cannot be submitted",
+            "Your application can't be submitted",
+            "Your application was unable to be submitted",
+            "Your application was not submitted",
+            "Your application wasn't successfully submitted",
+            "Your application has not been submitted",
+            "Your application hasn't been successfully submitted",
+            "Your application has not yet been submitted",
+            "Your application hasn't yet been submitted",
+            "Your application hasn’t yet been submitted",
+            "The application had not yet been submitted",
+            "The application hadn't yet been submitted",
+            "Your application is not submitted",
+            "Your application isn't successfully submitted",
+            "Your application was not yet submitted",
+            "Your application wasn't yet submitted",
+            "Your application wasn’t yet submitted",
+            "You have not submitted your application",
+            "You have not yet submitted your application",
+            "You haven't submitted your application",
+            "You haven't yet submitted your application",
+            "You haven’t yet submitted your application",
+            "The system has not yet submitted your application",
+            "We had not yet submitted an application",
+            "You did not submit the application",
+            "You didn't submit your application",
+            "You didn't yet submit your application",
+            "You didn’t yet submit your application",
+            "Status: NOT\nSUBMITTED",
+            "Status: NOT YET SUBMITTED",
+            "We did not receive your application",
+            "We didn't receive the application",
+            "We have not received your application",
+            "We haven't received application",
+            "The application was not received",
+            "The application wasn't received",
+            "Your application has not been received",
+            "Your application hasn't been received",
+            "The application is not received",
+            "The application isn't received",
+            "Submission failed",
+            "Application submission was unsuccessful",
+            "Submission was not successful",
+            "The application was not successfully submitted",
+        ] {
+            let mixed_body =
+                format!("Thank you for applying. {negative}. We received your application.");
+            assert!(
+                !has_explicit_submission_confirmation(&mixed_body),
+                "accepted mixed positive and negative confirmation: {negative:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_submission_proof_rejects_mixed_negative_confirmation_text() {
+        let (application, receipt) = provider_receipt_fixture();
+
+        for confirmation_text in [
+            "Thank you for applying, but your application was not submitted.",
+            "We received your application. However, it could not be submitted.",
+            "Thanks for applying, but the application was not received.",
+            "Thanks for applying. Application submission failed.",
+            "Thank you for applying. You have not submitted your application.",
+            "Thanks for applying. You haven't yet submitted your application.",
+            "We received your application, but it hasn’t yet been submitted.",
+        ] {
+            let mut invalid = receipt.clone();
+            invalid["result"]["confirmationText"] = json!(confirmation_text);
+            let error = validate_provider_submission_proof(&application, &invalid).unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("does not prove a successful submission"));
+        }
+    }
+
+    #[test]
+    fn provider_submission_proof_requires_exact_adapter_state_url_and_time() {
+        let (application, receipt) = provider_receipt_fixture();
+        validate_provider_submission_proof(&application, &receipt).unwrap();
+
+        for invalid in [
+            {
+                let mut value = receipt.clone();
+                value["adapterVersion"] = json!("2026.07.0-beta.1");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["events"][0]["detail"]["status"] = json!("pending");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["result"]["confirmationUrl"] =
+                    json!("https://jobs.lever.co/acme/confirmation");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["finalUrl"] =
+                    json!("https://boards.greenhouse.io/acme/jobs/other/confirmation");
+                value["result"]["confirmationUrl"] =
+                    json!("https://boards.greenhouse.io/acme/jobs/other/confirmation");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["finalUrl"] = json!("https://boards.greenhouse.io/acme/confirmation");
+                value["result"]["confirmationUrl"] =
+                    json!("https://boards.greenhouse.io/acme/confirmation");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["finalUrl"] = json!("https://boards.greenhouse.io/acme/jobs/123");
+                value["result"]["confirmationUrl"] =
+                    json!("https://boards.greenhouse.io/acme/jobs/123");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["events"][0]["occurredAt"] = json!("2026-08-04T13:00:00Z");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["result"]["confirmationText"] = json!("Application already submitted");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["result"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("submitHttpStatus");
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["result"]["submitHttpStatus"] = json!(199);
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["result"]["submitHttpStatus"] = json!(304);
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["result"]["submitHttpStatus"] = json!(400);
+                value
+            },
+            {
+                let mut value = receipt.clone();
+                value["result"]["submitHttpStatus"] = json!("302");
+                value
+            },
+        ] {
+            assert!(validate_provider_submission_proof(&application, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn successful_submit_http_status_accepts_only_2xx_and_intended_redirects() {
+        let mut result = serde_json::Map::new();
+
+        for status in 200..=399 {
+            result.insert("submitHttpStatus".to_string(), json!(status));
+            let expected = status <= 299 || matches!(status, 301 | 302 | 303 | 307 | 308);
+            if expected {
+                assert_eq!(successful_submit_http_status(&result).unwrap(), status);
+            } else {
+                assert!(successful_submit_http_status(&result).is_err());
+            }
+        }
+
+        for status in [199, 400] {
+            result.insert("submitHttpStatus".to_string(), json!(status));
+            assert!(successful_submit_http_status(&result).is_err());
+        }
+    }
+
+    #[test]
+    fn lever_provider_submission_proof_requires_its_exact_final_state() {
+        let (mut application, mut receipt) = provider_receipt_fixture();
+        application.receipt["approved_execution"]["job"]["canonicalUrl"] =
+            json!("https://jobs.lever.co/acme/job-123");
+        application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY]["adapter"] = json!("lever");
+        application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY]["adapterVersion"] =
+            json!(LEVER_SUBMISSION_ADAPTER_VERSION);
+        application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY]["control"] =
+            json!("lever_application_submit");
+        application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY]["job"] = json!({
+            "approvedCanonicalUrl": "https://jobs.lever.co/acme/job-123",
+            "pageUrl": "https://jobs.lever.co/acme/job-123",
+        });
+        application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY]["target"] = json!({
+            "actionUrl": "https://jobs.lever.co/acme/job-123/apply",
+            "method": "post",
+            "enctype": "multipart/form-data",
+            "formTarget": "_self",
+            "providerJobKey": "lever:jobs.lever.co:acme:job-123",
+            "formIdentity": r#"[0,"application-form","","","","",""]"#,
+        });
+        receipt["adapter"] = json!("lever");
+        receipt["adapterVersion"] = json!(LEVER_SUBMISSION_ADAPTER_VERSION);
+        receipt["finalUrl"] = json!("https://jobs.lever.co/acme/job-123/confirmation");
+        receipt["result"]["confirmationUrl"] =
+            json!("https://jobs.lever.co/acme/job-123/confirmation");
+        receipt["events"][0] = json!({
+            "id": "provider-final-state",
+            "occurredAt": "2026-08-04T12:00:01Z",
+            "type": "lever_state_changed",
+            "detail": {
+                "state": "receipt",
+                "outcome": "submitted",
+                "page_kind": "confirmation",
+                "mode": "review_only",
+            }
+        });
+        validate_provider_submission_proof(&application, &receipt).unwrap();
+
+        receipt["events"][0]["detail"]["mode"] = json!("auto_submit");
+        assert!(validate_provider_submission_proof(&application, &receipt).is_err());
+    }
+
+    #[test]
     fn receipt_verified_claims_must_exactly_match_confirmed_resume_claims() {
         let (_, _, _, mut receipt, _) = strict_receipt_fixture();
         receipt["packet"]["verifiedClaimIds"] = json!(["fact-confirmed"]);
@@ -6204,6 +16879,8 @@ mod tests {
                 compensation: "USD 150000-220000 year".to_string(),
                 employment_type: "full_time".to_string(),
                 posted_at_ms: Some(1_744_222_396_719),
+                verified_at_ms: 1_744_222_396_719,
+                evidence_hash: "a".repeat(64),
             }),
         );
 
@@ -6215,18 +16892,34 @@ mod tests {
         assert_eq!(posting.match_score, 0);
         assert_eq!(posting.availability_status, "active");
         assert!(posting.last_verified_at_ms.is_some());
+        assert_eq!(
+            posting.discovery_evidence.canonical_job_id.as_deref(),
+            Some(posting.canonical_key.as_str())
+        );
+        assert_eq!(
+            posting.discovery_evidence.original_source_status,
+            "verified_open"
+        );
+        assert_eq!(
+            posting.discovery_evidence.employer_verification_status,
+            "ats_tenant_verified"
+        );
+        assert_eq!(
+            posting.discovery_evidence.scam_risk_status,
+            "source_screened"
+        );
     }
 
     #[test]
     fn receipt_bundle_requires_exact_identity_packet_and_verified_evidence() {
-        let (application, posting, resume, receipt, verified_objects) = strict_receipt_fixture();
+        let (application, _posting, resume, receipt, verified_objects) = strict_receipt_fixture();
         validate_receipt_bundle(
             "acct-test",
             &application,
-            &posting,
             &resume,
             &receipt,
             &verified_objects,
+            true,
         )
         .unwrap();
 
@@ -6236,10 +16929,10 @@ mod tests {
             validate_receipt_bundle(
                 "acct-test",
                 &application,
-                &posting,
                 &resume,
                 &wrong_identity,
                 &verified_objects,
+                true,
             )
             .unwrap_err()
             .0,
@@ -6252,10 +16945,10 @@ mod tests {
             validate_receipt_bundle(
                 "acct-test",
                 &application,
-                &posting,
                 &resume,
                 &wrong_resume,
                 &verified_objects,
+                true,
             )
             .unwrap_err()
             .0,
@@ -6267,10 +16960,10 @@ mod tests {
         let changed_answers_error = validate_receipt_bundle(
             "acct-test",
             &application,
-            &posting,
             &resume,
             &changed_answers,
             &verified_objects,
+            true,
         )
         .unwrap_err();
         assert_eq!(changed_answers_error.0, StatusCode::BAD_REQUEST);
@@ -6281,26 +16974,718 @@ mod tests {
         let wrong_approval_error = validate_receipt_bundle(
             "acct-test",
             &application,
-            &posting,
             &resume,
             &wrong_approval,
             &verified_objects,
+            true,
         )
         .unwrap_err();
         assert_eq!(wrong_approval_error.0, StatusCode::BAD_REQUEST);
         assert!(wrong_approval_error.1.contains("exact application packet"));
 
+        let mut wrong_claims = receipt.clone();
+        wrong_claims["packet"]["verifiedClaimIds"] = json!(["claim-not-approved"]);
+        let wrong_claims_error = validate_receipt_bundle(
+            "acct-test",
+            &application,
+            &resume,
+            &wrong_claims,
+            &verified_objects,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(wrong_claims_error.0, StatusCode::BAD_REQUEST);
+        assert!(wrong_claims_error.1.contains("exact application packet"));
+
+        let mut wrong_job = receipt.clone();
+        wrong_job["job"]["company"] = json!("Other employer");
+        let wrong_job_error = validate_receipt_bundle(
+            "acct-test",
+            &application,
+            &resume,
+            &wrong_job,
+            &verified_objects,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(wrong_job_error.0, StatusCode::BAD_REQUEST);
+        assert!(wrong_job_error.1.contains("exact approved posting"));
+
+        let mut wrong_screenshot_hash = receipt.clone();
+        wrong_screenshot_hash["evidenceObjects"][0]["sha256"] = json!("d".repeat(64));
+        let manifest_error = validate_receipt_bundle(
+            "acct-test",
+            &application,
+            &resume,
+            &wrong_screenshot_hash,
+            &verified_objects,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(manifest_error.0, StatusCode::BAD_REQUEST);
+        assert!(manifest_error.1.contains("manifest"));
+
         let unverified = BTreeMap::new();
         let error = validate_receipt_bundle(
             "acct-test",
             &application,
-            &posting,
             &resume,
             &receipt,
             &unverified,
+            true,
         )
         .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(error.1.contains("not uploaded and verified"));
+        assert!(error.1.contains("manifest"));
+
+        let mut missing_receipt_object = receipt.clone();
+        missing_receipt_object
+            .as_object_mut()
+            .unwrap()
+            .remove("receiptObject");
+        let missing_error = validate_receipt_bundle(
+            "acct-test",
+            &application,
+            &resume,
+            &missing_receipt_object,
+            &verified_objects,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(missing_error.0, StatusCode::BAD_REQUEST);
+        assert!(missing_error.1.contains("immutable receipt object"));
+
+        let mut tampered_receipt_object = receipt.clone();
+        tampered_receipt_object["receiptObject"]["sha256"] = json!("d".repeat(64));
+        let tampered_error = validate_receipt_bundle(
+            "acct-test",
+            &application,
+            &resume,
+            &tampered_receipt_object,
+            &verified_objects,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(tampered_error.0, StatusCode::BAD_REQUEST);
+        assert!(tampered_error.1.contains("not uploaded and verified"));
+
+        let mut tampered_authority = receipt.clone();
+        tampered_authority[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            ["packet_revisions"] = json!([]);
+        let authority_error = validate_receipt_bundle(
+            "acct-test",
+            &application,
+            &resume,
+            &tampered_authority,
+            &verified_objects,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(authority_error.0, StatusCode::BAD_REQUEST);
+        assert!(authority_error.1.contains("submission authority"));
+    }
+
+    struct CertifiedReceiptValidationFixture {
+        pool: crate::db::DbPool,
+        application: JobApplication,
+        resume: ResumeVersion,
+        receipt: Value,
+        verified_objects: BTreeMap<String, String>,
+    }
+
+    fn certified_receipt_validation_fixture() -> CertifiedReceiptValidationFixture {
+        const SURFACE_SHA256: &str =
+            "a88a8916beb511abb11af4acd27242723f8387ea8bebf639dde83a5629f92a68";
+        let (mut application, _, resume, mut receipt, verified_objects) = strict_receipt_fixture();
+        let account_id = "acct-test";
+        let application_id = application.id.clone();
+        let run_id = application.run_id.clone().unwrap();
+        let target_key = "greenhouse:acme:123";
+        let target_key_sha256 = sha256_hex(target_key.as_bytes());
+        let manifest_sha256 = "2".repeat(64);
+        let activation_sha256 = "3".repeat(64);
+        let layout_observation_sha256 = "4".repeat(64);
+        let layout_set_sha256 = "7".repeat(64);
+        let adapter_bundle_sha256 = "8".repeat(64);
+        let runner_target_sha256 = "9".repeat(64);
+        let metering_reservation_sha256 = "c".repeat(64);
+        let now = chrono::Utc::now();
+        let now_ms = now.timestamp_millis();
+        let consumed_at_ms = now_ms - 1_000;
+        let expires_at_ms = now_ms + 60 * 60 * 1_000;
+        let generated_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        application.submission_mode = "auto_submit".to_string();
+        let approved_packet = application.receipt["approved_execution"]["packet"].clone();
+        let approved_job = application.receipt["approved_execution"]["job"].clone();
+        let certification_admission =
+            serde_json::to_value(jobs::AtsFrozenCertificationAdmissionProjection {
+                schema_version: 1,
+                provider: "greenhouse".to_string(),
+                adapter_version: GREENHOUSE_SUBMISSION_ADAPTER_VERSION.to_string(),
+                manifest_sha256: manifest_sha256.clone(),
+                activation_sha256: activation_sha256.clone(),
+                activation_generation: 5,
+                target_key_sha256: target_key_sha256.clone(),
+                layout_set_sha256: layout_set_sha256.clone(),
+                variant_key: "greenhouse_public".to_string(),
+                layout_contract_version: 1,
+                surface_sha256: SURFACE_SHA256.to_string(),
+                adapter_bundle_sha256: adapter_bundle_sha256.clone(),
+                runner_target_sha256s: vec![runner_target_sha256.clone()],
+                expires_at_ms,
+            })
+            .unwrap();
+        let admission = json!({
+            "kind": "track_auto_submit",
+            "authorization_id": "auto-auth-604",
+            "career_track_id": "track-test",
+            "revision_no": 4,
+            "authority_fingerprint": "1".repeat(64),
+            "ats_certification": certification_admission,
+        });
+        let approved_checksum = approved_execution_checksum_with_admission(
+            3,
+            &approved_packet,
+            &approved_job,
+            &admission,
+        )
+        .unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 3,
+            "approved_at_ms": now_ms - 5_000,
+            "checksum": approved_checksum,
+            "admission": admission,
+            "packet": approved_packet,
+            "job": approved_job,
+        });
+        let final_submit_proof = jobs::FinalSubmitProof {
+            schema_version: 4,
+            adapter: "greenhouse".to_string(),
+            adapter_version: GREENHOUSE_SUBMISSION_ADAPTER_VERSION.to_string(),
+            control: "greenhouse_submit_application".to_string(),
+            job: jobs::FinalSubmitJobProof {
+                approved_canonical_url: "https://boards.greenhouse.io/acme/jobs/123".to_string(),
+                page_url: "https://job-boards.greenhouse.io/embed/job_app?for=acme&token=123"
+                    .to_string(),
+            },
+            target: jobs::FinalSubmitTargetProof {
+                action_url: "https://job-boards.greenhouse.io/embed/job_app?for=acme&token=123"
+                    .to_string(),
+                method: "post".to_string(),
+                enctype: "multipart/form-data".to_string(),
+                form_target: "_self".to_string(),
+                provider_job_key: target_key.to_string(),
+                form_identity: r#"[0,"application_form","","application-form","","123"]"#
+                    .to_string(),
+            },
+            files: vec![jobs::FinalSubmitFileProof {
+                field_name: "resume".to_string(),
+                name: format!("resume-{}.pdf", "a".repeat(64)),
+                byte_length: 50,
+                sha256: "a".repeat(64),
+            }],
+            fields: vec![jobs::FinalSubmitFieldProof {
+                field_name: "job_id".to_string(),
+                value_byte_length: 3,
+                value_sha256: "d".repeat(64),
+            }],
+            part_order: vec![
+                jobs::FinalSubmitPartOrderProof {
+                    kind: "field".to_string(),
+                    index: 0,
+                },
+                jobs::FinalSubmitPartOrderProof {
+                    kind: "file".to_string(),
+                    index: 0,
+                },
+            ],
+            documents: vec![jobs::FinalSubmitDocumentProof {
+                kind: "resume".to_string(),
+                version_id: Some("resume-test".to_string()),
+                sha256: "a".repeat(64),
+            }],
+            certification: Some(jobs::AtsFinalSubmitCertificationProof {
+                schema_version: 1,
+                provider: "greenhouse".to_string(),
+                adapter_version: GREENHOUSE_SUBMISSION_ADAPTER_VERSION.to_string(),
+                manifest_sha256: manifest_sha256.clone(),
+                activation_sha256: activation_sha256.clone(),
+                activation_generation: 5,
+                target_key_sha256: target_key_sha256.clone(),
+                layout_set_sha256: layout_set_sha256.clone(),
+                adapter_bundle_sha256: adapter_bundle_sha256.clone(),
+                runner_target_sha256s: vec![runner_target_sha256.clone()],
+                expires_at_ms,
+            }),
+            observed_surface: Some(jobs::AtsFinalSubmitObservedSurfaceProof {
+                schema_version: 1,
+                variant_key: "greenhouse_public".to_string(),
+                layout_contract_version: 1,
+                surface_sha256: SURFACE_SHA256.to_string(),
+            }),
+        };
+        application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY] =
+            serde_json::to_value(final_submit_proof).unwrap();
+
+        let binding_id = "binding-api-receipt-604";
+        let application_attempt_id = "attempt-604";
+        let nonce_sha256 = "6".repeat(64);
+        let runtime = jobs::AtsCertificationRuntimeTarget {
+            runtime_kind: "cloud".to_string(),
+            runtime_id: "runner-test".to_string(),
+            runtime_sha256: runner_target_sha256.clone(),
+            platform: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            automation_bundle_sha256: "d".repeat(64),
+            browser_release_manifest_sha256: None,
+            browser_artifact_sha256: None,
+            browser_build_descriptor_sha256: None,
+            runner_build_id: Some("runner-build-604".to_string()),
+            runner_image_sha256: Some("e".repeat(64)),
+            playwright_version: "1.55.0".to_string(),
+            chromium_revision: "1234567".to_string(),
+            chromium_executable_sha256: "f".repeat(64),
+        };
+        let target_evidence = jobs::AtsCertificationFreshTargetEvidence {
+            canonical_url: "https://boards.greenhouse.io/acme/jobs/123".to_string(),
+            discovery_provider: "greenhouse".to_string(),
+            discovery_target_key: target_key.to_string(),
+            discovery_observed_at_ms: now_ms - 10_000,
+            original_source_provider: "greenhouse".to_string(),
+            original_source_target_key: target_key.to_string(),
+            original_source_observed_at_ms: now_ms - 10_000,
+        };
+        let certification_binding = jobs::AtsCertificationBinding {
+            binding_version: 1,
+            trust_policy_sha256: "0".repeat(64),
+            provider: "greenhouse".to_string(),
+            target_key: target_key.to_string(),
+            allowed_provider_hosts: vec![
+                "boards.greenhouse.io".to_string(),
+                "job-boards.greenhouse.io".to_string(),
+            ],
+            variant_key: "greenhouse_public".to_string(),
+            surface_sha256: SURFACE_SHA256.to_string(),
+            scope_sha256: "1".repeat(64),
+            manifest_sha256: manifest_sha256.clone(),
+            certification_id: "certification-604".to_string(),
+            manifest_generation: 4,
+            activation_sha256: activation_sha256.clone(),
+            activation_id: "activation-604".to_string(),
+            activation_generation: 5,
+            channel: "canary".to_string(),
+            channel_sequence: 5,
+            channel_head_revision: 5,
+            channel_transition_sha256: "b".repeat(64),
+            capability: "unattended_submit".to_string(),
+            account_allowlist_sha256: Some("a".repeat(64)),
+            canary_max_submissions: 10,
+            canary_account_cap: 2,
+            canary_concurrency_cap: 1,
+            canary_daily_side_effect_cap: 2,
+            adapter_version: GREENHOUSE_SUBMISSION_ADAPTER_VERSION.to_string(),
+            final_submit_control_id: "greenhouse_submit_application".to_string(),
+            adapter_bundle_sha256: adapter_bundle_sha256.clone(),
+            source_commit: "c".repeat(40),
+            layout_contract_version: 1,
+            layout_contract_sha256: "5".repeat(64),
+            layout_set_sha256: layout_set_sha256.clone(),
+            layout_observation_sha256s: vec![layout_observation_sha256.clone()],
+            evidence_sha256s: vec!["a".repeat(64)],
+            runtime_targets: vec![runtime.clone()],
+            selected_runtime: Some(runtime),
+            not_before_ms: now_ms - 60_000,
+            expires_at_ms,
+            last_verified_at_ms: now_ms - 5_000,
+        };
+        let binding_authority = jobs::AtsApplicationCertificationBindingAuthority {
+            schema_version: 1,
+            binding_id: binding_id.to_string(),
+            account_id: account_id.to_string(),
+            application_id: application_id.clone(),
+            run_id: run_id.clone(),
+            application_attempt_id: application_attempt_id.to_string(),
+            browser_session_id: run_id.clone(),
+            browser_profile_id: receipt["browserProfileId"].as_str().unwrap().to_string(),
+            packet_checksum_sha256: approved_checksum.clone(),
+            auto_authorization_id: "auto-auth-604".to_string(),
+            auto_authorization_revision: 4,
+            auto_authorization_fingerprint_sha256: "1".repeat(64),
+            target_evidence,
+            nonce_sha256: nonce_sha256.clone(),
+            certification: certification_binding,
+            requested_expires_at_ms: expires_at_ms,
+            created_at_ms: now_ms - 2_000,
+            expires_at_ms,
+        };
+        let mut canonical_binding = serde_json::to_vec(&binding_authority).unwrap();
+        canonical_binding.push(b'\n');
+        let binding_sha256 = hex::encode(Sha256::digest(&canonical_binding));
+        let frozen_certification_base64url =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&canonical_binding);
+
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-certified-receipt-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&path).unwrap();
+        crate::db::run_migrations(&pool).unwrap();
+        let connection = pool.get().unwrap();
+        // Seed the exact terminal output of Phase B without rebuilding the
+        // separately tested signed import lifecycle. The receipt validator
+        // still decodes and hashes the canonical frozen binding from storage.
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_application_ats_certification_bindings (
+                   binding_id, binding_sha256, account_id, application_id, run_id, attempt_id,
+                   browser_session_id, browser_profile_id, packet_checksum_sha256,
+                   auto_authorization_id, auto_authorization_revision,
+                   auto_authorization_fingerprint_sha256, provider, target_key,
+                   manifest_sha256, activation_sha256, layout_set_sha256,
+                   adapter_bundle_sha256, runner_target_sha256, platform, architecture,
+                   automation_bundle_sha256, browser_release_manifest_sha256,
+                   browser_artifact_sha256, browser_build_descriptor_sha256, runner_build_id,
+                   runner_image_sha256, browser_runtime_sha256, chromium_executable_sha256,
+                   nonce_sha256, frozen_certification_base64url, layout_observation_sha256,
+                   observed_surface_sha256, phase_b_request_id, phase_b_request_sha256,
+                   canary_reservation_sha256, metering_reservation_sha256, expires_at_ms,
+                   phase, fence, created_at_ms, consumed_at_ms, invalidation_kind,
+                   invalidated_at_ms
+                 ) VALUES (
+                   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                   ?16, ?17, ?18, ?19, ?20, ?21, ?22, NULL, NULL, NULL, ?23, ?24, ?25,
+                   ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, 'consumed', 1,
+                   ?36, ?37, NULL, NULL
+                 )",
+                rusqlite::params![
+                    binding_id,
+                    binding_sha256,
+                    account_id,
+                    application_id,
+                    run_id,
+                    application_attempt_id,
+                    run_id,
+                    binding_authority.browser_profile_id,
+                    approved_checksum,
+                    "auto-auth-604",
+                    4,
+                    "1".repeat(64),
+                    "greenhouse",
+                    target_key,
+                    manifest_sha256,
+                    activation_sha256,
+                    layout_set_sha256,
+                    adapter_bundle_sha256,
+                    runner_target_sha256,
+                    "linux",
+                    "x86_64",
+                    "d".repeat(64),
+                    "runner-build-604",
+                    "e".repeat(64),
+                    runner_target_sha256,
+                    "f".repeat(64),
+                    nonce_sha256,
+                    frozen_certification_base64url,
+                    layout_observation_sha256,
+                    SURFACE_SHA256,
+                    "phase-b-request-604",
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    metering_reservation_sha256,
+                    expires_at_ms,
+                    now_ms - 2_000,
+                    consumed_at_ms,
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        drop(connection);
+
+        let recovered = jobs::recover_ats_application_certification(
+            &pool,
+            &jobs::AtsCertificationRecoveryRequest {
+                binding_id: binding_id.to_string(),
+                account_id: account_id.to_string(),
+                application_id: application_id.clone(),
+                run_id: run_id.clone(),
+                application_attempt_id: application_attempt_id.to_string(),
+                nonce_sha256,
+            },
+        )
+        .unwrap();
+        receipt["schemaVersion"] = json!(2);
+        receipt["receiptId"] = json!("receipt-certified-604");
+        receipt["accountId"] = json!(account_id);
+        receipt["applicationId"] = json!(application_id);
+        receipt["runId"] = json!(run_id);
+        receipt["runner"] = json!("cloud");
+        receipt["generatedAt"] = json!(generated_at);
+        receipt["finalUrl"] = json!("https://boards.greenhouse.io/acme/jobs/123/confirmation");
+        receipt["result"] = json!({
+            "status": "submitted",
+            "issues": [],
+            "submitHttpStatus": 302,
+            "confirmationText": "Thank you for applying. Your application was received.",
+            "confirmationUrl": "https://boards.greenhouse.io/acme/jobs/123/confirmation",
+            "submittedAt": generated_at,
+        });
+        receipt["events"] = json!([{
+            "type": "greenhouse_state_transition",
+            "occurredAt": generated_at,
+            "detail": {
+                "state": "receipt",
+                "status": "submitted",
+                "capability": "beta_review",
+            },
+        }]);
+        receipt["atsCertifiedReceiptAuthority"] =
+            serde_json::to_value(&recovered.ats_certified_receipt_authority).unwrap();
+        receipt["packet"]["approvedPacketChecksum"] = json!(approved_checksum);
+        receipt["packet"]["approvedExecutionSchemaVersion"] = json!(3);
+        receipt["packet"]["approvedExecutionAdmission"] = admission;
+        receipt["receiptObject"]["schemaVersion"] = json!(2);
+        receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"] =
+            application.receipt.clone();
+        receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceiptSha256"] =
+            json!(jobs::submission_pre_receipt_sha256(&application.receipt).unwrap());
+
+        CertifiedReceiptValidationFixture {
+            pool,
+            application,
+            resume,
+            receipt,
+            verified_objects,
+        }
+    }
+
+    fn validate_complete_certified_receipt(
+        fixture: &CertifiedReceiptValidationFixture,
+        receipt: &Value,
+    ) -> Result<jobs::AtsCertifiedReceiptAuthority, ApiError> {
+        let authority = validate_receipt_ats_certification_authority(
+            &fixture.pool,
+            &fixture.application,
+            receipt,
+            "acct-test",
+            "app-test",
+            "run-test",
+            "cloud",
+        )?;
+        let claim_ids = frozen_submission_claim_ids(&fixture.application)?;
+        validate_receipt_verified_claim_ids(receipt, &claim_ids)?;
+        validate_provider_submission_proof(&fixture.application, receipt)?;
+        validate_receipt_final_submit_proof(&fixture.application, receipt)?;
+        validate_receipt_bundle(
+            "acct-test",
+            &fixture.application,
+            &fixture.resume,
+            receipt,
+            &fixture.verified_objects,
+            true,
+        )?;
+        Ok(authority)
+    }
+
+    #[test]
+    fn submitted_certified_receipt_classifies_from_authenticated_frozen_authority() {
+        let fixture = certified_receipt_validation_fixture();
+        assert!(receipt_has_frozen_certification("acct-test", &fixture.application).unwrap());
+
+        let mut submitted = fixture.application;
+        submitted.state = "submitted".to_string();
+        submitted.receipt = fixture.receipt;
+        assert!(!jobs::application_has_frozen_ats_certification(&submitted));
+        assert!(receipt_has_frozen_certification("acct-test", &submitted).unwrap());
+        // The original submitted record is still used for terminal ATS validation:
+        // its stored proof accessor resolves the authenticated nested snapshot.
+        validate_receipt_ats_certification_authority(
+            &fixture.pool,
+            &submitted,
+            &submitted.receipt,
+            "acct-test",
+            "app-test",
+            "run-test",
+            "cloud",
+        )
+        .unwrap();
+
+        let mut corrupt = submitted.clone();
+        corrupt.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceiptSha256"] =
+            json!("0".repeat(64));
+        assert_eq!(
+            receipt_has_frozen_certification("acct-test", &corrupt)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            receipt_has_frozen_certification("foreign-account", &submitted)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let review = authenticated_submitted_application_fixture(&"a".repeat(64));
+        assert!(!receipt_has_frozen_certification("acct-test", &review).unwrap());
+    }
+
+    #[test]
+    fn certified_receipt_evidence_keeps_bundle_and_payload_versions_separate() {
+        let fixture = certified_receipt_validation_fixture();
+        validate_complete_certified_receipt(&fixture, &fixture.receipt).unwrap();
+        let receipt_id = fixture.receipt["receiptId"].as_str().unwrap();
+        let evidence = submission_evidence_records(
+            &fixture.application.id,
+            receipt_id,
+            "greenhouse",
+            &fixture.receipt["job"],
+            &fixture.resume,
+            &fixture.receipt,
+            &fixture.verified_objects,
+            302,
+            "Application received".to_string(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let bundle = evidence
+            .iter()
+            .find(|item| item.kind == "application_receipt")
+            .unwrap();
+        assert_eq!(bundle.metadata["schema_version"], json!(1));
+        assert_eq!(fixture.receipt["receiptObject"]["schemaVersion"], json!(2));
+
+        let mut submitted = fixture.application;
+        submitted.receipt = fixture.receipt.clone();
+        assert!(validate_receipt_evidence_record(&submitted, bundle, receipt_id).is_ok());
+        submitted.receipt["receiptObject"]["schemaVersion"] = json!(1);
+        assert!(validate_receipt_evidence_record(&submitted, bundle, receipt_id).is_err());
+        submitted.receipt["schemaVersion"] = json!(3);
+        submitted.receipt["receiptObject"]["schemaVersion"] = json!(3);
+        assert!(validate_receipt_evidence_record(&submitted, bundle, receipt_id).is_err());
+        submitted.receipt = fixture.receipt.clone();
+        let mut invalid_bundle = bundle.clone();
+        invalid_bundle.metadata["schema_version"] = json!(2);
+        assert!(validate_receipt_evidence_record(&submitted, &invalid_bundle, receipt_id).is_err());
+    }
+
+    #[test]
+    fn interview_prep_uses_exact_certified_receipt_and_rejects_drift() {
+        use crate::api::jobs_interview_prep::build_interview_prep_source_for_account;
+
+        let mut fixture = certified_receipt_validation_fixture();
+        // The durable browser document includes the media type used for readback.
+        fixture.receipt["documents"][0]["mediaType"] = json!("application/pdf");
+        validate_complete_certified_receipt(&fixture, &fixture.receipt).unwrap();
+        let receipt_id = fixture.receipt["receiptId"].as_str().unwrap();
+        let evidence = submission_evidence_records(
+            &fixture.application.id,
+            receipt_id,
+            "greenhouse",
+            &fixture.receipt["job"],
+            &fixture.resume,
+            &fixture.receipt,
+            &fixture.verified_objects,
+            302,
+            "Application received".to_string(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut submitted = fixture.application;
+        submitted.state = "submitted".to_string();
+        submitted.submitted_at_ms = Some(1);
+        submitted.receipt = fixture.receipt;
+        let assert_prep = |application: &JobApplication, resume: &ResumeVersion, rows: &[_]| {
+            build_interview_prep_source_for_account(
+                &fixture.pool,
+                "acct-test",
+                application,
+                resume,
+                rows,
+            )
+        };
+        if let Err(error) = assert_prep(&submitted, &fixture.resume, &evidence) {
+            panic!("stored certified receipt could not prepare: {error:?}");
+        }
+
+        let mut wrong_admission = submitted.clone();
+        wrong_admission.receipt["packet"]["approvedExecutionAdmission"]["revision_no"] = json!(99);
+        let mut wrong_terminal_binding = submitted.clone();
+        wrong_terminal_binding.receipt["atsCertifiedReceiptAuthority"]["bindingFence"] = json!(99);
+        let mut wrong_object_version = submitted.clone();
+        wrong_object_version.receipt["receiptObject"]["schemaVersion"] = json!(1);
+        for application in [
+            wrong_admission,
+            wrong_terminal_binding,
+            wrong_object_version,
+        ] {
+            assert!(assert_prep(&application, &fixture.resume, &evidence).is_err());
+        }
+
+        let mut changed_resume = fixture.resume.clone();
+        changed_resume.content = json!({"summary": "Post-submission edit"});
+        assert!(assert_prep(&submitted, &changed_resume, &evidence).is_err());
+        let missing_confirmation = evidence
+            .into_iter()
+            .filter(|row| row.kind != "submission_confirmation")
+            .collect::<Vec<_>>();
+        assert!(assert_prep(&submitted, &fixture.resume, &missing_confirmation).is_err());
+    }
+
+    #[test]
+    fn schema_four_certified_receipt_requires_exact_terminal_and_evidence_authority() {
+        let fixture = certified_receipt_validation_fixture();
+        let proof = jobs::stored_final_submit_proof(&fixture.application).unwrap();
+        assert_eq!(proof.schema_version, 4);
+        assert_eq!(fixture.receipt["schemaVersion"], json!(2));
+        let exact = validate_complete_certified_receipt(&fixture, &fixture.receipt).unwrap();
+        assert_eq!(
+            serde_json::to_value(exact).unwrap(),
+            fixture.receipt["atsCertifiedReceiptAuthority"]
+        );
+
+        let mut wrong_document = fixture.receipt.clone();
+        wrong_document["documents"][0]["sha256"] = json!("f".repeat(64));
+        let document_error =
+            validate_complete_certified_receipt(&fixture, &wrong_document).unwrap_err();
+        assert_eq!(document_error.0, StatusCode::BAD_REQUEST);
+        assert!(document_error.1.contains("pre-click proof"));
+
+        let mut wrong_screenshot = fixture.receipt.clone();
+        wrong_screenshot["screenshotKeys"][0] =
+            json!("accounts/acct-test/jobs/app-test/different-confirmation.png");
+        let screenshot_error =
+            validate_complete_certified_receipt(&fixture, &wrong_screenshot).unwrap_err();
+        assert_eq!(screenshot_error.0, StatusCode::BAD_REQUEST);
+        assert!(screenshot_error.1.contains("manifest"));
+
+        let mut wrong_confirmation = fixture.receipt.clone();
+        wrong_confirmation["result"]["confirmationUrl"] =
+            json!("https://boards.greenhouse.io/acme/jobs/other/confirmation");
+        let confirmation_error =
+            validate_complete_certified_receipt(&fixture, &wrong_confirmation).unwrap_err();
+        assert_eq!(confirmation_error.0, StatusCode::BAD_REQUEST);
+        assert!(confirmation_error.1.contains("approved provider"));
+
+        for (field, value) in [
+            ("applicationAttemptId", json!("attempt-other")),
+            ("meteringReservationSha256", json!("e".repeat(64))),
+        ] {
+            let mut mismatch = fixture.receipt.clone();
+            mismatch["atsCertifiedReceiptAuthority"][field] = value;
+            let terminal_error =
+                validate_complete_certified_receipt(&fixture, &mismatch).unwrap_err();
+            assert_eq!(terminal_error.0, StatusCode::CONFLICT, "{field}");
+            assert!(terminal_error.1.contains("exact terminal server record"));
+        }
     }
 }

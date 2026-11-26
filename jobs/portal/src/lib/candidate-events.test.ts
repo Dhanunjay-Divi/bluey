@@ -2,9 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { CandidateEvent } from "../types";
 import {
   applicationIssues,
-  isJobPassed,
   latestApplicationOutcome,
-  latestMatchFeedback,
+  passedMatchJobIds,
 } from "./candidate-events";
 
 function event(overrides: Partial<CandidateEvent>): CandidateEvent {
@@ -29,8 +28,7 @@ describe("candidate event projections", () => {
       event({ id: "restore", action: "restore", created_at_ms: 20 }),
     ];
 
-    expect(latestMatchFeedback(events, "job-1")?.id).toBe("restore");
-    expect(isJobPassed(events, "job-1")).toBe(false);
+    expect(passedMatchJobIds(events).has("job-1")).toBe(false);
   });
 
   it("projects the latest user-confirmed outcome without changing application state", () => {
@@ -40,6 +38,28 @@ describe("candidate event projections", () => {
     ];
 
     expect(latestApplicationOutcome(events, "app-1")?.action).toBe("offer");
+  });
+
+  it("indexes feedback with the same latest-event and timestamp tie rules", () => {
+    const events = [
+      event({ id: "a", job_id: "tie", action: "pass", created_at_ms: 20 }),
+      event({ id: "z", job_id: "tie", action: "restore", created_at_ms: 20 }),
+      event({ id: "older", job_id: "other", action: "restore", created_at_ms: 10 }),
+      event({ id: "newer", job_id: "other", action: "pass", created_at_ms: 20 }),
+      event({ job_id: "other", event_type: "application_issue", action: "restore", created_at_ms: 30 }),
+      event({ job_id: undefined }),
+    ];
+    for (const rows of [events, [...events].reverse()]) {
+      expect([...passedMatchJobIds(rows)]).toEqual(["other"]);
+    }
+  });
+
+  it("retains feedback for a job outside the currently loaded posting page", () => {
+    const rows = [
+      event({ job_id: "loaded", action: "restore" }),
+      event({ job_id: "not-on-this-page", action: "pass" }),
+    ];
+    expect([...passedMatchJobIds(rows)]).toEqual(["not-on-this-page"]);
   });
 
   it("returns only issues for the selected application in newest-first order", () => {

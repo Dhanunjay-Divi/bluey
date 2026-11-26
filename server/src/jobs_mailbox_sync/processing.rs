@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::db::jobs::JobDiscoveryEvidence;
 use crate::db::{
     jobs::{
         self, ApplicationEvidence, Intervention, JobApplication, JobPosting, JobsProviderMessage,
@@ -420,6 +422,7 @@ mod tests {
             status: "matched".to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
         }
     }

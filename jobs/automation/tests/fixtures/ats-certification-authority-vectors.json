@@ -1,0 +1,212 @@
+{
+  "schemaVersion": 1,
+  "vectors": [
+    {
+      "name": "trust_policy",
+      "kind": "trustPolicy",
+      "authority": {
+        "version": 1,
+        "audience": "bluey-jobs-ats-certification-trust-policy-v1",
+        "policyId": "policy-vector-v1",
+        "trustGeneration": 1,
+        "predecessorPolicySha256": null,
+        "delegatedTrust": {
+          "roles": {
+            "activation": {
+              "threshold": 1,
+              "keys": { "activation-key-v1": "AQID" }
+            },
+            "layout_observation": {
+              "threshold": 1,
+              "keys": { "layout-key-v1": "BAUG" }
+            },
+            "manifest": {
+              "threshold": 1,
+              "keys": { "manifest-key-v1": "BwgJ" }
+            },
+            "revocation": {
+              "threshold": 1,
+              "keys": { "revocation-key-v1": "CgsM" }
+            }
+          }
+        },
+        "certificationRequirements": {
+          "allowedProviders": ["greenhouse", "lever"],
+          "suiteId": "bluey-jobs-ats-certification-v1",
+          "requiredCheckIds": [],
+          "requiredEvidenceClasses": ["authorized_sandbox"],
+          "maximumManifestLifetimeMs": 604800000,
+          "maximumClockSkewMs": 300000,
+          "maximumManifestSizeBytes": 65536,
+          "maximumTargetCount": 2,
+          "maximumObservationCount": 32,
+          "maximumEvidenceObjectCount": 32
+        },
+        "issuedAtMs": 2000000000000,
+        "validFromMs": 2000000000000,
+        "expiresAtMs": 2000604800000
+      },
+      "sha256": "1890e85dbaa95e908e04a92e2fec20dea4534a36a890a194ab5a8792891d9917"
+    },
+    {
+      "name": "layout_observation",
+      "kind": "layoutObservation",
+      "authority": {
+        "version": 1,
+        "audience": "bluey-jobs-ats-layout-observation-v1",
+        "observationId": "layout-vector-v1",
+        "policySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "provider": "greenhouse",
+        "targetFingerprintSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pageVariant": "public",
+        "surfaceSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "adapterVersion": "2026.07.1-beta.1",
+        "runnerTargetSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "evidenceClass": "authorized_sandbox",
+        "controls": [
+          {
+            "controlKind": "submit",
+            "required": true,
+            "providerAttributeSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "optionCount": 0,
+            "conditionalOnAttributeSha256": null
+          }
+        ],
+        "form": {
+          "method": "post",
+          "encoding": "multipart/form-data",
+          "targetSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "actionIdentitySha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "submitControlSha256": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "challengeCategories": ["captcha"],
+        "stepCount": 1,
+        "confirmationStateCategories": ["provider_success"],
+        "predecessorObservationSha256": null,
+        "observedAtMs": 2000000000000,
+        "issuedAtMs": 2000000001000,
+        "expiresAtMs": 2000604800000
+      },
+      "sha256": "9f9959d39e7bd69c3055d55a2310c05be15b34a7fb8ad5c3f26c12f5f7bc5d1b"
+    },
+    {
+      "name": "manifest",
+      "kind": "manifest",
+      "authority": {
+        "version": 1,
+        "audience": "bluey-jobs-ats-certification-manifest-v1",
+        "certificationId": "greenhouse-acme-123-vector-v1",
+        "policySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "manifestGeneration": 1,
+        "predecessorManifestSha256": null,
+        "provider": "greenhouse",
+        "targetKey": "greenhouse:acme:123",
+        "allowedProviderHosts": [
+          "boards.greenhouse.io",
+          "job-boards.greenhouse.io"
+        ],
+        "variantKey": "public",
+        "surfaceSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "scopeSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "adapterVersion": "2026.07.1-beta.1",
+        "finalSubmitControlId": "greenhouse_submit_application",
+        "adapterBundleSha256": "4444444444444444444444444444444444444444444444444444444444444444",
+        "sourceCommit": "5555555555555555555555555555555555555555555555555555555555555555",
+        "layoutContractVersion": 1,
+        "layoutContractSha256": "6666666666666666666666666666666666666666666666666666666666666666",
+        "maximumCapability": "auto_submit",
+        "certificationProfile": {
+          "suiteId": "bluey-jobs-ats-certification-v1",
+          "suiteVersion": "1.0.0",
+          "suiteManifestSha256": "7777777777777777777777777777777777777777777777777777777777777777",
+          "layoutSetSha256": "8888888888888888888888888888888888888888888888888888888888888888",
+          "layoutObservationSha256s": [
+            "9999999999999999999999999999999999999999999999999999999999999999"
+          ],
+          "checkResults": [],
+          "zeroTolerance": {
+            "hardFilterViolations": 0,
+            "unsupportedFactualClaims": 0,
+            "duplicateSubmitActivations": 0,
+            "falseSubmittedStates": 0,
+            "incompleteOrMismatchedReceipts": 0,
+            "piiBearingObservations": 0
+          }
+        },
+        "evidenceSha256s": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "runtimeTargets": [
+          {
+            "runtimeKind": "local",
+            "runtimeId": "darwin-arm64-vector-v1",
+            "runtimeSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "platform": "darwin",
+            "architecture": "arm64",
+            "automationBundleSha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "browserReleaseManifestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "browserArtifactSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "browserBuildDescriptorSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "runnerBuildId": null,
+            "runnerImageSha256": null,
+            "playwrightVersion": "1.54.1",
+            "chromiumRevision": "139.0.7258.5",
+            "chromiumExecutableSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+          }
+        ],
+        "testedAtMs": 2000000000000,
+        "issuedAtMs": 2000000001000,
+        "notBeforeMs": 2000000001000,
+        "expiresAtMs": 2000604800000
+      },
+      "sha256": "afdf9188de070a36c0020cdc47bf4717b46c763e58125f5400f2fec95f4f8913"
+    },
+    {
+      "name": "activation",
+      "kind": "activation",
+      "authority": {
+        "version": 1,
+        "audience": "bluey-jobs-ats-certification-activation-v1",
+        "activationId": "activation-vector-v1",
+        "policySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "activationGeneration": 1,
+        "predecessorActivationSha256": null,
+        "manifestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "scopeSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "channel": "canary",
+        "channelSequence": 1,
+        "capability": "auto_submit",
+        "accountAllowlistSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "canaryMaxSubmissions": 2,
+        "canaryAccountCap": 1,
+        "canaryConcurrencyCap": 1,
+        "canaryDailySideEffectCap": 2,
+        "canaryEvidenceManifestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "approvalRef": "approval-vector-v1",
+        "issuedAtMs": 2000000002000,
+        "notBeforeMs": 2000000002000,
+        "expiresAtMs": 2000604800000
+      },
+      "sha256": "edda93cec15066343cf2585a4b614c196b36351f5865c70ef74c591785ca14f1"
+    },
+    {
+      "name": "revocation",
+      "kind": "revocation",
+      "authority": {
+        "version": 1,
+        "audience": "bluey-jobs-ats-certification-revocation-v1",
+        "revocationId": "revocation-vector-v1",
+        "policySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "revocationGeneration": 1,
+        "predecessorRevocationSha256": null,
+        "subjectKind": "manifest",
+        "subjectId": "greenhouse-acme-123-vector-v1",
+        "subjectSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "reasonRef": "incident-vector-v1",
+        "issuedAtMs": 2000000003000,
+        "effectiveAtMs": 2000000003000
+      },
+      "sha256": "310920fa585ac63f07c258b9e5d533e405d842b476014bae157d520e4f654c12"
+    }
+  ]
+}

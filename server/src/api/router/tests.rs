@@ -6,6 +6,206 @@ mod story_grounding;
 
 static FIRST_TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn jobs_interview_prep_uses_a_fixed_unenriched_plan() {
+    assert!(CompletionScope::General.fixed_answer_plan().is_none());
+    let plan = CompletionScope::JobsInterviewPrep
+        .fixed_answer_plan()
+        .unwrap();
+    assert_eq!(plan.intent, AnswerIntent::Writing);
+    assert_eq!(plan.output, AnswerOutput::Compact);
+    assert_eq!(plan.recommended_lane, "balanced");
+    assert!(!plan.interview_context);
+    assert!(!plan.needs_screen && !plan.needs_docs && !plan.needs_transcript);
+    assert!(!plan.needs_memory && !plan.needs_web_search);
+}
+
+#[test]
+fn jobs_interview_prep_request_namespace_is_reserved() {
+    let fingerprint = "ab".repeat(32);
+    let private_id = format!("{JOBS_INTERVIEW_PREP_REQUEST_PREFIX}{fingerprint}");
+    assert!(is_jobs_interview_prep_request_id(&private_id));
+    assert!(!is_jobs_interview_prep_request_id(
+        &private_id.to_ascii_uppercase()
+    ));
+    assert!(!is_jobs_interview_prep_request_id(&format!(
+        "{private_id}0"
+    )));
+    assert!(!is_jobs_interview_prep_request_id(&format!(
+        "{JOBS_INTERVIEW_PREP_REQUEST_PREFIX}{}",
+        "AB".repeat(32)
+    )));
+    let (status, Json(error)) = reject_jobs_interview_prep_request_id(&private_id).unwrap_err();
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.reason.as_deref(), Some("reserved_request_id"));
+    assert!(reject_jobs_interview_prep_request_id(&format!("client-{private_id}")).is_ok());
+    assert!(reject_jobs_interview_prep_request_id(&format!(
+        "jobs-interview-prep-v2-{fingerprint}"
+    ))
+    .is_ok());
+}
+
+#[test]
+fn jobs_interview_prep_cache_never_relabels_an_ordinary_completion() {
+    let response = CompleteResponse {
+        text: "Synthetic draft".into(),
+        provider: "fake".into(),
+        model: "fake".into(),
+        input_tokens: 10,
+        output_tokens: 20,
+        cost_cents: 1,
+        balance_cents_after: 9,
+        trial_seconds_remaining: 0,
+        artifact_type: None,
+        artifact_body: None,
+        cost_label: None,
+        confidence: None,
+        sources: Vec::new(),
+    };
+    let general = CompletionScope::General;
+    let jobs = CompletionScope::JobsInterviewPrep;
+    let ordinary_cache = general.encode_cached(&response).unwrap();
+    let jobs_cache = jobs.encode_cached(&response).unwrap();
+    assert!(jobs.decode_cached(&ordinary_cache).is_err());
+    assert_eq!(jobs.decode_cached(&jobs_cache).unwrap().text, response.text);
+    let wrong_scope = serde_json::to_string(&("old-scope", &response)).unwrap();
+    assert!(jobs.decode_cached(&wrong_scope).is_err());
+}
+
+#[test]
+fn jobs_interview_prep_admission_failure_can_retry_but_terminal_rows_stay() {
+    use idempotency::ReserveOutcome::{CachedComplete, CachedFailed, FreshReservation};
+
+    let pool = temp_pool();
+    let account = make_account(&pool, "prep-retry@example.invalid");
+    let scope = CompletionScope::JobsInterviewPrep;
+    let request = format!("{}{}", JOBS_INTERVIEW_PREP_REQUEST_PREFIX, "ab".repeat(32));
+    assert_eq!(
+        idempotency::reserve(&pool, &account, &request).unwrap(),
+        FreshReservation
+    );
+    scope.finish_before_dispatch_failure(&pool, &account, &request);
+    assert_eq!(
+        idempotency::reserve(&pool, &account, &request).unwrap(),
+        FreshReservation
+    );
+
+    idempotency::mark_failed(&pool, &account, &request).unwrap();
+    scope.finish_before_dispatch_failure(&pool, &account, &request);
+    assert_eq!(
+        idempotency::reserve(&pool, &account, &request).unwrap(),
+        CachedFailed
+    );
+
+    let finished = format!("{}{}", JOBS_INTERVIEW_PREP_REQUEST_PREFIX, "cd".repeat(32));
+    assert_eq!(
+        idempotency::reserve(&pool, &account, &finished).unwrap(),
+        FreshReservation
+    );
+    idempotency::mark_complete(&pool, &account, &finished, "finished").unwrap();
+    scope.finish_before_dispatch_failure(&pool, &account, &finished);
+    assert_eq!(
+        idempotency::reserve(&pool, &account, &finished).unwrap(),
+        CachedComplete("finished".into())
+    );
+
+    assert_eq!(
+        idempotency::reserve(&pool, &account, "general").unwrap(),
+        FreshReservation
+    );
+    CompletionScope::General.finish_before_dispatch_failure(&pool, &account, "general");
+    assert_eq!(
+        idempotency::reserve(&pool, &account, "general").unwrap(),
+        CachedFailed
+    );
+}
+
+#[test]
+fn jobs_interview_prep_provider_errors_never_copy_detail_into_router_diagnostics() {
+    let error = anyhow::anyhow!("synthetic confidential input echoed by provider");
+    assert_eq!(
+        CompletionScope::JobsInterviewPrep.upstream_failure_detail(&error),
+        "redacted_private_prep_provider_error"
+    );
+    assert_eq!(
+        CompletionScope::General.upstream_failure_detail(&error),
+        error.to_string()
+    );
+}
+
+#[tokio::test]
+async fn jobs_interview_prep_can_reserve_same_draft_after_balance_is_restored() {
+    use idempotency::ReserveOutcome::FreshReservation;
+
+    let (pool, config) = crate::api::provisioning_router_tests::fixture();
+    crate::db::run_migrations(&pool).unwrap();
+    let account = Account::create_with_admin_and_trial_seconds(
+        &pool,
+        "prep-balance-retry@example.invalid",
+        "unused-test-hash",
+        false,
+        0,
+    )
+    .unwrap();
+    let state = AppState {
+        pool,
+        config: std::sync::Arc::new(config),
+        rate_limiters: crate::rate_limit::RateLimiters::default(),
+        provider_health: crate::provider_health::ProviderHealth::default(),
+    };
+    let request = format!("{}{}", JOBS_INTERVIEW_PREP_REQUEST_PREFIX, "ab".repeat(32));
+    let scope = CompletionScope::JobsInterviewPrep;
+    assert_eq!(
+        idempotency::reserve(&state.pool, &account.id, &request).unwrap(),
+        FreshReservation
+    );
+    let Err(error) = reserve_llm_usage(&state, &account, &request, 10, "llm", scope) else {
+        panic!("unfunded synthetic request reserved usage");
+    };
+    let (status, Json(error)) = *error;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(error.reason.as_deref(), Some("insufficient_balance"));
+    assert_eq!(
+        balance::current_balance(&state.pool, &account.id).unwrap(),
+        0
+    );
+    let count: i64 = state
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM usage_reservations WHERE account_id = ?1 AND request_id = ?2",
+            rusqlite::params![account.id, request],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+
+    state
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET balance_cents = 10 WHERE id = ?1",
+            [&account.id],
+        )
+        .unwrap();
+    assert_eq!(
+        idempotency::reserve(&state.pool, &account.id, &request).unwrap(),
+        FreshReservation
+    );
+    let Ok(reservation) = reserve_llm_usage(&state, &account, &request, 10, "llm", scope) else {
+        panic!("funded synthetic request could not reserve usage");
+    };
+    assert_eq!(reservation.reserved_cents, 10);
+    assert_eq!(reservation.attempt, 1);
+    release_llm_usage(&state.pool, &account.id, &request, "synthetic_cleanup");
+    assert_eq!(
+        balance::current_balance(&state.pool, &account.id).unwrap(),
+        10
+    );
+}
+
 fn png_data_url(width: u32, height: u32) -> String {
     let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
     bytes.extend_from_slice(&13_u32.to_be_bytes());

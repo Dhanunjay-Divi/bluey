@@ -4,6 +4,8 @@ import type {
   ApplicationPacket,
   BrowserLocator,
   BrowserPage,
+  EffectiveSubmitTargetIdentity,
+  ExactSubmitFormEvidence,
   FormControl,
   InterventionRequest,
   NormalizedJob,
@@ -12,11 +14,25 @@ import type {
 } from "../contracts.js";
 import {
   checkedExpectation,
+  exactSubmitFileEvidence,
+  exactSubmitTrustedFieldValues,
   fileExpectation,
   type FormFillExpectation,
   valueExpectation,
   verifyFillExpectations,
 } from "../form-readback.js";
+import {
+  assertApprovedProviderJob,
+  assertApprovedProviderJobOrConfirmation,
+  captureEffectiveSubmitTarget,
+  isApprovedProviderConfirmation,
+  sameEffectiveSubmitTarget,
+  sameExactSubmitFields,
+  sameExactSubmitPartOrder,
+} from "../effective-submit-target.js";
+import { ExactSubmitEvidenceError } from "../trusted-submit.js";
+import { hasNegativeSubmissionOutcome } from "../submission-confirmation.js";
+import { parseProviderApplicationTarget } from "../ats-target.js";
 
 export const GREENHOUSE_ADAPTER_PROFILE = Object.freeze({
   kind: "greenhouse",
@@ -85,8 +101,6 @@ interface FieldRule {
   aliases: string[];
 }
 
-const OFFICIAL_HOSTS = new Set(["boards.greenhouse.io", "job-boards.greenhouse.io"]);
-
 const APPLY_SELECTORS = [
   "#apply_button",
   "a#apply_button",
@@ -105,6 +119,19 @@ const SUBMIT_SELECTORS = [
   "button[type='submit']:has-text('Submit Application')",
   "input[type='submit'][value*='Submit']",
 ];
+
+const SUBMIT_IDENTITY_ATTRIBUTES = [
+  "id",
+  "name",
+  "type",
+  "value",
+  "data-testid",
+  "data-qa",
+  "formaction",
+  "aria-label",
+  "disabled",
+  "aria-disabled",
+] as const;
 
 const EMBEDDED_MARKERS: Array<{ selector: string; weight: number; providerBound?: boolean }> = [
   { selector: "iframe[src*='greenhouse.io/embed/job_app']", weight: 3, providerBound: true },
@@ -154,6 +181,15 @@ const CONFIRMATION_PATTERNS = [
   /^we(?:'ve| have) received your application\b/i,
 ];
 
+const VISIBLE_FORM_ERROR_PATTERNS = [
+  /please (?:complete|fill (?:out )?)\s+all required fields/i,
+  /please enter a valid email(?: address)?/i,
+  /there (?:was|were) (?:an error|errors) (?:with|submitting) your application/i,
+  /correct the highlighted fields/i,
+  /unable to submit (?:the |your )?application/i,
+  /could not submit (?:the |your )?application/i,
+];
+
 const CLOSED_PATTERNS = [
   /this (?:job|position|posting) is no longer available/i,
   /this (?:job|position|posting) (?:has been|is) closed/i,
@@ -197,20 +233,15 @@ const CHALLENGES: Array<{
   },
 ];
 
-export function detectGreenhouseUrl(rawUrl: URL | string): GreenhouseDetection | undefined {
-  let url: URL;
-  try {
-    url = typeof rawUrl === "string" ? new URL(rawUrl) : rawUrl;
-  } catch {
-    return undefined;
-  }
-  if (url.protocol !== "https:" || !OFFICIAL_HOSTS.has(url.hostname.toLowerCase())) return undefined;
-
-  const embedded = /^\/embed\/(?:job_app|job_board)\b/i.test(url.pathname);
+export function detectGreenhouseUrl(rawUrl: string): GreenhouseDetection | undefined {
+  const target = parseProviderApplicationTarget(rawUrl)
+    ?? parseProviderApplicationTarget(rawUrl, "confirmation");
+  if (!target || target.provider !== "greenhouse") return undefined;
+  const embedded = target.variant === "greenhouse_embedded";
   return {
     variant: embedded ? "embedded" : "public",
     source: "official_url",
-    tenant: tenantFromUrl(url, embedded),
+    tenant: target.tenant,
   };
 }
 
@@ -282,6 +313,15 @@ export class GreenhouseApplicationStateMachine {
   async prepare(): Promise<void> {
     if (this.current.name === "receipt") return;
     this.expectState("prepare");
+    await this.context.page.installExactSubmitGuard(
+      "greenhouse",
+      this.context.approvedCanonicalUrl,
+    );
+    assertApprovedProviderJobOrConfirmation(
+      "greenhouse",
+      this.context.approvedCanonicalUrl,
+      this.context.page.url(),
+    );
     const challenge = await detectChallenge(this.context.page);
     if (challenge) {
       await this.finish(interventionReceipt(challenge));
@@ -329,12 +369,22 @@ export class GreenhouseApplicationStateMachine {
       }
     }
 
+    assertApprovedProviderJob(
+      "greenhouse",
+      this.context.approvedCanonicalUrl,
+      this.context.page.url(),
+    );
+    await this.context.page.beginExactSubmitGuard();
     await this.move({ name: "fill", detection: this.requireDetection(), formOpened });
   }
 
   async fill(): Promise<void> {
     if (this.current.name === "receipt") return;
     this.expectState("fill");
+    await this.context.page.installExactSubmitGuard(
+      "greenhouse",
+      this.context.approvedCanonicalUrl,
+    );
     const challenge = await detectChallenge(this.context.page);
     if (challenge) {
       await this.finish(interventionReceipt(challenge));
@@ -345,20 +395,36 @@ export class GreenhouseApplicationStateMachine {
       return;
     }
 
+    assertApprovedProviderJob(
+      "greenhouse",
+      this.context.approvedCanonicalUrl,
+      this.context.page.url(),
+    );
+    await this.context.page.beginExactSubmitGuard();
+
     const controls = await this.readControls();
     if (!controls) return;
     this.fillExpectations = [];
     let filledFieldCount = 0;
+    const handledRadioGroups = new Set<string>();
     for (const control of controls) {
-      if (control.kind === "hidden" || control.kind === "other" || hasControlValue(control)) continue;
+      if (control.kind === "hidden" || control.kind === "other") continue;
       if (manualReviewKind(control)) continue;
 
       if (control.kind === "file") {
         const path = documentPath(control, this.context.packet);
         if (path) {
-          await this.context.page.locator(control.selector).setInputFiles([path]);
-          this.fillExpectations.push(fileExpectation(control, displayField(control), path));
-          filledFieldCount += 1;
+          let selectedFiles = control.files ?? [];
+          if (!hasControlValue(control)) {
+            selectedFiles = await this.context.page.locator(control.selector).setInputFiles([path]);
+            filledFieldCount += 1;
+          }
+          this.fillExpectations.push(fileExpectation(
+            control,
+            displayField(control),
+            path,
+            selectedFiles,
+          ));
         }
         continue;
       }
@@ -369,27 +435,47 @@ export class GreenhouseApplicationStateMachine {
       if (control.kind === "select") {
         const option = bestOption(control, answer);
         if (option !== undefined) {
-          await locator.selectOption(option);
           this.fillExpectations.push(valueExpectation(control, displayField(control), option));
-          filledFieldCount += 1;
+          if (!hasControlValue(control)) {
+            await locator.selectOption(option);
+            filledFieldCount += 1;
+          }
         }
       } else if (control.kind === "radio") {
-        if (radioMatches(control, answer)) {
-          await locator.setChecked(true);
-          this.fillExpectations.push(checkedExpectation(control, displayField(control), true));
+        const group = control.name || control.selector;
+        if (handledRadioGroups.has(group)) continue;
+        handledRadioGroups.add(group);
+        const groupControls = controls.filter((candidate) => candidate.kind === "radio"
+          && (candidate.name || candidate.selector) === group);
+        const matchingControl = groupControls.find((candidate) => radioMatches(candidate, answer));
+        if (!matchingControl) continue;
+        for (const candidate of groupControls) {
+          this.fillExpectations.push(checkedExpectation(
+            candidate,
+            displayField(candidate),
+            candidate.selector === matchingControl.selector,
+          ));
+        }
+        if (!groupControls.some((candidate) => candidate.checked)) {
+          await this.context.page.locator(matchingControl.selector).setChecked(true);
           filledFieldCount += 1;
         }
       } else if (control.kind === "checkbox") {
         const checked = booleanAnswer(answer);
-        await locator.setChecked(checked);
         this.fillExpectations.push(checkedExpectation(control, displayField(control), checked));
-        filledFieldCount += 1;
+        if (Boolean(control.checked) !== checked && !hasControlValue(control)) {
+          await locator.setChecked(checked);
+          filledFieldCount += 1;
+        }
       } else {
-        await locator.fill(answer);
         this.fillExpectations.push(valueExpectation(control, displayField(control), answer));
-        filledFieldCount += 1;
+        if (!hasControlValue(control)) {
+          await locator.fill(answer);
+          filledFieldCount += 1;
+        }
       }
     }
+    Object.freeze(this.fillExpectations);
 
     await this.context.log("greenhouse_fields_filled", {
       variant: this.requireDetection().variant,
@@ -487,6 +573,8 @@ export class GreenhouseApplicationStateMachine {
       this.context.packet,
     );
     if (records.length > 0) return this.finish(validationReceipt(records));
+    const authorizedFileEvidence = exactSubmitFileEvidence(this.fillExpectations, controls);
+    const trustedFieldValues = exactSubmitTrustedFieldValues(this.fillExpectations);
 
     const submit = await locateUniqueVisible(this.context.page, SUBMIT_SELECTORS);
     if (!submit.locator) {
@@ -495,14 +583,56 @@ export class GreenhouseApplicationStateMachine {
       }
       return this.finish(failedReceipt("application", "Bluey could not find the Greenhouse Submit Application control."));
     }
+    const authorizedUrl = this.context.page.url();
+    const authorizedSubmit = submit.locator;
+    const authorizedSubmitIdentity = await submitControlIdentity(authorizedSubmit);
+    const authorizedSubmitTarget = await captureEffectiveSubmitTarget(
+      authorizedSubmit,
+      "greenhouse",
+      this.context.approvedCanonicalUrl,
+      authorizedUrl,
+    );
+    const authorizedSubmitEvidence = await authorizedSubmit.successfulSubmitEvidence(
+      trustedFieldValues,
+      authorizedSubmitTarget.providerJobKey,
+    );
+    await this.context.page.assertExactSubmitGuardClean();
 
     // Fence the irreversible action before awaiting any browser-side work.
+    if (!this.context.beforeFinalSubmit) {
+      throw new Error("Greenhouse final submit authority is unavailable");
+    }
     this.submitStarted = true;
-    await this.context.beforeFinalSubmit?.();
+    await this.context.beforeFinalSubmit({
+      adapter: "greenhouse",
+      adapterVersion: GREENHOUSE_ADAPTER_PROFILE.version,
+      control: "greenhouse_submit_application",
+      target: authorizedSubmitTarget,
+      files: authorizedFileEvidence,
+      fields: authorizedSubmitEvidence.fields,
+      partOrder: authorizedSubmitEvidence.partOrder,
+    });
+    const finalSubmit = await this.verifyAuthorizedSubmitState(
+      authorizedUrl,
+      authorizedSubmit,
+      authorizedSubmitIdentity,
+      authorizedSubmitTarget,
+      authorizedSubmitEvidence,
+      trustedFieldValues,
+    );
     let clickFailed = false;
+    let submitHttpStatus: number | undefined;
     try {
-      await submit.locator.click();
-    } catch {
+      submitHttpStatus = await finalSubmit.clickWithExactSubmit({
+        target: authorizedSubmitTarget,
+        files: authorizedFileEvidence,
+        fields: authorizedSubmitEvidence.fields,
+        partOrder: authorizedSubmitEvidence.partOrder,
+      });
+    } catch (error) {
+      if (error instanceof ExactSubmitEvidenceError) {
+        throw new Error("Greenhouse submit evidence changed during activation");
+      }
       clickFailed = true;
     }
     await this.context.afterFinalSubmit?.(clickFailed ? "activation_uncertain" : "activated");
@@ -516,20 +646,33 @@ export class GreenhouseApplicationStateMachine {
     if (afterSubmitChallenge) return this.finish(interventionReceipt(afterSubmitChallenge));
 
     const body = await this.context.page.bodyText().catch(() => "");
+    const postSubmitControls = await this.context.page.controls().catch(() => []);
+    const postSubmitRecords = validationRecords(postSubmitControls, this.context.packet);
+    if (postSubmitRecords.length > 0) return this.finish(validationReceipt(postSubmitRecords));
+    const rerenderedSubmit = await locateUniqueVisible(this.context.page, SUBMIT_SELECTORS);
+    if (rerenderedSubmit.locator
+      || rerenderedSubmit.problem === "ambiguous"
+      || VISIBLE_FORM_ERROR_PATTERNS.some((pattern) => pattern.test(body))) {
+      return this.finish(postSubmitFormReceipt("Greenhouse", this.context.page.url()));
+    }
     const confirmationText = confirmationEvidence(body);
-    if (confirmationText) {
+    if (submitHttpStatus !== undefined
+      && confirmationText
+      && isApprovedProviderConfirmation(
+      "greenhouse",
+      this.context.approvedCanonicalUrl,
+      this.context.page.url(),
+      authorizedSubmitTarget.providerJobKey,
+    )) {
       return this.finish({
         status: "submitted",
+        submitHttpStatus,
         confirmationText,
         confirmationUrl: this.context.page.url(),
         submittedAt: this.now().toISOString(),
         issues: [],
       });
     }
-
-    const postSubmitControls = await this.context.page.controls().catch(() => []);
-    const postSubmitRecords = validationRecords(postSubmitControls, this.context.packet);
-    if (postSubmitRecords.length > 0) return this.finish(validationReceipt(postSubmitRecords));
 
     return this.finish(uncertainSubmissionReceipt(this.context.page.url(), clickFailed));
   }
@@ -541,6 +684,80 @@ export class GreenhouseApplicationStateMachine {
       await this.finish(failedReceipt("application", "Bluey could not inspect the Greenhouse application controls."));
       return undefined;
     }
+  }
+
+  private async verifyAuthorizedSubmitState(
+    authorizedUrl: string,
+    authorizedSubmit: BrowserLocator,
+    authorizedSubmitIdentity: string,
+    authorizedSubmitTarget: EffectiveSubmitTargetIdentity,
+    authorizedSubmitEvidence: Readonly<ExactSubmitFormEvidence>,
+    trustedFieldValues: ReturnType<typeof exactSubmitTrustedFieldValues>,
+  ): Promise<BrowserLocator> {
+    if (this.context.page.url() !== authorizedUrl) {
+      throw new Error("Greenhouse page changed after final submit authority");
+    }
+    if (await detectChallenge(this.context.page) || await isClosedPosting(this.context.page)) {
+      throw new Error("Greenhouse application changed after final submit authority");
+    }
+
+    let controls: FormControl[];
+    try {
+      controls = await this.context.page.controls();
+    } catch {
+      throw new Error("Greenhouse controls changed after final submit authority");
+    }
+    if (combinedValidationRecords(this.fillExpectations, controls, this.context.packet).length > 0) {
+      throw new Error("Greenhouse fields changed after final submit authority");
+    }
+
+    const originalCount = await authorizedSubmit.count().catch(() => 0);
+    const originalVisible = originalCount === 1
+      && await authorizedSubmit.isVisible().catch(() => false);
+    if (!originalVisible) {
+      throw new Error("Greenhouse submit control changed after final submit authority");
+    }
+
+    const currentSubmit = await locateUniqueVisible(this.context.page, SUBMIT_SELECTORS);
+    if (!currentSubmit.locator) {
+      throw new Error("Greenhouse submit control changed after final submit authority");
+    }
+    const currentSubmitIdentity = await submitControlIdentity(currentSubmit.locator);
+    let currentSubmitTarget: EffectiveSubmitTargetIdentity;
+    try {
+      currentSubmitTarget = await captureEffectiveSubmitTarget(
+        currentSubmit.locator,
+        "greenhouse",
+        this.context.approvedCanonicalUrl,
+        this.context.page.url(),
+      );
+    } catch {
+      throw new Error("Greenhouse submit target changed after final submit authority");
+    }
+    if (currentSubmitIdentity !== authorizedSubmitIdentity) {
+      throw new Error("Greenhouse submit control changed after final submit authority");
+    }
+    if (!sameEffectiveSubmitTarget(currentSubmitTarget, authorizedSubmitTarget)) {
+      throw new Error("Greenhouse submit target changed after final submit authority");
+    }
+    const currentSubmitEvidence = await currentSubmit.locator.successfulSubmitEvidence(
+      trustedFieldValues,
+      currentSubmitTarget.providerJobKey,
+    );
+    if (!sameExactSubmitFields(
+      currentSubmitEvidence.fields,
+      authorizedSubmitEvidence.fields,
+    ) || !sameExactSubmitPartOrder(
+      currentSubmitEvidence.partOrder,
+      authorizedSubmitEvidence.partOrder,
+    )) {
+      throw new Error("Greenhouse submit fields changed after final submit authority");
+    }
+    await this.context.page.assertExactSubmitGuardClean();
+    if (this.context.page.url() !== authorizedUrl) {
+      throw new Error("Greenhouse page changed after final submit authority");
+    }
+    return currentSubmit.locator;
   }
 
   private expectState(expected: GreenhouseApplicationStateName): void {
@@ -592,7 +809,7 @@ export class GreenhouseAdapter implements ApplicationAdapter {
   constructor(private readonly options: GreenhouseAdapterOptions = {}) {}
 
   detect(url: URL): boolean {
-    return detectGreenhouseUrl(url) !== undefined;
+    return detectGreenhouseUrl(url.href) !== undefined;
   }
 
   async normalize(page: BrowserPage): Promise<NormalizedJob> {
@@ -647,14 +864,6 @@ export class GreenhouseAdapter implements ApplicationAdapter {
 
 export function createGreenhouseAdapter(options: GreenhouseAdapterOptions = {}): GreenhouseAdapter {
   return new GreenhouseAdapter(options);
-}
-
-function tenantFromUrl(url: URL, embedded: boolean): string | undefined {
-  const queryTenant = url.searchParams.get("for");
-  if (queryTenant) return queryTenant;
-  if (embedded) return undefined;
-  const [first] = url.pathname.split("/").filter(Boolean);
-  return first && first !== "jobs" ? first : undefined;
 }
 
 function safeUrl(value: string): URL | undefined {
@@ -714,6 +923,17 @@ async function locateUniqueVisible(page: BrowserPage, selectors: string[]): Prom
   }
   if (matches.length > 1) return { problem: "ambiguous" };
   return matches[0] ? { locator: matches[0] } : { problem: "missing" };
+}
+
+async function submitControlIdentity(locator: BrowserLocator): Promise<string> {
+  const [text, ...attributes] = await Promise.all([
+    locator.textContent(),
+    ...SUBMIT_IDENTITY_ATTRIBUTES.map((attribute) => locator.getAttribute(attribute)),
+  ]);
+  return JSON.stringify([
+    (text ?? "").replace(/\s+/g, " ").trim(),
+    ...attributes,
+  ]);
 }
 
 async function detectChallenge(page: BrowserPage): Promise<InterventionRequest | undefined> {
@@ -821,6 +1041,7 @@ function manualReviewKind(control: FormControl): "sensitive" | "eligibility" | u
 
 function hasControlValue(control: FormControl): boolean {
   if (control.kind === "checkbox" || control.kind === "radio") return Boolean(control.checked);
+  if (control.kind === "file" && control.files !== undefined) return control.files.length > 0;
   return control.value.trim().length > 0;
 }
 
@@ -852,20 +1073,67 @@ function validationRecords(controls: FormControl[], packet: ApplicationPacket): 
   for (const control of controls) {
     if (control.kind === "hidden") continue;
     const reviewKind = manualReviewKind(control);
-    if (!control.required && !reviewKind) continue;
+
+    if (control.kind === "file" && hasControlValue(control) && !documentPath(control, packet)) {
+      const field = displayField(control);
+      records.push({
+        issue: {
+          field,
+          message: `Greenhouse found an attachment in ${field} that is not part of the approved packet.`,
+          severity: "blocking",
+        },
+        interventionKind: "unknown_question",
+      });
+      continue;
+    }
+
+    const answer = answerFor(control, packet);
+    if (control.kind === "select"
+      && answer !== undefined
+      && answer.trim() !== ""
+      && !bestOption(control, answer)) {
+      const field = displayField(control);
+      records.push({
+        issue: {
+          field,
+          message: `Greenhouse did not accept the packet value for ${field}.`,
+          severity: "blocking",
+        },
+        interventionKind: "missing_fact",
+        choices: choicesFor(control, controls),
+      });
+      continue;
+    }
 
     if (control.kind === "radio") {
       const group = control.name || control.selector;
       if (visitedRadioGroups.has(group)) continue;
       visitedRadioGroups.add(group);
-      const groupControls = controls.filter((candidate) => candidate.kind === "radio" && (candidate.name || candidate.selector) === group);
+      const groupControls = controls.filter((candidate) => candidate.kind === "radio"
+        && (candidate.name || candidate.selector) === group);
+      if (answer !== undefined
+        && answer.trim() !== ""
+        && !groupControls.some((candidate) => radioMatches(candidate, answer))) {
+        const field = displayField(control);
+        records.push({
+          issue: {
+            field,
+            message: `Greenhouse did not accept the packet value for ${field}.`,
+            severity: "blocking",
+          },
+          interventionKind: "missing_fact",
+          choices: choicesFor(control, controls),
+        });
+        continue;
+      }
+      if (!control.required && !reviewKind) continue;
       if (groupControls.some((candidate) => candidate.checked)) continue;
-    } else if (hasControlValue(control)) {
-      continue;
+    } else {
+      if (!control.required && !reviewKind) continue;
+      if (hasControlValue(control)) continue;
     }
 
     const field = displayField(control);
-    const answer = answerFor(control, packet);
     const known = Boolean(knownFieldRule(control) || documentKind(control));
     const interventionKind = reviewKind === "sensitive"
       ? "sensitive_question"
@@ -994,7 +1262,19 @@ function uncertainSubmissionReceipt(url: string, clickFailed = false): Submissio
   }]);
 }
 
+function postSubmitFormReceipt(provider: string, url: string): SubmissionReceipt {
+  const message = `${provider} returned the application form or a validation error after Submit.`;
+  return interventionReceipt({
+    kind: "browser_takeover",
+    title: `Review the ${provider} submission error`,
+    detail: `${message} Bluey will not treat confirmation-looking text as success or retry.`,
+    takeoverUrl: url,
+    resolution: { kind: "browser_takeover", resumeAfter: false },
+  }, [{ field: "submission", message, severity: "blocking" }]);
+}
+
 function confirmationEvidence(body: string): string | undefined {
+  if (hasNegativeSubmissionOutcome(body)) return undefined;
   const lines = body.split(/\n+/).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
   for (const line of lines) {
     const candidates = [line, ...(line.match(/[^.!?]+[.!?]?/g) ?? []).map((sentence) => sentence.trim())];

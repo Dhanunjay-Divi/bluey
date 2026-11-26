@@ -3,11 +3,13 @@
 //! Cloudflare R2 speaks the S3 SigV4 API. Keeping the client narrow avoids a
 //! large provider SDK dependency in the server binary.
 
+use std::{sync::OnceLock, time::Duration};
+
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use reqwest::{header, Method, Url};
+use reqwest::{header, Client, Method, RequestBuilder, Response, StatusCode, Url};
 use sha2::{Digest, Sha256};
 
 use crate::config::ObjectStorageConfig;
@@ -19,6 +21,9 @@ type HmacSha256 = Hmac<Sha256>;
 const DEFAULT_ACCOUNT_QUOTA_BYTES: i64 = 1024 * 1024 * 1024;
 const DEFAULT_DAILY_QUOTA_BYTES: i64 = 256 * 1024 * 1024;
 const DEFAULT_ACCOUNT_MAX_OBJECTS: i64 = 10_000;
+const MAX_ACCOUNT_PREFIX_DELETE_ROUNDS: usize = 10_000;
+const MAX_LIST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+static COMPLETE_READ_HTTP: OnceLock<Option<Client>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct ObjectStorage {
@@ -31,6 +36,17 @@ pub struct StoredObject {
     pub bytes: Bytes,
     pub content_type: String,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("object body exceeds {bound} of {maximum_bytes} bytes")]
+pub(crate) struct ObjectReadLimitExceeded {
+    bound: &'static str,
+    maximum_bytes: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("complete object length differs from recorded size")]
+pub(crate) struct ObjectReadIncomplete;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UploadLimits {
@@ -93,6 +109,42 @@ impl ObjectStorage {
             .to_ascii_lowercase();
         self.account_key(
             &format!("jobs/resumes/{asset_id}/sha256/{sha256}.{extension}"),
+            account_id,
+        )
+    }
+
+    pub fn browser_profile_snapshot_key(
+        &self,
+        account_id: &str,
+        browser_profile_id: &str,
+        generation: i64,
+        sha256: &str,
+    ) -> String {
+        let profile_scope = hex::encode(Sha256::digest(browser_profile_id.as_bytes()));
+        self.account_key(
+            &format!(
+                "jobs/browser-profiles/{profile_scope}/generation/{generation}/sha256/{sha256}.enc"
+            ),
+            account_id,
+        )
+    }
+
+    pub fn jobs_submission_bundle_key(
+        &self,
+        account_id: &str,
+        application_id: &str,
+        receipt_id: &str,
+        bundle_id: &str,
+        sha256: &str,
+    ) -> String {
+        let application_scope = hex::encode(Sha256::digest(application_id.as_bytes()));
+        let receipt_scope = hex::encode(Sha256::digest(receipt_id.as_bytes()));
+        let bundle_scope = hex::encode(Sha256::digest(bundle_id.as_bytes()));
+        self.account_key(
+            &format!(
+                "jobs/applications/{application_scope}/receipts/{receipt_scope}/bundles/\
+                 {bundle_scope}/sha256/{sha256}.json"
+            ),
             account_id,
         )
     }
@@ -170,26 +222,117 @@ impl ObjectStorage {
     }
 
     pub async fn get(&self, key: &str) -> Result<StoredObject> {
-        let payload_hash = sha256_hex([]);
-        let url = self.object_url(key)?;
-        let auth = self.authorization(Method::GET, &url, &payload_hash)?;
+        self.get_bounded(key, self.config.max_object_bytes).await
+    }
+
+    /// Bound the accumulated success body to the caller's limit or the
+    /// configured maximum, whichever is smaller.
+    pub(crate) async fn get_bounded(&self, key: &str, limit: usize) -> Result<StoredObject> {
+        let maximum_bytes = limit.min(self.config.max_object_bytes);
+        if maximum_bytes == 0 {
+            return Err(anyhow!("object read maximum must be positive"));
+        }
+        let bound = if maximum_bytes == self.config.max_object_bytes {
+            "configured maximum"
+        } else {
+            "read maximum"
+        };
         let response = self
-            .http
-            .get(url)
-            .header("x-amz-date", auth.amz_date)
-            .header("x-amz-content-sha256", payload_hash)
-            .header(header::AUTHORIZATION, auth.authorization)
+            .signed_get(&self.http, key)?
             .send()
             .await
             .context("get object")?;
         if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            // A provider error body is neither needed nor safe to buffer or log.
             return Err(anyhow!(
-                "object get failed with status {status}: {}",
-                truncate(&body, 256)
+                "object get failed with status {}",
+                response.status()
             ));
         }
+        Self::read_bounded_body(response, maximum_bytes, bound).await
+    }
+
+    /// Read immutable evidence as one complete identity response, not a
+    /// redirected, partial or re-encoded representation of the same bytes.
+    pub(crate) async fn get_complete_exact(
+        &self,
+        key: &str,
+        expected_bytes: usize,
+    ) -> Result<StoredObject> {
+        if expected_bytes == 0 || expected_bytes > self.config.max_object_bytes {
+            return Err(ObjectReadIncomplete.into());
+        }
+        let http = COMPLETE_READ_HTTP
+            .get_or_init(|| {
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(120))
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .retry(reqwest::retry::never())
+                    .no_gzip()
+                    .no_brotli()
+                    .no_zstd()
+                    .no_deflate()
+                    .build()
+                    .ok()
+            })
+            .as_ref()
+            .context("complete object read client unavailable")?;
+        let response = self
+            .signed_get(http, key)?
+            .header(header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("get complete object")?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "complete object get failed with status {}",
+                response.status()
+            ));
+        }
+        if response.status() != StatusCode::OK
+            || response.headers().contains_key(header::CONTENT_RANGE)
+            || response
+                .headers()
+                .get_all(header::CONTENT_ENCODING)
+                .iter()
+                .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            return Err(anyhow!(
+                "object provider did not return a complete identity response"
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length != expected_bytes as u64)
+        {
+            return Err(ObjectReadIncomplete.into());
+        }
+        let stored = Self::read_bounded_body(response, expected_bytes, "recorded size").await?;
+        if stored.bytes.len() != expected_bytes {
+            return Err(ObjectReadIncomplete.into());
+        }
+        Ok(stored)
+    }
+
+    fn signed_get(&self, http: &Client, key: &str) -> Result<RequestBuilder> {
+        let payload_hash = sha256_hex([]);
+        let url = self.object_url(key)?;
+        let auth = self.authorization(Method::GET, &url, &payload_hash)?;
+        Ok(http
+            .get(url)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(header::AUTHORIZATION, auth.authorization))
+    }
+
+    async fn read_bounded_body(
+        mut response: Response,
+        maximum_bytes: usize,
+        bound: &'static str,
+    ) -> Result<StoredObject> {
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -197,9 +340,39 @@ impl ObjectStorage {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let bytes = response.bytes().await.context("read object body")?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum_bytes as u64)
+        {
+            return Err(ObjectReadLimitExceeded {
+                bound,
+                maximum_bytes,
+            }
+            .into());
+        }
+        let mut body = BytesMut::with_capacity(
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(maximum_bytes),
+        );
+        while let Some(chunk) = response.chunk().await.context("read object body")? {
+            if body
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|length| length > maximum_bytes)
+            {
+                return Err(ObjectReadLimitExceeded {
+                    bound,
+                    maximum_bytes,
+                }
+                .into());
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(StoredObject {
-            bytes,
+            bytes: body.freeze(),
             content_type,
         })
     }
@@ -228,10 +401,107 @@ impl ObjectStorage {
         ))
     }
 
+    /// Delete every object under the authenticated account namespace, including
+    /// legacy bytes that predate the durable object-upload ledger. Each page is
+    /// deleted before listing the prefix again so a continuation token cannot
+    /// skip keys removed from an earlier page.
+    pub async fn delete_all_account_objects(&self, account_id: &str) -> Result<usize> {
+        let prefix = self.account_prefix(account_id)?;
+        let mut deleted = 0usize;
+        for _ in 0..MAX_ACCOUNT_PREFIX_DELETE_ROUNDS {
+            let keys = self.list_object_keys(&prefix).await?;
+            if keys.is_empty() {
+                return Ok(deleted);
+            }
+            for key in keys {
+                if !self.key_belongs_to_account(&key, account_id) {
+                    return Err(anyhow!("listed object is outside the account namespace"));
+                }
+                self.delete(&key).await?;
+                deleted = deleted
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("account object deletion count overflow"))?;
+            }
+        }
+        Err(anyhow!(
+            "account object prefix did not become empty within the deletion bound"
+        ))
+    }
+
+    async fn list_object_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let url = self.list_objects_url(prefix)?;
+        let payload_hash = sha256_hex([]);
+        let auth = self.authorization(Method::GET, &url, &payload_hash)?;
+        let response = self
+            .http
+            .get(url)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(header::AUTHORIZATION, auth.authorization)
+            .send()
+            .await
+            .context("list account objects")?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "account object listing failed with status {}",
+                response.status()
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_LIST_RESPONSE_BYTES as u64)
+        {
+            return Err(anyhow!("account object listing response is too large"));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("read account object listing")?;
+        if bytes.len() > MAX_LIST_RESPONSE_BYTES {
+            return Err(anyhow!("account object listing response is too large"));
+        }
+        parse_list_object_keys(&bytes, prefix)
+    }
+
+    fn list_objects_url(&self, prefix: &str) -> Result<Url> {
+        let mut url = self.bucket_url()?;
+        url.set_query(Some(&format!(
+            "list-type=2&max-keys=1000&prefix={}",
+            encode_segment(prefix)
+        )));
+        Ok(url)
+    }
+
     fn object_url(&self, key: &str) -> Result<Url> {
         let endpoint = self.config.endpoint_url.trim_end_matches('/');
         let encoded_path = [encode_segment(&self.config.bucket), encode_key_path(key)].join("/");
         Url::parse(&format!("{endpoint}/{encoded_path}")).context("parse object URL")
+    }
+
+    fn bucket_url(&self) -> Result<Url> {
+        let endpoint = self.config.endpoint_url.trim_end_matches('/');
+        Url::parse(&format!(
+            "{endpoint}/{}",
+            encode_segment(&self.config.bucket)
+        ))
+        .context("parse object storage bucket URL")
+    }
+
+    fn account_prefix(&self, account_id: &str) -> Result<String> {
+        if account_id.is_empty()
+            || account_id.len() > 240
+            || !account_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(anyhow!("invalid account object namespace"));
+        }
+        let prefix = self.config.key_prefix.trim_matches('/');
+        Ok(if prefix.is_empty() {
+            format!("accounts/{account_id}/")
+        } else {
+            format!("{prefix}/accounts/{account_id}/")
+        })
     }
 
     fn account_key(&self, suffix: &str, account_id: &str) -> String {
@@ -256,10 +526,12 @@ impl ObjectStorage {
         let signed_headers = "host;x-amz-content-sha256;x-amz-date";
         let canonical_headers =
             format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+        let canonical_query = canonical_query(url);
         let canonical_request = format!(
-            "{}\n{}\n\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             method.as_str(),
             canonical_uri,
+            canonical_query,
             canonical_headers,
             signed_headers,
             payload_hash
@@ -278,6 +550,235 @@ impl ObjectStorage {
             authorization,
         })
     }
+}
+
+fn parse_list_object_keys(xml: &[u8], prefix: &str) -> Result<Vec<String>> {
+    use quick_xml::{events::Event, Reader};
+
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut elements = Vec::<Vec<u8>>::new();
+    let mut keys = Vec::new();
+    let mut listed_prefix = None;
+    let mut key_count = None;
+    let mut is_truncated = None;
+    let mut saw_prefix = false;
+    let mut saw_key_count = false;
+    let mut saw_is_truncated = false;
+    let mut open_contents_key_count = None;
+    let mut open_key_had_value = None;
+    let mut root_closed = false;
+    loop {
+        match reader
+            .read_event()
+            .context("parse account object listing")?
+        {
+            Event::Start(element) => {
+                let name = element.name().as_ref().to_vec();
+                if root_closed {
+                    return Err(anyhow!(
+                        "account object listing contains content after its root element"
+                    ));
+                }
+                if elements.is_empty() {
+                    if name.as_slice() != b"ListBucketResult" {
+                        return Err(anyhow!(
+                            "account object listing has an unexpected root element"
+                        ));
+                    }
+                } else if matches!(
+                    elements.as_slice(),
+                    [root] if root.as_slice() == b"ListBucketResult"
+                ) && matches!(name.as_slice(), b"Prefix" | b"KeyCount" | b"IsTruncated")
+                {
+                    let already_seen = match name.as_slice() {
+                        b"Prefix" => std::mem::replace(&mut saw_prefix, true),
+                        b"KeyCount" => std::mem::replace(&mut saw_key_count, true),
+                        b"IsTruncated" => std::mem::replace(&mut saw_is_truncated, true),
+                        _ => unreachable!(),
+                    };
+                    if already_seen {
+                        return Err(anyhow!("account object listing repeats an authority field"));
+                    }
+                } else if name.as_slice() == b"Contents" {
+                    if !matches!(
+                        elements.as_slice(),
+                        [root] if root.as_slice() == b"ListBucketResult"
+                    ) || open_contents_key_count.replace(keys.len()).is_some()
+                    {
+                        return Err(anyhow!("account object listing contents are malformed"));
+                    }
+                } else if name.as_slice() == b"Key"
+                    && (!matches!(
+                        elements.as_slice(),
+                        [root, contents]
+                            if root.as_slice() == b"ListBucketResult"
+                                && contents.as_slice() == b"Contents"
+                    ) || open_key_had_value.replace(false).is_some())
+                {
+                    return Err(anyhow!("account object listing key is malformed"));
+                }
+                elements.push(name);
+            }
+            Event::Empty(_) => {
+                return Err(anyhow!(
+                    "account object listing contains an unexpected empty element"
+                ));
+            }
+            Event::Text(value) => {
+                let value = value
+                    .unescape()
+                    .context("decode account object listing value")?
+                    .into_owned();
+                match elements.as_slice() {
+                    [root, field]
+                        if root.as_slice() == b"ListBucketResult"
+                            && field.as_slice() == b"Prefix"
+                            && listed_prefix.replace(value.clone()).is_some() =>
+                    {
+                        return Err(anyhow!(
+                            "account object listing repeats its requested prefix"
+                        ));
+                    }
+                    [root, field]
+                        if root.as_slice() == b"ListBucketResult"
+                            && field.as_slice() == b"KeyCount" =>
+                    {
+                        let value = value
+                            .parse::<usize>()
+                            .context("parse account object listing key count")?;
+                        if value > 1_000 || key_count.replace(value).is_some() {
+                            return Err(anyhow!("account object listing has an invalid key count"));
+                        }
+                    }
+                    [root, field]
+                        if root.as_slice() == b"ListBucketResult"
+                            && field.as_slice() == b"IsTruncated" =>
+                    {
+                        let value = match value.as_str() {
+                            "true" => true,
+                            "false" => false,
+                            _ => {
+                                return Err(anyhow!(
+                                    "account object listing has an invalid truncation marker"
+                                ));
+                            }
+                        };
+                        if is_truncated.replace(value).is_some() {
+                            return Err(anyhow!(
+                                "account object listing repeats its truncation marker"
+                            ));
+                        }
+                    }
+                    [root, contents, field]
+                        if root.as_slice() == b"ListBucketResult"
+                            && contents.as_slice() == b"Contents"
+                            && field.as_slice() == b"Key" =>
+                    {
+                        if open_key_had_value != Some(false)
+                            || value.is_empty()
+                            || !value.starts_with(prefix)
+                            || keys.len() >= 1_000
+                            || keys.contains(&value)
+                        {
+                            return Err(anyhow!(
+                                "account object listing escaped its requested prefix"
+                            ));
+                        }
+                        open_key_had_value = Some(true);
+                        keys.push(value);
+                    }
+                    [root] if root.as_slice() == b"ListBucketResult" && !value.is_empty() => {
+                        return Err(anyhow!(
+                            "account object listing contains text inside its result root"
+                        ));
+                    }
+                    [] if !value.is_empty() => {
+                        return Err(anyhow!(
+                            "account object listing contains text outside its result root"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(element) => {
+                let Some(opened) = elements.pop() else {
+                    return Err(anyhow!(
+                        "account object listing contains an unmatched closing element"
+                    ));
+                };
+                if opened.as_slice() != element.name().as_ref() {
+                    return Err(anyhow!(
+                        "account object listing contains mismatched elements"
+                    ));
+                }
+                if opened.as_slice() == b"Key" && open_key_had_value.take() != Some(true) {
+                    return Err(anyhow!("account object listing key is empty"));
+                }
+                if opened.as_slice() == b"Contents" {
+                    let Some(previous_count) = open_contents_key_count.take() else {
+                        return Err(anyhow!("account object listing contents are malformed"));
+                    };
+                    if keys.len() != previous_count + 1 {
+                        return Err(anyhow!(
+                            "account object listing contents must contain exactly one key"
+                        ));
+                    }
+                }
+                if elements.is_empty() {
+                    root_closed = true;
+                }
+            }
+            Event::Eof => {
+                if !elements.is_empty() {
+                    return Err(anyhow!("account object listing is incomplete"));
+                }
+                break;
+            }
+            Event::CData(_) => {
+                return Err(anyhow!(
+                    "account object listing contains an unsupported value"
+                ));
+            }
+            Event::Decl(_) | Event::Comment(_) | Event::PI(_) | Event::DocType(_) => {}
+        }
+    }
+    if !root_closed {
+        return Err(anyhow!("account object listing is missing its result root"));
+    }
+    if listed_prefix.as_deref() != Some(prefix) {
+        return Err(anyhow!(
+            "account object listing does not match its requested prefix"
+        ));
+    }
+    let key_count =
+        key_count.ok_or_else(|| anyhow!("account object listing is missing its key count"))?;
+    let is_truncated = is_truncated
+        .ok_or_else(|| anyhow!("account object listing is missing its truncation marker"))?;
+    if key_count != keys.len() {
+        return Err(anyhow!(
+            "account object listing key count does not match its contents"
+        ));
+    }
+    if is_truncated && keys.is_empty() {
+        return Err(anyhow!(
+            "account object listing is truncated without a deletable page"
+        ));
+    }
+    Ok(keys)
+}
+
+fn canonical_query(url: &Url) -> String {
+    let mut pairs = url
+        .query_pairs()
+        .map(|(key, value)| (encode_segment(&key), encode_segment(&value)))
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 pub fn spawn_cleanup_worker(
@@ -463,7 +964,11 @@ mod tests {
     use crate::db::object_uploads::{
         record_put_failure, reserve_upload, NewObjectUpload, ObjectKind,
     };
-    use wiremock::matchers::{method, path};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use wiremock::matchers::{header as matches_header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -499,6 +1004,439 @@ mod tests {
             archive_key,
             format!("bluey-cloud/global/jobs/candidates/candidate/sha256/{hash}.json")
         );
+        let bundle_key = storage.jobs_submission_bundle_key(
+            "acct",
+            "app-secret",
+            "receipt-secret",
+            "bundle-secret",
+            &hash,
+        );
+        assert!(bundle_key.starts_with("bluey-cloud/accounts/acct/jobs/applications/"));
+        assert!(bundle_key.ends_with(&format!("/sha256/{hash}.json")));
+        assert!(!bundle_key.contains("app-secret"));
+        assert!(!bundle_key.contains("receipt-secret"));
+        assert!(!bundle_key.contains("bundle-secret"));
+    }
+
+    #[tokio::test]
+    async fn object_get_rejects_a_body_larger_than_the_configured_maximum() {
+        let object_store = MockServer::start().await;
+        let storage = ObjectStorage::new(ObjectStorageConfig {
+            endpoint_url: object_store.uri(),
+            bucket: "bucket".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            region: "auto".into(),
+            key_prefix: "bluey-cloud".into(),
+            retention_days: 365,
+            max_object_bytes: 4,
+        });
+        Mock::given(method("GET"))
+            .and(path("/bucket/oversized"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0_u8; 5]))
+            .expect(1)
+            .mount(&object_store)
+            .await;
+
+        let error = storage.get("oversized").await.unwrap_err();
+        assert!(error.is::<ObjectReadLimitExceeded>());
+        assert!(error
+            .to_string()
+            .contains("object body exceeds configured maximum of 4 bytes"));
+    }
+
+    #[tokio::test]
+    async fn bounded_object_get_uses_smaller_limit_and_does_not_expose_error_bodies() {
+        let object_store = MockServer::start().await;
+        let storage = ObjectStorage::new(ObjectStorageConfig {
+            endpoint_url: object_store.uri(),
+            bucket: "bucket".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            region: "auto".into(),
+            key_prefix: "bluey-cloud".into(),
+            retention_days: 365,
+            max_object_bytes: 4,
+        });
+        for (key, status, body) in [
+            ("exact", 200, "123"),
+            ("over", 200, "12345"),
+            ("error", 503, "private synthetic provider message"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/bucket/{key}")))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&object_store)
+                .await;
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/bucket/zero"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&object_store)
+            .await;
+        assert_eq!(
+            storage
+                .get_bounded("zero", 0)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "object read maximum must be positive"
+        );
+        let object = storage.get_bounded("exact", 3).await.unwrap();
+        assert_eq!(object.bytes.as_ref(), b"123");
+        assert!(storage
+            .get_bounded("exact", 2)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("read maximum of 2 bytes"));
+        assert!(storage
+            .get_bounded("over", 10)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("maximum of 4 bytes"));
+        assert_eq!(
+            storage
+                .get_bounded("error", 3)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "object get failed with status 503 Service Unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_object_get_enforces_limit_without_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (limit, should_pass) in [(6, true), (5, false)] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut storage = ObjectStorage::new(ObjectStorageConfig {
+                endpoint_url: format!("http://{address}"),
+                bucket: "bucket".into(),
+                access_key_id: "ak".into(),
+                secret_access_key: "sk".into(),
+                region: "auto".into(),
+                key_prefix: "bluey-cloud".into(),
+                retention_days: 365,
+                max_object_bytes: 10,
+            });
+            storage.http = reqwest::Client::builder()
+                .no_proxy()
+                .http1_only()
+                .build()
+                .unwrap();
+            let peer = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 4096, "synthetic request header too long");
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                assert!(request.starts_with(b"GET /bucket/chunked HTTP/1.1\r\n"));
+                stream
+                    .write_all(
+                        concat!(
+                            "HTTP/1.1 200 OK\r\n",
+                            "Transfer-Encoding: chunked\r\n",
+                            "Content-Type: application/octet-stream\r\n",
+                            "Connection: close\r\n\r\n",
+                            "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(storage.get_bounded("chunked", limit), peer)
+            })
+            .await
+            .expect("synthetic chunked exchange timed out");
+            if should_pass {
+                let object = result.unwrap();
+                assert_eq!(object.bytes.as_ref(), b"abcdef");
+                assert_eq!(object.content_type, "application/octet-stream");
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.is::<ObjectReadLimitExceeded>());
+                assert_eq!(
+                    error.to_string(),
+                    "object body exceeds read maximum of 5 bytes"
+                );
+            }
+        }
+    }
+
+    fn complete_read_test_store(endpoint_url: String) -> ObjectStorage {
+        ObjectStorage::new(ObjectStorageConfig {
+            endpoint_url,
+            bucket: "bucket".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            region: "auto".into(),
+            key_prefix: "bluey-cloud".into(),
+            retention_days: 365,
+            max_object_bytes: 10,
+        })
+    }
+
+    #[tokio::test]
+    async fn complete_object_read_rejects_contradictory_responses_at_the_same_size() {
+        let origin = MockServer::start().await;
+        let storage = complete_read_test_store(origin.uri());
+        for (key, status, name, value) in [
+            ("partial", 206, "content-range", "bytes 0-2/6"),
+            ("ranged", 200, "content-range", "bytes 0-2/6"),
+            ("encoded", 200, "content-encoding", "gzip"),
+            ("created", 201, "content-encoding", "identity"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/bucket/{key}")))
+                .and(matches_header("accept-encoding", "identity"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header(name, value)
+                        .set_body_bytes(b"abc".to_vec()),
+                )
+                .expect(1)
+                .mount(&origin)
+                .await;
+            let error = storage.get_complete_exact(key, 3).await.unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "object provider did not return a complete identity response",
+                "{key}"
+            );
+        }
+        Mock::given(method("GET"))
+            .and(path("/bucket/exact"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"abc".to_vec()))
+            .expect(3)
+            .mount(&origin)
+            .await;
+        for expected in [2, 4] {
+            assert!(storage
+                .get_complete_exact("exact", expected)
+                .await
+                .unwrap_err()
+                .is::<ObjectReadIncomplete>());
+        }
+        assert_eq!(
+            storage.get_complete_exact("exact", 3).await.unwrap().bytes,
+            &b"abc"[..]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_object_read_does_not_follow_a_redirect() {
+        let origin = MockServer::start().await;
+        let target = MockServer::start().await;
+        let storage = complete_read_test_store(origin.uri());
+        Mock::given(method("GET"))
+            .and(path("/bucket/redirect"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/never", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let error = storage.get_complete_exact("redirect", 3).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "complete object get failed with status 302 Found"
+        );
+        assert!(target.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_object_read_checks_exact_chunked_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for expected in [5, 6, 7] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let storage =
+                complete_read_test_store(format!("http://{}", listener.local_addr().unwrap()));
+            let peer = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 4096);
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("get /bucket/exact http/1.1\r\n"));
+                assert!(request.contains("\r\naccept-encoding: identity\r\n"));
+                assert!(!request.contains("\r\nrange:"));
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(storage.get_complete_exact("exact", expected), peer)
+            })
+            .await
+            .expect("synthetic chunked exchange timed out");
+            match expected {
+                5 => assert!(result.unwrap_err().is::<ObjectReadLimitExceeded>()),
+                6 => assert_eq!(result.unwrap().bytes, &b"abcdef"[..]),
+                _ => assert!(result.unwrap_err().is::<ObjectReadIncomplete>()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn account_prefix_delete_removes_legacy_objects_until_listing_is_empty() {
+        let object_store = MockServer::start().await;
+        let storage = ObjectStorage::new(ObjectStorageConfig {
+            endpoint_url: object_store.uri(),
+            bucket: "bucket".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            region: "auto".into(),
+            key_prefix: "bluey-cloud".into(),
+            retention_days: 365,
+            max_object_bytes: 100,
+        });
+        let prefix = "bluey-cloud/accounts/acct-one/";
+        let first_key = format!("{prefix}jobs/browser-profiles/legacy-one.enc");
+        let second_key = format!("{prefix}jobs/resumes/legacy-two.pdf");
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let list_responder = Arc::clone(&list_calls);
+        let first_key_for_xml = first_key.clone();
+        let second_key_for_xml = second_key.clone();
+        Mock::given(method("GET"))
+            .and(path("/bucket"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("max-keys", "1000"))
+            .and(query_param("prefix", prefix))
+            .respond_with(move |_request: &wiremock::Request| {
+                if list_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_string(format!(
+                        "<ListBucketResult><Prefix>{prefix}</Prefix><KeyCount>2</KeyCount>\
+                         <IsTruncated>false</IsTruncated>\
+                         <Contents><Key>{first_key_for_xml}</Key></Contents>\
+                         <Contents><Key>{second_key_for_xml}</Key></Contents></ListBucketResult>"
+                    ))
+                } else {
+                    ResponseTemplate::new(200).set_body_string(format!(
+                        "<ListBucketResult><Prefix>{prefix}</Prefix><KeyCount>0</KeyCount>\
+                         <IsTruncated>false</IsTruncated></ListBucketResult>"
+                    ))
+                }
+            })
+            .expect(2)
+            .mount(&object_store)
+            .await;
+        for key in [&first_key, &second_key] {
+            Mock::given(method("DELETE"))
+                .and(path(format!("/bucket/{key}")))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&object_store)
+                .await;
+        }
+
+        assert_eq!(
+            storage
+                .delete_all_account_objects("acct-one")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn account_object_listing_rejects_a_key_outside_the_requested_prefix() {
+        let error = parse_list_object_keys(
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>1</KeyCount><IsTruncated>false</IsTruncated>\
+              <Contents><Key>bluey-cloud/accounts/other/private</Key></Contents>\
+              </ListBucketResult>",
+            "bluey-cloud/accounts/acct-one/",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("escaped its requested prefix"));
+    }
+
+    #[test]
+    fn account_object_listing_rejects_non_authoritative_success_bodies() {
+        let prefix = "bluey-cloud/accounts/acct-one/";
+        for body in [
+            b"".as_slice(),
+            b"<Error><Code>AccessDenied</Code></Error>".as_slice(),
+            b"<ListBucketResult></ListBucketResult>".as_slice(),
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>0</KeyCount></ListBucketResult>"
+                .as_slice(),
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>0</KeyCount><IsTruncated>false</IsTruncated>\
+              <Contents><Key></Key></Contents></ListBucketResult>"
+                .as_slice(),
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>0</KeyCount><IsTruncated>false</IsTruncated>\
+              <Contents></Contents></ListBucketResult>"
+                .as_slice(),
+            b"<ListBucketResult>garbage\
+              <Prefix>bluey-cloud/accounts/acct-one/</Prefix><KeyCount>0</KeyCount>\
+              <IsTruncated>false</IsTruncated></ListBucketResult>"
+                .as_slice(),
+            b"<ListBucketResult><Prefix></Prefix>\
+              <Prefix>bluey-cloud/accounts/acct-one/</Prefix><KeyCount>0</KeyCount>\
+              <IsTruncated>false</IsTruncated></ListBucketResult>"
+                .as_slice(),
+        ] {
+            assert!(parse_list_object_keys(body, prefix).is_err());
+        }
+    }
+
+    #[test]
+    fn account_object_listing_rejects_inconsistent_empty_pages() {
+        let prefix = "bluey-cloud/accounts/acct-one/";
+        let error = parse_list_object_keys(
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>0</KeyCount><IsTruncated>true</IsTruncated></ListBucketResult>",
+            prefix,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("truncated without a deletable page"));
+    }
+
+    #[test]
+    fn account_object_listing_query_is_sigv4_canonical() {
+        let storage = ObjectStorage::new(ObjectStorageConfig {
+            endpoint_url: "https://objects.example.test".into(),
+            bucket: "bucket".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            region: "auto".into(),
+            key_prefix: "bluey cloud".into(),
+            retention_days: 365,
+            max_object_bytes: 100,
+        });
+        let url = storage
+            .list_objects_url("bluey cloud/accounts/acct-one/")
+            .unwrap();
+        let expected = "list-type=2&max-keys=1000&prefix=bluey%20cloud%2Faccounts%2Facct-one%2F";
+
+        assert_eq!(url.query(), Some(expected));
+        assert_eq!(canonical_query(&url), expected);
+        assert!(!url.as_str().contains('+'));
     }
 
     #[tokio::test]

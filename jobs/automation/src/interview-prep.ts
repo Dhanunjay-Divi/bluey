@@ -185,7 +185,11 @@ function resolveVerifiedClaims(
   return receipt.packet.verifiedClaimIds.map((id) => {
     const claim = byId.get(id);
     if (!claim) throw new Error(`Submitted verified claim ${id} is missing from the resume snapshot`);
-    if (claim.status !== "confirmed" && claim.source !== "resume_import") {
+    if (claim.status === "rejected") {
+      throw new Error(`Submitted verified claim ${id} was rejected`);
+    }
+    const submittedImport = claim.status === "unverified" && claim.source === "resume_import";
+    if (claim.status !== "confirmed" && !submittedImport) {
       throw new Error(`Submitted verified claim ${id} is not confirmed`);
     }
     if (!claim.statement.trim()) throw new Error(`Submitted verified claim ${id} has no evidence statement`);

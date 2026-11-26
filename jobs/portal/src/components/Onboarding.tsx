@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useId, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -22,13 +22,11 @@ import type {
 } from "../types";
 import {
   applyResumeImport,
-  importResume,
-  prepareResumeImport,
   summarizeResumeImport,
   type ResumeImportMode,
-  type ResumeImportPreview,
   type ResumeImportSummary,
 } from "../lib/documents";
+import { useResumeImport } from "../lib/use-resume-import";
 import { ResumeImportReview } from "./ResumeImportReview";
 import {
   validateCareerProfile,
@@ -66,6 +64,11 @@ import {
   BLUEY_DAILY_APPLICATION_LIMIT,
   BLUEY_MAX_POSTING_AGE_DAYS,
 } from "../lib/search-policy";
+import {
+  applicationIdentityIssueCopy,
+  resolveOnboardingApplicationIdentity,
+  validateSelectedOnboardingApplicationIdentity,
+} from "../lib/onboarding-application-identity";
 import blueyIcon from "../../../../web/assets/bluey-logo.svg";
 import blueyWordmark from "../../../../web/assets/bluey-wordmark.svg";
 
@@ -95,17 +98,48 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
     engagement_types: workspace.preferences.engagement_types || [],
   });
   const [notes, setNotes] = useState("");
-  const [importing, setImporting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [validation, setValidation] = useState("");
   const [importSummary, setImportSummary] = useState<ResumeImportSummary | null>(
     workspace.profile.source_resume_name ? summarizeResumeImport(workspace.profile) : null,
   );
-  const [importPreview, setImportPreview] = useState<ResumeImportPreview>();
-  const [pendingResume, setPendingResume] = useState<{ file: File; pageCount?: number }>();
+  const resumeImport = useResumeImport(profile);
+  const savingResume = useRef(false);
   const [resumeStart, setResumeStart] = useState<"import" | "build">("import");
+  const showImport = step === 0 && resumeStart === "import";
+  const importing = showImport && resumeImport.loading;
+  const pendingResume = showImport ? resumeImport.ready : undefined;
+  const importPreview = showImport ? resumeImport.preview : undefined;
+  const importError = showImport && resumeImport.error !== undefined
+    ? resumeImport.error instanceof Error ? resumeImport.error.message : "That resume could not be read."
+    : "";
   const fileRef = useRef<HTMLInputElement>(null);
-  const trackId = useRef(workspace.tracks[0]?.id || "onboarding-primary-track");
+  const trackId = useRef(workspace.tracks[0]?.id || crypto.randomUUID());
+  const applicationIdentityFieldId = useId();
+  const applicationIdentityErrorId = useId();
+  const existingTrack = workspace.tracks.find((item) => item.id === trackId.current);
+  const initialIdentity = useMemo(
+    () => resolveOnboardingApplicationIdentity(
+      workspace.application_identities,
+      existingTrack?.application_identity_id,
+    ),
+    [existingTrack?.application_identity_id, workspace.application_identities],
+  );
+  const [applicationIdentityId, setApplicationIdentityId] = useState(
+    initialIdentity.kind === "selected" ? initialIdentity.identity.id : "",
+  );
+  const selectedIdentity = useMemo(
+    () => validateSelectedOnboardingApplicationIdentity(
+      workspace.application_identities,
+      applicationIdentityId,
+    ),
+    [applicationIdentityId, workspace.application_identities],
+  );
+  const applicationIdentityIssue = selectedIdentity.kind === "unavailable"
+    ? (applicationIdentityId ? selectedIdentity.issue : initialIdentity.kind === "unavailable"
+      ? initialIdentity.issue
+      : selectedIdentity.issue)
+    : undefined;
 
   const progress = ((step + 1) / steps.length) * 100;
   const track = useMemo<CareerTrack>(
@@ -115,6 +149,7 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
       role: preferences.desired_roles[0] || profile.headline,
       locations: preferences.desired_locations,
       remote_preference: preferences.remote_preference,
+      application_identity_id: applicationIdentityId || undefined,
       policy: {
         role_family: "",
         relevant_employment_ids: [],
@@ -127,7 +162,7 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
       created_at_ms: workspace.tracks[0]?.created_at_ms || 0,
       updated_at_ms: 0,
     }),
-    [preferences, profile.employment, profile.headline, profile.work_authorization, workspace.tracks],
+    [applicationIdentityId, preferences, profile.employment, profile.headline, profile.work_authorization, workspace.tracks],
   );
   const roleSuggestions = useMemo(
     () => mergeCareerSuggestions(
@@ -166,23 +201,22 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
   const updatePreferences = <K extends keyof JobPreferences>(key: K, value: JobPreferences[K]) =>
     setPreferences((current) => ({ ...current, [key]: value }));
 
-  const handleFile = async (file?: File) => {
-    if (!file) return;
-    setImporting(true);
+  const chooseResumeStart = (choice: "import" | "build") => {
+    if (saving || savingResume.current) return;
+    if (choice === "build") resumeImport.discard();
+    setResumeStart(choice);
+  };
+
+  const handleFile = (file?: File) => {
+    if (!file || !showImport || saving || savingResume.current) return;
     setValidation("");
-    try {
-      const imported = await importResume(file);
-      setImportPreview(prepareResumeImport(profile, imported));
-      setPendingResume({ file, pageCount: imported.page_count });
-    } catch (fileError) {
-      setValidation(fileError instanceof Error ? fileError.message : "That resume could not be read.");
-    } finally {
-      setImporting(false);
-    }
+    void resumeImport.select(file);
   };
 
   const applyImport = async (mode: ResumeImportMode) => {
-    if (!importPreview || !pendingResume) return;
+    if (!importPreview || !pendingResume || saving || savingResume.current ||
+        !resumeImport.isCurrent(pendingResume.token)) return;
+    savingResume.current = true;
     setSaving(true);
     setValidation("");
     try {
@@ -190,21 +224,23 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
       const savedProfile = await onImportResume(
         pendingResume.file,
         importedProfile,
-        pendingResume.pageCount,
+        pendingResume.parsed.page_count,
       );
       setProfile(savedProfile);
       setImportSummary(summarizeResumeImport(savedProfile));
-      setImportPreview(undefined);
-      setPendingResume(undefined);
+      resumeImport.discard();
     } catch (requestError) {
       setValidation(requestError instanceof Error ? requestError.message : "Bluey could not save that resume.");
     } finally {
+      savingResume.current = false;
       setSaving(false);
     }
   };
 
   const moveToStep = async (nextStep: number) => {
+    if (saving || savingResume.current) return;
     const boundedStep = Math.max(0, Math.min(nextStep, steps.length - 1));
+    if (step === 0 && boundedStep !== 0) resumeImport.discard();
     const nextProfile = {
       ...profile,
       onboarding_step: boundedStep,
@@ -254,6 +290,14 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
       setValidation(message);
       return;
     }
+    const currentIdentity = validateSelectedOnboardingApplicationIdentity(
+      workspace.application_identities,
+      applicationIdentityId,
+    );
+    if (currentIdentity.kind === "unavailable") {
+      setValidation(applicationIdentityIssueCopy(currentIdentity.issue));
+      return;
+    }
     setSaving(true);
     const finishedProfile = {
       ...profile,
@@ -271,6 +315,7 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
     const finishedTrack = {
       ...track,
       role: canonicalizeTargetRole(track.role),
+      application_identity_id: currentIdentity.identity.id,
     };
     try {
       await onComplete(finishedProfile, finishedPreferences, finishedTrack);
@@ -317,17 +362,20 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
                 hidden
                 type="file"
                 accept=".pdf,.docx,.txt"
-                onChange={(event) => { void handleFile(event.target.files?.[0]); event.target.value = ""; }}
+                disabled={!showImport || saving}
+                onChange={(event) => { handleFile(event.target.files?.[0]); event.target.value = ""; }}
               />
               <div className="onboarding-start-choice" role="group" aria-label="Career Profile starting point">
-                <button className={resumeStart === "import" ? "active" : ""} onClick={() => setResumeStart("import")}><FileUp size={18} /><span><b>Import my resume</b><small>Start from PDF, DOCX, or TXT.</small></span></button>
-                <button className={resumeStart === "build" ? "active" : ""} onClick={() => setResumeStart("build")}><UserRound size={18} /><span><b>I do not have a resume</b><small>Build the same Career Profile from your history.</small></span></button>
+                <button className={resumeStart === "import" ? "active" : ""} disabled={saving} onClick={() => chooseResumeStart("import")}><FileUp size={18} /><span><b>Import my resume</b><small>Start from PDF, DOCX, or TXT.</small></span></button>
+                <button className={resumeStart === "build" ? "active" : ""} disabled={saving} onClick={() => chooseResumeStart("build")}><UserRound size={18} /><span><b>I do not have a resume</b><small>Build the same Career Profile from your history.</small></span></button>
               </div>
-              {resumeStart === "import" ? <button className="resume-dropzone" onClick={() => fileRef.current?.click()}>
-                {importing ? <LoaderCircle className="spin" /> : <FileUp />}
-                <strong>{profile.source_resume_name || "Choose PDF, DOCX, or TXT"}</strong>
+              {resumeStart === "import" ? <button className="resume-dropzone" disabled={saving} aria-busy={importing} onClick={() => fileRef.current?.click()}>
+                {importing ? <LoaderCircle className="spin" aria-hidden="true" /> : <FileUp aria-hidden="true" />}
+                <strong>{importing ? "Reading resume…" : profile.source_resume_name || "Choose PDF, DOCX, or TXT"}</strong>
                 <span>{profile.source_resume_name ? "Choose another file, review the extracted facts, then decide whether to replace or fill blanks." : "Bluey extracts a baseline you can review before anything is prepared."}</span>
               </button> : <div className="no-resume-note"><Sparkles size={18} /><span><b>Start with the facts you know</b><small>Add roles, education, and skills in the next steps. Bluey builds the first resume from that profile.</small></span></div>}
+              <span className="sr-only" role="status">{importing ? "Reading resume" : ""}</span>
+              {importError && <div className="inline-error" role="alert">{importError}</div>}
               {importSummary && (
                 <div className="resume-import-summary" aria-live="polite">
                   <Check size={17} />
@@ -459,9 +507,39 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
                   <button className={profile.default_submission_mode === "auto_submit" ? "active" : ""} onClick={() => update("default_submission_mode", "auto_submit")}><b>Auto-submit later</b><span>Available per Career Track only when server rules and site certification pass.</span></button>
                 </div>
               </div>
+              <div className="choice-section">
+                <div className="field">
+                  <label htmlFor={applicationIdentityFieldId}>Application email</label>
+                  <select
+                    id={applicationIdentityFieldId}
+                    value={applicationIdentityId}
+                    disabled={initialIdentity.verified.length === 0}
+                    aria-invalid={applicationIdentityIssue ? true : undefined}
+                    aria-describedby={applicationIdentityIssue ? applicationIdentityErrorId : undefined}
+                    onChange={(event) => setApplicationIdentityId(event.target.value)}
+                  >
+                    <option value="" disabled>Choose a verified application email</option>
+                    {initialIdentity.verified.map((identity) => (
+                      <option key={identity.id} value={identity.id}>
+                        {identity.label ? `${identity.label} — ${identity.email}` : identity.email}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="field-note">Used for applications. Your resume contact email does not verify or replace it.</p>
+                  {applicationIdentityIssue && (
+                    <p id={applicationIdentityErrorId} className="field-note inline-error" role="alert">
+                      {applicationIdentityIssueCopy(applicationIdentityIssue)}
+                    </p>
+                  )}
+                </div>
+              </div>
               <div className="setting-line">
                 <div><b>Review new claims</b><span>Pause when Bluey proposes a factual claim not already in your profile.</span></div>
-                <Toggle checked={profile.review_new_claims} onChange={(checked) => update("review_new_claims", checked)} />
+                <Toggle
+                  ariaLabel="Review new claims"
+                  checked={profile.review_new_claims}
+                  onChange={(checked) => update("review_new_claims", checked)}
+                />
               </div>
               <SearchPolicySummary profile={profile} role={track.role} />
             </>
@@ -508,7 +586,7 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
         preview={importPreview}
         busy={saving}
         onApply={applyImport}
-        onClose={() => { setImportPreview(undefined); setPendingResume(undefined); }}
+        onClose={() => { if (!savingResume.current) resumeImport.discard(); }}
       />
     </main>
   );
@@ -548,8 +626,27 @@ interface SpeechRecognitionLike {
   start(): void;
 }
 
-function Toggle({ checked, onChange }: { checked: boolean; onChange(checked: boolean): void }) {
-  return <button type="button" className={`toggle ${checked ? "on" : ""}`} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}><span /></button>;
+function Toggle({
+  ariaLabel,
+  checked,
+  onChange,
+}: {
+  ariaLabel: string;
+  checked: boolean;
+  onChange(checked: boolean): void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`toggle ${checked ? "on" : ""}`}
+      role="switch"
+      aria-label={ariaLabel}
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+    >
+      <span />
+    </button>
+  );
 }
 
 function validateStep(step: number, profile: CareerProfile, preferences: JobPreferences): string {

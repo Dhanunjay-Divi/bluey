@@ -1,0 +1,1010 @@
+name: Jobs managed-cloud release authority
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build or advance one already-built release artifact set
+        required: true
+        type: choice
+        options:
+          - candidate
+          - authorize
+          - publish
+          - promote
+          - rollback
+      jobs_ci_run_id:
+        description: Successful exact-tip default-branch Jobs CI run for candidate
+        required: false
+        type: string
+      observability_run_id:
+        description: Successful exact-tip default-branch Observability run for candidate
+        required: false
+        type: string
+      candidate_run_id:
+        description: Successful candidate run for authorize
+        required: false
+        type: string
+      candidate_run_attempt:
+        description: Exact successful build-and-verify attempt for authorize
+        required: false
+        type: string
+      authorized_run_id:
+        description: Successful protected authorize run for publish or promote
+        required: false
+        type: string
+      authorized_run_attempt:
+        description: Exact protected authorization attempt for publish or promote
+        required: false
+        type: string
+      publication_run_id:
+        description: Successful protected remote-publication run for promote
+        required: false
+        type: string
+      publication_run_attempt:
+        description: Exact protected remote-publication attempt for promote
+        required: false
+        type: string
+      from_promotion_run_id:
+        description: Current promotion run for rollback
+        required: false
+        type: string
+      target_promotion_run_id:
+        description: Successor promotion over prior verified bytes for rollback
+        required: false
+        type: string
+      release_id:
+        description: Immutable release identifier for a candidate build
+        required: false
+        type: string
+      manifest_generation:
+        description: Monotonic manifest generation for a candidate build
+        required: false
+        type: string
+      release_sequence:
+        description: Monotonic release sequence for a candidate build
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobs-managed-cloud-release
+  cancel-in-progress: false
+
+jobs:
+  # RELEASE-GATE: CANDIDATE-BUILD-BEGIN
+  candidate:
+    if: >-
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch &&
+      github.ref_protected == true &&
+      github.event.inputs.operation == 'candidate'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install the exact release Node interpreter
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.2
+      - name: Verify the exact release Node interpreter
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.23.2"
+      - name: Validate immutable build inputs
+        env:
+          JOBS_CI_RUN_ID: ${{ github.event.inputs.jobs_ci_run_id }}
+          NODE_IMAGE: ${{ vars.BLUEY_JOBS_NODE_IMAGE }}
+          OBSERVABILITY_RUN_ID: ${{ github.event.inputs.observability_run_id }}
+          PORTAL_ARTIFACT_ORIGIN: ${{ vars.BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN }}
+          REGISTRY_NAMESPACE: ${{ vars.BLUEY_JOBS_ARTIFACT_NAMESPACE }}
+          RELEASE_ID: ${{ github.event.inputs.release_id }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_ID"
+          case "$JOBS_CI_RUN_ID:$OBSERVABILITY_RUN_ID" in
+            *[!0-9:]*|:*|*:) echo "Exact-tip CI run IDs are required" >&2; exit 1 ;;
+          esac
+          case "$REGISTRY_NAMESPACE" in
+            ghcr.io/bluey|ghcr.io/bluey/*|*[A-Z]*|*@*|*:*/*:*)
+              echo "BLUEY_JOBS_ARTIFACT_NAMESPACE is not a controlled prefix" >&2
+              exit 1
+              ;;
+            */*) ;;
+            *) echo "BLUEY_JOBS_ARTIFACT_NAMESPACE is invalid" >&2; exit 1 ;;
+          esac
+          case "$PORTAL_ARTIFACT_ORIGIN" in
+            https://*[^/]) ;;
+            *) echo "BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN is invalid" >&2; exit 1 ;;
+          esac
+          case "$NODE_IMAGE" in
+            *@sha256:????????????????????????????????????????????????????????????????) ;;
+            *) echo "BLUEY_JOBS_NODE_IMAGE must be digest-pinned" >&2; exit 1 ;;
+          esac
+          docker buildx version
+      - name: Create closed contracts and run the release-gate tests
+        run: |
+          set -euo pipefail
+          mkdir -p release/contracts release/prepared release/oci
+          node jobs/scripts/managed-cloud-release-gate.mjs contracts-current \
+            --repo "$GITHUB_WORKSPACE" \
+            --out "$GITHUB_WORKSPACE/release/contracts" \
+            --version 4
+          node --test jobs/scripts/managed-cloud-release-gate.test.mjs
+          printf '%s\n%s\n' \
+            bluey-jobs-managed-cloud-release-gate-tests-v4 \
+            "$GITHUB_SHA" \
+            > release/prepared/release-gate-tests.log
+      - name: Bind successful exact-tip CI instead of synthetic candidate evidence
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          JOBS_CI_RUN_ID: ${{ github.event.inputs.jobs_ci_run_id }}
+          OBSERVABILITY_RUN_ID: ${{ github.event.inputs.observability_run_id }}
+        run: |
+          set -euo pipefail
+          case "$JOBS_CI_RUN_ID:$OBSERVABILITY_RUN_ID" in
+            *[!0-9:]*|:*|*:) echo "Exact-tip CI run IDs are required" >&2; exit 1 ;;
+          esac
+          if ! gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$JOBS_CI_RUN_ID" \
+            | node jobs/scripts/managed-cloud-release-gate.mjs publication-api-capture \
+                --kind run --out release/prepared/jobs-ci-run.json
+          then
+            rm -f -- release/prepared/jobs-ci-run.json \
+              release/prepared/jobs-ci-run.json.partial
+            exit 1
+          fi
+          if ! gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$OBSERVABILITY_RUN_ID" \
+            | node jobs/scripts/managed-cloud-release-gate.mjs publication-api-capture \
+                --kind run --out release/prepared/observability-run.json
+          then
+            rm -f -- release/prepared/observability-run.json \
+              release/prepared/observability-run.json.partial
+            exit 1
+          fi
+          SELF_TEST_SHA=$(sha256sum release/prepared/release-gate-tests.log | cut -d' ' -f1)
+          node jobs/scripts/managed-cloud-release-gate.mjs ci-evidence \
+            --jobs-ci-run release/prepared/jobs-ci-run.json \
+            --observability-run release/prepared/observability-run.json \
+            --release-contract-self-test-sha256 "$SELF_TEST_SHA" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --out release/prepared/test-evidence.json
+      - name: Build each component exactly once
+        env:
+          NODE_IMAGE: ${{ vars.BLUEY_JOBS_NODE_IMAGE }}
+          RELEASE_ID: ${{ github.event.inputs.release_id }}
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          CONFIG_SCHEMA_SHA256=$(sha256sum release/contracts/config-contract.json | cut -d' ' -f1)
+          MIGRATION_SET_SHA256=$(sha256sum release/contracts/migration-contract.json | cut -d' ' -f1)
+          PROTOCOL_SET_SHA256=$(sha256sum release/contracts/protocol-contract.json | cut -d' ' -f1)
+          docker buildx create --driver docker-container --use
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/jobs:/workspace:ro" \
+            --workdir /workspace \
+            "$NODE_IMAGE" \
+            sh -euc 'node -e "const [major,minor]=process.versions.node.split(\".\").map(Number);if(major<22||(major===22&&minor<13))process.exit(1)" && npm audit --audit-level=moderate'
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg "BLUEY_JOBS_BUILD_ID=$RELEASE_ID-jobs-api" \
+            --build-arg "BLUEY_JOBS_CONFIG_SCHEMA_SHA256=$CONFIG_SCHEMA_SHA256" \
+            --build-arg "BLUEY_JOBS_MIGRATION_SET_SHA256=$MIGRATION_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_PROTOCOL_SET_SHA256=$PROTOCOL_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --output type=oci,dest=release/oci/jobs-api,tar=false,compression=uncompressed,force-compression=true \
+            --file server/Dockerfile.jobs .
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg "BLUEY_JOBS_NODE_IMAGE=$NODE_IMAGE" \
+            --build-arg "BLUEY_JOBS_BUILD_ID=$RELEASE_ID-jobs-workflows" \
+            --build-arg "BLUEY_JOBS_CONFIG_SCHEMA_SHA256=$CONFIG_SCHEMA_SHA256" \
+            --build-arg "BLUEY_JOBS_MIGRATION_SET_SHA256=$MIGRATION_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_PROTOCOL_SET_SHA256=$PROTOCOL_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
+            --build-arg "BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=discovery_worker,global_discovery_worker,original_source_verifier,workflow_gateway,workflow_worker" \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --output type=oci,dest=release/oci/jobs-workflows,tar=false,compression=uncompressed,force-compression=true \
+            --file jobs/workflows/Dockerfile jobs
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg "BLUEY_JOBS_BUILD_ID=$RELEASE_ID-jobs-runner" \
+            --build-arg "BLUEY_JOBS_CONFIG_SCHEMA_SHA256=$CONFIG_SCHEMA_SHA256" \
+            --build-arg "BLUEY_JOBS_MIGRATION_SET_SHA256=$MIGRATION_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_PROTOCOL_SET_SHA256=$PROTOCOL_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --output type=oci,dest=release/oci/jobs-runner,tar=false,compression=uncompressed,force-compression=true \
+            --file jobs/runner/Dockerfile jobs
+          docker run --rm \
+            --env PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+            --volume "$GITHUB_WORKSPACE/jobs:/workspace" \
+            --workdir /workspace \
+            "$NODE_IMAGE" \
+            sh -euc 'npm ci --workspace @bluey/jobs-portal --include-workspace-root && npm run build --workspace @bluey/jobs-portal'
+          for component in jobs-api jobs-workflows jobs-runner; do
+            (cd "release/oci/$component" \
+              && find . -mindepth 1 -printf '%P\0' \
+                | LC_ALL=C sort -z \
+                | tar --null --no-recursion --files-from=- \
+                    --format=ustar --mtime='@0' --owner=0 --group=0 \
+                    --numeric-owner --mode='u+rwX,go+rX,go-w' \
+                    -cf "$GITHUB_WORKSPACE/release/prepared/$component.oci.tar")
+          done
+          (cd jobs/portal/dist \
+            && find . -mindepth 1 -printf '%P\0' \
+              | LC_ALL=C sort -z \
+              | tar --null --no-recursion --files-from=- \
+                  --format=ustar --mtime='@0' --owner=0 --group=0 \
+                  --numeric-owner --mode='u+rwX,go+rX,go-w' \
+                  -cf "$GITHUB_WORKSPACE/release/prepared/jobs-portal.tar")
+      - name: Create Bluey file SBOM and recipe provenance, not OCI attestations
+        env:
+          RELEASE_ID: ${{ github.event.inputs.release_id }}
+        run: |
+          set -euo pipefail
+          for component in jobs-api jobs-runner jobs-workflows; do
+            node jobs/scripts/managed-cloud-release-gate.mjs inspect-artifact \
+              --file "release/prepared/$component.oci.tar" \
+              --component "$component" --kind oci_image \
+              --out "release/prepared/$component.content-inventory.json"
+          done
+          node jobs/scripts/managed-cloud-release-gate.mjs inspect-artifact \
+            --file release/prepared/jobs-portal.tar \
+            --component jobs-portal --kind static_bundle \
+            --out release/prepared/jobs-portal.content-inventory.json
+          BUILDER_SHA=$(sha256sum release/contracts/builder-policy.json | cut -d' ' -f1)
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          for component in jobs-api jobs-portal jobs-runner jobs-workflows; do
+            node jobs/scripts/managed-cloud-release-gate.mjs sbom \
+              --inventory "release/prepared/$component.content-inventory.json" \
+              --out "release/prepared/$component.sbom.json"
+            node jobs/scripts/managed-cloud-release-gate.mjs provenance \
+              --inventory "release/prepared/$component.content-inventory.json" \
+              --build-id "$RELEASE_ID-$component" \
+              --builder-policy-sha256 "$BUILDER_SHA" \
+              --source-commit "$GITHUB_SHA" \
+              --source-date-epoch "$SOURCE_DATE_EPOCH" \
+              --out "release/prepared/$component.provenance.json"
+          done
+      - name: Assemble the deterministic release candidate
+        env:
+          MANIFEST_GENERATION: ${{ github.event.inputs.manifest_generation }}
+          PORTAL_ARTIFACT_ORIGIN: ${{ vars.BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN }}
+          REGISTRY_NAMESPACE: ${{ vars.BLUEY_JOBS_ARTIFACT_NAMESPACE }}
+          RELEASE_ID: ${{ github.event.inputs.release_id }}
+          RELEASE_SEQUENCE: ${{ github.event.inputs.release_sequence }}
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const components = ["jobs-api", "jobs-portal", "jobs-runner", "jobs-workflows"];
+          const inventory = (id) => JSON.parse(
+            readFileSync(`release/prepared/${id}.content-inventory.json`, "utf8"),
+          );
+          const descriptor = {
+            audience: "bluey-jobs-managed-cloud-release-descriptor-v4",
+            builds: components.map((componentId) => {
+              const value = inventory(componentId);
+              const oci = value.artifactKind === "oci_image";
+              return {
+                architecture: oci ? "x86_64" : "wasm",
+                artifactKind: value.artifactKind,
+                artifactRef: oci
+                  ? `${process.env.REGISTRY_NAMESPACE}-${componentId.slice(5)}@sha256:${value.artifactSha256}`
+                  : `${process.env.PORTAL_ARTIFACT_ORIGIN}/${process.env.RELEASE_ID}/${value.artifactSha256}.tar`,
+                buildId: `${process.env.RELEASE_ID}-${componentId}`,
+                candidateFile: `release/prepared/${componentId}.${oci ? "oci.tar" : "tar"}`,
+                componentId,
+                contentInventoryFile: `release/prepared/${componentId}.content-inventory.json`,
+                platform: oci ? "linux" : "web",
+                provenanceFile: `release/prepared/${componentId}.provenance.json`,
+                sbomFile: `release/prepared/${componentId}.sbom.json`,
+              };
+            }),
+            featureAuthority: {
+              cloudDistribution: true,
+              directDiscovery: true,
+              globalDiscovery: true,
+              sourceVerification: true,
+              workflowCleanup: true,
+              workflowCommandDispatch: true,
+            },
+            manifestGeneration: Number(process.env.MANIFEST_GENERATION),
+            manifestId: `${process.env.RELEASE_ID}-manifest`,
+            publishedAtMs: Number(process.env.SOURCE_DATE_EPOCH) * 1000,
+            releaseId: process.env.RELEASE_ID,
+            releaseSequence: Number(process.env.RELEASE_SEQUENCE),
+            sourceCommit: process.env.GITHUB_SHA,
+            sourceDateEpoch: Number(process.env.SOURCE_DATE_EPOCH),
+            testEvidenceFile: "release/prepared/test-evidence.json",
+            version: 4,
+          };
+          writeFileSync("release/prepared/release-descriptor.json", JSON.stringify(descriptor));
+          NODE
+          node jobs/scripts/managed-cloud-release-gate.mjs assemble \
+            --repo "$GITHUB_WORKSPACE" \
+            --contracts "$GITHUB_WORKSPACE/release/contracts" \
+            --descriptor "$GITHUB_WORKSPACE/release/prepared/release-descriptor.json" \
+            --out "$GITHUB_WORKSPACE/release/candidate"
+      - name: Upload the only candidate bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release/candidate
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: CANDIDATE-BUILD-END
+
+  # RELEASE-GATE: VERIFY-NO-REBUILD-BEGIN
+  verify:
+    if: >-
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch &&
+      github.ref_protected == true &&
+      github.event.inputs.operation == 'candidate'
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out only the verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install the exact release Node interpreter
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.2
+      - name: Verify the exact release Node interpreter
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.23.2"
+      - name: Fetch candidate bytes from the build job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jobs-managed-cloud-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate
+      - name: Independently inspect the downloaded bytes
+        run: node jobs/scripts/managed-cloud-release-gate.mjs verify --candidate candidate
+  # RELEASE-GATE: VERIFY-NO-REBUILD-END
+
+  # RELEASE-GATE: AUTHORIZE-NO-REBUILD-BEGIN
+  authorize:
+    if: >-
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch &&
+      github.ref_protected == true &&
+      github.event.inputs.operation == 'authorize'
+    environment: jobs-managed-cloud-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out only the verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install the exact release Node interpreter
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.2
+      - name: Verify the exact release Node interpreter
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.23.2"
+      - name: Read the verified candidate source commit
+        id: candidate-source
+        env:
+          AUTHORIZED_ARCHIVE_MAX_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_ARCHIVE_MAX_BYTES }}
+          AUTHORIZED_MAX_UNPACKED_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_MAX_UNPACKED_BYTES }}
+          AUTHORIZED_RESERVE_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_RESERVE_BYTES }}
+          CANDIDATE_RUN_ATTEMPT: ${{ github.event.inputs.candidate_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ github.event.inputs.candidate_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          proof="$(bash jobs/scripts/intake-managed-cloud-authorized.sh candidate)"
+          node -e '
+            const { root, candidateSourceCommit, candidateSetSha256 } = JSON.parse(require("node:fs").readFileSync(0,"utf8"));
+            if (!require("node:path").isAbsolute(root) || /[\r\n]/.test(root) ||
+                !/^[0-9a-f]{40}$/.test(candidateSourceCommit) || !/^[0-9a-f]{64}$/.test(candidateSetSha256)) process.exit(1);
+            process.stdout.write("root="+root+"\ncommit="+candidateSourceCommit+"\nset-digest="+candidateSetSha256+"\n");
+          ' <<<"$proof" >> "$GITHUB_OUTPUT"
+      - name: Check out candidate policy files as data only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ steps.candidate-source.outputs.commit }}
+          path: candidate-policy
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/workflows/observability-policy.yml
+            /scripts/analyze-tracing-calls.py
+      - name: Verify the protected Observability policy before handling release signatures
+        env:
+          APPROVED_OBSERVABILITY_POLICY_SHA256: ${{ secrets.BLUEY_JOBS_OBSERVABILITY_POLICY_SHA256 }}
+          POLICY_SOURCE_COMMIT: ${{ steps.candidate-source.outputs.commit }}
+        run: |
+          set -euo pipefail
+          test "$(git --no-optional-locks -C candidate-policy rev-parse HEAD)" = "$POLICY_SOURCE_COMMIT"
+          node jobs/scripts/check-managed-cloud-observability-policy.mjs \
+            --repo "$GITHUB_WORKSPACE/candidate-policy" \
+            --source-commit "$POLICY_SOURCE_COMMIT" \
+            --approved-policy-sha256 "$APPROVED_OBSERVABILITY_POLICY_SHA256" > /dev/null
+      - name: Reverify and authorize with protected trust material
+        env:
+          APPROVED_OBSERVABILITY_POLICY_SHA256: ${{ secrets.BLUEY_JOBS_OBSERVABILITY_POLICY_SHA256 }}
+          CANDIDATE_ROOT: ${{ steps.candidate-source.outputs.root }}
+          RELEASE_SIGNATURES: ${{ secrets.BLUEY_JOBS_RELEASE_SIGNATURES_BASE64URL }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+          TRUST_BUNDLE: ${{ secrets.BLUEY_JOBS_RELEASE_TRUST_BUNDLE_BASE64URL }}
+          VERIFIED_CANDIDATE_SET_SHA256: ${{ steps.candidate-source.outputs.set-digest }}
+        run: |
+          set -euo pipefail
+          mkdir authority
+          node -e 'require("node:fs").writeFileSync("authority/release-signatures.json", Buffer.from(process.env.RELEASE_SIGNATURES, "base64url"))'
+          node -e 'require("node:fs").writeFileSync("authority/trust-bundle.json", Buffer.from(process.env.TRUST_BUNDLE, "base64url"))'
+          node jobs/scripts/managed-cloud-release-gate.mjs authorize \
+            --candidate "$CANDIDATE_ROOT" \
+            --expected-candidate-set-sha256 "$VERIFIED_CANDIDATE_SET_SHA256" \
+            --observability-policy-repo "$GITHUB_WORKSPACE/candidate-policy" \
+            --approved-observability-policy-sha256 "$APPROVED_OBSERVABILITY_POLICY_SHA256" \
+            --authorization-id "authorization-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --signatures authority/release-signatures.json \
+            --trust-bundle authority/trust-bundle.json \
+            --out authorized
+      - name: Upload authorized bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-authorized-${{ github.run_id }}-${{ github.run_attempt }}
+          path: authorized
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: AUTHORIZE-NO-REBUILD-END
+
+  # RELEASE-GATE: PUBLISH-REMOTE-BEGIN
+  publish:
+    if: >-
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch &&
+      github.ref_protected == true &&
+      github.event.inputs.operation == 'publish'
+    environment: jobs-managed-cloud-artifact-publication
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out only the publication verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install the exact release Node interpreter
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.2
+      - name: Verify the exact release Node interpreter
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.23.2"
+      - name: Install the pinned OCI Distribution client
+        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
+        with:
+          version: 1.3.1
+      - name: Intake exact protected authorization before publication
+        id: intake-authorization
+        env:
+          APPROVED_OBSERVABILITY_POLICY_SHA256: ${{ secrets.BLUEY_JOBS_OBSERVABILITY_POLICY_SHA256 }}
+          AUTHORIZATION_WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+          AUTHORIZED_ARCHIVE_MAX_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_ARCHIVE_MAX_BYTES }}
+          AUTHORIZED_MAX_UNPACKED_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_MAX_UNPACKED_BYTES }}
+          AUTHORIZED_RESERVE_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_RESERVE_BYTES }}
+          AUTHORIZED_RUN_ATTEMPT: ${{ github.event.inputs.authorized_run_attempt }}
+          AUTHORIZED_RUN_ID: ${{ github.event.inputs.authorized_run_id }}
+          CANDIDATE_SOURCE_COMMIT: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          test "$AUTHORIZATION_WORKFLOW_COMMIT" = "$CANDIDATE_SOURCE_COMMIT"
+          proof="$(bash jobs/scripts/intake-managed-cloud-authorized.sh)"
+          root="$(node -e '
+            const root=JSON.parse(require("node:fs").readFileSync(0,"utf8")).root;
+            if (!require("node:path").isAbsolute(root) || /[\r\n]/.test(root)) process.exit(1);
+            process.stdout.write(root);
+          ' <<<"$proof")"
+          printf 'root=%s\n' "$root" >> "$GITHUB_OUTPUT"
+      - name: Create the controlled immutable publication plan
+        env:
+          AUTHORIZED_ROOT: ${{ steps.intake-authorization.outputs.root }}
+          PORTAL_ARTIFACT_ORIGIN: ${{ vars.BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN }}
+          REGISTRY_NAMESPACE: ${{ vars.BLUEY_JOBS_ARTIFACT_NAMESPACE }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          mkdir publication
+          node jobs/scripts/managed-cloud-release-gate.mjs publication-plan \
+            --authorized "$AUTHORIZED_ROOT" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --registry-namespace "$REGISTRY_NAMESPACE" \
+            --portal-artifact-origin "$PORTAL_ARTIFACT_ORIGIN" \
+            --out publication/publication-plan.json
+      - name: Publish exact stored bytes and pull them back by immutable digest
+        env:
+          AUTHORIZED_ROOT: ${{ steps.intake-authorization.outputs.root }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_NAMESPACE: ${{ vars.BLUEY_JOBS_ARTIFACT_NAMESPACE }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          OWNER_LOWER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          case "$REGISTRY_NAMESPACE" in
+            "ghcr.io/$OWNER_LOWER/"*) ;;
+            *) echo "Current publisher only admits this repository owner's GHCR namespace" >&2; exit 1 ;;
+          esac
+          node jobs/scripts/managed-cloud-release-gate.mjs publication-runtime \
+            --authorized "$AUTHORIZED_ROOT" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --plan publication/publication-plan.json \
+            --source-commit "$GITHUB_SHA" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID"
+          printf '%s' "$GH_TOKEN" | oras login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+          mkdir publication-readback publication-source publication-layout \
+            portal-upload portal-download
+          for component in jobs-api jobs-runner jobs-workflows; do
+            DIGEST=$(node -e '
+              const plan=require("./publication/publication-plan.json");
+              const row=plan.artifacts.find((item)=>item.componentId===process.argv[1]);
+              if(!row)process.exit(2);process.stdout.write(row.artifactSha256);
+            ' "$component")
+            TAG_REF=$(node -e '
+              const plan=require("./publication/publication-plan.json");
+              const row=plan.artifacts.find((item)=>item.componentId===process.argv[1]);
+              if(!row)process.exit(2);process.stdout.write(row.publicationTagRef);
+            ' "$component")
+            SIGNED_ARTIFACT_REF=$(node -e '
+              const plan=require("./publication/publication-plan.json");
+              const row=plan.artifacts.find((item)=>item.componentId===process.argv[1]);
+              if(!row)process.exit(2);process.stdout.write(row.signedArtifactRef);
+            ' "$component")
+            mkdir "publication-source/$component" "publication-layout/$component"
+            tar --extract --file "$AUTHORIZED_ROOT/candidate/payloads/$component.oci.tar" \
+              --directory "publication-source/$component" \
+              --no-same-owner --no-same-permissions
+            oras cp --from-oci-layout \
+              "publication-source/$component@sha256:$DIGEST" "$TAG_REF"
+            test "$(oras resolve "$TAG_REF")" = "sha256:$DIGEST"
+            test "$(oras resolve "$SIGNED_ARTIFACT_REF")" = "sha256:$DIGEST"
+            oras cp --to-oci-layout "$SIGNED_ARTIFACT_REF" \
+              "publication-layout/$component:$GITHUB_RUN_ID"
+            (cd "publication-layout/$component" \
+              && find . -mindepth 1 -printf '%P\0' \
+                | LC_ALL=C sort -z \
+                | tar --null --no-recursion --files-from=- \
+                    --format=ustar --mtime='@0' --owner=0 --group=0 \
+                    --numeric-owner --mode='u+rwX,go+rX,go-w' \
+                    -cf "$GITHUB_WORKSPACE/publication-readback/$component.oci.tar")
+          done
+          PORTAL_TAG_REF=$(node -e '
+            const plan=require("./publication/publication-plan.json");
+            const row=plan.artifacts.find((item)=>item.componentId==="jobs-portal");
+            if(!row)process.exit(2);process.stdout.write(row.publicationTagRef);
+          ')
+          PORTAL_MANIFEST_CREATED_AT=$(node -e '
+            const plan=require("./publication/publication-plan.json");
+            process.stdout.write(plan.portalManifestCreatedAt);
+          ')
+          cp "$AUTHORIZED_ROOT/candidate/payloads/jobs-portal.tar" portal-upload/jobs-portal.tar
+          (cd portal-upload && oras push "$PORTAL_TAG_REF" \
+            --artifact-type application/vnd.bluey.jobs.portal.v1 \
+            --annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT" \
+            jobs-portal.tar:application/vnd.bluey.jobs.portal.tar)
+          PORTAL_DIGEST=$(oras resolve "$PORTAL_TAG_REF")
+          PORTAL_REPOSITORY=${PORTAL_TAG_REF%:*}
+          PORTAL_REGISTRY_REF="$PORTAL_REPOSITORY@$PORTAL_DIGEST"
+          if ! oras manifest fetch "$PORTAL_REGISTRY_REF" \
+            | node jobs/scripts/managed-cloud-release-gate.mjs \
+                publication-portal-capture \
+                --out publication-readback/jobs-portal.oci-manifest.json
+          then
+            rm -f -- publication-readback/jobs-portal.oci-manifest.json \
+              publication-readback/jobs-portal.oci-manifest.json.partial
+            exit 1
+          fi
+          node jobs/scripts/managed-cloud-release-gate.mjs \
+            publication-portal-manifest \
+            --plan publication/publication-plan.json \
+            --portal-registry-ref "$PORTAL_REGISTRY_REF" \
+            --manifest publication-readback/jobs-portal.oci-manifest.json
+          oras pull "$PORTAL_REGISTRY_REF" --output portal-download
+          node jobs/scripts/managed-cloud-release-gate.mjs \
+            publication-portal-readback \
+            --plan publication/publication-plan.json \
+            --portal-registry-ref "$PORTAL_REGISTRY_REF" \
+            --manifest publication-readback/jobs-portal.oci-manifest.json \
+            --download portal-download \
+            --out publication-readback/jobs-portal.tar
+          printf '%s\n' "$PORTAL_REGISTRY_REF" > publication/portal-registry-ref.txt
+      - name: Verify full remote readback and bind the native addon
+        env:
+          AUTHORIZED_ROOT: ${{ steps.intake-authorization.outputs.root }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          PORTAL_REGISTRY_REF=$(tr -d '\n' < publication/portal-registry-ref.txt)
+          rm publication/portal-registry-ref.txt
+          node jobs/scripts/managed-cloud-release-gate.mjs publication-attest \
+            --authorized "$AUTHORIZED_ROOT" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --plan publication/publication-plan.json \
+            --readback publication-readback \
+            --portal-registry-ref "$PORTAL_REGISTRY_REF" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --out publication/publication-set.json
+          node jobs/scripts/managed-cloud-release-gate.mjs publication-verify \
+            --authorized "$AUTHORIZED_ROOT" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --publication publication \
+            --readback publication-readback \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Upload the remote publication receipt only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-publication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: publication
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: PUBLISH-REMOTE-END
+
+  # RELEASE-GATE: PROMOTE-NO-REBUILD-BEGIN
+  promote:
+    if: >-
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch &&
+      github.ref_protected == true &&
+      github.event.inputs.operation == 'promote'
+    environment: jobs-managed-cloud-release
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out only the verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install the exact release Node interpreter
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.2
+      - name: Verify the exact release Node interpreter
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.23.2"
+      - name: Install the pinned OCI Distribution client
+        uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2.0.0
+        with:
+          version: 1.3.1
+      - name: Select one immutable receipt from the exact publication attempt
+        id: select-publication
+        env:
+          APPROVED_OBSERVABILITY_POLICY_SHA256: ${{ secrets.BLUEY_JOBS_OBSERVABILITY_POLICY_SHA256 }}
+          AUTHORIZED_ARCHIVE_MAX_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_ARCHIVE_MAX_BYTES }}
+          AUTHORIZED_MAX_UNPACKED_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_MAX_UNPACKED_BYTES }}
+          AUTHORIZED_RESERVE_BYTES: ${{ vars.BLUEY_JOBS_AUTHORIZED_RESERVE_BYTES }}
+          AUTHORIZED_RUN_ATTEMPT: ${{ github.event.inputs.authorized_run_attempt }}
+          AUTHORIZED_RUN_ID: ${{ github.event.inputs.authorized_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_RUN_ATTEMPT: ${{ github.event.inputs.publication_run_attempt }}
+          PUBLICATION_RUN_ID: ${{ github.event.inputs.publication_run_id }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          node --input-type=module - \
+            "$PUBLICATION_RUN_ID" "$PUBLICATION_RUN_ATTEMPT" <<'NODE'
+          const [runId, runAttempt] = process.argv.slice(2);
+          for (const [label, value] of [["run ID", runId], ["run attempt", runAttempt]]) {
+            if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+              throw new Error(`Publication ${label} must be a canonical positive safe integer`);
+            }
+          }
+          NODE
+          if ! gh api --hostname github.com "/repos/$GITHUB_REPOSITORY/actions/runs/$PUBLICATION_RUN_ID/attempts/$PUBLICATION_RUN_ATTEMPT" \
+            | node jobs/scripts/managed-cloud-release-gate.mjs publication-api-capture \
+                --kind run --out publication-workflow-run.json
+          then
+            rm -f -- publication-workflow-run.json publication-workflow-run.json.partial
+            exit 1
+          fi
+          if ! gh api --hostname github.com "/repos/$GITHUB_REPOSITORY/actions/runs/$PUBLICATION_RUN_ID/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100" \
+            | node jobs/scripts/managed-cloud-release-gate.mjs publication-api-capture \
+                --kind jobs --out publication-workflow-jobs.json
+          then
+            rm -f -- publication-workflow-jobs.json publication-workflow-jobs.json.partial
+            exit 1
+          fi
+          if ! gh api --hostname github.com "/repos/$GITHUB_REPOSITORY/actions/runs/$PUBLICATION_RUN_ID/artifacts?per_page=100" \
+            | node jobs/scripts/managed-cloud-release-gate.mjs publication-api-capture \
+                --kind artifacts --out publication-workflow-artifacts.json
+          then
+            rm -f -- publication-workflow-artifacts.json publication-workflow-artifacts.json.partial
+            exit 1
+          fi
+          source_commit="$(node jobs/scripts/managed-cloud-release-gate.mjs publication-source-commit \
+            --run publication-workflow-run.json \
+            --run-id "$PUBLICATION_RUN_ID" --run-attempt "$PUBLICATION_RUN_ATTEMPT" \
+            --default-branch "$DEFAULT_BRANCH" --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID")"
+          proof="$(AUTHORIZATION_WORKFLOW_COMMIT="$source_commit" CANDIDATE_SOURCE_COMMIT="$source_commit" \
+            bash jobs/scripts/intake-managed-cloud-authorized.sh)"
+          root="$(node -e '
+            const root=JSON.parse(require("node:fs").readFileSync(0,"utf8")).root;
+            if (!require("node:path").isAbsolute(root) || /[\r\n]/.test(root)) process.exit(1);
+            process.stdout.write(root);
+          ' <<<"$proof")"
+          node jobs/scripts/managed-cloud-release-gate.mjs publication-artifact-select \
+            --authorized "$root" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --run publication-workflow-run.json \
+            --jobs publication-workflow-jobs.json \
+            --artifacts publication-workflow-artifacts.json \
+            --run-id "$PUBLICATION_RUN_ID" \
+            --run-attempt "$PUBLICATION_RUN_ATTEMPT" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --out publication-workflow-evidence.json
+          ARTIFACT_ID=$(node -e '
+            const evidence=require("./publication-workflow-evidence.json");
+            process.stdout.write(String(evidence.artifactId));
+          ')
+          printf 'artifact-id=%s\n' "$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
+          printf 'authorized-root=%s\n' "$root" >> "$GITHUB_OUTPUT"
+      - name: Fetch the selected immutable remote-publication receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}
+          merge-multiple: true
+          path: publication
+          run-id: ${{ github.event.inputs.publication_run_id }}
+          github-token: ${{ github.token }}
+      - name: Independently pull every published artifact by immutable digest
+        env:
+          AUTHORIZED_ROOT: ${{ steps.select-publication.outputs.authorized-root }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_RUN_ATTEMPT: ${{ github.event.inputs.publication_run_attempt }}
+          PUBLICATION_RUN_ID: ${{ github.event.inputs.publication_run_id }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          node jobs/scripts/managed-cloud-release-gate.mjs publication-preflight \
+            --authorized "$AUTHORIZED_ROOT" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --publication publication \
+            --publication-workflow-evidence publication-workflow-evidence.json \
+            --default-branch "$DEFAULT_BRANCH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --out publication-preflight.json
+          REGISTRY_NAMESPACE=$(node -e '
+            const preflight=require("./publication-preflight.json");
+            process.stdout.write(preflight.registryNamespace);
+          ')
+          OWNER_LOWER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          case "$REGISTRY_NAMESPACE" in
+            "ghcr.io/$OWNER_LOWER/"*) ;;
+            *) echo "Publication receipt is outside this repository owner's GHCR namespace" >&2; exit 1 ;;
+          esac
+          printf '%s' "$GH_TOKEN" | oras login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+          mkdir publication-readback publication-layout portal-download
+          for component in jobs-api jobs-runner jobs-workflows; do
+            SIGNED_ARTIFACT_REF=$(node -e '
+              const preflight=require("./publication-preflight.json");
+              const row=preflight.artifacts.find((item)=>item.componentId===process.argv[1]);
+              if(!row)process.exit(2);process.stdout.write(row.publishedRegistryRef);
+            ' "$component")
+            mkdir "publication-layout/$component"
+            oras cp --to-oci-layout "$SIGNED_ARTIFACT_REF" \
+              "publication-layout/$component:$GITHUB_RUN_ID"
+            (cd "publication-layout/$component" \
+              && find . -mindepth 1 -printf '%P\0' \
+                | LC_ALL=C sort -z \
+                | tar --null --no-recursion --files-from=- \
+                    --format=ustar --mtime='@0' --owner=0 --group=0 \
+                    --numeric-owner --mode='u+rwX,go+rX,go-w' \
+                    -cf "$GITHUB_WORKSPACE/publication-readback/$component.oci.tar")
+          done
+          PORTAL_REGISTRY_REF=$(node -e '
+            const preflight=require("./publication-preflight.json");
+            const row=preflight.artifacts.find((item)=>item.componentId==="jobs-portal");
+            if(!row)process.exit(2);process.stdout.write(row.publishedRegistryRef);
+          ')
+          if ! oras manifest fetch "$PORTAL_REGISTRY_REF" \
+            | node jobs/scripts/managed-cloud-release-gate.mjs \
+                publication-portal-capture \
+                --out publication-readback/jobs-portal.oci-manifest.json
+          then
+            rm -f -- publication-readback/jobs-portal.oci-manifest.json \
+              publication-readback/jobs-portal.oci-manifest.json.partial
+            exit 1
+          fi
+          node jobs/scripts/managed-cloud-release-gate.mjs \
+            publication-portal-manifest \
+            --preflight publication-preflight.json \
+            --portal-registry-ref "$PORTAL_REGISTRY_REF" \
+            --manifest publication-readback/jobs-portal.oci-manifest.json
+          oras pull "$PORTAL_REGISTRY_REF" --output portal-download
+          node jobs/scripts/managed-cloud-release-gate.mjs \
+            publication-portal-readback \
+            --preflight publication-preflight.json \
+            --portal-registry-ref "$PORTAL_REGISTRY_REF" \
+            --manifest publication-readback/jobs-portal.oci-manifest.json \
+            --download portal-download \
+            --out publication-readback/jobs-portal.tar
+          node jobs/scripts/managed-cloud-release-gate.mjs publication-verify \
+            --authorized "$AUTHORIZED_ROOT" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --publication publication \
+            --readback publication-readback \
+            --workflow-run-id "$PUBLICATION_RUN_ID" \
+            --workflow-run-attempt "$PUBLICATION_RUN_ATTEMPT"
+      - name: Reverify and produce a remote-publication promotion
+        env:
+          AUTHORIZED_ROOT: ${{ steps.select-publication.outputs.authorized-root }}
+          ACTIVATION: ${{ secrets.BLUEY_JOBS_ACTIVATION_BASE64URL }}
+          ACTIVATION_EVIDENCE: ${{ secrets.BLUEY_JOBS_ACTIVATION_EVIDENCE_BUNDLE_BASE64URL }}
+          ACTIVATION_SIGNATURES: ${{ secrets.BLUEY_JOBS_ACTIVATION_SIGNATURES_BASE64URL }}
+          COHORT: ${{ secrets.BLUEY_JOBS_COHORT_BASE64URL }}
+          COHORT_SIGNATURES: ${{ secrets.BLUEY_JOBS_COHORT_SIGNATURES_BASE64URL }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          mkdir authority evidence
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from "node:fs";
+          const material = [
+            ["authority/activation.json", "ACTIVATION"],
+            ["authority/activation-signatures.json", "ACTIVATION_SIGNATURES"],
+            ["authority/cohort.json", "COHORT"],
+            ["authority/cohort-signatures.json", "COHORT_SIGNATURES"],
+          ];
+          for (const [path, name] of material) {
+            writeFileSync(path, Buffer.from(process.env[name], "base64url"));
+          }
+          const bundle = JSON.parse(
+            Buffer.from(process.env.ACTIVATION_EVIDENCE, "base64url").toString("utf8"),
+          );
+          const expected = [
+            "canary.json", "cleanup-authority.json", "failure-converter.json",
+            "portal-readback.json", "runner-fleet.json", "storage-config.json",
+            "task-queue.json", "temporal-namespace.json",
+          ];
+          if (JSON.stringify(Object.keys(bundle).sort()) !== JSON.stringify(expected)) {
+            throw new Error("activation evidence bundle is not exact");
+          }
+          for (const name of expected) {
+            writeFileSync(`evidence/${name}`, Buffer.from(bundle[name], "base64url"));
+          }
+          NODE
+          node jobs/scripts/managed-cloud-release-gate.mjs promote \
+            --authorized "$AUTHORIZED_ROOT" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --cohort authority/cohort.json \
+            --cohort-signatures authority/cohort-signatures.json \
+            --activation authority/activation.json \
+            --activation-signatures authority/activation-signatures.json \
+            --evidence evidence \
+            --publication publication \
+            --publication-preflight publication-preflight.json \
+            --publication-readback publication-readback \
+            --promotion-id "promotion-$GITHUB_RUN_ID" \
+            --out promotion
+      - name: Upload promotion authority and bound publication receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-promotion
+          path: promotion
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: PROMOTE-NO-REBUILD-END
+
+  # RELEASE-GATE: ROLLBACK-NO-REBUILD-BEGIN
+  rollback:
+    if: >-
+      github.ref_type == 'branch' &&
+      github.ref_name == github.event.repository.default_branch &&
+      github.ref_protected == true &&
+      github.event.inputs.operation == 'rollback'
+    environment: jobs-managed-cloud-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out only the verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install the exact release Node interpreter
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.23.2
+      - name: Verify the exact release Node interpreter
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v22.23.2"
+      - name: Fetch the current promotion
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jobs-managed-cloud-promotion
+          path: from-promotion
+          run-id: ${{ github.event.inputs.from_promotion_run_id }}
+          github-token: ${{ github.token }}
+      - name: Fetch the signed successor promotion over old bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jobs-managed-cloud-promotion
+          path: target-promotion
+          run-id: ${{ github.event.inputs.target_promotion_run_id }}
+          github-token: ${{ github.token }}
+      - name: Reverify both promotions and create the rollback receipt
+        env:
+          ROLLBACK: ${{ secrets.BLUEY_JOBS_ROLLBACK_BASE64URL }}
+          ROLLBACK_SIGNATURES: ${{ secrets.BLUEY_JOBS_ROLLBACK_SIGNATURES_BASE64URL }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          mkdir authority
+          node -e 'require("node:fs").writeFileSync("authority/rollback.json", Buffer.from(process.env.ROLLBACK, "base64url"))'
+          node -e 'require("node:fs").writeFileSync("authority/rollback-signatures.json", Buffer.from(process.env.ROLLBACK_SIGNATURES, "base64url"))'
+          node jobs/scripts/managed-cloud-release-gate.mjs rollback \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --from-promotion from-promotion \
+            --to-promotion target-promotion \
+            --rollback authority/rollback.json \
+            --rollback-signatures authority/rollback-signatures.json \
+            --out rollback
+      - name: Upload rollback receipt and both verified promotions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-rollback
+          path: rollback
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: ROLLBACK-NO-REBUILD-END

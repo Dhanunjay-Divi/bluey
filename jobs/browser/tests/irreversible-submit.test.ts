@@ -7,7 +7,6 @@ import {
   acquireFinalSubmitAuthority,
   durableFinalSubmitHooks,
   finalSubmitMarkerExists,
-  recordReconciledSubmitConfirmation,
 } from "../src/irreversible-submit.js";
 import { classifyLocalFailure, LocalBrowserError } from "../src/local-failure.js";
 import { identityProfileDirectory } from "../src/profile.js";
@@ -55,26 +54,33 @@ describe("irreversible submit authority", () => {
     const restartedHooks = durableFinalSubmitHooks(runDirectory);
 
     await expect(finalSubmitMarkerExists(runDirectory)).resolves.toBe(true);
-    await expect(restartedHooks.beforeFinalSubmit()).rejects.toMatchObject({
+    await expect(restartedHooks.beforeFinalSubmit({
+      adapter: "greenhouse",
+      adapterVersion: "2026.07.1-beta.1",
+      control: "greenhouse_submit_application",
+      target: {
+        actionUrl: "https://boards.greenhouse.io/acme/jobs/123",
+        method: "post",
+        enctype: "multipart/form-data",
+        formTarget: "_self",
+        providerJobKey: "greenhouse:acme:123",
+        formIdentity: "greenhouse-form",
+      },
+      files: [{
+        fieldName: "resume",
+        name: `resume-${"a".repeat(64)}.pdf`,
+        byteLength: 1,
+        sha256: "a".repeat(64),
+      }],
+      fields: [{
+        fieldName: "job_id",
+        valueByteLength: 3,
+        valueSha256: "d".repeat(64),
+      }],
+      partOrder: [{ kind: "field", index: 0 }, { kind: "file", index: 0 }],
+    })).rejects.toMatchObject({
       code: "submit_authority_exists",
     });
-  });
-
-  it("persists explicit manual confirmation without creating duplicate authority", async () => {
-    const runDirectory = await temporaryRunDirectory();
-    await recordReconciledSubmitConfirmation(
-      runDirectory,
-      () => new Date("2026-07-12T12:00:00.000Z"),
-    );
-    await recordReconciledSubmitConfirmation(runDirectory);
-
-    const marker = await readFile(join(runDirectory, FINAL_SUBMIT_MARKER_FILE), "utf8");
-    expect(marker.trim().split("\n")).toHaveLength(1);
-    expect(JSON.parse(marker)).toEqual({
-      phase: "confirmation_reconciled",
-      at: "2026-07-12T12:00:00.000Z",
-    });
-    await expect(finalSubmitMarkerExists(runDirectory)).resolves.toBe(true);
   });
 
   it("stores only bounded non-PII phases and timestamps", async () => {

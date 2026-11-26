@@ -72,16 +72,20 @@ fn load_mic_device_setting_round_trips() {
     use cue_daemon::audio::capture::load_mic_device_setting;
     use cue_daemon::db::Database;
 
-    let db_path = format!("/tmp/cue_test_mic_device_{}.db", std::process::id());
-    let db = Database::open(&db_path).unwrap();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("bluey-mic-device-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("create collision-safe launcher-controlled test directory");
+    let db_path = temp_dir.path().join("mic-device.sqlite");
+    let db_path = db_path
+        .to_str()
+        .expect("temporary database path must be valid UTF-8");
+    let db = Database::open(db_path).unwrap();
     db.save_setting("audio.mic_device", "Blue Yeti").unwrap();
     drop(db);
 
-    let loaded = load_mic_device_setting(&db_path);
+    let loaded = load_mic_device_setting(db_path);
     assert_eq!(loaded, Some("Blue Yeti".to_string()));
-
-    // Cleanup
-    let _ = std::fs::remove_file(&db_path);
 }
 
 /// Verify the IPC serialization round-trips with the new field.

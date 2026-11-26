@@ -1,0 +1,15 @@
+{
+  "name": "@bluey/jobs-browser-packaging",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Quarantined native release SDK; a clean metadata audit does not permit SDK execution or publication",
+  "scripts": {
+    "audit": "node ../scripts/verify-packaging-toolchain.mjs"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "devDependencies": {
+    "electron-builder": "26.15.3"
+  }
+}

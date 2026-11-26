@@ -48,6 +48,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install build prerequisites
         run: |
@@ -81,12 +82,14 @@ jobs:
             ~/.cargo/git/db/
             target/
             server/target/
+            jobs/runner/native-storage/target/
           key: ${{ runner.os }}-release-quality-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-release-quality-
 
       - name: Self-test release and source guards
         run: |
           python3 scripts/check-release-artifact-contents.py --self-test
+          node --test web/tests/bluey-site-jobs-auth-return.test.mjs web/assets/bluey-account-delete.test.cjs
           node jobs/scripts/ci-guards-self-test.mjs
           node jobs/scripts/privacy-gate.mjs
           node jobs/scripts/check-jobs-schema-parity.mjs
@@ -96,16 +99,28 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo fmt --manifest-path server/Cargo.toml -- --check
+          cargo fmt --manifest-path jobs/runner/native-storage/Cargo.toml --all -- --check
 
       - name: Lint Rust workspaces
         run: |
           cargo clippy --all-targets -- -D warnings
-          cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
+          cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features --features integration-test-support --test integration_e2e -- -D warnings
+          cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features --features business-messaging-simulator-test-support --test business_messaging_simulator -- -D warnings
+          cargo clippy --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Test Rust workspaces
         run: |
           cargo test --all-targets
-          cargo test --manifest-path server/Cargo.toml --all-targets
+          cargo test --manifest-path server/Cargo.toml --locked --all-targets
+          cargo test --manifest-path server/Cargo.toml --locked --no-default-features --features integration-test-support --test integration_e2e
+          cargo test --manifest-path server/Cargo.toml --locked --no-default-features --features business-messaging-simulator-test-support --test business_messaging_simulator
+          cargo test --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked
+
+      - name: Build native runner storage release artifact
+        run: >-
+          cargo build --manifest-path jobs/runner/native-storage/Cargo.toml
+          --release --locked
 
       - name: Test and build dashboard UI
         run: |
@@ -114,11 +129,39 @@ jobs:
           npm run build --prefix crates/cue-dashboard/ui
 
       - name: Test, typecheck, and build Jobs
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: "0"
         run: |
           npm ci --prefix jobs --no-audit --no-fund
+          npm audit --prefix jobs --audit-level=moderate
+          node jobs/node_modules/playwright/cli.js install --with-deps --no-shell chromium
           npm test --prefix jobs
           npm run typecheck --prefix jobs
           npm run build --prefix jobs
+          node jobs/scripts/check-business-messaging-simulator-containment.mjs
+          bundle_status="$(git --no-optional-locks status --porcelain=v1 --untracked-files=all --ignored=matching -- web/jobs)" || exit 1
+          if [ -n "$bundle_status" ]; then
+            printf '%s\n' 'The regenerated Jobs portal bundle differs from the checkout.' "$bundle_status" >&2
+            exit 1
+          fi
+
+      - name: Build and smoke the managed runner image
+        env:
+          BLUEY_JOBS_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test -n "$BLUEY_JOBS_SOURCE_COMMIT"
+          docker build \
+            --build-arg BLUEY_JOBS_BUILD_ID=jobs-runner-release-gate \
+            --build-arg BLUEY_JOBS_CONFIG_SCHEMA_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg BLUEY_JOBS_MIGRATION_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg BLUEY_JOBS_PROTOCOL_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$BLUEY_JOBS_SOURCE_COMMIT" \
+            --tag bluey-jobs-runner-release-gate --file jobs/runner/Dockerfile jobs
+          docker run --rm \
+            --entrypoint /usr/local/bin/node \
+            --env BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT=/var/lib/bluey-jobs-runner/native-smoke \
+            --volume "$GITHUB_WORKSPACE/jobs/scripts/native-runner-addon-smoke.mjs:/app/scripts/native-runner-addon-smoke.mjs:ro" \
+            bluey-jobs-runner-release-gate /app/scripts/native-runner-addon-smoke.mjs
 
   build:
     needs: quality

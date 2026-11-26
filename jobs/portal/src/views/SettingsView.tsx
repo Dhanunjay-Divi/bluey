@@ -22,9 +22,12 @@ import {
 } from "lucide-react";
 import type {
   AnswerMemory,
+  AnswerMemorySaveInput,
+  CompanyAnswerMemoryScope,
   ApplicationIdentity,
   CareerProfile,
   CareerTrack,
+  CareerTrackPolicyAuthority,
   JobPreferences,
   JobsWorkspace,
   MailboxConnection,
@@ -56,6 +59,8 @@ import {
   BLUEY_MAX_POSTING_AGE_DAYS,
 } from "../lib/search-policy";
 import { money, titleCase } from "../lib/format";
+import { isApprovedTrackPolicyAuthority } from "../lib/track-policy-authority";
+import { isCompanyAnswerScopeReference, validateCompanyAnswerScope } from "../lib/company-answer-scope";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -72,12 +77,63 @@ interface Props {
   onDeleteIdentity(identity: ApplicationIdentity): Promise<void>;
   onMailboxProviders(): Promise<MailboxProviderAvailability[]>;
   onConnectMailbox(provider: MailboxConnection["provider"]): Promise<void>;
+  onAuthorizeMailboxCommunication(connection: MailboxConnection): Promise<void>;
   onMailboxSyncState(connection: MailboxConnection): Promise<MailboxSyncState>;
   onMailboxMessages(connectionId?: string): Promise<MailboxMessage[]>;
   onSyncMailbox(connection: MailboxConnection): Promise<MailboxSyncState>;
   onDeleteMailbox(connection: MailboxConnection): Promise<void>;
-  onSaveAnswerMemory(answer: AnswerMemory): Promise<AnswerMemory>;
+  onSaveAnswerMemory(answer: AnswerMemorySaveInput): Promise<AnswerMemory>;
+  onLookupCompanyAnswerScope(jobId: string): Promise<CompanyAnswerMemoryScope>;
   onDeleteAnswerMemory(answer: AnswerMemory): Promise<void>;
+}
+
+export async function saveSearchAndAutomationDefaults(
+  preferences: JobPreferences,
+  profile: CareerProfile,
+  onSavePreferences: Props["onSavePreferences"],
+  onSaveProfile: Props["onSaveProfile"],
+): Promise<void> {
+  // Both saves trigger a server-authoritative workspace readback. Keep them in
+  // commit order so an earlier readback cannot overwrite the later mutation.
+  await onSavePreferences({
+    ...preferences,
+    desired_roles: canonicalTargetRoles(preferences.desired_roles),
+    daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+    max_posting_age_days: BLUEY_MAX_POSTING_AGE_DAYS,
+  });
+  await onSaveProfile({
+    ...profile,
+    auto_submit_threshold: BLUEY_AUTO_SUBMIT_THRESHOLD,
+    daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+  });
+}
+
+export type TrackAutoSubmitReadiness = "active" | "needs_review" | "review_first";
+
+export function trackAutoSubmitReadiness(
+  authorizationStatus: string | undefined,
+  policyApproved: boolean,
+): TrackAutoSubmitReadiness {
+  if (authorizationStatus === "active" && policyApproved) return "active";
+  if (authorizationStatus === "active" || authorizationStatus === "needs_review") {
+    return "needs_review";
+  }
+  return "review_first";
+}
+
+function trackLocationReviewMessage(authority: CareerTrackPolicyAuthority | undefined): string | null {
+  if (authority?.review_state !== "needs_review" || !Array.isArray(authority.review_reason_codes)) return null;
+  const reasons = authority.review_reason_codes;
+  if (reasons.includes("location_required")) {
+    return "Add a location. Choose a country if you have no city preference.";
+  }
+  if (reasons.includes("ambiguous_location")) {
+    return "A location is ambiguous. Add its region or country.";
+  }
+  if (reasons.includes("unknown_location")) {
+    return "A location could not be verified. Try a city and region, or a country.";
+  }
+  return null;
 }
 
 export function SettingsView({
@@ -95,11 +151,13 @@ export function SettingsView({
   onDeleteIdentity,
   onMailboxProviders,
   onConnectMailbox,
+  onAuthorizeMailboxCommunication,
   onMailboxSyncState,
   onMailboxMessages,
   onSyncMailbox,
   onDeleteMailbox,
   onSaveAnswerMemory,
+  onLookupCompanyAnswerScope,
   onDeleteAnswerMemory,
 }: Props) {
   const [preferences, setPreferences] = useState({
@@ -120,7 +178,10 @@ export function SettingsView({
   const [saved, setSaved] = useState("");
   const [localError, setLocalError] = useState("");
   const [savingSearch, setSavingSearch] = useState(false);
-  const [autoSubmitBusyTrackId, setAutoSubmitBusyTrackId] = useState("");
+  const [autoSubmitPending, setAutoSubmitPending] = useState<{
+    trackId: string;
+    action: "authorize" | "revoke";
+  } | null>(null);
   const [searchDirty, setSearchDirty] = useState(false);
   const roleSuggestions = useMemo(
     () => mergeCareerSuggestions(preferences.desired_roles, [profile.headline], profile.employment.map((entry) => entry.title), ROLE_SUGGESTIONS),
@@ -165,19 +226,12 @@ export function SettingsView({
     setLocalError("");
     setSaved("");
     try {
-      await Promise.all([
-        onSavePreferences({
-          ...preferences,
-          desired_roles: canonicalTargetRoles(preferences.desired_roles),
-          daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
-          max_posting_age_days: BLUEY_MAX_POSTING_AGE_DAYS,
-        }),
-        onSaveProfile({
-          ...profile,
-          auto_submit_threshold: BLUEY_AUTO_SUBMIT_THRESHOLD,
-          daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
-        }),
-      ]);
+      await saveSearchAndAutomationDefaults(
+        preferences,
+        profile,
+        onSavePreferences,
+        onSaveProfile,
+      );
       setSearchDirty(false);
       setSaved("Search and automation defaults saved.");
       window.setTimeout(() => setSaved(""), 2600);
@@ -207,15 +261,41 @@ export function SettingsView({
             const autoSubmit = workspace.auto_submit_authorizations.find(
               (authorization) => authorization.career_track_id === track.id,
             );
-            const autoSubmitActive = autoSubmit?.status === "active";
+            const policyAuthority = track.policy.authority;
+            const policyApproved = isApprovedTrackPolicyAuthority(
+              policyAuthority,
+              {
+                ...workspace.profile,
+                applicationIdentityId: track.application_identity_id,
+              },
+            );
+            const autoSubmitReadiness = trackAutoSubmitReadiness(
+              autoSubmit?.status,
+              policyApproved,
+            );
+            const autoSubmitActive = autoSubmitReadiness === "active";
+            const autoSubmitNeedsReview = autoSubmitReadiness === "needs_review";
+            // Needs review still represents an unrevoked grant, not an enabled Track.
+            const canRevoke = autoSubmitActive || autoSubmitNeedsReview;
             const canAuthorize = track.active
               && identity?.verification_status === "verified"
-              && Boolean(workspace.profile.source_resume_asset_id);
+              && Boolean(workspace.profile.source_resume_asset_id)
+              && policyApproved;
             const autoSubmitDetail = autoSubmitActive
               ? "Eligible certified jobs may queue automatically after every server check passes."
-              : autoSubmit?.status === "needs_review"
-                ? "This Track, resume, or application email changed. Review it before enabling again."
+              : autoSubmitNeedsReview
+                ? "Auto-submit is paused. Review settings to enable it again, or turn it off to withdraw permission."
                 : "Review first stays on until you authorize this exact Track, resume, and application email.";
+            const pendingAction = autoSubmitPending?.trackId === track.id
+              ? autoSubmitPending.action
+              : null;
+            const updateAutoSubmit = (action: "authorize" | "revoke") => {
+              setLocalError("");
+              setAutoSubmitPending({ trackId: track.id, action });
+              void (action === "revoke" ? onRevokeTrackAutoSubmit(track) : onAuthorizeTrackAutoSubmit(track))
+                .catch(showError(setLocalError))
+                .finally(() => setAutoSubmitPending(null));
+            };
             return (
               <article className="track-settings-card" key={track.id}>
                 <button
@@ -229,6 +309,9 @@ export function SettingsView({
                     <small><MapPin size={12} />{track.locations.join(" · ") || "No locations"}</small>
                     <small><MailCheck size={12} />{identity?.email || "Application email required"}</small>
                     <small><FileText size={12} />{workspace.profile.source_resume_name || "Source resume required"}</small>
+                    <small><ShieldCheck size={12} aria-hidden="true" />{policyApproved
+                      ? `Canonical policy approved · revision ${policyAuthority.policy_revision_no}`
+                      : trackLocationReviewMessage(policyAuthority) ?? "Canonical policy review required"}</small>
                   </div>
                   <span className={track.active ? "agent-state active" : "agent-state"}>{track.active ? "Active" : "Paused"}</span>
                   <ChevronRight size={17} />
@@ -238,34 +321,36 @@ export function SettingsView({
                     <ShieldCheck size={16} />
                   </span>
                   <div>
-                    <b>{autoSubmitActive ? "Auto-submit enabled" : autoSubmit?.status === "needs_review" ? "Auto-submit needs review" : "Review first"}</b>
+                    <b>{autoSubmitActive ? "Auto-submit enabled" : autoSubmitNeedsReview ? "Auto-submit needs review" : "Review first"}</b>
                     <small>{autoSubmitDetail}</small>
                   </div>
-                  <button
-                    className={autoSubmitActive ? "button secondary compact" : "button primary compact"}
-                    disabled={autoSubmitBusyTrackId === track.id || (!autoSubmitActive && !canAuthorize)}
-                    title={!canAuthorize && !autoSubmitActive
-                      ? "Activate the Track, verify its application email, and review the current resume first."
-                      : undefined}
-                    onClick={() => {
-                      setLocalError("");
-                      setAutoSubmitBusyTrackId(track.id);
-                      const action = autoSubmitActive
-                        ? onRevokeTrackAutoSubmit(track)
-                        : onAuthorizeTrackAutoSubmit(track);
-                      void action
-                        .catch(showError(setLocalError))
-                        .finally(() => setAutoSubmitBusyTrackId(""));
-                    }}
-                  >
-                    {autoSubmitBusyTrackId === track.id
-                      ? "Saving..."
-                      : autoSubmitActive
-                        ? "Turn off"
-                        : autoSubmit?.status === "needs_review"
-                          ? "Enable again"
-                          : "Enable Auto-submit"}
-                  </button>
+                  <div className="track-auto-submit-actions" aria-busy={pendingAction !== null}>
+                    {!autoSubmitActive && (!canRevoke || canAuthorize) && (
+                      <button
+                        type="button"
+                        className="button primary compact"
+                        disabled={autoSubmitPending !== null || !canAuthorize}
+                        title={!canAuthorize
+                          ? "Activate the Track, verify its email, and approve its canonical policy first."
+                          : undefined}
+                        onClick={() => updateAutoSubmit("authorize")}
+                      >
+                        {pendingAction === "authorize"
+                          ? "Saving..."
+                          : autoSubmitNeedsReview ? "Enable again" : "Enable Auto-submit"}
+                      </button>
+                    )}
+                    {canRevoke && (
+                      <button
+                        type="button"
+                        className="button secondary compact"
+                        disabled={autoSubmitPending !== null}
+                        onClick={() => updateAutoSubmit("revoke")}
+                      >
+                        {pendingAction === "revoke" ? "Turning off..." : "Turn off"}
+                      </button>
+                    )}
+                  </div>
                 </div>
               </article>
             );
@@ -392,6 +477,7 @@ export function SettingsView({
         workspace={workspace}
         onMailboxProviders={onMailboxProviders}
         onConnectMailbox={onConnectMailbox}
+        onAuthorizeMailboxCommunication={onAuthorizeMailboxCommunication}
         onMailboxSyncState={onMailboxSyncState}
         onMailboxMessages={onMailboxMessages}
         onSyncMailbox={onSyncMailbox}
@@ -400,13 +486,20 @@ export function SettingsView({
       />
 
       <section className="settings-section" id="plans">
-        <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} included applications used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
+        <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} included application kits used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
         <div className="plan-grid">
-          <Plan name="Free" price="$0" details="1 agent · 5 reviewed applications · 2 application emails" active={workspace.entitlement.plan === "free"} />
-          <Plan name="Pro" price="$29" details="3 agents · 50 applications · 10 application emails · local runner beta waitlist" active={workspace.entitlement.plan === "pro"} />
-          <Plan name="Cloud" price="$49" details="5 agents · 100 applications · 25 application emails · invited cloud runner beta" active={workspace.entitlement.plan === "cloud"} />
+          <Plan name="Free" price="$0" details="1 agent · 5 reviewed application kits · 2 application emails" active={workspace.entitlement.plan === "free"} />
+          <Plan name="Pro" price="$29" details="3 agents · 50 application kits · 10 application emails · web review and job-site handoff" active={workspace.entitlement.plan === "pro"} />
+          <Plan name="Cloud" price="$49" details="5 agents · 100 application kits · 25 application emails · limited public cloud automation" active={workspace.entitlement.plan === "cloud"} />
         </div>
-        <p className="plan-footnote">Application emails are included. Connected inboxes use read-only access to match employer updates and never send mail. After the included applications, each additional completed application is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
+        <p className="plan-footnote">
+          Application emails are included. Connected inboxes start with read-only employer-update
+          access. Where provider authorization is offered, you can separately add send and
+          calendar-write scopes for reviewed replies and events; every exact draft still requires
+          approval. After the included applications, each additional completed application is
+          {` ${money(workspace.entitlement.overage_cents)} `}
+          from your shared Bluey balance. Retries and secure handoffs do not count again.
+        </p>
       </section>
 
       <ApplicationEmailDialog
@@ -433,6 +526,9 @@ export function SettingsView({
         open={answerOpen}
         answer={editingAnswer}
         tracks={workspace.tracks}
+        companyJobs={[...new Map([...workspace.matches, ...workspace.application_jobs]
+          .map((job) => [job.id, { id: job.id, company: job.company, title: job.title }])).values()]}
+        onLookupCompany={onLookupCompanyAnswerScope}
         onClose={() => setAnswerOpen(false)}
         onSave={async (answer) => {
           setLocalError("");
@@ -440,16 +536,16 @@ export function SettingsView({
           setAnswerOpen(false);
         }}
       />
-      <TrackDialog
-        open={trackOpen}
+      {trackOpen && <TrackDialog
         track={editingTrack}
+        preferences={workspace.preferences}
         identities={workspace.application_identities}
         roleSuggestions={targetRoleSuggestionValues}
         locationSuggestions={locationSuggestions}
         onClose={() => setTrackOpen(false)}
         onSave={async (track) => { await onSaveTrack(track); setTrackOpen(false); }}
         onDelete={(track) => { setTrackOpen(false); setDeletingTrack(track); }}
-      />
+      />}
       <ConfirmDialog open={Boolean(deletingIdentity)} title={`Remove ${deletingIdentity?.email || "application email"}?`} description="Bluey will keep existing application receipts, but this address will no longer be available for new Career Tracks." confirmLabel="Remove email" tone="danger" onClose={() => setDeletingIdentity(null)} onConfirm={() => { const identity = deletingIdentity; setDeletingIdentity(null); if (identity) void onDeleteIdentity(identity).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingTrack)} title={`Delete ${deletingTrack?.name || "Career Track"}?`} description="This stops discovery for the track. Existing matches and applications stay in your history." confirmLabel="Delete track" tone="danger" onClose={() => setDeletingTrack(null)} onConfirm={() => { const track = deletingTrack; setDeletingTrack(null); if (track) void onDeleteTrack(track).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingAnswer)} title="Remove this saved answer?" description="Bluey will ask again the next time this question appears. Existing application receipts stay unchanged." confirmLabel="Remove answer" tone="danger" onClose={() => setDeletingAnswer(null)} onConfirm={() => { const answer = deletingAnswer; setDeletingAnswer(null); if (answer) void onDeleteAnswerMemory(answer).catch(showError(setLocalError)); }} />
@@ -457,28 +553,82 @@ export function SettingsView({
   );
 }
 
-function AnswerMemoryDialog({ open, answer, tracks, onClose, onSave }: { open: boolean; answer: AnswerMemory | null; tracks: CareerTrack[]; onClose(): void; onSave(answer: AnswerMemory): Promise<void> }) {
+function AnswerMemoryDialog({ open, answer, tracks, companyJobs, onLookupCompany, onClose, onSave }: {
+  open: boolean;
+  answer: AnswerMemory | null;
+  tracks: CareerTrack[];
+  companyJobs: Array<{ id: string; company: string; title: string }>;
+  onLookupCompany(jobId: string): Promise<CompanyAnswerMemoryScope>;
+  onClose(): void;
+  onSave(answer: AnswerMemorySaveInput): Promise<void>;
+}) {
   const [value, setValue] = useState<AnswerMemory>(() => emptyAnswerMemory());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [companyMode, setCompanyMode] = useState<"legacy" | "verified">("verified");
+  const [companyJobId, setCompanyJobId] = useState("");
+  const [companyBinding, setCompanyBinding] = useState<CompanyAnswerMemoryScope | null>(null);
+  const [companyLoading, setCompanyLoading] = useState(false);
+  const [companyError, setCompanyError] = useState("");
+  const [companyConfirmed, setCompanyConfirmed] = useState(false);
+  const [companyBindingAnswerId, setCompanyBindingAnswerId] = useState("");
+  const currentAnswerId = answer?.id || "new-answer";
 
   useEffect(() => {
     if (open) {
       setValue(answer ? { ...answer } : emptyAnswerMemory());
       setError("");
+      setCompanyMode(answer?.scope === "company" && !isCompanyAnswerScopeReference(answer.scope_id)
+        ? "legacy" : "verified");
+      setCompanyJobId("");
+      setCompanyBinding(null);
+      setCompanyConfirmed(false);
     }
   }, [open, answer]);
 
+  useEffect(() => {
+    let active = true;
+    setCompanyBinding(null);
+    setCompanyConfirmed(false);
+    setCompanyBindingAnswerId("");
+    setCompanyError("");
+    setCompanyLoading(false);
+    if (!open || value.scope !== "company" || companyMode !== "verified" || !companyJobId) return;
+    setCompanyLoading(true);
+    void onLookupCompany(companyJobId).then((result) => {
+      const binding = validateCompanyAnswerScope(result, companyJobId, answer);
+      if (active) {
+        setCompanyBinding(binding);
+        setCompanyBindingAnswerId(currentAnswerId);
+      }
+    }).catch((cause) => {
+      if (active) setCompanyError(errorMessage(cause));
+    }).finally(() => {
+      if (active) setCompanyLoading(false);
+    });
+    return () => { active = false; };
+  }, [open, value.scope, companyMode, companyJobId, answer, currentAnswerId, onLookupCompany]);
+
   const scopeId = value.scope === "track" ? value.scope_id || tracks[0]?.id || "" : value.scope_id || "";
+  const verifiedCompanyReady = Boolean(companyBinding && companyBinding.job_id === companyJobId
+    && companyBindingAnswerId === currentAnswerId && companyConfirmed && !companyLoading && !companyError);
+  const missingScope = value.scope === "company" && companyMode === "verified"
+    ? !verifiedCompanyReady : value.scope !== "account" && !scopeId;
   const save = async () => {
-    if (!value.question.trim() || !value.value.trim()) return;
+    if (saving || !value.question.trim() || !value.value.trim() || missingScope) return;
     setSaving(true);
     setError("");
     try {
       await onSave({
         ...value,
         key: normalizeAnswerKey(value.question),
-        scope_id: value.scope === "account" ? undefined : value.scope === "company" ? normalizeCompanyKey(scopeId) : scopeId,
+        scope_id: value.scope === "account" ? undefined
+          : value.scope === "company" && companyMode === "verified" ? companyBinding!.scope_id
+            : value.scope === "company" ? normalizeCompanyKey(scopeId) : scopeId,
+        ...(value.scope === "company" && companyMode === "verified" ? {
+          company_job_id: companyJobId,
+          expected_company_scope: companyBinding!.scope_id,
+        } : {}),
         confirmed: true,
       });
     } catch (requestError) {
@@ -488,16 +638,42 @@ function AnswerMemoryDialog({ open, answer, tracks, onClose, onSave }: { open: b
     }
   };
 
-  return <Dialog open={open} title={answer ? "Edit saved answer" : "Add saved answer"} description="Bluey reuses the closest confirmed answer when the same application question appears." onClose={onClose}>
+  return <Dialog open={open} title={answer ? "Edit saved answer" : "Add saved answer"} description="Bluey reuses an exact confirmed question within its saved scope." onClose={onClose}>
     <div className="answer-memory-form">
       <label><span>Application question</span><input value={value.question} onChange={(event) => setValue({ ...value, question: event.target.value })} placeholder="Why are you interested in this role?" /></label>
       <label><span>Answer</span><textarea rows={4} value={value.value} onChange={(event) => setValue({ ...value, value: event.target.value })} placeholder="Enter the answer Bluey should use" /></label>
-      <label><span>Reuse for</span><select value={value.scope} onChange={(event) => setValue({ ...value, scope: event.target.value as AnswerMemory["scope"], scope_id: undefined })}><option value="account">All applications</option>{tracks.length > 0 && <option value="track">One Career Track</option>}<option value="company">One company</option></select></label>
+      <label><span>Reuse for</span><select value={value.scope} onChange={(event) => {
+        setValue({ ...value, scope: event.target.value as AnswerMemory["scope"], scope_id: undefined });
+        setCompanyMode("verified");
+      }}><option value="account">All applications</option>{tracks.length > 0 && <option value="track">One Career Track</option>}<option value="company">One company</option></select></label>
       {value.scope === "track" && <label><span>Career Track</span><select value={scopeId} onChange={(event) => setValue({ ...value, scope_id: event.target.value })}>{tracks.map((track) => <option value={track.id} key={track.id}>{track.name}</option>)}</select></label>}
-      {value.scope === "company" && <label><span>Company</span><input value={scopeId.replace(/-/g, " ")} onChange={(event) => setValue({ ...value, scope_id: event.target.value })} placeholder="Company name" /></label>}
+      {value.scope === "company" && companyMode === "legacy" && <>
+        <label><span>Legacy company name</span><input value={scopeId.replace(/-/g, " ")} onChange={(event) => setValue({ ...value, scope_id: event.target.value })} /></label>
+        <p className="field-note">This name-based answer stays available for review, but is not reused automatically.</p>
+        <button className="button secondary" type="button" onClick={() => setCompanyMode("verified")}>Connect to a verified employer</button>
+      </>}
+      {value.scope === "company" && companyMode === "verified" && <>
+        <label><span>Employer from a current job</span><select value={companyJobId} onChange={(event) => {
+          setCompanyJobId(event.target.value);
+          setCompanyBinding(null);
+          setCompanyConfirmed(false);
+        }}>
+          <option value="">Choose a job to verify its employer</option>
+          {companyJobs.map((job) => <option key={job.id} value={job.id}>{job.company} · {job.title}</option>)}
+        </select></label>
+        {companyLoading && <p className="field-note" role="status">Verifying employer…</p>}
+        {companyError && <p className="inline-error" role="alert">{companyError}</p>}
+        {companyBinding && companyBinding.job_id === companyJobId
+          && companyBindingAnswerId === currentAnswerId && <label>
+          <input type="checkbox" checked={companyConfirmed} onChange={(event) => setCompanyConfirmed(event.target.checked)} />
+          <span>Use this answer for {companyBinding.company} ({companyBinding.domain}).</span>
+        </label>}
+        {answer?.scope === "company" && !isCompanyAnswerScopeReference(answer.scope_id)
+          && <p className="field-note">Confirmation creates a new verified-company answer and preserves the old entry.</p>}
+      </>}
       {error && <div className="inline-error" role="alert">{error}</div>}
     </div>
-    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !value.question.trim() || !value.value.trim() || (value.scope !== "account" && !scopeId)} onClick={() => void save()}>{saving ? "Saving..." : "Save answer"}</button></div>
+    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !value.question.trim() || !value.value.trim() || missingScope} onClick={() => void save()}>{saving ? "Saving..." : "Save answer"}</button></div>
   </Dialog>;
 }
 
@@ -517,7 +693,9 @@ function emptyAnswerMemory(): AnswerMemory {
 }
 
 function answerScopeLabel(answer: AnswerMemory, workspace: JobsWorkspace): string {
-  if (answer.scope === "company") return `Company · ${titleCase((answer.scope_id || "Company").replace(/-/g, " "))}`;
+  if (answer.scope === "company") return isCompanyAnswerScopeReference(answer.scope_id)
+    ? "Company · Saved employer reference"
+    : `Company · ${titleCase((answer.scope_id || "Company").replace(/-/g, " "))} · Needs confirmation`;
   if (answer.scope === "track") return `Career Track · ${workspace.tracks.find((track) => track.id === answer.scope_id)?.name || "Saved track"}`;
   return "All applications";
 }
@@ -589,20 +767,31 @@ function VerifyIdentityDialog({ identity, onClose, onVerify, onResend }: { ident
   </Dialog>;
 }
 
-function TrackDialog({ open, track, identities, roleSuggestions, locationSuggestions, onClose, onSave, onDelete }: { open: boolean; track: CareerTrack | null; identities: ApplicationIdentity[]; roleSuggestions: string[]; locationSuggestions: string[]; onClose(): void; onSave(track: CareerTrack): Promise<void>; onDelete(track: CareerTrack): void }) {
+type TrackCategoryDefaults = Pick<JobPreferences, "employment_types" | "engagement_types">;
+
+function TrackDialog({ track, preferences, identities, roleSuggestions, locationSuggestions, onClose, onSave, onDelete }: {
+  track: CareerTrack | null;
+  preferences: TrackCategoryDefaults;
+  identities: ApplicationIdentity[];
+  roleSuggestions: string[];
+  locationSuggestions: string[];
+  onClose(): void;
+  onSave(track: CareerTrack): Promise<void>;
+  onDelete(track: CareerTrack): void;
+}) {
   const defaultIdentityId = identities.find((identity) => identity.is_default && identity.verification_status === "verified")?.id;
-  const [draft, setDraft] = useState<CareerTrack>(normalizeTrack(track, defaultIdentityId));
+  const [draft, setDraft] = useState(() => createTrackDraft(track, preferences, defaultIdentityId));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  useEffect(() => {
-    if (open) {
-      setDraft(normalizeTrack(track, defaultIdentityId));
-      setError("");
-    }
-  }, [open, track, defaultIdentityId]);
   const current = draft;
+  const hasEmploymentType = EMPLOYMENT_TYPE_OPTIONS.some(
+    ({ value }) => current.policy.employment_types.includes(value),
+  );
+  const canSave = !saving && current.name && current.role && hasEmploymentType &&
+    (current.application_identity_id || defaultIdentityId);
   const update = (next: CareerTrack) => setDraft(next);
   const save = async () => {
+    if (!canSave) return;
     setSaving(true);
     setError("");
     try {
@@ -617,20 +806,20 @@ function TrackDialog({ open, track, identities, roleSuggestions, locationSuggest
       setSaving(false);
     }
   };
-  return <Dialog open={open} title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, job category, and application email." onClose={onClose}>
+  return <Dialog open title={track ? "Edit Career Track" : "New Career Track"} description="Give this agent one role, location policy, job category, and application email." onClose={onClose}>
     <div className="dialog-form">
       <CareerField label="Track name" value={current.name} onChange={(value) => update({ ...current, name: value })} placeholder="Product engineering" />
       <CareerField label="Target role" value={current.role} onChange={(value) => update({ ...current, role: value })} placeholder="Software Engineer" suggestions={roleSuggestions} />
       <p className="field-note">Choose the full role name. Bluey maps common abbreviations such as SWE and SDE to Software Engineer.</p>
       <CareerTagField label="Locations" values={current.locations} onChange={(values) => update({ ...current, locations: values })} placeholder="Add a location" suggestions={locationSuggestions} />
       <label><span>Workplace preference</span><select value={current.remote_preference} onChange={(event) => update({ ...current, remote_preference: event.target.value })}><option value="remote_or_hybrid">Remote or hybrid</option><option value="remote_only">Remote only</option><option value="hybrid_ok">Hybrid is fine</option><option value="onsite_ok">On-site is fine</option></select></label>
-      <JobCategoryChoices label="Employment types" description="Only match these job arrangements for this Career Track." values={current.policy.employment_types} options={EMPLOYMENT_TYPE_OPTIONS} onChange={(values) => update({ ...current, policy: { ...current.policy, employment_types: values } })} />
-      <JobCategoryChoices label="Contract engagement" description="Optional. Restrict contract work to the selected engagement types." values={current.policy.engagement_types} options={ENGAGEMENT_TYPE_OPTIONS} onChange={(values) => update({ ...current, policy: { ...current.policy, engagement_types: values } })} />
+      <JobCategoryChoices label="Employment types" description="Select at least one job arrangement for this Career Track." values={current.policy.employment_types} options={EMPLOYMENT_TYPE_OPTIONS} onChange={(values) => update({ ...current, policy: { ...current.policy, employment_types: values } })} />
+      <JobCategoryChoices label="Contract engagement" description="Optional. When selected, only match postings with one of these engagement types." values={current.policy.engagement_types} options={ENGAGEMENT_TYPE_OPTIONS} onChange={(values) => update({ ...current, policy: { ...current.policy, engagement_types: values } })} />
       <label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label>
       <label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label>
       {error && <div className="inline-error" role="alert">{error}</div>}
     </div>
-    <div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !current.name || !current.role || !(current.application_identity_id || defaultIdentityId)} onClick={() => void save()}>{saving ? "Saving..." : "Save track"}</button></div>
+    <div className="dialog-actions">{track && <button className="button danger subtle" onClick={() => onDelete(track)}><Trash2 size={15} />Delete</button>}<span /><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={!canSave} onClick={() => void save()}>{saving ? "Saving..." : "Save track"}</button></div>
   </Dialog>;
 }
 
@@ -650,9 +839,35 @@ function showError(setError: (message: string) => void): (error: unknown) => voi
   return (error) => setError(errorMessage(error));
 }
 
-function emptyTrack(applicationIdentityId?: string): CareerTrack {
+// Match the supported aliases in candidate_policy.rs so stored account values
+// are visible in the new Track's canonical choice controls.
+const trackEmploymentAliases = new Map([
+  ["fulltime", "full_time"], ["ft", "full_time"], ["permanent", "full_time"], ["direct_hire", "full_time"],
+  ["contractor", "contract"], ["temp", "temporary"], ["intern", "internship"],
+  ["apprentice", "apprenticeship"], ["perdiem", "per_diem"],
+]);
+const trackEngagementAliases = new Map([
+  ["w_2", "w2"], ["c_2_c", "c2c"], ["corp_to_corp", "c2c"], ["corporation_to_corporation", "c2c"],
+  ["independent_contractor", "1099"], ["permanent_hire", "direct_hire"],
+]);
+
+function trackCategoryDefaults(
+  values: readonly string[] | undefined,
+  options: ReadonlyArray<{ value: string }>,
+  aliases: ReadonlyMap<string, string>,
+): string[] {
+  return [...new Set((values ?? []).map((value) => {
+    const key = value.replace(/[^a-zA-Z0-9]+/g, " ").trim().toLowerCase().replaceAll(" ", "_");
+    return aliases.get(key) ?? (options.some((option) => option.value === key) ? key : value);
+  }))];
+}
+
+function emptyTrack(preferences: TrackCategoryDefaults, applicationIdentityId?: string): CareerTrack {
+  const employmentTypes = trackCategoryDefaults(
+    preferences.employment_types, EMPLOYMENT_TYPE_OPTIONS, trackEmploymentAliases,
+  );
   return {
-    id: "",
+    id: crypto.randomUUID(),
     name: "",
     role: "",
     locations: [],
@@ -661,8 +876,10 @@ function emptyTrack(applicationIdentityId?: string): CareerTrack {
     policy: {
       role_family: "",
       relevant_employment_ids: [],
-      employment_types: [],
-      engagement_types: [],
+      employment_types: employmentTypes.length ? employmentTypes : ["full_time"],
+      engagement_types: trackCategoryDefaults(
+        preferences.engagement_types, ENGAGEMENT_TYPE_OPTIONS, trackEngagementAliases,
+      ),
       work_authorizations: [],
     },
     active: true,
@@ -672,8 +889,12 @@ function emptyTrack(applicationIdentityId?: string): CareerTrack {
   };
 }
 
-function normalizeTrack(track: CareerTrack | null, applicationIdentityId?: string): CareerTrack {
-  if (!track) return emptyTrack(applicationIdentityId);
+export function createTrackDraft(
+  track: CareerTrack | null,
+  preferences: TrackCategoryDefaults,
+  applicationIdentityId?: string,
+): CareerTrack {
+  if (!track) return emptyTrack(preferences, applicationIdentityId);
   return {
     ...track,
     application_identity_id: track.application_identity_id || applicationIdentityId,
@@ -683,6 +904,7 @@ function normalizeTrack(track: CareerTrack | null, applicationIdentityId?: strin
       employment_types: track.policy?.employment_types || [],
       engagement_types: track.policy?.engagement_types || [],
       work_authorizations: track.policy?.work_authorizations || [],
+      authority: track.policy?.authority,
     },
   };
 }

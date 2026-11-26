@@ -22,12 +22,29 @@ import {
   PendingProtocolQueue,
 } from "./pending-protocol-queue.js";
 import { PowerAdmissionGuard } from "./power-admission.js";
+import {
+  claimBrowserBuildProof,
+  loadPackagedBrowserBuildProof,
+} from "./packaged-release.js";
 
 const PROTOCOL_PREFIX = "bluey-jobs://";
 const CONNECTIVITY_POLL_MS = 15_000;
 
 export async function startBlueyBrowserApplication(): Promise<void> {
   app.setName("Bluey Browser");
+  const electronVersion = process.versions.electron;
+  if (!electronVersion) {
+    throw new Error("Bluey Browser must run inside Electron");
+  }
+  const verifiedBuild = await loadPackagedBrowserBuildProof({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    appVersion: app.getVersion(),
+    electronVersion,
+    platform: process.platform,
+    architecture: process.arch,
+    ...developmentReleaseAuthority(),
+  });
   if (app.isPackaged) app.setAsDefaultProtocolClient("bluey-jobs");
 
   const singleInstance = app.requestSingleInstanceLock();
@@ -177,7 +194,10 @@ export async function startBlueyBrowserApplication(): Promise<void> {
   };
 
   await browserShell.start(net.isOnline());
-  await initializeLocalRunController(browserShell);
+  await initializeLocalRunController(
+    browserShell,
+    claimBrowserBuildProof(verifiedBuild),
+  );
   ready = true;
   updatePowerAdmission();
   app.on("activate", () => browserShell?.show());
@@ -194,6 +214,28 @@ export async function startBlueyBrowserApplication(): Promise<void> {
 
   for (const url of pendingProtocolUrls.drain()) dispatchProtocol(url);
 
+}
+
+function developmentReleaseAuthority(): {
+  developmentReleaseDirectory?: string;
+} {
+  if (app.isPackaged) return {};
+  const configured = process.env.BLUEY_JOBS_BROWSER_DEVELOPMENT_RELEASE_DIRECTORY;
+  if (!configured) return {};
+  const apiOrigin = process.env.BLUEY_JOBS_API_ORIGIN;
+  if (!apiOrigin) {
+    throw new Error("Development Browser release authority requires a loopback Jobs API");
+  }
+  const url = new URL(apiOrigin);
+  if (
+    url.protocol !== "http:" ||
+    !["127.0.0.1", "localhost"].includes(url.hostname) ||
+    url.username ||
+    url.password
+  ) {
+    throw new Error("Development Browser release authority requires a loopback Jobs API");
+  }
+  return { developmentReleaseDirectory: configured };
 }
 
 function blueyJobsUrl(): string {

@@ -500,4 +500,232 @@ mod tests {
         .unwrap();
         assert_eq!(next.reserved_trial_seconds, trial_seconds);
     }
+
+    #[test]
+    fn postgres_completion_settlement_cache_atomic_when_owned() {
+        const CASE: &str =
+            "db::usage_reservations::tests::postgres_completion_settlement_cache_atomic_when_owned";
+        let Some(url) = db::owned_postgres_test::owned_url(CASE) else {
+            return;
+        };
+        let pool = db::open_postgres_pool(&url).unwrap();
+        db::run_migrations(&pool).unwrap();
+        let account = Account::create(
+            &pool,
+            "completion-cache-atomic@example.com",
+            "synthetic-hash",
+        )
+        .unwrap();
+        pool.get_pg()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET trial_seconds_remaining = 0 WHERE id = $1",
+                &[&account.id],
+            )
+            .unwrap();
+        assert!(
+            balance::credit_internal(&pool, &account.id, 100, "completion-cache-atomic-test",)
+                .unwrap()
+        );
+        let request_id = "completion-cache-atomic-request";
+        assert_eq!(
+            idempotency::reserve(&pool, &account.id, request_id).unwrap(),
+            idempotency::ReserveOutcome::FreshReservation
+        );
+        reserve(&pool, input(&account.id, request_id, 40, 1_000, 61_000)).unwrap();
+        let components = [SettlementUsageEvent {
+            event: UsageEvent {
+                request_id: request_id.to_string(),
+                kind: "llm".to_string(),
+                task_type: None,
+                lane: Some("instant".to_string()),
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5.4-mini".to_string()),
+                input_tokens: 2,
+                output_tokens: 1,
+                latency_ms: 5,
+                cost_cents_to_bluey: 0,
+                cost_cents_to_customer: 20,
+                was_speculative: false,
+                was_fallback: false,
+            },
+            customer_cost_cents: 20,
+        }];
+        let encode = |settled: &SettledUsage| {
+            serde_json::to_string(&serde_json::json!({
+                "balance_cents": settled.balance_cents_after,
+                "charged_cents": settled.charged_customer_cents,
+                "request_id": request_id,
+            }))
+        };
+        let snapshot = || {
+            let mut conn = pool.get_pg().unwrap();
+            let row = conn
+                .query_one(
+                    "SELECT a.balance_cents, a.reserved_cents, r.status,
+                            (SELECT COUNT(*)::bigint FROM usage_events
+                              WHERE account_id = $1 AND request_id = $2),
+                            (SELECT COUNT(*)::bigint FROM balance_ledger_entries
+                              WHERE account_id = $1),
+                            (SELECT COALESCE(SUM(remaining_cents), 0)::bigint
+                               FROM credit_batches WHERE account_id = $1),
+                            i.status, i.response_json,
+                            COALESCE(i.http_status = 200, FALSE),
+                            i.completed_at IS NOT NULL,
+                            CASE WHEN i.completed_at IS NULL THEN NULL
+                                 ELSE i.completed_at::text END
+                       FROM accounts a
+                       JOIN usage_reservations r ON r.account_id = a.id
+                       JOIN request_idempotency i ON i.account_id = a.id
+                      WHERE a.id = $1 AND r.request_id = $2 AND i.request_id = $2",
+                    &[&account.id, &request_id],
+                )
+                .unwrap();
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, String>(2),
+                row.get::<_, i64>(3),
+                row.get::<_, i64>(4),
+                row.get::<_, i64>(5),
+                row.get::<_, String>(6),
+                row.get::<_, Option<String>>(7),
+                row.get::<_, bool>(8),
+                row.get::<_, bool>(9),
+                row.get::<_, Option<String>>(10),
+            )
+        };
+        let reserved = snapshot();
+        assert_eq!(
+            (&reserved.0, &reserved.1, reserved.2.as_str()),
+            (&60, &40, "reserved")
+        );
+        assert_eq!(reserved.3, 0);
+        assert_eq!(reserved.5, 100);
+        assert_eq!(reserved.6, "in_progress");
+        assert_eq!(
+            (reserved.7.as_ref(), reserved.8, reserved.9),
+            (None, false, false)
+        );
+
+        pool.get_pg()
+            .unwrap()
+            .batch_execute(
+                "CREATE FUNCTION bluey_test_reject_completion_cache() RETURNS trigger
+                     LANGUAGE plpgsql AS $$
+                   BEGIN
+                     RAISE EXCEPTION 'synthetic completion cache refusal';
+                   END
+                   $$;
+                 CREATE TRIGGER bluey_test_reject_completion_cache
+                   BEFORE UPDATE ON request_idempotency
+                   FOR EACH ROW WHEN (NEW.status = 'complete')
+                   EXECUTE FUNCTION bluey_test_reject_completion_cache();",
+            )
+            .unwrap();
+        let injected = settle_with_events_and_completion(
+            &pool,
+            &account.id,
+            request_id,
+            20,
+            1_000,
+            "completed",
+            2_000,
+            &components,
+            &encode,
+        )
+        .unwrap_err();
+        let UsageReservationError::Db(injected) = injected else {
+            panic!("expected injected database failure");
+        };
+        let sqlstate = injected.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<postgres::Error>()
+                .and_then(postgres::Error::code)
+                .map(|code| code.code().to_string())
+        });
+        assert_eq!(sqlstate.as_deref(), Some("P0001"));
+        assert_eq!(snapshot(), reserved);
+        pool.get_pg()
+            .unwrap()
+            .batch_execute(
+                "DROP TRIGGER bluey_test_reject_completion_cache ON request_idempotency;
+                 DROP FUNCTION bluey_test_reject_completion_cache();",
+            )
+            .unwrap();
+
+        let settled = settle_with_events_and_completion(
+            &pool,
+            &account.id,
+            request_id,
+            20,
+            1_000,
+            "completed",
+            3_000,
+            &components,
+            &encode,
+        )
+        .unwrap();
+        assert_eq!(settled.charged_customer_cents, 20);
+        let expected_response = encode(&settled).unwrap();
+        let complete = snapshot();
+        assert_eq!(
+            (&complete.0, &complete.1, complete.2.as_str()),
+            (&80, &0, "settled")
+        );
+        assert_eq!(complete.3, 1);
+        assert_eq!(complete.4, reserved.4 + 1);
+        assert_eq!(complete.5, 80);
+        assert_eq!(complete.6, "complete");
+        assert_eq!(complete.7.as_deref(), Some(expected_response.as_str()));
+        assert!(complete.8 && complete.9 && complete.10.is_some());
+
+        assert_eq!(
+            settle_with_events_and_completion(
+                &pool,
+                &account.id,
+                request_id,
+                20,
+                1_000,
+                "completed",
+                4_000,
+                &components,
+                &encode,
+            )
+            .unwrap(),
+            settled
+        );
+        assert_eq!(snapshot(), complete);
+
+        pool.get_pg()
+            .unwrap()
+            .execute(
+                "UPDATE request_idempotency SET response_json = $3
+                  WHERE account_id = $1 AND request_id = $2",
+                &[&account.id, &request_id, &"{\"wrong\":true}"],
+            )
+            .unwrap();
+        let mismatched = snapshot();
+        assert!(matches!(
+            settle_with_events_and_completion(
+                &pool,
+                &account.id,
+                request_id,
+                20,
+                1_000,
+                "completed",
+                5_000,
+                &components,
+                &encode,
+            ),
+            Err(UsageReservationError::InvalidReservation)
+        ));
+        assert_eq!(snapshot(), mismatched);
+        assert_eq!(
+            (&mismatched.0, &mismatched.1, mismatched.2.as_str()),
+            (&80, &0, "settled")
+        );
+        assert_eq!((mismatched.3, mismatched.4), (complete.3, complete.4));
+        println!("owned_postgres_completion_settlement_cache_atomic_complete");
+    }
 }

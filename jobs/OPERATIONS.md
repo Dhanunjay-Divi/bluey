@@ -8,7 +8,9 @@ Run these as separate deployable services:
 2. `@bluey/jobs-workflows` worker on the `bluey-jobs-applications` Temporal task queue.
 3. `@bluey/jobs-workflows` discovery worker via `npm run start:discovery --workspace @bluey/jobs-workflows`.
 4. `@bluey/jobs-workflows` global candidate-feed worker via `npm run start:global-discovery --workspace @bluey/jobs-workflows`.
-5. `@bluey/jobs-workflows` gateway for authenticated workflow start and resume requests.
+5. `@bluey/jobs-workflows` gateway for exact authenticated protocol-v2 workflow commands and the
+   independently gated, stateless schema-v3 workflow-cleanup protocol. With cleanup disabled, the
+   authenticated cleanup path is not registered and returns 404.
 6. `@bluey/jobs-runner` in a Chromium-capable container pool.
 7. The static Jobs portal under `/jobs`.
 
@@ -16,17 +18,42 @@ On a Bluey production host, install `ops/bluey-jobs.env.example` as
 `/etc/bluey-api/bluey-jobs.env`, replace every placeholder with an independent
 secret, and set mode `0640` with owner `root:bluey`. The Jobs systemd unit also
 loads the shared API, Valkey, and Postgres environment files. Keep
-`BLUEY_JOBS_BETA_ENABLED=0` until the restricted beta is intentionally opened.
-Keep `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` until versioned Bluey
-Browser packages and updater metadata are published and physical macOS/Windows
-install, launch, protocol, and rollback canaries pass. Plan entitlement alone
-must never expose an undistributed client.
+`BLUEY_JOBS_BETA_ENABLED=0` until the public cohort migration, closed-state
+read-back, backup/restore, exact-artifact smoke, suspension, and rollback are
+proved. This variable is the master kill switch, not a cohort-size control.
+The launch product is the browser-delivered Jobs portal at `/jobs/automation`
+with the managed cloud Background runner. Customers install nothing. The
+legacy `/jobs/browser` route is compatibility navigation only and must not be
+used to advertise a local installer. Keep the retained local release and
+recovery procedures below for unresolved historical authority and possible P2
+demand; they are not a prerequisite for a cloud-first beta.
+Keep `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` until an independently
+approved root trust anchor, exact server release ID, signed channel authority,
+immutable native packages, and physical macOS/Windows install, launch,
+protocol, upgrade, rollback, immutable-host read-back, and portal-download
+canaries are complete. Plan entitlement alone must never expose an
+undistributed client. Native self-update remains a separate release capability;
+the manifest-bound macOS ZIP does not imply that an installed-app updater
+exists.
 Keep `BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0` until the authenticated
 workflow gateway, Temporal workers, and isolated Chromium pool are deployed and
 their start, intervention, restart-recovery, receipt, and rollback canaries pass.
 The Jobs workspace masks Cloud plan runner access unless both that explicit
 release gate and a non-empty workflow credential are present. A plan entitlement
 must never be presented as runtime availability.
+Keep `BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED=0` until the paired command migrations, Jobs
+API, Temporal worker, and exact protocol-v2 gateway are deployed in that order and an authorized
+internal canary proves fresh start, exact replay, intervention-bound Update, response loss, and
+rollback. The API request path writes durable commands even while dispatch is parked; it never
+falls back to direct gateway delivery.
+Keep `BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0` until the complete Round 610 rollout described below
+has independent approval and hosted evidence. The route and Rust dispatcher recognize only the
+exact literal `true`; unset, `0`, `1`, case variants, and whitespace variants remain disabled.
+Disabled startup does not validate cleanup secrets, create inventory authority, or start a cleanup
+worker, and the authenticated `/workflow-cleanup` path remains 404. Enabled startup validates the
+private HTTPS origin, shared bearer token, exact Temporal namespace, owner-approved visibility
+cutoff, bounded lease/poll/confirmation settings, and fixed protocol-v1 query before any background
+worker starts. Configuration is not inventory evidence and never authorizes customer distribution.
 Install `ops/bluey-api-jobs-env.conf.example` as the main API service drop-in so
 account export, account deletion, and Jobs admin routes use the same data key.
 The standalone Jobs API binds to loopback by default; container deployments
@@ -36,29 +63,158 @@ reviewed redirect URIs, encrypted provider-token storage, and mailbox-worker
 monitoring are configured and verified. The server defaults the read-only
 mailbox worker off when the variable is absent. Connecting an inbox does not
 authorize Bluey to send mail or infer employer outcomes.
+Keep `BLUEY_JOBS_COMMUNICATION_OAUTH_WRITE_ENABLED=0`,
+`BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED=0`, and
+`BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED=0` as independent release
+gates. Read-only inbox consent never implies send or calendar authority. The
+server-owned communication worker keeps decrypted OAuth credentials inside the
+API process and starts no provider write or lookup loop unless its exact flag is
+enabled.
 
-The Jobs API and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
-API and Temporal worker share `BLUEY_JOBS_WORKER_TOKEN`. The Temporal worker
-and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated
-32-byte secrets and rotate them separately.
+The Jobs API command dispatcher and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
+API and Temporal worker use request-bound HMAC signatures from
+`BLUEY_JOBS_WORKER_SIGNING_KEY`; provision `BLUEY_JOBS_WORKER_SIGNING_KEY_PREVIOUS` only during a
+bounded rotation. `BLUEY_JOBS_WORKER_TOKEN` is retained only for debug-build legacy authentication
+and is not production worker authority. The Temporal worker and browser pool share
+`BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated secrets of at least 32 bytes and rotate
+them separately. The workflow token is trimmed at configuration load and must be 32 through 8,192
+UTF-8 bytes in the RFC 6750 bearer grammar `[A-Za-z0-9._~+/-]+=*`; the Rust dispatcher and
+TypeScript gateway enforce the same rule. Whitespace, control characters, non-ASCII bytes, or
+interior padding fail configuration instead of reaching an HTTP header.
+
+### Phase 609 workflow-command rollout
+
+Treat durable command admission, command dispatch, future Temporal cleanup, and customer cloud
+distribution as four different authorities. A safe source/deployment order is:
+
+1. Back up and migrate PostgreSQL, then deploy every selected server binary that hosts Jobs routes
+   with `BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED=0`. The shared server and standalone Jobs API
+   both contain the same independently gated dispatcher; a deployment may select either topology.
+2. Deploy the protocol-v2 Temporal worker and command gateway with
+   `BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0`. Verify the exact `/workflow-commands` body, response,
+   headers, task queue, failure converter, and worker/API signing-key rotation on private ingress.
+   Verify authenticated `/workflow-cleanup` is 404 while disabled and that malformed cleanup
+   enablement does not register the route.
+3. Complete the separate Phase 610 workflow-cleanup rollout below. A source search, an empty local
+   database, a caller boolean, or an earlier global zero receipt is not account-deletion proof.
+4. Under a separately approved internal canary, enable only command dispatch and prove a fresh
+   start, byte-identical replay after response loss, exact already-started identity, one
+   intervention-bound Update, trusted receipt terminalization, and rollback. Keep cloud Browser
+   distribution disabled throughout this internal canary.
+5. Disable dispatch again if any receipt echo, identity, history-privacy, retry, lease, or terminal
+   state differs. Do not delete the command, mint a replacement identity, release a charged packet,
+   or reopen an intervention to manufacture recovery.
+
+Setting the dispatcher flag back to `0` stops new claims; it does not erase or resolve commands
+already `delivering`, `delivery_unknown`, or accepted. Reconcile those exact identities before a
+rollback migration or deployment is considered complete.
+
+Round 609 itself did not authorize cleanup. Round 610 supplies the separately gated local-source
+path, but that does not retroactively create a production namespace inventory, hosted absence
+proof, provider retention evidence, deployment approval, or customer distribution authority.
+
+### Phase 610 workflow-cleanup rollout
+
+Treat schema installation, gateway registration, global protocol-v1 inventory, account-scoped
+protocol-v2 cleanup, account deletion, and Browser distribution as separate authorities. The safe
+rollout order is:
+
+1. Back up and migrate PostgreSQL with `032_jobs_workflow_cleanup_authority.sql` while workflow
+   command dispatch, workflow cleanup, and cloud Browser distribution all remain `0`. Replay the
+   complete migration chain and verify the schema, triggers, views, constraints, privacy columns,
+   and server binary agree before continuing.
+2. Deploy every selected server binary and the workflow gateway with cleanup still `0`. Both
+   `bluey-server` and `bluey-jobs-api` validate cleanup configuration before starting any background
+   worker if the exact flag is later enabled. Verify the disabled authenticated cleanup route is
+   404 and the generic unauthenticated boundary remains 401.
+3. Resolve and approve the one production Temporal namespace and protocol-v1 cutover timestamp.
+   Configure `BLUEY_JOBS_WORKFLOW_NAMESPACE` to equal `TEMPORAL_NAMESPACE`. The cleanup query is
+   fixed to `WorkflowType = "applicationWorkflow"`; the cutoff is bound cutover authority and is
+   not a `StartTime` visibility filter.
+4. In an internal, independently approved cleanup canary, enable only workflow cleanup. Keep
+   command dispatch and cloud Browser distribution `0`. Prove immutable page-chain replay,
+   continuation-token handling, bounded failure/retry, exact protocol-v1 run reconciliation, and
+   exact protocol-v2 type/memo/request/payload/first-run/known-run authority against the hosted
+   namespace.
+5. Drain every discovered protocol-v1 execution. A running protocol-v1 execution remains pending;
+   this batch does not force-terminate it. Closed protocol-v1 history can be deleted, but absence
+   needs exact Describe NotFound, History NotFound, and an exhaustive exact-run visibility zero.
+   Protocol-v2 cleanup may terminate only an exactly bound running execution before deleting its
+   history and proving the same three-part absence boundary.
+6. Complete two exhausted fixed-query scans separated by the database-owned confirmation age.
+   Every discovered target must have two current proof-epoch absence observations. Before the
+   global authority becomes complete, verify reversible legacy workflow/run ciphertext and page
+   tokens have been compacted; pseudonymous HMACs/digests remain for replay and deletion proof.
+7. Run a non-customer account-deletion canary. The first confirmed delete must atomically establish
+   the write fence, freeze the exact protocol-v2 target set, advance any completed global inventory
+   into a fresh database-time epoch, and return HTTP 202 `pending_workflow_cleanup` with zero object
+   deletes. Complete the new global epoch and exact account targets, then prove the runner-purge and
+   workflow-cleanup authorities are atomically bound before any object I/O.
+8. Inject response loss and authority drift during a multi-scope object sweep. The exact sorted
+   manifests and prefix sweeps must be authorized durably before I/O; partial progress must resume
+   without inventing deleted objects back into existence. Any proof drift after the sweep starts
+   must retain the fenced account and return `pending_workflow_cleanup_revalidation`; hard deletion
+   requires the same completed sweep, runner proof, workflow tombstone, and transaction-scoped
+   cascade token.
+9. Confirm the final response says only that the account and covered Bluey records were removed
+   from configured active storage. Do not turn Temporal API NotFound, object-store results, or a
+   database cascade into a claim about provider retention, archival, payload-codec/KMS destruction,
+   backups, or physical erasure.
+10. Disable cleanup and stop the rollout on any namespace/query/cutoff drift, malformed or repeated
+    page token, page-cap exhaustion, unexpected status, identity conflict, proof-epoch mismatch,
+    request/lease/fence mismatch, sweep-manifest mismatch, or hosted visibility inconsistency.
+    Reconcile the exact durable identity; never mint caller-owned zero evidence or bypass the
+    deletion fence.
+
+Source completion alone does not authorize step 1 or any later step. Round 610 did not deploy,
+contact a hosted Temporal namespace, mutate a real execution, run a production account deletion,
+or enable a release flag. Installed Bluey Browser packaging and distribution remain parked and are
+not a prerequisite for the browser-delivered portal plus managed cloud execution direction.
 
 ## Required environment
 
 ```text
 BLUEY_JOBS_BETA_ENABLED=1
 BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
+# Configure for Browser registry import/verification before enabling local
+# Browser distribution. The server release ID must be accepted by the active
+# signed activation; the JSON contains public root Ed25519 keys and an
+# independently approved threshold.
+# BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID=server-603.1
+# BLUEY_JOBS_BROWSER_ROOT_TRUST_ANCHOR_JSON='{"threshold":2,"keys":{"root-key-1":"<base64url-public-key>","root-key-2":"<base64url-public-key>"}}'
 BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
+BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED=0
+# These bounded dispatcher settings are read only when dispatch is enabled.
+BLUEY_JOBS_WORKFLOW_COMMAND_POLL_SECONDS=5
+BLUEY_JOBS_WORKFLOW_COMMAND_LEASE_MS=30000
+BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0
+# Required only after an approved change to the exact literal `true`. The
+# workflow namespace must equal TEMPORAL_NAMESPACE. These values are inert
+# while cleanup remains disabled.
+# BLUEY_JOBS_WORKFLOW_NAMESPACE=<approved Temporal namespace>
+# BLUEY_JOBS_WORKFLOW_CLEANUP_VISIBILITY_CUTOFF_MS=<approved cutover milliseconds>
+# BLUEY_JOBS_WORKFLOW_CLEANUP_POLL_SECONDS=5
+# BLUEY_JOBS_WORKFLOW_CLEANUP_LEASE_MS=30000
+# BLUEY_JOBS_WORKFLOW_CLEANUP_CONFIRMATION_MS=30000
 # Keep managed model generation disabled until provider credentials, the
 # global spend guard, and usage-ledger monitoring are verified in production.
 BLUEY_JOBS_MODEL_GENERATION_ENABLED=0
 BLUEY_JOBS_MAILBOX_SYNC_ENABLED=0
 # Set to 1 only after the Gmail/Outlook release gates below are complete.
 # BLUEY_JOBS_MAILBOX_SYNC_POLL_SECONDS=30
+BLUEY_JOBS_COMMUNICATION_OAUTH_WRITE_ENABLED=0
+BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED=0
+BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED=0
 BLUEY_UPSTREAM_SPEND_LIMIT_CENTS=1000
 BLUEY_UPSTREAM_SPEND_WINDOW_HOURS=24
 BLUEY_JOBS_WORKFLOW_ORIGIN=https://jobs-workflows.internal
 BLUEY_JOBS_WORKFLOW_TOKEN=<random secret>
-BLUEY_JOBS_WORKER_TOKEN=<random secret>
+BLUEY_JOBS_WORKER_SIGNING_KEY=<independent random secret of at least 32 bytes>
+# BLUEY_JOBS_WORKER_SIGNING_KEY_PREVIOUS=<previous secret during bounded rotation>
+# Debug builds only; never use as production worker authority.
+BLUEY_JOBS_WORKER_TOKEN=<independent legacy debug token>
+BLUEY_JOBS_WORKFLOW_WORKER_ID=<stable Temporal workflow-worker replica ID>
+BLUEY_JOBS_TASK_QUEUE=bluey-jobs-applications
 BLUEY_JOBS_DISCOVERY_WORKER_ID=<stable deployment replica ID>
 BLUEY_JOBS_DISCOVERY_POLL_MS=5000
 BLUEY_JOBS_GLOBAL_DISCOVERY_WORKER_ID=<stable global-ingestion replica ID>
@@ -79,7 +235,25 @@ BLUEY_JOBS_RUNNER_ORIGIN=https://jobs-runner.internal
 BLUEY_JOBS_RUNNER_TOKEN=<random secret>
 BLUEY_JOBS_RUNNER_ID=<stable browser-pool replica ID>
 BLUEY_JOBS_PROFILE_ENCRYPTION_KEY=<base64 32-byte key>
-BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs
+BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs-runner
+BLUEY_JOBS_RUNNER_BUILD_ID=runner-602.1
+BLUEY_JOBS_RUNNER_ADMISSION_GRANT_ID=<one-time per-volume grant ID>
+BLUEY_JOBS_RUNNER_ADMISSION_GRANT_TOKEN=<one-time per-volume grant token>
+BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_ID=<one-time per-process runtime grant ID>
+BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_TOKEN=<one-time per-process runtime grant token>
+BLUEY_JOBS_RUNNER_IMAGE_SHA256=<final 64-character OCI image SHA-256>
+BLUEY_JOBS_AUTOMATION_BUNDLE_SHA256=<64-character automation bundle SHA-256>
+BLUEY_JOBS_PLAYWRIGHT_VERSION=<exact Playwright version>
+BLUEY_JOBS_CHROMIUM_REVISION=<exact Chromium revision>
+BLUEY_JOBS_CHROMIUM_EXECUTABLE_SHA256=<64-character Chromium executable SHA-256>
+BLUEY_JOBS_RUNNER_PROVIDER=<provider ID>
+BLUEY_JOBS_RUNNER_PROVIDER_RESOURCE_ID=<managed volume resource ID>
+BLUEY_JOBS_RUNNER_RESOURCE_FINGERPRINT=<64 lowercase hex characters>
+BLUEY_JOBS_RUNNER_SERVER_COMMAND_KEYS=<JSON key-ID to public-key map>
+BLUEY_JOBS_RUNNER_PURGE_SIGNING_KEY_ID=<current server key ID>
+BLUEY_JOBS_RUNNER_PURGE_SIGNING_KEY=<base64url 32-byte server seed>
+BLUEY_JOBS_RUNNER_MINIMUM_BUILD_ID=runner-602.1
+BLUEY_JOBS_RUNNER_PURGE_VERIFYING_KEYS_JSON=<JSON public-key history>
 BLUEY_JOBS_TAKEOVER_ORIGIN=https://jobs-browser.bluey.sh
 BLUEY_JOBS_API_ORIGIN=https://bluey.sh
 TEMPORAL_ADDRESS=<namespace endpoint>
@@ -87,6 +261,34 @@ TEMPORAL_NAMESPACE=<namespace>
 TEMPORAL_API_KEY=<Temporal Cloud API key>
 TEMPORAL_TLS=true
 ```
+
+The four purge-policy variables are server-owned and must be valid before the
+API starts because account deletion now depends on signed immutable fan-out.
+The private signing seed never enters a runner. Each runner instead receives
+the public `BLUEY_JOBS_RUNNER_SERVER_COMMAND_KEYS` map plus its own provider-
+bound admission grant. Create that grant through
+`POST /admin/jobs/runner-volumes/admission-grants` only after resolving the
+exact worker ID, provider resource ID, and resource fingerprint; mount the
+returned ID and token into one runner and start it before the ten-minute expiry.
+The grant is single-use. Use `ops/bluey-jobs-runner.env.example` as the
+per-volume template, not the shared API environment.
+
+Create the separate process-runtime grant through
+`POST /admin/jobs/runner-volumes/process-runtime-grants` only after deployment
+has resolved the final OCI image digest, runner build, platform/architecture,
+automation bundle, Playwright and Chromium revisions, and Chromium executable
+digest. Deliver its returned ID and one-time token to exactly one new process.
+The signed volume instance claim atomically consumes it; neither fleet HMAC,
+the volume key, nor lease JSON may self-assert a runtime. Cancel an unused or
+leaked grant through the authenticated `.../:grant_id/revocations` route before
+its ten-minute expiry.
+
+Do not enable either Browser distribution flag merely because enrollment
+succeeds. The fleet status, zero legacy inventory authority, current signed
+storage attestations, exact cutover record, container smoke, and separate
+authorized device/provider canaries must all pass. Lost or offline volumes stay
+in the deletion target set until they acknowledge or an administrator records
+provider-bound destruction evidence.
 
 Run the discovery worker as a separate deployment using the workflows image
 with command `node workflows/dist/discovery-worker.js`, or install
@@ -189,6 +391,37 @@ Run the same check during incident response:
 sudo /usr/local/sbin/check-bluey-jobs-discovery.sh
 ```
 
+The health host must have Python 3 and `psql` installed. Provision a dedicated,
+random 32-byte hex `BLUEY_JOBS_DIAGNOSTIC_KEY` through the host secret manager
+or the root-owned environment file read by the check:
+
+```text
+BLUEY_JOBS_DIAGNOSTIC_KEY=<64 hexadecimal characters>
+```
+
+By default the check sources `/etc/bluey-api/bluey-api.env` and
+`/etc/bluey-api/bluey-postgres.env`; the health unit does not load
+`bluey-jobs.env` directly. A reviewed systemd drop-in may instead set
+`BLUEY_JOBS_API_ENV_FILE` to a dedicated root-owned secret file. Do not reuse
+`BLUEY_JOBS_DATA_KEY`: the diagnostic key is only for domain-separated opaque
+source correlation and never enters SQL, a process argument, or alert output.
+The check resolves exact Python and `psql` paths, starts each helper with a
+minimal clean environment, and passes the diagnostic key or database URL only
+through an inherited file descriptor. The `psql` child receives the database
+URL as `PGDATABASE`; the renderer receives no database, data-encryption,
+diagnostic, or provider key in its environment. Use
+`BLUEY_JOBS_PYTHON_BIN` only when the reviewed Python 3 executable is not named
+`python3`, and use `BLUEY_JOBS_PSQL_BIN` only for a reviewed `psql` executable.
+A missing or malformed key, missing dependency, unknown diagnostic dimension,
+or invalid diagnostic row fails the check. Provisioning this key and those
+host dependencies plus process-table inspection on the target host is an
+external deployment gate; source tests do not prove it.
+
+An overdue-source alert has the bounded form
+`direct|global:<provider>:ref-<64-lowercase-hex>`. It must never contain the raw
+source key. Treat any raw source, account, employer, URL, token, or secret in
+this diagnostic as a privacy incident and stop the rollout.
+
 The 12-hour limit is twice the slowest normal six-hour global cadence. A source
 older than that is delayed even when its last stored health value says
 `healthy`. The Jobs portal uses the same threshold and shows `Updates delayed`
@@ -265,6 +498,294 @@ freshness, missing-job grace, and portal source health before provisioning the
 next tenant. A missing job is expired only after two complete snapshots and a
 30-minute grace period; failed or partial snapshots never close jobs.
 
+### Operational Jobs holds and readiness
+
+Run the `bluey-ops` preflight before creating or releasing an operational hold
+or changing its deployment contract.
+
+Phase 606 adds one durable, fail-closed control plane for stopping new Jobs
+authority before a side effect. It does not enable a feature and it is not a
+replacement for a feature flag, discovery-source pause, signed ATS circuit,
+account-deletion fence, provider grant, Browser release, or runner authority.
+The same protected routes are mounted on the full Bluey server and the
+standalone Jobs API; both surfaces must use the same Jobs database and data-key
+configuration.
+
+PostgreSQL Jobs admission requires the effective transaction isolation
+`read committed`. The hold lookup runs in a fresh statement after acquiring
+its shared advisory lock. Admission refuses other isolation modes instead of
+reading a potentially stale hold. Operator hold/release updates explicitly
+start at `READ COMMITTED`, so a drifted role default does not disable the
+emergency stop. Check `SHOW transaction_isolation;` in a fresh transaction
+through the deployed application role before enabling Jobs actions. On
+mismatch, keep effects disabled and correct the role, database, or connection
+setting through the normal configuration review. Do not bypass the fence.
+
+The closed capability set is `discovery`, `generation`, `application_queue`,
+`runner_claim`, `final_submit`, `mailbox_sync`, and
+`communication_dispatch`. An operator-only `all` hold applies alongside the
+requested concrete capability. The closed scope set is `global`,
+`discovery_source`, `ats_provider`, `ats_adapter`, `employer_domain`, `account`,
+`career_track`, `region`, `runner_kind`, `mailbox_provider`, `model_provider`,
+and `model`.
+
+The protected administrator routes are:
+
+| Route | Contract |
+|-------|----------|
+| `POST /admin/jobs/operational-holds/events` | Append or exactly replay one hold/release event. |
+| `GET /admin/jobs/operational-holds` | List redacted heads with encrypted keyset pagination. |
+| `GET /admin/jobs/readiness` | Read aggregate generic and native blockers by capability. |
+
+Every route requires a bearer access token for an active administrator account.
+They reject normal accounts, apply a 64 KiB request-body limit, and treat
+unknown mutation fields as invalid. Every success, validation error,
+authentication error, conflict, and storage error is private and non-storable:
+
+```text
+Cache-Control: private, no-store
+Pragma: no-cache
+```
+
+Do not put request bodies, bearer tokens, raw scope IDs, event IDs, reason
+references, or responses into shared terminals, tickets, URLs, or logs.
+
+#### Create the first hold
+
+The first event for one capability/scope pair must be `held`, must expect
+revision zero, and must not name a predecessor. Use the raw route only after
+resolving the exact server-owned scope. For example:
+
+```http
+POST /admin/jobs/operational-holds/events
+Authorization: Bearer <administrator-access-token>
+Content-Type: application/json
+
+{
+  "eventId": "<unique-operator-event-id>",
+  "capability": "generation",
+  "scopeKind": "account",
+  "scopeId": "<exact-account-id>",
+  "transition": "held",
+  "reasonCode": "incident",
+  "reasonRef": "INC-606",
+  "expectedHeadRevision": 0,
+  "expectedCurrentEventId": null
+}
+```
+
+`global` accepts only `scopeId: "*"`. Account, Career Track, and discovery
+source IDs remain exact identifiers. Region and Unicode employer-domain scopes
+are lowercased and NFC-normalized; verified employer-domain context includes
+both its normalized Unicode form and its ASCII IDNA form. Other categorical
+scope values are lowercase ASCII. Unknown-like regions such as `unknown`,
+`n/a`, `not specified`, and `unspecified` are omitted from derived admission
+context rather than becoming scope authority.
+
+The closed reason-code set is `incident`, `security_review`, `privacy_review`,
+`compliance_review`, `quality_regression`, `provider_outage`, `capacity_guard`,
+`maintenance`, `account_request`, `certification_guard`, `rollout_guard`, and
+`manual_release`. A reason reference is optional, at most 120 ASCII characters,
+starts with an alphanumeric character, and otherwise contains only letters,
+digits, `.`, `_`, or `-`.
+
+A new append returns `201 Created`; an exact replay of the same event and actor
+returns `200 OK` with `replayed: true`. Changed bytes or actor under an existing
+event ID, stale compare-and-swap state, an unresolved opaque reference, or an
+account-deletion fence returns a bounded conflict. Invalid input is rejected,
+and storage or canonical-state corruption returns an unavailable response.
+Never interpret a timeout, transport loss, or unavailable response as release
+authority: read the current head before deciding whether an exact replay is
+appropriate.
+
+The response exposes only `capability`, `scopeKind`, `scopeRef`, `headRevision`,
+`currentEventRef`, `eventSha256`, `state`, `reasonCode`, `recordedAtMs`, and
+`replayed`. It never exposes raw scope ID, raw event ID, reason reference,
+administrator identity, or canonical event bytes.
+
+#### List and transition a hold by opaque reference
+
+List active heads with:
+
+```http
+GET /admin/jobs/operational-holds?activeOnly=true&limit=50
+Authorization: Bearer <administrator-access-token>
+```
+
+`activeOnly` defaults to `true`; set it to `false` when released heads are also
+needed. `limit` defaults to 50 and must be from 1 through 100. When
+`nextCursor` is present, pass it unchanged as `cursor` with the same
+`activeOnly` value. The cursor is encrypted, purpose-bound, bounded to 2,048
+bytes, and ordered by the internal capability/scope key. Do not decode, edit,
+or reuse it with another filter. Follow pages until `nextCursor` is absent.
+
+The list deliberately returns no raw scope or event identity. Use its exact
+`scopeRef`, `headRevision`, and `currentEventRef` for a later transition:
+
+```http
+POST /admin/jobs/operational-holds/events
+Authorization: Bearer <administrator-access-token>
+Content-Type: application/json
+
+{
+  "eventId": "<new-unique-operator-event-id>",
+  "capability": "generation",
+  "scopeKind": "account",
+  "scopeRef": "scope-<64-lowercase-hex>",
+  "transition": "released",
+  "reasonCode": "manual_release",
+  "reasonRef": "INC-606",
+  "expectedHeadRevision": 1,
+  "expectedCurrentEventRef": "event-<64-lowercase-hex>"
+}
+```
+
+The server resolves both refs against one indexed current head, verifies them
+in constant time, then applies the same canonical compare-and-swap and replay
+rules as a raw transition. Never release by guessing a ref, reconstructing a
+raw identifier from an alert, changing only one expected field, deleting a
+row, or updating a head directly. A release has no TTL and is itself an
+append-only event. `held -> held`, `held -> released`, and
+`released -> held` each require the exact current predecessor; a second
+consecutive release and a first-event release are rejected.
+
+#### Interpret readiness without weakening native authority
+
+`GET /admin/jobs/readiness` returns schema version 1, aggregate readiness, one
+entry for every concrete capability, the paused discovery-source count, the
+open ATS-circuit count, and the evaluation timestamp. Each capability entry
+contains `ready`, `blockerCount`, `operationalHoldCount`, and
+`nativeBlockerCount`. An active `all` hold is counted for every concrete
+capability in addition to its capability-specific holds.
+
+Native authority remains independent:
+
+- paused discovery sources contribute native blockers only to `discovery`;
+- open signed ATS circuits contribute native blockers only to `final_submit`;
+- releasing a generic hold does not resume a source or close a circuit; and
+- resuming a source or reviewing a circuit does not release a generic hold.
+
+Readiness fails closed when storage is unavailable or a count contains an
+unknown/private dimension. A zero generic-hold count does not grant provider,
+tenant, account, runner, model, or submission authority. Verify every relevant
+native status and disabled-by-default release flag separately. The protected
+metrics endpoint uses only the closed capability and scope-kind labels; it must
+not contain raw tenant, source, employer, model, URL, token, hash, cursor,
+reason reference, actor, event ID, or error text.
+
+Holds stop only new authority at these boundaries:
+
+- direct and global discovery lease acquisition;
+- paid managed-generation provider reservation;
+- application-attempt reservation, including an active-reservation replay;
+- local and cloud runner claim or reissue;
+- local and cloud final pre-click authorization;
+- mailbox-sync lease claim; and
+- communication-dispatch claim and its durable request-start marker.
+
+Those boundaries validate their complete server-owned projection before they
+evaluate a hold. Mailbox sync requires the connection, relational sync state,
+and encrypted sync state to name the same provider. A `curated_feed:*` posting
+requires the account's exact managed `curated_feed` / `bluey-curated-v1`
+membership before application- or job-scoped authority is admitted. Discovery
+leases freeze relevant Career Track insert, update, and delete operations while
+the lease is unexpired; successful completion, recorded failure, or lease
+expiry releases that freeze. Account-wide curated discovery validates every
+Track's relational/JSON ID and active projection and selects only active
+Tracks; a directly bound inactive Track remains in Career Track and Region hold
+scope. Treat any projection mismatch as storage corruption: stop admission and
+repair the canonical rows rather than releasing a hold or editing a head.
+
+An API-created `unassigned` application reservation has no `runner_kind` scope;
+use `application_queue` and the other applicable account, Track, employer, ATS,
+region, or model scopes to stop that reservation. A later cloud or local runner
+claim independently evaluates its concrete `runner_kind` before atomically
+persisting the binding.
+
+Do not use a hold to suppress evidence after a possible side effect. Heartbeat,
+Browser-profile sealing, exact click-started replay, worker result and receipt
+persistence, submission checkpoint recovery, mailbox completion,
+communication completion, and read-only reconciliation remain available so
+Bluey can reduce uncertainty safely.
+
+For local `click_started` recovery, "exact" binds the ticket and encrypted
+payload, account/application/run, running session, final-submit proof, terminal
+ATS authority, active evidence capacity, and the complete Browser
+build/release binding frozen onto the run. It does not freeze the current server
+process deployment ID from the first authorization call. If the immutable
+activation frozen onto that Browser binding accepted server releases `A` and
+`B`, a possible side effect started under `A` may be recovered after the server
+deploys `B`. An ID outside that same frozen accepted set is denied. The replay
+must return the already durable ATS receipt authority without another marker,
+canary reservation, capacity reservation, or final click. This accepted
+`A -> B` rule is recovery continuity, not permission to switch the frozen
+Browser manifest, build, channel, activation, or trust authority.
+
+The HTTP exception is equally narrow. An expired signed v2 submit capability
+may reach recovery only for a durable `click_started` ticket and only inside
+the reconciliation grace. A disabled local-distribution flag blocks claimed or
+new submit work but permits that exact ticket to reach database reconstruction.
+If the object-storage maximum changed after the marker, recovery uses the
+already active durable reserved bytes/object count and the current upload
+limits; it never reserves replacement capacity. Signed v1 or v2 result
+reconciliation uses that durable capacity when ticket state is
+`click_started` or `side_effect_unknown`; submit recovery remains signed
+v2-only. Claimed, `needs_input`, and other new/pre-side-effect paths derive
+capacity from current storage configuration. Missing, inactive, expired,
+non-local, or wrong-scope durable capacity is denied.
+
+During an incident pause, set only
+`BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0`. Keep the current
+`BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID`, imported root/activation/manifest
+authority, Jobs data key, and evidence object-storage configuration available
+until every post-marker run is submitted, reconciled, or otherwise terminal.
+The server release ID is still required to prove that the current deployment is
+in the frozen activation's accepted set, and object-storage configuration is
+still required to retain current upload limits. Removing either dependency is
+not a safe kill switch: it strands evidence/recovery while possible employer
+side effects remain unresolved.
+
+#### Read the submission drain during an approved incident pause
+
+Keep admission holds in place and preserve recovery dependencies. Generate
+the counts-only statement with
+`node jobs/scripts/check-jobs-submission-drain.mjs --sql postgres` (or `--sql sqlite`
+for an owned SQLite rehearsal). Run it in an independently authenticated,
+complete-scope, read-only session on the exact live database, not a lagging
+replica, stale export, or tenant-filtered connection. Set a short statement
+timeout. Require successful SQL execution and pass the single unadorned output
+line, including its trailing newline, into
+`node jobs/scripts/check-jobs-submission-drain.mjs --check`.
+
+- Exit 2 means keep recovery dependencies in place. This covers local and
+  cloud click markers, unknown outcomes, and cloud finish acknowledgements
+  without the matching committed publication rows. Active evidence reservations
+  and unresolved application/attempt rows block independently.
+- Expiry never removes an unresolved row from these counts. The age field
+  counts execution rows whose last durable update was at least 24 hours ago;
+  it is an escalation signal, not a deadline or proof of which click occurred.
+  Row counters overlap and must not be summed as a total number of candidates.
+- Exit 0 means no unresolved rows in the checked storage classes at that
+  snapshot. The result always includes `releaseAuthorized:false`. Confirm a
+  current observation time, continuous admission holds, old worker closure,
+  separately verified receipt evidence and authorized operator approval before
+  retiring recovery dependencies or resuming effects. This check does not
+  attest to browser, Temporal, mailbox, or hosted-provider state. If the read
+  fails, output is incomplete, or database scope cannot be proved, keep the
+  dependency hold and use the reviewed incident procedure.
+
+Before production operation, complete the external gates that source work
+cannot prove: authorized live PostgreSQL migration and two-connection lock
+rehearsal, backup/restore evidence, exact artifact promotion, shared database
+and data-key configuration across both router surfaces, administrator access
+and audit ownership, alert thresholds, incident/release drills, and an approved
+canary that proves a committed hold wins against concurrent new admission while
+post-marker recovery still completes. Also provision the separate diagnostic
+key and Python 3 dependency described above. Keep every Jobs, model, Browser,
+mailbox, communication, provider, and tenant flag at its existing parked value
+until its own launch gate passes; an operational release is never an enabling
+action.
+
 ### Browser execution leases
 
 Every cloud run claims a database execution lease before opening Chromium.
@@ -296,13 +817,25 @@ syncs the parent directory where the platform supports directory fsync. These
 records make Temporal activity retries idempotent even when a submit response
 is lost in transit.
 
+Protocol-v2 result reads require the exact request ID and the complete account, application,
+application-identity, browser-session, and run binding before a stored result can affect the
+workflow. A possible side effect is first persisted as a minimal encrypted, purgeable ambiguity
+tombstone; the runner must durably write that authority before returning the exact private
+`side_effect_unknown` response. Restart recovery checks durable results as well as checkpoint
+phase: a bound submitted result is promoted through the exact lease-finish replay, a bound failed
+result remains terminal, and an unresolved `final_submit_started` marker remains ambiguous rather
+than opening Chromium or replaying Submit. Before startup recovery reads or persists any result or
+ambiguity tombstone, it recomputes the profile scope from the frozen account and application
+identity and rejects any checkpoint stored under a different scope.
+
 Nonterminal browser work is also checkpointed in authenticated `BLUEYJP2`
 `run-checkpoint` envelopes under `run-checkpoints/<profile-scope>/`. The AAD and
 HKDF context bind both the hashed profile scope and hashed browser-session
 scope. A checkpoint contains the frozen request, bounded events, safe workflow
-phase, provider-review state, and non-secret lease fence/expiry/owner metadata;
-it never serializes the lease token or worker signing key. On startup the
-runner seals every valid crash-left `active/<profile-scope>` directory into its
+phase, provider-review state, lease fence/expiry/owner metadata, and—in the encrypted v2
+envelope only—the exact lease token needed for crash reconciliation. The token is never written
+outside that authenticated envelope or logged, and the worker signing key is never serialized. On
+startup the runner seals every valid crash-left `active/<profile-scope>` directory into its
 encrypted profile snapshot (or removes it if sealing fails) before opening the
 HTTP listener. It rehydrates only unexpired `prepared`, `needs_input`, and
 `provider_review` checkpoints. `final_submit_started`, activated, uncertain,
@@ -310,6 +843,20 @@ and otherwise ambiguous checkpoints remain `side_effect_unknown` and are never
 automatically replayed. Configure a stable `BLUEY_JOBS_RUNNER_ID` so a restarted
 replica can rotate its still-prepared server lease immediately; without one,
 recovery waits for the old prepared lease to expire.
+
+An exact committed `needs_input` result may remain recoverable after the ordinary checkpoint expiry
+because publication belongs to the Temporal workflow, not to the runner's checkpoint timer. The
+runner may restore that exact intervention only after revalidating current server authority and
+writing a fresh bounded checkpoint; expired state alone is never authority to publish or resume.
+Current restore is always attempted first. Only when that expired checkpoint's new lease claim is
+rejected with exact `lease_unavailable` authority may recovery use the frozen old lease token/fence
+to reconcile and remove it. A current checkpoint, another lease operation/code, timeout, transport
+failure, or reconciliation failure stays fail-closed and preserves the checkpoint.
+
+Browser release is cleanup after the submitted or terminal database state commits. HTTP 401 and
+403 from the runner are treated as repairable credential drift and keep the idempotent cleanup
+activity retrying; they are not permanent evidence that the browser was released. A bounded
+permanent cleanup rejection cannot downgrade the already committed canonical application state.
 
 ## Global candidate cold storage
 
@@ -354,25 +901,36 @@ Before enabling production archival:
    archive retry counts remain healthy before increasing throughput.
 
 ```sql
-SELECT c.id, c.canonical_key, c.updated_at_ms
-FROM jobs_global_candidates c
-WHERE c.availability_status = 'expired'
-  AND c.archive_state = 'hot'
-  AND c.updated_at_ms < (
-      EXTRACT(EPOCH FROM NOW() - INTERVAL '30 days') * 1000
-  )::BIGINT
-  AND NOT EXISTS (
-      SELECT 1
-      FROM jobs_global_candidate_memberships m
-      WHERE m.candidate_id = c.id
-        AND m.expired_at_ms IS NULL
+WITH archive_clock AS (
+    SELECT
+        (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT AS now_ms,
+        (EXTRACT(EPOCH FROM clock_timestamp() - INTERVAL '30 days') * 1000)::BIGINT
+            AS stale_before_ms
+)
+SELECT candidate.id, candidate.canonical_key, candidate.updated_at_ms
+FROM jobs_global_candidates candidate
+CROSS JOIN archive_clock
+WHERE candidate.availability_status = 'expired'
+  AND candidate.updated_at_ms <= archive_clock.stale_before_ms
+  AND (
+      (candidate.archive_state IN ('hot', 'retry')
+       AND candidate.archive_next_attempt_at_ms <= archive_clock.now_ms)
+      OR
+      (candidate.archive_state = 'archiving'
+       AND COALESCE(candidate.archive_lease_expires_at_ms, 0) <= archive_clock.now_ms)
   )
   AND NOT EXISTS (
       SELECT 1
-      FROM jobs_global_candidate_materializations m
-      WHERE m.candidate_id = c.id
+      FROM jobs_global_candidate_memberships membership
+      WHERE membership.candidate_id = candidate.id
+        AND membership.availability_status <> 'expired'
   )
-ORDER BY c.updated_at_ms
+  AND NOT EXISTS (
+      SELECT 1
+      FROM jobs_global_candidate_materializations materialization
+      WHERE materialization.candidate_id = candidate.id
+  )
+ORDER BY candidate.updated_at_ms, candidate.id
 LIMIT 100;
 ```
 
@@ -385,11 +943,12 @@ FROM jobs_global_candidates
 GROUP BY archive_state
 ORDER BY archive_state;
 
-SELECT id, archive_attempt_count, archive_next_attempt_at_ms
+SELECT id, archive_state, archive_attempt_count,
+       archive_next_attempt_at_ms, archive_lease_expires_at_ms
 FROM jobs_global_candidates
-WHERE archive_state = 'hot'
-  AND archive_attempt_count > 0
-ORDER BY archive_next_attempt_at_ms
+WHERE archive_state IN ('retry', 'archiving')
+   OR archive_attempt_count > 0
+ORDER BY archive_next_attempt_at_ms, id
 LIMIT 100;
 ```
 
@@ -474,33 +1033,916 @@ do not replace a deny-by-default production network policy.
 
 ## Desktop releases
 
-`npm run package --workspace @bluey/jobs-browser` downloads the matching
-Playwright Chromium and builds macOS, Windows, and Linux artifacts. Public
-artifacts require Apple signing/notarization and Windows Authenticode signing.
-Unsigned beta artifacts must not be presented as production installers.
-
-Run direct Electron Builder validation from `jobs/browser` so package-relative
-icons, Chromium resources, and the `dist/main.js` entry resolve correctly:
+Browser release packaging is target-explicit and native-host-only:
 
 ```sh
-CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --dir --config electron-builder.yml
+cd jobs
+npm run package:darwin-arm64 --workspace @bluey/jobs-browser
+npm run package:darwin-x64 --workspace @bluey/jobs-browser
+npm run package:windows-x64 --workspace @bluey/jobs-browser
 ```
 
-The package build cleans every production `dist` directory before compiling.
-Release validation must confirm `app.asar` contains `dist/main.js` and the
-compiled `@bluey/jobs-automation/dist/index.js`, contains no Bluey `src` or
-`tests` directories or test configuration, and includes the matching Chromium
-bundle under the app's `Resources/playwright` directory.
+These are low-level target entry points. They require the already compiled
+automation and Browser trees, target-matching Chromium, exact descriptor inputs,
+and native signing environment; they are not a substitute for the protected
+release workflow and must not be used alone to label an artifact releasable.
 
-The authenticated portal starts a local application by creating a 24-hour
+The generic `package` and `prepare:chromium` entry points intentionally fail
+without one exact target. Linux and universal-macOS artifacts are not supported
+by this release contract. Use the protected `Bluey Browser Release Authority
+Gate` workflow for candidates: it checks out one exact clean default-branch
+commit, materializes build-signing inputs outside the repository, packages once
+on the matching native host, and preserves those same bytes through independent
+threshold authorization and promotion. Do not run Electron Builder directly
+for a releasable artifact and do not rebuild between candidate verification and
+promotion.
+
+Each candidate must prove the exact approved native signer. macOS validation
+verifies signatures, notarization, and existing staples for the ZIP application,
+DMG, and mounted DMG application, then byte-compares their canonical Resources
+and bundle-metadata inventories. Windows validation checks
+the signed/timestamped NSIS installer, extracts its exact `app-64.7z` payload,
+checks the signed/timestamped application executable, and inventories those
+extracted Resources. The gate also proves `app.asar`, the compiled automation
+dependency, matching headed Chromium revision/architecture, embedded build
+authority, excluded source/test/config files, immutable artifact hashes and
+sizes, and all five native packages. Promotion validates a canonical external
+canary-evidence record with the exact required stable check IDs; it does not run
+those physical canaries itself.
+The protected candidate environment must supply
+`BLUEY_BROWSER_MACOS_SIGNER_IDENTITY` and
+`BLUEY_BROWSER_WINDOWS_SIGNER_IDENTITY` alongside the corresponding native
+signing/notarization credentials; an absent or non-exact identity fails before
+candidate evidence can be emitted.
+
+On macOS, post-signing `Info.plist` inspection proves the exact bundle ID,
+product name, and custom-protocol declaration in both package forms. On Windows,
+the source gate proves the locked trusted NSIS construction inputs and the
+packaged runtime's exact protocol-registration call without executing candidate
+application code on the signing runner. Actual Windows registry registration is
+therefore a mandatory fresh, credential-free clean-install canary, together with
+installer/AUMID identity and `bluey-jobs` protocol launch. Outer/inner
+Authenticode signatures, timestamps, ASAR inventory, and the compiled
+`setAsDefaultProtocolClient("bluey-jobs")` call are construction proof only.
+
+The macOS ZIP is retained as a manifest-classified updater artifact only. No
+installed-app feed, downloader, installer coordinator, or automatic rollback is
+shipped by this batch, so it must not be presented as self-update readiness.
+
+### Browser release workflow handoff
+
+The `Bluey Browser Release Authority Gate` workflow has four explicit
+operations. `contract` also runs for pull requests; manually dispatched
+`candidate`, `authorize`, and `promote` operations must run from the repository
+default branch. Every later operation must name the exact prior run, artifact,
+source commit, release ID, and authority digests printed by the earlier run:
+
+1. `contract` exercises the release scripts and fail-closed workflow contract.
+2. `candidate` prepares one exact clean commit without credentials on each
+   native target, packages it once inside the protected
+   `bluey-browser-release-signing` environment, verifies native evidence, and
+   assembles the three target parts into one five-artifact candidate set.
+3. `authorize` downloads that exact candidate and joins it to an independently
+   produced threshold manifest signature set. It neither rebuilds nor signs a
+   native package.
+4. `promote` downloads that exact authorization and joins it to the canonical
+   activation, promotion signature set, and separately collected physical
+   canary-evidence record. `require_production_ready=true` validates the record
+   and its required check IDs; it is not evidence that this source checkout ran
+   the devices.
+
+GitHub artifacts retained by this workflow are handoff evidence, not an
+immutable public download origin. Before registry activation, copy the exact
+verified bytes to the manifest's immutable HTTPS URLs and perform a complete
+public read-back with matching sizes and SHA-256 digests. Never rebuild or
+rename an artifact between candidate, authorization, read-back, and promotion.
+
+### Browser release authority inventory
+
+The protected `bluey-browser-release-signing` native packaging environment must
+configure the build and native-signing values below. An empty, wrong, or extra
+credential must fail the candidate rather than fall back to an unsigned
+package:
+
+- Build identity: `BLUEY_BROWSER_BUILD_PRIVATE_KEY_PKCS8_BASE64`,
+  `BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_BASE64`, and
+  `BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_SHA256`.
+- macOS: `BLUEY_BROWSER_APPLE_API_KEY_BASE64`,
+  `BLUEY_BROWSER_APPLE_API_KEY_ID`, `BLUEY_BROWSER_APPLE_API_ISSUER`,
+  `BLUEY_BROWSER_MACOS_CSC_LINK`, `BLUEY_BROWSER_MACOS_CSC_KEY_PASSWORD`, and
+  `BLUEY_BROWSER_MACOS_SIGNER_IDENTITY`.
+- Windows: `BLUEY_BROWSER_WINDOWS_CSC_LINK`,
+  `BLUEY_BROWSER_WINDOWS_CSC_KEY_PASSWORD`, and
+  `BLUEY_BROWSER_WINDOWS_SIGNER_IDENTITY`.
+
+Candidate assembly must also receive
+`BLUEY_BROWSER_RELEASE_TRUST_POLICY_BASE64` and
+`BLUEY_BROWSER_RELEASE_TRUST_POLICY_SHA256`. They are public authority material,
+not private signing keys, and must identify the exact approved policy used to
+assemble the candidate.
+
+The workflow's manifest signature set, activation, activation signature set,
+and canary evidence are canonical public authorities passed between offline
+ceremony and exact stored-byte verification. Root, release, promotion, and
+incident private keys must never be stored in the repository, candidate
+artifacts, Browser package, API environment, or workflow outputs. The API host
+receives only `BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID` and the independently
+approved public `BLUEY_JOBS_BROWSER_ROOT_TRUST_ANCHOR_JSON`.
+
+`BLUEY_JOBS_BROWSER_DEVELOPMENT_RELEASE_DIRECTORY` is deliberately absent from
+the production environment example. It is accepted only by an unpackaged
+Browser process whose Jobs API origin is credential-free loopback HTTP; a
+packaged process ignores it. Never place it in a production service, package,
+or customer environment.
+
+### Browser release registry ceremony
+
+The administrator-authenticated registry exposes eight routes. Import and
+movement requests are strict JSON with unknown fields rejected:
+
+| Route | Request authority | Purpose |
+|-------|-------------------|---------|
+| `POST /admin/jobs/browser-releases/trust-policies` | `{canonicalBase64url, signatureSetBase64url}` | Import or byte-replay a root-authorized trust policy. |
+| `POST /admin/jobs/browser-releases/manifests` | `{canonicalBase64url, signatureSetBase64url, buildProofs}` | Import the threshold-authorized manifest and every exact packaged build proof. |
+| `POST /admin/jobs/browser-releases/activations` | `{canonicalBase64url, signatureSetBase64url}` | Import a promotion-authorized channel activation without moving the head. |
+| `POST /admin/jobs/browser-releases/activations/apply` | `{activationSha256, expectedHeadRevision, expectedTransitionSha256}` | Compare-and-swap the channel head to an imported activation. |
+| `POST /admin/jobs/browser-releases/rollbacks` | `{canonicalBase64url, signatureSetBase64url}` | Apply an exact signed higher-sequence rollback transition. |
+| `POST /admin/jobs/browser-releases/revocations` | `{canonicalBase64url, signatureSetBase64url}` | Append an irreversible incident-authorized revocation. |
+| `POST /admin/jobs/browser-releases/accounts/:account_id/channel` | `{assignmentGeneration, predecessorAssignmentSha256, channel, reasonRef, assignedAtMs}` | Assign one account to one channel with a monotonic generation and predecessor digest. |
+| `GET /admin/jobs/browser-releases/channels/:channel/status` | none | Read current CAS fields, authority digests, expiry, and availability. |
+
+Use this order for a new channel head: configure the public root anchor and
+server release ID; import the trust policy; import the manifest and exact build
+proofs from the stored promotion set; import the activation; read channel
+status; apply the activation with that exact `headRevision` and
+`transitionSha256`; assign only intended accounts with the next exact assignment
+generation; then read channel and account-facing availability again. A replay
+must return the same digests with `replayed=true`; any conflicting replay,
+sequence regression, stale compare-and-swap, incomplete artifact set, obsolete
+origin, expiry, or revocation stops the ceremony.
+
+Rollback and revocation are separate incident paths. A rollback requires a new
+higher-sequence signed authority that binds the current activation and exact
+target manifest. A revocation is append-only and must be followed by channel
+status and account-facing availability checks. Keep
+`BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` throughout rehearsal; enabling
+it is a distinct approved production change after immutable hosting, native
+credentials, and every physical canary have independently passed.
+
+#### Parked P2 local-client protocol (server-retained, not a portal launch path)
+
+The current browser-delivered portal never starts a local application or opens
+the custom protocol below. The server retains this recovery-compatible contract
+for historical local runs and a possible separately reviewed P2 client; it is
+not part of the cloud-first launch and its distribution flag remains disabled.
+
+If local distribution is reactivated in a later approved batch, a reviewed
+client starts an application by creating a bounded
 capability in `jobs_local_run_tickets`, then opening
 `bluey-jobs://run/<run-id>?ticket=<random-ticket>`. Only the ticket enters the
 custom-protocol URL. Its secret and frozen packet are encrypted in the Jobs
 database, the database stores a lookup hash separately, and terminal results
-are idempotent. The desktop claims and reports the run through
-`BLUEY_JOBS_API_ORIGIN`; production must keep that origin on HTTPS.
+are idempotent. Claim sends the exact packaged canonical build descriptor,
+detached signature, and request-bound nonce. The server consumes the ticket
+only after the current account assignment, signed channel head, server-runtime
+compatibility, full artifact set, and revocation state pass in one transaction,
+then freezes those bindings into operation-scoped capabilities. Pre-click
+authorization rechecks the current assignment, activation compatibility, and
+revocation state without weakening result/resume or trusted-receipt recovery.
+The desktop claims and reports the run through `BLUEY_JOBS_API_ORIGIN`;
+production must keep that origin on HTTPS.
+
+## ATS certification authority
+
+Run the `bluey-ops` preflight before importing or changing any ATS
+certification authority. Discovery coverage, review-fill coverage, ATS
+certification, Career Track Auto authorization, and Browser distribution are
+independent gates. A provider URL, source catalog entry, adapter result,
+synthetic fixture, portal label, or successful reviewed submission never grants
+`certified` by itself.
+
+The safe default is zero active certification. A fresh migration must create no
+active head, seed no tenant, and grant no unattended capability. Greenhouse and
+Lever remain `beta_review`; Workday, Ashby, and SmartRecruiters remain
+review-fill only; semantic and protected portals remain Review, Takeover, or
+Handoff. An absent root anchor, incomplete authority, expired record, unknown
+layout, open circuit, stale compare-and-swap, or runtime mismatch preserves that
+default.
+
+Keep all four independent production gates at `0` throughout local source work,
+schema rehearsal, signed-authority import rehearsal, and shadow observation:
+
+```text
+BLUEY_JOBS_MODEL_GENERATION_ENABLED=0
+BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
+BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
+BLUEY_JOBS_MAILBOX_SYNC_ENABLED=0
+```
+
+An imported or applied ATS activation cannot override either Browser
+distribution flag. Conversely, an available Browser cannot manufacture an ATS
+certification.
+
+### Certification preflight
+
+Before any authority import or movement:
+
+1. Resolve the exact reviewed source commit and confirm the worktree is clean.
+2. Verify the paired SQLite/PostgreSQL ATS-certification migration and schema
+   parity from that commit. An older Jobs binary must not run against a newer
+   authority schema.
+3. Confirm a new database contains zero certification heads, zero canary
+   reservations, and zero application certification bindings.
+4. Resolve the exact provider, tenant, variant, surface digest, adapter version
+   and bundle digest, layout-contract digest, suite version, and runner target.
+   The target comes from canonical job and original-source authority, never an
+   operator-supplied arbitrary URL.
+5. For a local target, resolve the exact active Browser release manifest,
+   platform/architecture artifact, build descriptor, Playwright version, and
+   Chromium revision. For cloud, resolve the immutable runner image digest,
+   runner build ID, automation bundle, Playwright version, and Chromium
+   revision.
+6. Verify every referenced evidence object by complete immutable read-back,
+   exact byte size, SHA-256, media type, provenance, authorization reference,
+   sanitizer version, capture time, and expiry.
+7. Confirm signed layout observations contain no candidate values, labels with
+   candidate data, page text, HTML, screenshots, documents, cookies, tokens,
+   OTPs, credentials, full query strings, or selectors containing user data.
+8. Confirm manifest, evidence, activation, revocation, and layout-observation
+   signing roles use disjoint approved public keys and required independent
+   thresholds.
+9. Confirm the approved canary account set, eligible plan, daily submission
+   cap, concurrency cap, named support owner, incident owner, and rollback
+   authority are recorded outside the repository.
+10. Read current target status, quarantine/circuit status, head revision,
+    transition digest, expiry, and revocation state before attempting a change.
+
+The API host receives only the independently approved public ATS-certification
+root anchor, for example through
+`BLUEY_JOBS_ATS_CERTIFICATION_ROOT_TRUST_ANCHOR_JSON`. Manifest, evidence,
+activation, revocation, and layout-observation private keys must not enter the
+repository, Jobs API environment, Browser package, runner image, database, CI
+artifact, or workflow output. If the deployed implementation does not recognize
+and validate the exact root-anchor setting, stop; an environment variable alone
+is not authority.
+
+### Shadow observations and zero-authority rehearsal
+
+`LayoutObservationV1` is a signed, PII-free structural record. It binds one
+provider-target fingerprint, adapter version, exact runner target, page variant,
+control shapes, effective submit target, unique submit-control identity,
+challenge categories, observation time, expiry, and predecessor digest.
+
+Evidence-object source kind is classified explicitly:
+
+- `synthetic` exercises fixtures, parity vectors, validators, drift handling,
+  and failure paths;
+- `fault_injection` proves crash, replay, ambiguity, and circuit behavior in an
+  authorized non-production environment;
+- `authorized_sandbox` proves the exact approved sandbox target; and
+- `authorized_canary` proves a separately authorized live test vacancy.
+
+The separately signed layout-observation class is exactly `synthetic`,
+`authorized_sandbox`, or `authorized_live`. A non-shadow activation requires a
+complete authorized-sandbox and authorized-live check/result and layout pair for
+every exact runtime target. Fault-injection objects do not become a production
+layout class.
+
+Synthetic and fault-injection evidence are shadow-only. They may support an
+`observe_only` shadow manifest and activation, but they cannot authorize a
+canary or general unattended head. A source test that accepts a synthetic
+manifest proves only that the authority validator works.
+
+Import observations before the manifest that names them. A byte-identical
+replay must return the same digest. A conflicting replay, PII-bearing record,
+unapproved evidence class, wrong target, wrong runner, expired observation, or
+predecessor conflict stops the ceremony and creates no authority.
+
+### Signed import and activation ceremony
+
+Administrative import and movement requests use strict JSON with unknown
+fields rejected. Use the exact routes implemented by the reviewed Jobs API;
+the intended registry shape is:
+
+| Route | Request authority | Purpose |
+|-------|-------------------|---------|
+| `POST /admin/jobs/ats-certifications/trust-policies` | canonical root-authorized trust policy and signature set | Import or byte-replay public signing policy. |
+| `POST /admin/jobs/ats-certifications/layout-observations` | canonical `LayoutObservationV1` and independent signature set | Import one PII-free exact structural observation. |
+| `POST /admin/jobs/ats-certifications/manifests` | aggregate of a canonical independently signed `ManifestV1` plus independently signed immutable evidence envelopes | Atomically import one exact provider/target/adapter/layout/runner candidate and its evidence metadata. |
+| `POST /admin/jobs/ats-certifications/activations` | canonical `ActivationV1` and independent promotion signature set | Import a shadow, canary, or general activation without moving a head. |
+| `POST /admin/jobs/ats-certifications/activations/apply` | activation digest, expected head revision, expected transition digest | Compare-and-swap one exact scope/channel head. |
+| `POST /admin/jobs/ats-certifications/canary-allowlists` | exact bounded account set, validity window, and approval reference | Import or byte-replay the server-owned allowlist referenced by a canary activation. |
+| `POST /admin/jobs/ats-certifications/canary-allowlists/revoke` | exact allowlist digest and revocation reference | Irreversibly stop new authority from that canary account set. |
+| `POST /admin/jobs/ats-certifications/circuits` | exact scope, transition, trigger, and authority reference | Open, hold, or reviewed-close a circuit. |
+| `POST /admin/jobs/ats-certifications/revocations` | canonical `RevocationV1` and independent incident signature set | Append an irreversible revocation. |
+| `GET /admin/jobs/ats-certifications/targets/:target_key/status` | none beyond administrator authentication | Read current head, manifest, expiry, revocation, quarantine, circuit, and rollout state. |
+
+If the reviewed release exposes different route names or request fields, update
+this runbook and its contract tests before operating it. Never infer a route or
+send signed authority to an unreviewed endpoint.
+
+Use this order:
+
+1. Configure and verify the independently approved public root anchor.
+2. Import or byte-replay the current trust policy; verify its digest, sequence,
+   predecessor, time window, disjoint key roles, and thresholds.
+3. Import every signed PII-free layout observation and verify its exact
+   provider-target, adapter, runner, evidence class, sanitizer, and expiry.
+4. Import the immutable evidence metadata only after full object read-back
+   matches the recorded bytes, size, and SHA-256.
+5. Import `ManifestV1`. Verify the exact tenant, variant, surface, scope,
+   adapter version and bundle, layout set, suite and stable check IDs, source
+   commit, maximum capability, evidence set, and runtime targets.
+6. Before importing a canary activation, import and read back its exact bounded
+   allowlist. Verify the digest, members, validity window, approval reference,
+   and absence of revocation; a client-supplied account list is not authority.
+7. Import `ActivationV1` with a separate promotion signature. Verify the
+   manifest digest, scope, channel, capability ceiling, sequence, time window,
+   account allowlist digest, activation-wide total/distinct-account/concurrency
+   caps, and server-owned UTC daily side-effect cap. For a canary, the
+   `canaryEvidenceManifestSha256` field is not a second artifact: it must equal
+   the exact canonical `ManifestV1` digest that already binds the independently
+   signed evidence/layout objects and complete suite results.
+8. Read target status. Do not rely on the import response as current-head
+   evidence.
+9. Apply the activation using that exact `headRevision` and
+   `transitionSha256`. A stale revision, sequence regression, wrong predecessor,
+   expired object, open circuit, quarantine, revocation, incomplete evidence,
+   synthetic evidence in a non-shadow channel, or runtime mismatch stops the
+   compare-and-swap.
+10. Read status again and verify the expected manifest, activation, channel,
+   capability, validity, runner targets, transition, and head revision.
+11. Re-read customer-facing availability. With both Browser distribution flags
+    still `0`, it must remain unavailable even when a signed certification head
+    is valid.
+
+Use `shadow` first. Move to `canary` only with authorized sandbox/live evidence,
+an exact account allowlist digest, a positive submission cap, a named support
+owner, and separately approved runner distribution. `general` requires the full
+external matrix, independent production canary evidence, reviewed launch
+thresholds, and an explicit production approval. No source-complete Round 604
+checkout may perform that movement by assumption.
+
+### Two-phase irreversible-submit boundary
+
+Certification is checked twice and bound once. It is not a reusable bearer
+permission.
+
+Phase A is server-side preflight and single-use binding. Before a certified Auto
+run becomes employer-facing, the server atomically rechecks the exact job and
+original-source evidence, eligibility and hard filters, confirmed claims,
+current Track Auto authorization, verified identity, source resume, approved
+packet checksum, attempt and allowance, runner distribution, release/image,
+current activation head, manifest, target, adapter, layout set, expiry,
+revocations, quarantine, circuit, and rollout scope. It freezes those digests
+with the application, run, attempt, browser session/profile, random nonce hash,
+expiry, and fence. One attempt may hold only one live binding.
+
+Phase B begins immediately before the durable irreversible marker. The runner
+presents only its operation-scoped single-use capability, exact provider proof,
+and current PII-free layout digest. One transaction locks and rechecks the
+application, attempt, local ticket or cloud lease, binding, activation head,
+revocations, circuit, target, adapter, layout, runner, Track authority, packet,
+documents, discovery evidence, and eligibility. It then reserves exact canary
+capacity, consumes the binding, and advances the fence once.
+
+Immediately before the Phase B request, the runner writes an encrypted
+`final_submit_started` recovery marker. That conservative pre-I/O marker is not
+authorization, click authority, or evidence that the provider control was
+activated. Only a successful Phase B response may authorize and activate the
+one provider-scoped submit control. A bounded 4xx prevents activation but keeps
+the recovery marker until exact reconciliation, so response routing or
+lost-success ambiguity cannot erase the attempt boundary. HTTP 5xx, transport
+loss, timeout, malformed success, or any response that may conceal a committed
+Phase B transaction resolves conservatively through exact `side_effect_unknown`
+authority and is never retried as a fresh submit.
+
+Review-first and `beta_review` paths keep explicit packet and provider-final
+approval. An active signed provider-target certification does not force a
+Review Career Track into Auto. Only a current `track_auto_submit` admission plus
+an exact active certification and distributed runner may omit per-application
+final approval. Any changed answer, document, identity, resume, Track policy,
+packet, layout, or build invalidates the preflight binding before the marker.
+
+### Quarantine, circuits, and revocation
+
+An unexpected layout, target mismatch, evidence failure, confirmation
+ambiguity, false-state risk, repeated side-effect uncertainty, or configured
+error threshold opens the narrowest safe circuit and blocks new preflight and
+Phase B authority. Record every quarantine/circuit command and transition
+append-only. A successful later run does not auto-close a circuit or delete a
+quarantine record.
+
+Incident order:
+
+1. Open or hold the exact provider, tenant, surface, adapter, activation, or
+   runtime circuit.
+2. Verify new preflights and Phase B requests fail before the marker.
+3. Preserve active browser, result, receipt, evidence, binding, canary
+   reservation, and reconciliation records.
+4. Read the affected head and exact frozen bindings before importing incident
+   authority.
+5. Import and verify the independently signed append-only `RevocationV1`.
+6. Read target and customer-facing status again; new unattended authority must
+   be unavailable.
+7. Reconcile every run already at or beyond the irreversible marker through its
+   frozen recovery authority.
+
+Revocation, expiry, head replacement, or circuit opening after the marker must
+not deny the exact trusted result or receipt. It blocks new side effects while
+allowing only:
+
+- replay of the exact bound trusted result and immutable evidence;
+- completion of a valid provider-confirmed submitted receipt;
+- recovery-only result/resume capabilities that cannot reach Submit; or
+- the existing owner-confirmed-not-submitted reconciliation path.
+
+Never revoke by deleting rows, rewriting canonical bytes, moving a head
+backward, restoring an older database, or rejecting recovery until an operator
+is tempted to retry. Submitted state remains irreversible. Provider, target,
+adapter, and runtime circuits require reviewed release. Only an exact predecessor
+activation circuit may close through an applied newer activation whose complete
+trust, manifest, runtime, revocation, quarantine, and canary authority remains
+current after the database authority lock is acquired. A backdated event cannot
+restore stale authority. Changed layout, adapter, Browser release, cloud image,
+Chromium build, or suite requires new signed evidence and a new manifest.
+
+### Monitoring and canary stop conditions
+
+Monitor and alert by provider, tenant/surface, adapter version and bundle,
+manifest, activation, channel, and runner target:
+
+- certification preflight allows and typed denials;
+- layout-observation age, mismatch, and quarantine rate;
+- form fill/read-back and exact document-upload failures;
+- challenge and intervention rates by type;
+- Phase B authorization, canary reservation, and fence conflicts;
+- submit activations, explicit confirmations, and negative-result vetoes;
+- `side_effect_unknown` count, age, and reconciliation outcome;
+- complete receipt/evidence acceptance and rejection;
+- duplicate-prevention conflicts and workflow replay;
+- activation-wide canary total, distinct-account, live-concurrency, and UTC-day
+  side-effect reservation use;
+- circuit state and transition age;
+- authority, observation, manifest, and activation expiry; and
+- current revocations and affected in-flight recovery bindings.
+
+Stop the canary and open the circuit on any hard-filter violation, unsupported
+candidate claim, duplicate submit activation, false Submitted state,
+incomplete/mismatched receipt, PII-bearing observation or telemetry, unexpected
+layout, unexplained evidence loss, or recovery path that attempts another
+click. Do not average zero-tolerance failures into a success rate.
+
+Before expanding an approved canary, confirm the policy-defined success,
+intervention, recovery, and latency thresholds; zero unresolved
+`side_effect_unknown` outside the bounded reconciliation window; complete
+typed receipts; healthy source and runner state; allowance correctness; and
+available support capacity. Expansion always uses a separately reviewed signed
+activation and compare-and-swap transition.
+
+### External certification gates and launch truth
+
+Source-complete evidence may prove the registry, canonical validation, target
+matching, shadow observations, lifecycle, two-phase fence, quarantine, circuit,
+and recovery behavior. It cannot prove a real provider tenant or production
+runner.
+
+Before any Greenhouse or Lever target is activated beyond shadow, require:
+
+- independently managed signing roles and approved public root anchor;
+- two or three owner-authorized sandbox/live test vacancies for that exact
+  provider target and layout variants;
+- every required stable suite check, including custom/dynamic fields, exact PDF
+  upload/read-back, sensitive/legal handling, CAPTCHA/2FA/assessment pause,
+  unique submit control, positive and negative confirmation, crash-after-click,
+  duplicate delivery, drift, privacy, and complete receipt evidence;
+- an exact local signed Browser release with immutable public read-back and
+  physical platform canaries, or an exact cloud image/Chromium build with
+  authenticated Temporal, PostgreSQL, R2/S3, network, takeover, crash, and
+  capacity canaries;
+- approved canary accounts and plan, activation-wide distinct-account and total
+  caps, UTC daily side-effect cap, live-concurrency cap, support owner, incident
+  owner, and rollback authority;
+- provider/data-rights approval where required; and
+- an explicit production change authorizing the selected Browser distribution
+  flag.
+
+Workday, Ashby, and SmartRecruiters cannot receive unattended activation until
+their own provider-specific state machines and the same complete external
+matrix pass. Semantic, unknown, and protected portals cannot inherit another
+provider's certification.
+
+Do not write or approve launch claims that say an ATS is certified, unattended
+submission is available, a canary passed, or a runner launched from migrations,
+fixtures, synthetic/fault evidence, signed-object parser tests, imported shadow
+authority, or a source-complete review. Until the Round 604 verification matrix
+is fully green, say only:
+
+> Signed ATS certification authority implementation is in progress; every
+> provider remains Review first.
+
+After every source-completable Round 604 gate is proven, the strongest honest
+source-only wording is:
+
+> Signed ATS certification authority is source-ready; every provider remains
+> Review first pending authorized tenant and runner evidence.
+
+## Historical managed original-source verifier release-v2 authority
+
+Release-v2 remains a readable and runnable historical source-verification
+contract. It keeps direct and global discovery false and measures the exact
+`jobs-workflows` image for these sorted roles:
+
+```text
+original_source_verifier
+workflow_gateway
+workflow_worker
+```
+
+Run the verifier as a separate rootless process from those same stored image
+bytes with the immutable command:
+
+```text
+/usr/local/bin/node workflows/dist/original-source-verifier.js
+```
+
+Do not rebuild or retag the image for that role. The protected deployment must
+issue a distinct one-time runtime grant, token, instance ID, and worker ID for
+`original_source_verifier`; inject the generic managed-runtime settings only
+into that process; and keep its API origin HTTPS in production. The measured
+runtime identity is derived inside the container and must never be configured.
+
+The process claims its exact grant, remeasures the image, publishes one fresh
+runtime heartbeat, and performs a successful lease poll before it may continue
+reporting ready. Every assignment remains bound to the exact activation,
+manifest, protocol, runtime instance/epoch, worker, generation, and fence. A
+final lease heartbeat immediately precedes terminal publication. Runtime,
+release, source, subject, operational-hold, or fence drift denies publication;
+byte-identical terminal replay remains lookup-only and changed bytes quarantine
+the assignment.
+
+Promotion evidence must include `original-source-verifier-readiness` in the
+exact canary set alongside the workflow image-digest and read-only-rootfs
+attestations. Treat a missing/stale verifier heartbeat, failed dependency poll,
+wrong runtime role, v1 manifest, missing source-verification protocol, missing
+entrypoint, enabled direct/global discovery, or mismatched stored-byte readback
+as a stop-the-line failure. Disable new authority through the signed head or
+runtime grant; preserve immutable observations, receipts, and response-loss
+replay. Rollback is a higher-sequence transition to previously verified stored
+bytes, never a rebuild or pointer rewind.
+
+The checked-in production switches stay off. This source contract does not
+activate a release, contact a provider, create a customer cohort, or authorize
+an application, message, mailbox action, or discovery worker. Anonymous live
+provider canaries, rights/rate approval, hosted PostgreSQL/Temporal behavior,
+runtime capacity, monitoring, kill-switch exercise, and rollback rehearsal are
+separate release gates.
+
+## Managed discovery and source-verifier release-v3 authority
+
+An approved change to the global discovery decoder requires a fresh run. Do
+not have old and new workers share in-flight global-ingestion runs, including
+on rollback. Verify terminal status and lease closure before switching. See
+[the Jobhive category fix](../docs/work/FIX-1155-jobs-jobhive-typed-categories.md)
+for the required proof and the otherwise possible mixed-decoder batch case.
+
+For an already approved rollout window, use the counts-only observation in
+[`check-global-discovery-quiescence.mjs`](scripts/check-global-discovery-quiescence.mjs).
+`node jobs/scripts/check-global-discovery-quiescence.mjs --sql` only prints
+SQL. Execute it once in an independently authenticated, complete-scope
+read-only session on the exact intended database. Require successful
+execution and precisely the single unadorned result line (no headers or
+footers), then pass that line to the same script with `--check`. Do not
+treat a successful parser as proof that the SQL client succeeded.
+
+The check holds for any lease fields, unresolved source or run state, or an
+empty source table. Even an exit-0 `no_inflight_rows` has
+`activationAuthorized:false`. Establish protected Discovery/source admission
+holds and independently exclude predecessor workers before observing; keep
+those controls through the switch. Holds alone do not cancel previous owners,
+and a database snapshot does not stop an old worker from resuming. See
+[FIX-1156](../docs/work/FIX-1156-jobs-global-decoder-quiescence.md) for
+interpretation and verification.
+
+If the global discovery poll reports `invalid_response`, the acknowledgement
+did not establish the outcome. Do not take that log as proof that the
+database rolled back, and do not reset the run, lease or receipt to retry.
+Verify the exact stored result through the authorized readback process.
+See [FIX-1157](../docs/work/FIX-1157-jobs-global-ingestion-acknowledgements.md).
+
+The candidate workflow now emits release-v3. V1 and v2 audiences, migration
+heads, feature matrices, canonical fixture bytes, and runtime behavior remain
+accepted without reinterpretation. Release-v3 alone enables direct discovery,
+global discovery, and original-source verification together. Its current
+source-verifier boot authority is SQLite head `065` and PostgreSQL head `043`;
+`062`/`040` remain historical startup-authority migrations and are not the v3
+readiness procedure. It measures `jobs-workflows` for exactly:
+
+```text
+discovery_worker
+global_discovery_worker
+original_source_verifier
+workflow_gateway
+workflow_worker
+```
+
+The verifier may not announce v3 readiness through a generic ready heartbeat.
+It must claim its one-time grant, register its stable process boot ID, publish
+the registered generation at sequence `N` as `degraded/startup`, then call:
+
+```text
+POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-registration
+POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-startup
+```
+
+Both requests use the managed-runtime HMAC, exact origin, body digest, fresh
+nonce, clock, worker, path, and claimed runtime-session proof. Registration
+assigns the strictly monotonic generation. An exact retry retains the same boot
+ID, request ID, session-bound canonical body, and response bytes/time; only the
+worker-auth nonce and HMAC are fresh for each delivery. A changed canonical
+payload conflicts.
+
+New startup publication accepts only the current boot's exact `degraded/startup`
+predecessor. An authenticated exact committed response retry remains read-only
+after a replacement boot registers; it does not permit stale execution. The
+server runs the real bounded lease-decision path in a
+rollback-only savepoint, then atomically commits immutable startup authority and
+`N degraded/startup` to `N+1 ready`. An idle queue is healthy; a leaseable queue
+proves the same claim path without retaining an assignment, attempt, event,
+lease, or provider subject. Only after receiving the canonical response may the
+worker start and recurring boot-scoped heartbeats begin at `N+2`.
+
+Startup replay is a server-side idempotency detail; do not order recovery around
+client replay. On an ambiguous or failed startup, start no worker and do not
+send a speculative `degraded/probe_failed` heartbeat. A new process registers a
+new generation and proves readiness again. Historical v2 instances retain their
+reviewed direct-ready and ready-to-ready behavior because they do not carry the
+v3 boot protocol row.
+
+Release-v3 reuses builder policy v2, exact-tip test evidence v2, portal readback
+v2, and the reviewed publication, promotion, and rollback generations. It does
+not authorize a build, registry write, signature, workflow dispatch, deployment,
+flag change, provider call, application, email, or customer cohort. Require
+exact-source local and hosted evidence plus action-time authorization before any
+of those operations.
+
+### Managed-cloud artifact publication and read-back
+
+Candidate creation now requires two successful default-branch `push` runs at
+the exact candidate commit: Bluey Jobs CI / Privacy Gate and Observability
+Policy. The candidate's own release-contract self-test is supplemental evidence
+only; it cannot replace either full exact-tip run. GitHub's Actions-run payload
+does not supply repository `default_branch`; the workflow therefore passes the
+trusted workflow-event default branch separately, stores it once in generation-2
+CI evidence used by release-v2 and release-v3, and requires both normalized
+runs' `headBranch` to equal it.
+Each candidate run response is piped through Bluey's fixed 128 KiB `run`
+capture before it becomes evidence. The capture creates a private partial file
+and atomically renames it only after success; cap overflow, capture failure, or
+an API producer failure removes both final and partial output. Never redirect a
+candidate `gh api` response directly into an evidence file.
+
+The source workflow has a separate `publish` operation in the protected
+`jobs-managed-cloud-artifact-publication` environment. Configure all of the
+following before dispatching it:
+
+- repository variable `BLUEY_JOBS_ARTIFACT_NAMESPACE`, set to a controlled,
+  lowercase OCI repository prefix such as
+  `ghcr.io/dhanunjay-divi/bluey-jobs`;
+- repository variable `BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN`, set to the canonical
+  immutable HTTPS directory that will later serve the exact portal tar;
+- required reviewers and deployment-branch policy on
+  `jobs-managed-cloud-artifact-publication` and
+  `jobs-managed-cloud-release`;
+- GitHub Packages billing and repository Actions access for the four resulting
+  packages; and
+- the existing root-anchor and threshold-signing authority.
+
+Referencing an environment or requesting `packages: write` in source does not
+prove any of that control is configured. Verify the repository settings and
+package access separately before dispatch. The publication job alone receives
+`packages: write`; promotion receives only `packages: read`. Every release job
+declares `actions: read` and `contents: read` locally because it consumes pinned
+Actions or release evidence. Candidate, verify, authorize, and rollback receive
+no Packages permission, and the workflow-level default remains `contents: read`
+only.
+
+Immediately before registry login or any GHCR write, the publisher validates
+that the canonical plan's source commit, repository name, numeric repository
+ID, and trusted current default branch equal `GITHUB_SHA`,
+`GITHUB_REPOSITORY`, `GITHUB_REPOSITORY_ID`, and the default branch from the
+workflow event. A mismatch stops publication before credentials are used. This
+runtime binding revalidates the exact authorized candidate and plan and is
+separate from namespace ownership validation.
+
+Publication extracts the three already-verified OCI-layout tars into layout
+directories without rebuilding, resolves their exact signed image-manifest
+digests, publishes the exact portal tar as an OCI artifact, and pulls all four
+artifacts back by immutable digest. Freshly pulled layouts are normalized back
+into verifier tars; registry tag annotations or tar packaging size are not
+authority. The read-back verifier re-inspects each OCI manifest and canonical
+content inventory plus the exact portal bytes, and binds the runner native
+addon path, size, mode, and SHA-256. Promotion repeats the remote pull
+independently and rejects a missing or changed publication receipt. Production
+promotion and rollback creation emit remote audience/schema v2 and never emit
+`local_fixture`. Strict historical audience/schema-v1 `local_fixture`
+promotion and rollback readers remain available only to audit and read back
+already stored historical bytes. Remote v2 and historical v1 documents may not
+be mixed in one promotion or rollback tree.
+
+A rollback can restore older verified release bytes, but it cannot restore an
+older or alternative signing policy. The target promotion's verified trust
+chain must retain the exact signing policy of the current promotion. This
+check applies when creating the rollback receipt and when reading it back.
+The receipt still does not prove the live scope head or complete a deployment.
+
+The portal pull is stricter than a matching tar hash. Both publication and
+promotion pipe the compact raw OCI manifest from `oras manifest fetch` through
+Bluey's fixed 32 KiB streaming capture. The capture writes a private partial
+file and atomically renames it only on success; byte 32,769 fails and removes
+both partial and final output. The completed manifest must then pass validation
+before `oras pull`: its SHA-256 must equal the immutable reference, and it must
+be the exact OCI image manifest and Bluey portal artifact type with the exact
+empty OCI config and one layer only. That layer must name `jobs-portal.tar` and
+match the candidate tar's digest, size, and media type. Only after the manifest
+passes may ORAS pull; its output must contain exactly that one regular file.
+The final publication read-back must be a flat five-file tree: three OCI layout
+tars, the portal tar, and its raw OCI manifest. Extra files or even empty
+directories fail closed.
+
+The plan stores one canonical UTC RFC3339 whole-second
+`portalManifestCreatedAt` derived from the signed portal provenance
+`sourceDateEpoch`. Publication supplies it explicitly as the ORAS
+`org.opencontainers.image.created` annotation, and read-back requires exact
+equality. Do not substitute current runner time: a retry at another wall-clock
+time must retain the same manifest digest, while a different signed source
+epoch must produce a different digest.
+
+Promotion requires both `publication_run_id` and the exact
+`publication_run_attempt`; it never resolves a race-prone "latest attempt."
+Before downloading the receipt, it queries the exact run and exact-attempt jobs
+endpoints plus the run-scoped artifact list. Each API response is captured
+atomically before parsing: run JSON is capped at 128 KiB, and jobs/artifacts JSON
+at 1 MiB each. Cap overflow or command failure removes partial and final output.
+The run must be a completed successful dispatch of the exact managed-cloud
+release workflow at the candidate source commit. Exactly one `publish` job from
+the explicit attempt, its publication-receipt upload step, and exactly one
+unexpired artifact named
+`jobs-managed-cloud-publication-<run-id>-<run-attempt>` must have succeeded.
+Artifact metadata is bound by immutable ID, digest, and size; size may not
+exceed 1 MiB. The workflow downloads only that validated artifact ID, never an
+artifact name.
+
+The verifier combines that selected evidence with the exact authorized
+candidate, canonical plan/publication-set hashes, and current repository
+ID/name/default branch into a 128 KiB-capped canonical preflight before registry
+login or ref consumption. The selected run and attempt, rather than the
+workflow file's current tip, bind the candidate source commit. Every immutable
+ref used by promotion comes only from that preflight; never parse downloaded
+plan/set JSON directly into an ORAS command. The normalized run/job/artifact
+evidence is stored in the promotion and rebound during final validation. Its
+environment status is deliberately `workflow_declared_settings_not_attested`:
+this proves which source job ran, not that required reviewers, branch policy,
+or self-review prevention are configured.
+
+Portal registry storage and portal delivery are distinct. Publication records
+both the signed HTTPS delivery ref and the GHCR immutable ref actually read
+back. Release-v2 `portal-readback.json` must use audience
+`bluey-jobs-managed-cloud-portal-readback-evidence-v2`, include `artifactRef`
+equal to the signed portal component ref, and bind the returned tar SHA-256.
+The older evidence-v1 shape remains historical release-v1 compatibility only.
+
+Builder-policy compatibility is versioned. Historical v1 and pre-Phase-627B
+v2 candidates retain the audience/schema-v1 four-stage policy bytes and remain
+verifiable. New contract-v2 candidates emit audience/schema-v2 policy that
+also fences `publish`. Production publication explicitly requires that v2
+policy; accepting old bytes for historical verification never grants them new
+registry-write authority.
+
+The candidate emits Bluey's exhaustive file-inventory SBOM and deterministic
+recipe/source provenance documents. Docker Buildx still runs with OCI-native
+SBOM and provenance attestations disabled, so the publication receipt records
+both registry attestation states as `not_generated`. Do not describe those
+internal documents as OCI attestations. Adding registry-native attestations is
+a successor contract and requires their exact digests, read-back, and policy
+validation.
+
+GHCR publication is durable artifact evidence, not proof that the portal is
+served, a runtime is deployed, a root filesystem is read-only, or an activation
+is current. Promotion still requires the separate static-origin portal
+read-back, deployed image/runtime attestations, protected threshold approval,
+hosted canaries, and compare-and-swap activation evidence.
+
+The historical manifest field `publishedAtMs` is the deterministic source
+commit epoch used by the reproducible v1/v2 candidate schema; it is not a
+registry timestamp. Publication receipts use `attestedAtMs`. Do not present
+the legacy field as hosted publication evidence.
+
+## Reviewed communication release authority
+
+Recruiter replies and interview-calendar actions use an authority boundary that
+is separate from read-only mailbox synchronization. A connected inbox is not
+send authority. The user must inspect the exact immutable draft, and the server
+must verify an explicit provider write grant before approval can become
+dispatchable.
+
+The provider worker runs in-process rather than behind a credential-bearing HTTP
+lease, so OAuth access and refresh tokens never leave the owning server process
+or appear in portal responses. Both `bluey-jobs-api` and `bluey-server` embed the
+worker. The production Jobs routes run under `bluey-jobs-api.service` on port
+8081, which loads `/etc/bluey-api/bluey-jobs.env`; `bluey-api.service` also loads
+that file when `bluey-api-jobs-env.conf` is installed. Before a provider write,
+the worker revalidates the account, application, mailbox connection, exact
+stored reply target and source message where required, payload digest, approval
+revision, granted scope revision, release flag, and fenced attempt. It commits
+an append-only request-start marker before network I/O. Calendar creates use an
+exact IANA time zone and request attendee invitations from the provider.
+
+Keep these gates independent:
+
+```text
+BLUEY_JOBS_COMMUNICATION_OAUTH_WRITE_ENABLED=0
+BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED=0
+BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED=0
+```
+
+The dispatch and reconciliation loops are selected at process startup. The
+OAuth write gate is checked on each upgrade and callback request, but a systemd
+environment-file change still does not reach an already running process. After
+an independently approved flag change, restart `bluey-jobs-api.service` and
+every other running worker-capable service that loads `bluey-jobs.env`, including
+`bluey-api.service` when its Jobs environment drop-in is installed. Enabling one
+gate never enables either of the other two.
+
+Do not enable write-scope OAuth until read-only Gmail/Outlook canaries, approved
+Google/Microsoft applications, exact redirect URIs, consent-screen review, token
+rotation/revocation, retention, deletion, and monitoring are complete. Required
+write grants are Gmail send, Google Calendar events, Microsoft Mail.Send, and
+Microsoft Calendars.ReadWrite; capabilities must be derived from the grants the
+provider actually returns.
+
+Do not enable dispatch until fixture and live authorized sandbox matrices prove
+recipient/thread binding, exact provider identity, duplicate prevention,
+disconnect and account-deletion fencing, token expiry/rotation, outage handling,
+and receipt/evidence completeness for all four transports.
+
+Before enabling any communication gate, exercise authenticated list, detail,
+approval, cancellation, and account-export requests with an authorized canary.
+Verify every private communication JSON response sends `Cache-Control: private,
+no-store` and `Pragma: no-cache`, the portal requests use client-side
+`cache: "no-store"`, and no sensitive response is retained in browser or service
+worker caches. The owning customer export intentionally contains the immutable
+reviewed payload; confirm it omits OAuth tokens and grants, provider
+object/thread/conversation IDs, request and idempotency markers, private evidence
+and reconciliation fingerprints, lease or worker identity, and raw provider
+errors. Inspect structured server logs separately and confirm they omit all of
+those fields plus payload text.
+
+Provider timeout, connection loss, 5xx, or malformed success after a possible
+write is `side_effect_unknown`. Never retry it. Reconciliation is a separately
+gated provider lookup that may prove the exact sent message/event, leave the
+result unknown, or prove bounded absence and return the immutable draft to fresh
+user review. A worker cycle claims at most 25 eligible actions, and each action
+has a separate ceiling of 20 reconciliation claims. Exact found or inconclusive
+lookup may run immediately; an authoritative absence counts only after at least
+15 minutes from dispatch, and three counted absences return the action to
+`needs_input`. Persisted unknown observations back off for at least five minutes.
+An inconclusive or conflicting result remains unknown and requires manual
+operator investigation; it never becomes retry authority. Disabling dispatch
+must not convert unknown outcomes into retries.
+
+If account deletion or mailbox disconnect enters communication drain:
+
+1. Treat the persisted drain as a write fence. Do not clear it, reconnect under
+   another identifier, delete the source message, or issue a replacement action.
+2. Allow only exact completion of the already-started attempt and, when its
+   separate flag and provider-read gate are approved, read-only reconciliation.
+3. Preserve the action, attempt, request-start, provider evidence, and encrypted
+   credential boundary while the result remains unknown. Never copy operation
+   keys, provider objects, raw errors, grants, or tokens into tickets or logs.
+4. If exact provider evidence proves success, retain the terminal customer
+   result; if three bounded authoritative absences prove no side effect, cancel
+   the resulting reviewable draft as part of the pending lifecycle rather than
+   approving it again.
+5. If evidence conflicts or stays inconclusive, keep the drain and escalate to
+   the named privacy/incident owner. Retry deletion or disconnect only after the
+   unresolved irreversible authority is terminally settled.
+
+Until the complete Round 605 local matrix and independent review pass, say only:
+
+> Reviewed communication execution authority implementation is in progress;
+> connected inboxes remain read-only and no provider delivery is enabled.
+
+After every source-completable Round 605 gate passes and independent review
+accepts the source, but before authorized provider sandboxes and production
+canaries pass, the strongest honest wording is:
+
+> Reviewed communication execution is source-ready; connected inboxes remain
+> read-only and no reply or calendar action is enabled for provider delivery.
 
 ## External release gates
+
+Cloud-first launch gates:
 
 - Gmail and Outlook OAuth applications, redirect URIs, webhook subscriptions,
   and encrypted refresh-token storage.
@@ -510,5 +1952,56 @@ are idempotent. The desktop claims and reports the run through
 - Live sandbox certification for representative tenants of every supported ATS.
 - Regional Temporal, Postgres, Valkey, OpenSearch, and browser-pool monitoring.
 
+Parked P2 local-distribution gates, required only before an installable local
+runner is reconsidered:
+
+- Apple Developer ID/notarization and Windows Authenticode/timestamp credentials,
+  exact approved signer identities, and immutable artifact-host access.
+- Physical macOS arm64/x64 and Windows x64 clean-install, protocol-claim,
+  upgrade, rollback, immutable-readback, and portal-download canary evidence.
+
 No source change can manufacture provider approvals, signing certificates, or
-production credentials. Keep the Jobs beta flag off until these gates pass.
+production credentials. Keep the Jobs beta flag off until the applicable
+cloud-first launch gates pass. Keep local distribution disabled independently;
+do not block the browser-delivered launch on the parked P2 device matrix.
+
+## Source-verifier boot generation endpoints
+
+Both require the managed-cloud-runtime worker HMAC scope, exact path admission,
+and the actual claimed runtime session token. Canonical responses never include
+the session token. Never supply a production credential to a local verification run.
+
+- POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-registration
+  Server assigns a strictly monotonic boot generation. Idempotent by registrationRequestId:
+  an identical canonical payload replays stored bytes, a changed payload returns HTTP 409.
+
+- POST /api/jobs/internal/managed-cloud/runtime-instances/:runtime_instance_id/source-verifier-boot-startup
+  Runs the real backend lease path in a rollback-only savepoint, then atomically
+  commits degraded N to ready N+1 bound to an exact generation.
+  Idempotent by startupRequestId. A stale generation is rejected and committed readiness never
+  regresses. Duplicate ready reporting is a no-op.
+
+Operators must not describe readiness recovery as client-ordered replay. Replay is a server-side
+idempotency detail only.
+
+The client makes at most three attempts on transport/timeouts and transient
+502/503/504 responses, keeping its boot ID, request token and body identical.
+It never sends a speculative `probe_failed` heartbeat after an ambiguous startup.
+A new process registers a new generation and must prove readiness again.
+
+All boot-scoped startup and recurring heartbeats carry `bootId` and
+`bootGeneration`. Missing, mismatched or stale fences fail closed, including
+otherwise exact heartbeat replays. Generic liveness cannot lower the committed
+ready generation; liveness expiration remains independently authoritative.
+
+Verifier work requests use paired `boot_id` / `boot_generation` in their
+binding. Runtime readiness must match the process's current ready generation;
+each claimed attempt retains that exact boot identity. Never auto-follow a new
+boot head or adopt a predecessor's in-flight attempt. Legacy non-boot release
+bindings omit both fields. Startup accepts only a current `degraded/startup`
+heartbeat, never a `degraded/probe_failed` predecessor.
+
+V3 release heads are SQLite `065_jobs_source_verifier_heartbeat_boot_bindings.sql`
+and PostgreSQL `043_jobs_source_verifier_heartbeat_boot_bindings.sql`.
+They preserve earlier migration bytes and historical manifests. Do not enable
+flags, publish images or deploy merely because local checks pass.

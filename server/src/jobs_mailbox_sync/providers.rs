@@ -1,21 +1,14 @@
 use crate::{
-    api::jobs_mailbox_oauth::ProviderConfig,
     db::jobs::{JobsProviderCredential, JobsProviderMessage},
+    jobs_provider_auth::{bounded_provider_json, ProviderConfig},
 };
 use base64::Engine;
+use lettre::message::Mailbox;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 const MAX_MESSAGES_PER_SYNC: usize = 200;
 const MAX_BODY_CHARS: usize = 24_000;
-
-#[derive(Debug)]
-pub(crate) struct RefreshResult {
-    pub access_token: String,
-    pub refresh_token: String,
-    pub scopes: Vec<String>,
-    pub expires_in_seconds: i64,
-}
 
 #[derive(Debug)]
 pub(crate) struct FetchedMessages {
@@ -58,54 +51,6 @@ impl ProviderMessage {
     }
 }
 
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: String,
-    #[serde(default)]
-    expires_in: i64,
-    #[serde(default)]
-    scope: String,
-}
-
-pub(crate) async fn refresh_access_token(
-    client: &reqwest::Client,
-    config: &ProviderConfig,
-    refresh_token: &str,
-) -> anyhow::Result<RefreshResult> {
-    if refresh_token.trim().is_empty() {
-        anyhow::bail!("mailbox refresh token is missing")
-    }
-    let response = client
-        .post(&config.token_url)
-        .form(&[
-            ("client_id", config.client_id.as_str()),
-            ("client_secret", config.client_secret.as_str()),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
-            ("scope", config.scopes.join(" ").as_str()),
-        ])
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<TokenResponse>()
-        .await?;
-    if response.access_token.trim().is_empty() {
-        anyhow::bail!("provider refresh returned no access token")
-    }
-    Ok(RefreshResult {
-        access_token: response.access_token,
-        refresh_token: response.refresh_token,
-        scopes: response
-            .scope
-            .split_whitespace()
-            .map(str::to_string)
-            .collect(),
-        expires_in_seconds: response.expires_in,
-    })
-}
-
 pub(crate) async fn fetch_messages(
     client: &reqwest::Client,
     config: &ProviderConfig,
@@ -143,14 +88,15 @@ async fn fetch_gmail_messages(
                 pairs.append_pair("pageToken", token);
             }
         }
-        let page = client
+        let response = client
             .get(url)
             .bearer_auth(&credential.access_token)
             .send()
             .await?
-            .error_for_status()?
-            .json::<GmailListResponse>()
-            .await?;
+            .error_for_status()?;
+        let page = bounded_provider_json::<GmailListResponse>(response)
+            .await
+            .map_err(|_| anyhow::anyhow!("provider mailbox response was invalid"))?;
         ids.extend(page.messages.into_iter().map(|item| item.id));
         page_token = page.next_page_token;
         if page_token.is_none() {
@@ -163,14 +109,15 @@ async fn fetch_gmail_messages(
     for id in ids {
         let url =
             format!("https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full");
-        let message = client
+        let response = client
             .get(url)
             .bearer_auth(&credential.access_token)
             .send()
             .await?
-            .error_for_status()?
-            .json::<GmailMessage>()
-            .await?;
+            .error_for_status()?;
+        let message = bounded_provider_json::<GmailMessage>(response)
+            .await
+            .map_err(|_| anyhow::anyhow!("provider mailbox response was invalid"))?;
         messages.push(parse_gmail_message(message)?);
     }
     Ok(FetchedMessages {
@@ -228,8 +175,11 @@ struct GmailBody {
 
 fn parse_gmail_message(message: GmailMessage) -> anyhow::Result<ProviderMessage> {
     let sender = header_value(&message.payload.headers, "from");
+    let sender = normalize_address(&sender);
+    let reply_target = gmail_reply_target(&message.payload.headers, &sender)?;
     let recipients = split_addresses(&header_value(&message.payload.headers, "to"));
     let subject = header_value(&message.payload.headers, "subject");
+    let rfc_message_id = header_value(&message.payload.headers, "message-id");
     let mut plain = String::new();
     let mut html = String::new();
     collect_gmail_body(&message.payload, &mut plain, &mut html);
@@ -240,12 +190,16 @@ fn parse_gmail_message(message: GmailMessage) -> anyhow::Result<ProviderMessage>
     };
     Ok(ProviderMessage {
         external_id: message.id,
-        sender: normalize_address(&sender),
+        sender,
         recipients,
         subject: trim_text(&subject, 500),
         body_text: trim_text(&body_text, MAX_BODY_CHARS),
         received_at_ms: message.internal_date.parse::<i64>()?,
-        metadata: json!({ "thread_id": message.thread_id }),
+        metadata: json!({
+            "thread_id": message.thread_id,
+            "rfc_message_id": trim_text(&rfc_message_id, 998),
+            "reply_target": reply_target,
+        }),
     })
 }
 
@@ -276,6 +230,27 @@ fn header_value(headers: &[GmailHeader], name: &str) -> String {
         .unwrap_or_default()
 }
 
+fn gmail_reply_target(headers: &[GmailHeader], sender: &str) -> anyhow::Result<String> {
+    let values = headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("reply-to"))
+        .map(|header| header.value.as_str())
+        .collect::<Vec<_>>();
+    let target = match values.as_slice() {
+        [] if !sender.is_empty() => sender.to_string(),
+        [value] => value
+            .parse::<Mailbox>()
+            .ok()
+            .map(|mailbox| normalize_address(mailbox.email.as_ref()))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    if target.is_empty() {
+        anyhow::bail!("provider reply target is invalid")
+    }
+    Ok(target)
+}
+
 async fn fetch_outlook_messages(
     client: &reqwest::Client,
     credential: &JobsProviderCredential,
@@ -288,7 +263,7 @@ async fn fetch_outlook_messages(
         .map(str::to_string)
         .unwrap_or_else(|| {
             "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta\
-             ?$select=id,internetMessageId,conversationId,from,toRecipients,subject,bodyPreview,receivedDateTime\
+             ?$select=id,internetMessageId,conversationId,from,replyTo,toRecipients,subject,bodyPreview,receivedDateTime\
              &$top=50"
                 .replace(' ', "")
         });
@@ -298,14 +273,16 @@ async fn fetch_outlook_messages(
         if !valid_outlook_delta_url(&next) {
             anyhow::bail!("invalid Outlook continuation URL")
         }
-        let page = client
+        let response = client
             .get(&next)
+            .header("Prefer", "IdType=\"ImmutableId\"")
             .bearer_auth(&credential.access_token)
             .send()
             .await?
-            .error_for_status()?
-            .json::<OutlookDeltaResponse>()
-            .await?;
+            .error_for_status()?;
+        let page = bounded_provider_json::<OutlookDeltaResponse>(response)
+            .await
+            .map_err(|_| anyhow::anyhow!("provider mailbox response was invalid"))?;
         for value in page.value {
             if messages.len() >= MAX_MESSAGES_PER_SYNC {
                 break;
@@ -354,6 +331,8 @@ struct OutlookMessage {
     conversation_id: String,
     #[serde(default)]
     from: Option<OutlookRecipient>,
+    #[serde(rename = "replyTo", default)]
+    reply_to: Vec<OutlookRecipient>,
     #[serde(rename = "toRecipients", default)]
     to_recipients: Vec<OutlookRecipient>,
     #[serde(default)]
@@ -385,6 +364,15 @@ fn parse_outlook_message(message: OutlookMessage) -> anyhow::Result<ProviderMess
         .from
         .map(|value| value.email_address.address)
         .unwrap_or_default();
+    let sender = normalize_address(&sender);
+    let reply_target = match message.reply_to.as_slice() {
+        [] => sender.clone(),
+        [recipient] => normalize_address(&recipient.email_address.address),
+        _ => String::new(),
+    };
+    if reply_target.is_empty() {
+        anyhow::bail!("provider reply target is invalid")
+    }
     let recipients = message
         .to_recipients
         .into_iter()
@@ -394,14 +382,15 @@ fn parse_outlook_message(message: OutlookMessage) -> anyhow::Result<ProviderMess
         chrono::DateTime::parse_from_rfc3339(&message.received_date_time)?.timestamp_millis();
     Ok(ProviderMessage {
         external_id,
-        sender: normalize_address(&sender),
+        sender,
         recipients,
         subject: trim_text(&message.subject, 500),
         body_text: trim_text(&message.body_preview, MAX_BODY_CHARS),
         received_at_ms,
         metadata: json!({
             "provider_id": message.id,
-            "conversation_id": message.conversation_id
+            "conversation_id": message.conversation_id,
+            "reply_target": reply_target,
         }),
     })
 }
@@ -425,6 +414,9 @@ fn split_addresses(value: &str) -> Vec<String> {
 }
 
 fn normalize_address(value: &str) -> String {
+    if !crate::db::jobs::communication_review_text_is_safe(value) {
+        return String::new();
+    }
     let candidate = value
         .rsplit_once('<')
         .and_then(|(_, tail)| tail.split_once('>').map(|(email, _)| email))
@@ -491,5 +483,75 @@ mod tests {
             trim_text(&strip_html("<p>Hello <b>candidate</b></p>"), 100),
             "Hello candidate"
         );
+    }
+
+    #[test]
+    fn outlook_reply_target_prefers_one_reply_to_and_rejects_multiple() {
+        let message = OutlookMessage {
+            id: "immutable-message-1".to_string(),
+            internet_message_id: "<message@example.com>".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            from: Some(outlook_recipient("from@example.com")),
+            reply_to: vec![outlook_recipient("reply@example.net")],
+            to_recipients: vec![outlook_recipient("candidate@example.com")],
+            subject: "Subject".to_string(),
+            body_preview: "Body".to_string(),
+            received_date_time: "2026-08-06T12:00:00Z".to_string(),
+        };
+        let parsed = parse_outlook_message(message).unwrap();
+        assert_eq!(parsed.metadata["provider_id"], "immutable-message-1");
+        assert_eq!(parsed.metadata["reply_target"], "reply@example.net");
+
+        let multiple = OutlookMessage {
+            id: "immutable-message-2".to_string(),
+            internet_message_id: "<message-2@example.com>".to_string(),
+            conversation_id: "conversation-2".to_string(),
+            from: Some(outlook_recipient("from@example.com")),
+            reply_to: vec![
+                outlook_recipient("first@example.net"),
+                outlook_recipient("second@example.net"),
+            ],
+            to_recipients: Vec::new(),
+            subject: "Subject".to_string(),
+            body_preview: "Body".to_string(),
+            received_date_time: "2026-08-06T12:00:00Z".to_string(),
+        };
+        assert!(parse_outlook_message(multiple).is_err());
+    }
+
+    #[test]
+    fn gmail_reply_target_accepts_one_rfc_mailbox_and_rejects_ambiguity() {
+        let quoted = vec![GmailHeader {
+            name: "Reply-To".to_string(),
+            value: "\"Doe, Jane\" <Jane@Example.NET>".to_string(),
+        }];
+        assert_eq!(
+            gmail_reply_target(&quoted, "sender@example.org").unwrap(),
+            "jane@example.net"
+        );
+        let multiple = vec![GmailHeader {
+            name: "Reply-To".to_string(),
+            value: "first@example.net, second@example.net".to_string(),
+        }];
+        assert!(gmail_reply_target(&multiple, "sender@example.org").is_err());
+        let repeated = vec![
+            GmailHeader {
+                name: "Reply-To".to_string(),
+                value: "first@example.net".to_string(),
+            },
+            GmailHeader {
+                name: "Reply-To".to_string(),
+                value: "second@example.net".to_string(),
+            },
+        ];
+        assert!(gmail_reply_target(&repeated, "sender@example.org").is_err());
+    }
+
+    fn outlook_recipient(address: &str) -> OutlookRecipient {
+        OutlookRecipient {
+            email_address: OutlookEmailAddress {
+                address: address.to_string(),
+            },
+        }
     }
 }

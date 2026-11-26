@@ -1,8 +1,26 @@
 const MAILBOX_SYNC_DEFAULT_INTERVAL_MS: i64 = 2 * 60 * 1_000;
 const MAILBOX_SYNC_MAX_BATCH: usize = 50;
+const MAILBOX_SYNC_HELD_DEFERRAL_MS: i64 = 30 * 1_000;
+const MAILBOX_SYNC_SCAN_MULTIPLIER: usize = 4;
+const MAILBOX_SYNC_MAX_SCAN_BUDGET: usize =
+    MAILBOX_SYNC_MAX_BATCH * MAILBOX_SYNC_SCAN_MULTIPLIER;
 const MAILBOX_MESSAGE_LIST_MAX: usize = 200;
 
 type MailboxSyncStateParts = (
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+    i64,
+    i64,
+);
+
+type MailboxSyncCandidateParts = (
+    String,
+    String,
     String,
     String,
     String,
@@ -48,6 +66,9 @@ fn mailbox_sync_state_from_parts(parts: MailboxSyncStateParts) -> Result<JobsPro
         updated_at_ms,
     ) = parts;
     let mut state: JobsProviderSyncState = parse_json(sync_json, "Jobs provider sync state")?;
+    if state.connection_id != connection_id || state.provider != provider {
+        anyhow::bail!("stored Jobs provider sync state identity is inconsistent")
+    }
     state.connection_id = connection_id;
     state.provider = provider;
     state.next_sync_at_ms = next_sync_at_ms;
@@ -57,6 +78,41 @@ fn mailbox_sync_state_from_parts(parts: MailboxSyncStateParts) -> Result<JobsPro
     state.created_at_ms = created_at_ms;
     state.updated_at_ms = updated_at_ms;
     Ok(state)
+}
+
+fn mailbox_sync_claim_scan_budget(limit: usize) -> usize {
+    limit
+        .saturating_mul(MAILBOX_SYNC_SCAN_MULTIPLIER)
+        .clamp(MAILBOX_SYNC_MAX_BATCH, MAILBOX_SYNC_MAX_SCAN_BUDGET)
+}
+
+fn deferred_mailbox_sync_payload(
+    mut state: JobsProviderSyncState,
+    deferred_until_ms: i64,
+    updated_at_ms: i64,
+) -> Result<String> {
+    state.next_sync_at_ms = deferred_until_ms;
+    state.updated_at_ms = updated_at_ms;
+    to_json(&state, "Jobs provider sync state")
+}
+
+fn mailbox_sync_candidate_state(
+    candidate: &MailboxSyncCandidateParts,
+) -> Result<JobsProviderSyncState> {
+    if candidate.2 != candidate.3 {
+        anyhow::bail!("mailbox sync provider projection is inconsistent")
+    }
+    mailbox_sync_state_from_parts((
+        candidate.1.clone(),
+        candidate.2.clone(),
+        candidate.4.clone(),
+        candidate.5,
+        candidate.6,
+        candidate.7.clone(),
+        candidate.8,
+        candidate.9,
+        candidate.10,
+    ))
 }
 
 fn provider_message_from_parts(parts: ProviderMessageParts) -> Result<JobsProviderMessage> {
@@ -83,6 +139,79 @@ fn provider_message_from_parts(parts: ProviderMessageParts) -> Result<JobsProvid
     message.created_at_ms = created_at_ms;
     message.updated_at_ms = updated_at_ms;
     Ok(message)
+}
+
+fn enrich_provider_message_authority_metadata(
+    stored: &mut JobsProviderMessage,
+    incoming: &JobsProviderMessage,
+) -> Result<bool> {
+    if stored.connection_id != incoming.connection_id
+        || stored.provider != incoming.provider
+        || stored.external_id != incoming.external_id
+    {
+        anyhow::bail!("provider message identity collision")
+    }
+    let incoming_metadata = incoming
+        .metadata
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("provider message metadata is invalid"))?;
+    if !stored.metadata.is_object() {
+        if stored.metadata.is_null() {
+            stored.metadata = json!({});
+        } else {
+            anyhow::bail!("stored provider message metadata is invalid")
+        }
+    }
+    let stored_metadata = stored.metadata.as_object_mut().unwrap();
+    let mut changed = false;
+    for key in [
+        "provider_id",
+        "thread_id",
+        "conversation_id",
+        "rfc_message_id",
+        "reply_target",
+    ] {
+        let Some(incoming_value) = incoming_metadata.get(key) else {
+            continue;
+        };
+        let incoming_value = incoming_value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("provider message authority metadata is invalid"))?;
+        if incoming_value.is_empty() {
+            continue;
+        }
+        if incoming_value.len() > 2_048
+            || incoming_value != incoming_value.trim()
+            || incoming_value.chars().any(char::is_control)
+        {
+            anyhow::bail!("provider message authority metadata is invalid")
+        }
+        if key == "reply_target"
+            && normalize_communication_email(incoming_value)? != incoming_value
+        {
+            anyhow::bail!("provider message reply target is not canonical")
+        }
+        match stored_metadata.get(key) {
+            Some(Value::String(existing)) => {
+                if existing.is_empty() {
+                    stored_metadata
+                        .insert(key.to_string(), Value::String(incoming_value.to_string()));
+                    changed = true;
+                } else if existing != incoming_value {
+                    anyhow::bail!("provider message authority metadata changed")
+                }
+            }
+            Some(_) => anyhow::bail!("stored provider message authority metadata is invalid"),
+            None => {
+                stored_metadata.insert(key.to_string(), Value::String(incoming_value.to_string()));
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        stored.updated_at_ms = now_ms().max(stored.updated_at_ms.saturating_add(1));
+    }
+    Ok(changed)
 }
 
 pub fn mailbox_connection(
@@ -267,13 +396,17 @@ pub fn claim_mailbox_sync(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let row: Option<MailboxSyncStateParts> = tx
+            let candidate: Option<MailboxSyncCandidateParts> = tx
                 .query_row(
-                    "SELECT connection_id, provider, sync_json, next_sync_at_ms,
-                            last_synced_at_ms, lease_owner, lease_expires_at_ms,
-                            created_at_ms, updated_at_ms
-                       FROM jobs_provider_sync_state
-                      WHERE account_id = ?1 AND connection_id = ?2",
+                    "SELECT s.account_id, s.connection_id, s.provider, c.provider,
+                            s.sync_json, s.next_sync_at_ms, s.last_synced_at_ms,
+                            s.lease_owner, s.lease_expires_at_ms,
+                            s.created_at_ms, s.updated_at_ms
+                       FROM jobs_provider_sync_state AS s
+                       JOIN jobs_mailbox_connections AS c
+                         ON c.id = s.connection_id AND c.account_id = s.account_id
+                      WHERE s.account_id = ?1 AND s.connection_id = ?2
+                        AND c.status = 'connected'",
                     params![account_id, connection_id],
                     |row| {
                         Ok((
@@ -286,15 +419,34 @@ pub fn claim_mailbox_sync(
                             row.get(6)?,
                             row.get(7)?,
                             row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some(row) = row else {
+            let Some(candidate) = candidate else {
                 tx.commit()?;
                 return Ok(None);
             };
-            if row.6.is_some_and(|expires| expires > now) && row.5.as_deref() != Some(owner) {
+            let mut state = mailbox_sync_candidate_state(&candidate)?;
+            let hold_context = operational_hold_context_for_mailbox_sqlite_tx(
+                &tx,
+                account_id,
+                connection_id,
+            )
+                .map_err(anyhow::Error::new)?;
+            if !operational_hold_allows(require_operational_capability_sqlite_tx(
+                &tx,
+                OperationalCapability::MailboxSync,
+                &hold_context,
+            ))? {
+                tx.commit()?;
+                return Ok(None);
+            }
+            if candidate.8.is_some_and(|expires| expires > now)
+                && candidate.7.as_deref() != Some(owner)
+            {
                 tx.commit()?;
                 return Ok(None);
             }
@@ -303,12 +455,14 @@ pub fn claim_mailbox_sync(
                     SET lease_owner = ?3, lease_expires_at_ms = ?4, updated_at_ms = ?5
                   WHERE account_id = ?1 AND connection_id = ?2
                     AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?5 OR lease_owner = ?3)
+                    AND jobs_provider_sync_state.provider = ?6
                     AND EXISTS (
                         SELECT 1
                           FROM jobs_mailbox_connections AS c
                          WHERE c.id = jobs_provider_sync_state.connection_id
                            AND c.account_id = jobs_provider_sync_state.account_id
                            AND c.status = 'connected'
+                           AND c.provider = ?6
                     )",
                 params![
                     account_id,
@@ -316,34 +470,27 @@ pub fn claim_mailbox_sync(
                     owner,
                     lease_expires_at_ms,
                     now,
+                    candidate.3,
                 ],
             )?;
             if changed == 0 {
                 tx.commit()?;
                 return Ok(None);
             }
-            tx.commit()?;
-            let mut state = mailbox_sync_state_from_parts((
-                row.0,
-                row.1,
-                row.2,
-                row.3,
-                row.4,
-                Some(owner.to_string()),
-                Some(lease_expires_at_ms),
-                row.7,
-                now,
-            ))?;
             state.lease_owner = Some(owner.to_string());
             state.lease_expires_at_ms = Some(lease_expires_at_ms);
+            state.updated_at_ms = now;
+            tx.commit()?;
             Ok(Some(state))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
             let row = tx.query_opt(
-                "SELECT s.connection_id, s.provider, s.sync_json, s.next_sync_at_ms,
-                        s.last_synced_at_ms, s.lease_owner, s.lease_expires_at_ms,
+                "SELECT s.account_id, s.connection_id, s.provider, c.provider,
+                        s.sync_json, s.next_sync_at_ms, s.last_synced_at_ms,
+                        s.lease_owner, s.lease_expires_at_ms,
                         s.created_at_ms, s.updated_at_ms
                    FROM jobs_provider_sync_state AS s
                    JOIN jobs_mailbox_connections AS c
@@ -357,24 +504,53 @@ pub fn claim_mailbox_sync(
                 tx.commit()?;
                 return Ok(None);
             };
-            let current_owner: Option<String> = row.get(5);
-            let current_expiry: Option<i64> = row.get(6);
-            if current_expiry.is_some_and(|expires| expires > now)
-                && current_owner.as_deref() != Some(owner)
+            let candidate: MailboxSyncCandidateParts = (
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+                row.get(6),
+                row.get(7),
+                row.get(8),
+                row.get(9),
+                row.get(10),
+            );
+            let mut state = mailbox_sync_candidate_state(&candidate)?;
+            let provider = candidate.3.clone();
+            let hold_context = operational_hold_context_for_mailbox_postgres_tx(
+                &mut tx,
+                account_id,
+                connection_id,
+            )
+                .map_err(anyhow::Error::new)?;
+            if !operational_hold_allows(require_operational_capability_postgres_tx(
+                &mut tx,
+                OperationalCapability::MailboxSync,
+                &hold_context,
+            ))? {
+                tx.commit()?;
+                return Ok(None);
+            }
+            if candidate.8.is_some_and(|expires| expires > now)
+                && candidate.7.as_deref() != Some(owner)
             {
                 tx.commit()?;
                 return Ok(None);
             }
-            tx.execute(
+            let changed = tx.execute(
                 "UPDATE jobs_provider_sync_state
                     SET lease_owner = $3, lease_expires_at_ms = $4, updated_at_ms = $5
                   WHERE account_id = $1 AND connection_id = $2
+                    AND jobs_provider_sync_state.provider = $6
                     AND EXISTS (
                         SELECT 1
                           FROM jobs_mailbox_connections AS c
                          WHERE c.id = jobs_provider_sync_state.connection_id
                            AND c.account_id = jobs_provider_sync_state.account_id
                            AND c.status = 'connected'
+                           AND c.provider = $6
                     )",
                 &[
                     &account_id,
@@ -382,19 +558,15 @@ pub fn claim_mailbox_sync(
                     &owner,
                     &lease_expires_at_ms,
                     &now,
+                    &provider,
                 ],
             )?;
-            let state = mailbox_sync_state_from_parts((
-                row.get(0),
-                row.get(1),
-                row.get(2),
-                row.get(3),
-                row.get(4),
-                Some(owner.to_string()),
-                Some(lease_expires_at_ms),
-                row.get(7),
-                now,
-            ))?;
+            if changed != 1 {
+                anyhow::bail!("mailbox sync provider projection changed during claim")
+            }
+            state.lease_owner = Some(owner.to_string());
+            state.lease_expires_at_ms = Some(lease_expires_at_ms);
+            state.updated_at_ms = now;
             tx.commit()?;
             Ok(Some(state))
         }
@@ -413,106 +585,244 @@ pub fn claim_due_mailbox_syncs(
     }
     let now = now_ms();
     let lease_expires_at_ms = now.saturating_add(lease_ms.max(1_000));
-    let limit = limit.clamp(1, MAILBOX_SYNC_MAX_BATCH) as i64;
+    let limit = limit.clamp(1, MAILBOX_SYNC_MAX_BATCH);
+    let scan_budget = mailbox_sync_claim_scan_budget(limit);
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let mut conn = pool.get()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let rows = {
-                let mut stmt = tx.prepare(
-                    "SELECT s.account_id, s.connection_id, s.provider, s.sync_json,
-                            s.next_sync_at_ms, s.last_synced_at_ms,
-                            s.created_at_ms, s.updated_at_ms
-                       FROM jobs_provider_sync_state AS s
-                       JOIN jobs_mailbox_connections AS c
-                         ON c.id = s.connection_id AND c.account_id = s.account_id
-                      WHERE s.next_sync_at_ms <= ?1
-                        AND (s.lease_expires_at_ms IS NULL OR s.lease_expires_at_ms <= ?1)
-                        AND c.status = 'connected'
-                      ORDER BY s.next_sync_at_ms ASC, s.connection_id ASC
-                      LIMIT ?2",
-                )?;
-                let mapped = stmt.query_map(params![now, limit], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                    ))
-                })?;
-                mapped.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            let mut claimed = Vec::with_capacity(rows.len());
-            for row in rows {
+            let mut claimed = Vec::with_capacity(limit);
+            for _ in 0..scan_budget {
+                if claimed.len() >= limit {
+                    break;
+                }
+                let mut conn = pool.get()?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let candidate: Option<MailboxSyncCandidateParts> = tx
+                    .query_row(
+                        "SELECT s.account_id, s.connection_id, s.provider, c.provider,
+                                s.sync_json, s.next_sync_at_ms, s.last_synced_at_ms,
+                                s.lease_owner, s.lease_expires_at_ms,
+                                s.created_at_ms, s.updated_at_ms
+                           FROM jobs_provider_sync_state AS s
+                           JOIN jobs_mailbox_connections AS c
+                             ON c.id = s.connection_id AND c.account_id = s.account_id
+                          WHERE s.next_sync_at_ms <= ?1
+                            AND (s.lease_expires_at_ms IS NULL OR s.lease_expires_at_ms <= ?1)
+                            AND c.status = 'connected'
+                          ORDER BY s.next_sync_at_ms ASC, s.connection_id ASC
+                          LIMIT 1",
+                        params![now],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                                row.get(8)?,
+                                row.get(9)?,
+                                row.get(10)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some(candidate) = candidate else {
+                    tx.commit()?;
+                    break;
+                };
+                let mut state = mailbox_sync_candidate_state(&candidate)?;
+                let hold_context = OperationalHoldContext::new()
+                    .with_scope(OperationalHoldScopeKind::Account, &candidate.0)
+                    .and_then(|context| {
+                        context.with_scope(
+                            OperationalHoldScopeKind::MailboxProvider,
+                            &candidate.3,
+                        )
+                    })
+                    .map_err(anyhow::Error::new)?;
+                if !operational_hold_allows(require_operational_capability_sqlite_tx(
+                    &tx,
+                    OperationalCapability::MailboxSync,
+                    &hold_context,
+                ))? {
+                    let deferred_until_ms = now.saturating_add(MAILBOX_SYNC_HELD_DEFERRAL_MS);
+                    let updated_at_ms = now.max(candidate.10.saturating_add(1));
+                    let payload =
+                        deferred_mailbox_sync_payload(state, deferred_until_ms, updated_at_ms)?;
+                    let changed = tx.execute(
+                        "UPDATE jobs_provider_sync_state
+                            SET sync_json = ?3, next_sync_at_ms = ?4, updated_at_ms = ?5
+                          WHERE account_id = ?1 AND connection_id = ?2
+                            AND next_sync_at_ms <= ?6
+                            AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?6)
+                            AND jobs_provider_sync_state.provider = ?7
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM jobs_mailbox_connections AS c
+                                 WHERE c.id = jobs_provider_sync_state.connection_id
+                                   AND c.account_id = jobs_provider_sync_state.account_id
+                                   AND c.status = 'connected'
+                                   AND c.provider = ?7
+                            )",
+                        params![
+                            candidate.0,
+                            candidate.1,
+                            payload,
+                            deferred_until_ms,
+                            updated_at_ms,
+                            now,
+                            candidate.3,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("held mailbox sync deferral lost authority")
+                    }
+                    tx.commit()?;
+                    continue;
+                }
                 let changed = tx.execute(
                     "UPDATE jobs_provider_sync_state
                         SET lease_owner = ?3, lease_expires_at_ms = ?4, updated_at_ms = ?5
                       WHERE account_id = ?1 AND connection_id = ?2
                         AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?5)
+                        AND jobs_provider_sync_state.provider = ?6
                         AND EXISTS (
                             SELECT 1
                               FROM jobs_mailbox_connections AS c
                              WHERE c.id = jobs_provider_sync_state.connection_id
                                AND c.account_id = jobs_provider_sync_state.account_id
                                AND c.status = 'connected'
+                               AND c.provider = ?6
                         )",
-                    params![row.0, row.1, owner, lease_expires_at_ms, now],
+                    params![
+                        candidate.0,
+                        candidate.1,
+                        owner,
+                        lease_expires_at_ms,
+                        now,
+                        candidate.3,
+                    ],
                 )?;
                 if changed == 0 {
+                    tx.commit()?;
                     continue;
                 }
-                let state = mailbox_sync_state_from_parts((
-                    row.1.clone(),
-                    row.2,
-                    row.3,
-                    row.4,
-                    row.5,
-                    Some(owner.to_string()),
-                    Some(lease_expires_at_ms),
-                    row.6,
-                    now,
-                ))?;
-                claimed.push((row.0, state));
+                state.lease_owner = Some(owner.to_string());
+                state.lease_expires_at_ms = Some(lease_expires_at_ms);
+                state.updated_at_ms = now;
+                tx.commit()?;
+                claimed.push((candidate.0, state));
             }
-            tx.commit()?;
             Ok(claimed)
         }
         DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            let mut tx = conn.transaction()?;
-            let rows = tx.query(
-                "SELECT s.account_id, s.connection_id, s.provider, s.sync_json,
-                        s.next_sync_at_ms, s.last_synced_at_ms,
-                        s.created_at_ms, s.updated_at_ms
-                   FROM jobs_provider_sync_state AS s
-                   JOIN jobs_mailbox_connections AS c
-                     ON c.id = s.connection_id AND c.account_id = s.account_id
-                  WHERE s.next_sync_at_ms <= $1
-                    AND (s.lease_expires_at_ms IS NULL OR s.lease_expires_at_ms <= $1)
-                    AND c.status = 'connected'
-                  ORDER BY s.next_sync_at_ms ASC, s.connection_id ASC
-                  FOR UPDATE OF s SKIP LOCKED
-                  LIMIT $2",
-                &[&now, &limit],
-            )?;
-            let mut claimed = Vec::with_capacity(rows.len());
-            for row in rows {
-                let account_id: String = row.get(0);
-                let connection_id: String = row.get(1);
-                tx.execute(
+            let mut claimed = Vec::with_capacity(limit);
+            for _ in 0..scan_budget {
+                if claimed.len() >= limit {
+                    break;
+                }
+                let mut conn = pool.get_pg()?;
+                let mut tx = conn.transaction()?;
+                lock_operational_hold_shared_postgres_tx(&mut tx)
+                    .map_err(anyhow::Error::new)?;
+                let row = tx.query_opt(
+                    "SELECT s.account_id, s.connection_id, s.provider, c.provider,
+                            s.sync_json, s.next_sync_at_ms, s.last_synced_at_ms,
+                            s.lease_owner, s.lease_expires_at_ms,
+                            s.created_at_ms, s.updated_at_ms
+                       FROM jobs_provider_sync_state AS s
+                       JOIN jobs_mailbox_connections AS c
+                         ON c.id = s.connection_id AND c.account_id = s.account_id
+                      WHERE s.next_sync_at_ms <= $1
+                        AND (s.lease_expires_at_ms IS NULL OR s.lease_expires_at_ms <= $1)
+                        AND c.status = 'connected'
+                      ORDER BY s.next_sync_at_ms ASC, s.connection_id ASC
+                      FOR UPDATE OF s SKIP LOCKED
+                      LIMIT 1",
+                    &[&now],
+                )?;
+                let Some(row) = row else {
+                    tx.commit()?;
+                    break;
+                };
+                let candidate: MailboxSyncCandidateParts = (
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                    row.get(5),
+                    row.get(6),
+                    row.get(7),
+                    row.get(8),
+                    row.get(9),
+                    row.get(10),
+                );
+                let mut state = mailbox_sync_candidate_state(&candidate)?;
+                let account_id = candidate.0.clone();
+                let connection_id = candidate.1.clone();
+                let provider = candidate.3.clone();
+                let hold_context = OperationalHoldContext::new()
+                    .with_scope(OperationalHoldScopeKind::Account, &account_id)
+                    .and_then(|context| {
+                        context.with_scope(OperationalHoldScopeKind::MailboxProvider, &provider)
+                    })
+                    .map_err(anyhow::Error::new)?;
+                if !operational_hold_allows(require_operational_capability_postgres_tx(
+                    &mut tx,
+                    OperationalCapability::MailboxSync,
+                    &hold_context,
+                ))? {
+                    let deferred_until_ms = now.saturating_add(MAILBOX_SYNC_HELD_DEFERRAL_MS);
+                    let updated_at_ms = now.max(candidate.10.saturating_add(1));
+                    let payload =
+                        deferred_mailbox_sync_payload(state, deferred_until_ms, updated_at_ms)?;
+                    let changed = tx.execute(
+                        "UPDATE jobs_provider_sync_state
+                            SET sync_json = $3, next_sync_at_ms = $4, updated_at_ms = $5
+                          WHERE account_id = $1 AND connection_id = $2
+                            AND next_sync_at_ms <= $6
+                            AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $6)
+                            AND jobs_provider_sync_state.provider = $7
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM jobs_mailbox_connections AS c
+                                 WHERE c.id = jobs_provider_sync_state.connection_id
+                                   AND c.account_id = jobs_provider_sync_state.account_id
+                                   AND c.status = 'connected'
+                                   AND c.provider = $7
+                            )",
+                        &[
+                            &candidate.0,
+                            &candidate.1,
+                            &payload,
+                            &deferred_until_ms,
+                            &updated_at_ms,
+                            &now,
+                            &provider,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("held mailbox sync deferral lost authority")
+                    }
+                    tx.commit()?;
+                    continue;
+                }
+                let changed = tx.execute(
                     "UPDATE jobs_provider_sync_state
                         SET lease_owner = $3, lease_expires_at_ms = $4, updated_at_ms = $5
                       WHERE account_id = $1 AND connection_id = $2
+                        AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $5)
+                        AND jobs_provider_sync_state.provider = $6
                         AND EXISTS (
                             SELECT 1
                               FROM jobs_mailbox_connections AS c
                              WHERE c.id = jobs_provider_sync_state.connection_id
                                AND c.account_id = jobs_provider_sync_state.account_id
                                AND c.status = 'connected'
+                               AND c.provider = $6
                         )",
                     &[
                         &account_id,
@@ -520,22 +830,19 @@ pub fn claim_due_mailbox_syncs(
                         &owner,
                         &lease_expires_at_ms,
                         &now,
+                        &provider,
                     ],
                 )?;
-                let state = mailbox_sync_state_from_parts((
-                    connection_id,
-                    row.get(2),
-                    row.get(3),
-                    row.get(4),
-                    row.get(5),
-                    Some(owner.to_string()),
-                    Some(lease_expires_at_ms),
-                    row.get(6),
-                    now,
-                ))?;
+                if changed == 0 {
+                    tx.commit()?;
+                    continue;
+                }
+                state.lease_owner = Some(owner.to_string());
+                state.lease_expires_at_ms = Some(lease_expires_at_ms);
+                state.updated_at_ms = now;
+                tx.commit()?;
                 claimed.push((account_id, state));
             }
-            tx.commit()?;
             Ok(claimed)
         }
     })
@@ -713,8 +1020,11 @@ pub fn save_provider_message(
 ) -> Result<(JobsProviderMessage, bool)> {
     let mut value = message.clone();
     value.provider = normalize_mailbox_provider(&value.provider)?;
+    value.external_id = value.external_id.trim().to_string();
     if value.connection_id.trim().is_empty()
-        || value.external_id.trim().is_empty()
+        || value.external_id.is_empty()
+        || value.external_id.len() > 2_048
+        || value.external_id.chars().any(char::is_control)
         || value.sender.trim().is_empty()
         || value.received_at_ms <= 0
     {
@@ -722,7 +1032,7 @@ pub fn save_provider_message(
     }
     let mailbox = mailbox_connection(pool, account_id, &value.connection_id)?
         .ok_or_else(|| anyhow::anyhow!("mailbox connection not found"))?;
-    if mailbox.provider != value.provider {
+    if mailbox.provider != value.provider || mailbox.status != "connected" {
         anyhow::bail!("provider message does not match the mailbox")
     }
     if let Some(application_id) = value.application_id.as_deref() {
@@ -761,8 +1071,15 @@ pub fn save_provider_message(
         value.processed_at_ms = Some(now);
     }
     let message_hash = private_lookup_hash(
+        &format!(
+            "jobs-provider-message:{}:{}",
+            value.provider, value.connection_id
+        ),
+        &value.external_id,
+    )?;
+    let legacy_message_hash = private_lookup_hash(
         &format!("jobs-provider-message:{}", value.provider),
-        value.external_id.trim(),
+        &value.external_id,
     )?;
     let payload = to_json(&value, "Jobs provider message")?;
 
@@ -770,34 +1087,109 @@ pub fn save_provider_message(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let inserted = tx.execute(
-                "INSERT INTO jobs_provider_messages (
-                    id, account_id, connection_id, provider, provider_message_hash,
-                    application_id, processing_status, message_json, received_at_ms,
-                    processed_at_ms, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 ON CONFLICT(account_id, provider, provider_message_hash) DO NOTHING",
-                params![
-                    value.id,
-                    account_id,
-                    value.connection_id,
-                    value.provider,
-                    message_hash,
-                    value.application_id,
-                    value.processing_status,
-                    payload,
-                    value.received_at_ms,
-                    value.processed_at_ms,
-                    value.created_at_ms,
-                    value.updated_at_ms,
-                ],
-            )? > 0;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let mailbox_matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = ?1 AND id = ?2 AND provider = ?3
+                    AND status = 'connected')",
+                params![account_id, value.connection_id, value.provider],
+                |row| row.get(0),
+            )?;
+            if !mailbox_matches {
+                anyhow::bail!("provider message mailbox authority changed")
+            }
+            if let Some(application_id) = value.application_id.as_deref() {
+                let application_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM jobs_applications
+                      WHERE account_id = ?1 AND id = ?2)",
+                    params![account_id, application_id],
+                    |row| row.get(0),
+                )?;
+                if !application_exists {
+                    anyhow::bail!("provider message application authority changed")
+                }
+            }
+            let existing: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT id, provider_message_hash
+                       FROM jobs_provider_messages
+                      WHERE account_id = ?1 AND connection_id = ?2 AND provider = ?3
+                        AND provider_message_hash IN (?4, ?5)
+                      ORDER BY CASE WHEN provider_message_hash = ?4 THEN 0 ELSE 1 END
+                      LIMIT 1",
+                    params![
+                        account_id,
+                        value.connection_id,
+                        value.provider,
+                        message_hash,
+                        legacy_message_hash,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (stored_id, inserted) = if let Some((stored_id, stored_hash)) = existing {
+                if stored_hash == legacy_message_hash && stored_hash != message_hash {
+                    let changed = tx.execute(
+                        "UPDATE jobs_provider_messages
+                            SET provider_message_hash = ?4
+                          WHERE account_id = ?1 AND id = ?2 AND connection_id = ?3
+                            AND provider_message_hash = ?5",
+                        params![
+                            account_id,
+                            stored_id,
+                            value.connection_id,
+                            message_hash,
+                            legacy_message_hash,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("provider message legacy identity changed")
+                    }
+                }
+                (stored_id, false)
+            } else {
+                let inserted = tx.execute(
+                    "INSERT INTO jobs_provider_messages (
+                        id, account_id, connection_id, provider, provider_message_hash,
+                        application_id, processing_status, message_json, received_at_ms,
+                        processed_at_ms, created_at_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(account_id, provider, provider_message_hash) DO NOTHING",
+                    params![
+                        value.id,
+                        account_id,
+                        value.connection_id,
+                        value.provider,
+                        message_hash,
+                        value.application_id,
+                        value.processing_status,
+                        payload,
+                        value.received_at_ms,
+                        value.processed_at_ms,
+                        value.created_at_ms,
+                        value.updated_at_ms,
+                    ],
+                )?;
+                if inserted != 1 {
+                    anyhow::bail!("provider message identity collision")
+                }
+                (value.id.clone(), true)
+            };
             let row = tx.query_row(
                 "SELECT id, connection_id, provider, application_id, processing_status,
                         message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
                    FROM jobs_provider_messages
-                  WHERE account_id = ?1 AND provider = ?2 AND provider_message_hash = ?3",
-                params![account_id, value.provider, message_hash],
+                  WHERE account_id = ?1 AND id = ?2 AND connection_id = ?3
+                    AND provider = ?4 AND provider_message_hash = ?5",
+                params![
+                    account_id,
+                    stored_id,
+                    value.connection_id,
+                    value.provider,
+                    message_hash,
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -813,47 +1205,139 @@ pub fn save_provider_message(
                     ))
                 },
             )?;
+            let mut stored = provider_message_from_parts((
+                row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+            ))?;
+            if !inserted && enrich_provider_message_authority_metadata(&mut stored, &value)? {
+                let payload = to_json(&stored, "Jobs provider message")?;
+                let changed = tx.execute(
+                    "UPDATE jobs_provider_messages
+                        SET message_json = ?4, updated_at_ms = ?5
+                      WHERE account_id = ?1 AND id = ?2 AND connection_id = ?3",
+                    params![
+                        account_id,
+                        stored.id,
+                        stored.connection_id,
+                        payload,
+                        stored.updated_at_ms,
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("provider message authority enrichment changed")
+                }
+            }
             tx.commit()?;
-            Ok((
-                provider_message_from_parts((
-                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
-                ))?,
-                inserted,
-            ))
+            Ok((stored, inserted))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let inserted = tx.execute(
-                "INSERT INTO jobs_provider_messages (
-                    id, account_id, connection_id, provider, provider_message_hash,
-                    application_id, processing_status, message_json, received_at_ms,
-                    processed_at_ms, created_at_ms, updated_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                 ON CONFLICT(account_id, provider, provider_message_hash) DO NOTHING",
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let mailbox_matches: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM jobs_mailbox_connections
+                      WHERE account_id = $1 AND id = $2 AND provider = $3
+                        AND status = 'connected')",
+                    &[&account_id, &value.connection_id, &value.provider],
+                )?
+                .get(0);
+            if !mailbox_matches {
+                anyhow::bail!("provider message mailbox authority changed")
+            }
+            if let Some(application_id) = value.application_id.as_deref() {
+                let application_exists: bool = tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM jobs_applications
+                          WHERE account_id = $1 AND id = $2)",
+                        &[&account_id, &application_id],
+                    )?
+                    .get(0);
+                if !application_exists {
+                    anyhow::bail!("provider message application authority changed")
+                }
+            }
+            let existing = tx.query_opt(
+                "SELECT id, provider_message_hash
+                   FROM jobs_provider_messages
+                  WHERE account_id = $1 AND connection_id = $2 AND provider = $3
+                    AND provider_message_hash IN ($4, $5)
+                  ORDER BY CASE WHEN provider_message_hash = $4 THEN 0 ELSE 1 END
+                  LIMIT 1 FOR UPDATE",
                 &[
-                    &value.id,
                     &account_id,
                     &value.connection_id,
                     &value.provider,
                     &message_hash,
-                    &value.application_id,
-                    &value.processing_status,
-                    &payload,
-                    &value.received_at_ms,
-                    &value.processed_at_ms,
-                    &value.created_at_ms,
-                    &value.updated_at_ms,
+                    &legacy_message_hash,
                 ],
-            )? > 0;
+            )?;
+            let (stored_id, inserted) = if let Some(existing) = existing {
+                let stored_id: String = existing.get(0);
+                let stored_hash: String = existing.get(1);
+                if stored_hash == legacy_message_hash && stored_hash != message_hash {
+                    let changed = tx.execute(
+                        "UPDATE jobs_provider_messages
+                            SET provider_message_hash = $4
+                          WHERE account_id = $1 AND id = $2 AND connection_id = $3
+                            AND provider_message_hash = $5",
+                        &[
+                            &account_id,
+                            &stored_id,
+                            &value.connection_id,
+                            &message_hash,
+                            &legacy_message_hash,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("provider message legacy identity changed")
+                    }
+                }
+                (stored_id, false)
+            } else {
+                let inserted = tx.execute(
+                    "INSERT INTO jobs_provider_messages (
+                        id, account_id, connection_id, provider, provider_message_hash,
+                        application_id, processing_status, message_json, received_at_ms,
+                        processed_at_ms, created_at_ms, updated_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     ON CONFLICT(account_id, provider, provider_message_hash) DO NOTHING",
+                    &[
+                        &value.id,
+                        &account_id,
+                        &value.connection_id,
+                        &value.provider,
+                        &message_hash,
+                        &value.application_id,
+                        &value.processing_status,
+                        &payload,
+                        &value.received_at_ms,
+                        &value.processed_at_ms,
+                        &value.created_at_ms,
+                        &value.updated_at_ms,
+                    ],
+                )?;
+                if inserted != 1 {
+                    anyhow::bail!("provider message identity collision")
+                }
+                (value.id.clone(), true)
+            };
             let row = tx.query_one(
                 "SELECT id, connection_id, provider, application_id, processing_status,
                         message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
                    FROM jobs_provider_messages
-                  WHERE account_id = $1 AND provider = $2 AND provider_message_hash = $3",
-                &[&account_id, &value.provider, &message_hash],
+                  WHERE account_id = $1 AND id = $2 AND connection_id = $3
+                    AND provider = $4 AND provider_message_hash = $5",
+                &[
+                    &account_id,
+                    &stored_id,
+                    &value.connection_id,
+                    &value.provider,
+                    &message_hash,
+                ],
             )?;
-            let stored = provider_message_from_parts((
+            let mut stored = provider_message_from_parts((
                 row.get(0),
                 row.get(1),
                 row.get(2),
@@ -865,6 +1349,24 @@ pub fn save_provider_message(
                 row.get(8),
                 row.get(9),
             ))?;
+            if !inserted && enrich_provider_message_authority_metadata(&mut stored, &value)? {
+                let payload = to_json(&stored, "Jobs provider message")?;
+                let changed = tx.execute(
+                    "UPDATE jobs_provider_messages
+                        SET message_json = $4, updated_at_ms = $5
+                      WHERE account_id = $1 AND id = $2 AND connection_id = $3",
+                    &[
+                        &account_id,
+                        &stored.id,
+                        &stored.connection_id,
+                        &payload,
+                        &stored.updated_at_ms,
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("provider message authority enrichment changed")
+                }
+            }
             tx.commit()?;
             Ok((stored, inserted))
         }
@@ -981,6 +1483,111 @@ pub fn list_provider_messages(
                 })
                 .collect()
         }
+    })
+}
+
+pub fn export_provider_messages(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<JobsProviderMessageExport>> {
+    let messages: Vec<JobsProviderMessage> = crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, connection_id, provider, application_id, processing_status,
+                        message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_provider_messages
+                  WHERE account_id = ?1 ORDER BY received_at_ms, id",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| {
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                ))
+            })?;
+            rows.map(|row| provider_message_from_parts(row?))
+                .collect::<Result<Vec<_>>>()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query(
+                "SELECT id, connection_id, provider, application_id, processing_status,
+                        message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_provider_messages
+                  WHERE account_id = $1 ORDER BY received_at_ms, id",
+                &[&account_id],
+            )?
+            .into_iter()
+            .map(|row| {
+                provider_message_from_parts((
+                    row.get(0), row.get(1), row.get(2), row.get(3), row.get(4),
+                    row.get(5), row.get(6), row.get(7), row.get(8), row.get(9),
+                ))
+            })
+            .collect(),
+    })?;
+    Ok(messages
+        .into_iter()
+        .map(|message| JobsProviderMessageExport {
+            id: message.id,
+            connection_id: message.connection_id,
+            provider: message.provider,
+            sender: message.sender,
+            recipients: message.recipients,
+            subject: message.subject,
+            body_text: message.body_text,
+            received_at_ms: message.received_at_ms,
+            application_id: message.application_id,
+            processing_status: message.processing_status,
+            classification: message.classification,
+            created_at_ms: message.created_at_ms,
+            updated_at_ms: message.updated_at_ms,
+        })
+        .collect())
+}
+
+pub fn provider_message(
+    pool: &DbPool,
+    account_id: &str,
+    connection_id: &str,
+    message_id: &str,
+) -> Result<Option<JobsProviderMessage>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let row = pool
+                .get()?
+                .query_row(
+                    "SELECT id, connection_id, provider, application_id, processing_status,
+                            message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
+                       FROM jobs_provider_messages
+                      WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3",
+                    params![account_id, connection_id, message_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                            row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(provider_message_from_parts).transpose()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT id, connection_id, provider, application_id, processing_status,
+                        message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_provider_messages
+                  WHERE account_id = $1 AND connection_id = $2 AND id = $3",
+                &[&account_id, &connection_id, &message_id],
+            )?
+            .map(|row| {
+                provider_message_from_parts((
+                    row.get(0), row.get(1), row.get(2), row.get(3), row.get(4),
+                    row.get(5), row.get(6), row.get(7), row.get(8), row.get(9),
+                ))
+            })
+            .transpose(),
     })
 }
 
@@ -1127,11 +1734,8 @@ pub fn update_provider_message_processing(
             message.processing_status = processing_status.clone();
             message.classification = classification.clone();
             message.confidence = confidence.clamp(0.0, 1.0);
-            message.metadata = if metadata.is_null() {
-                json!({})
-            } else {
-                metadata.clone()
-            };
+            message.metadata =
+                merge_provider_processing_metadata(&message.metadata, &metadata)?;
             message.processed_at_ms = if message.processing_status == "received" {
                 None
             } else {
@@ -1188,11 +1792,8 @@ pub fn update_provider_message_processing(
             message.processing_status = processing_status;
             message.classification = classification;
             message.confidence = confidence.clamp(0.0, 1.0);
-            message.metadata = if metadata.is_null() {
-                json!({})
-            } else {
-                metadata
-            };
+            message.metadata =
+                merge_provider_processing_metadata(&message.metadata, &metadata)?;
             message.processed_at_ms = if message.processing_status == "received" {
                 None
             } else {
@@ -1219,4 +1820,349 @@ pub fn update_provider_message_processing(
             Ok(Some(message))
         }
     })
+}
+
+fn merge_provider_processing_metadata(existing: &Value, processing: &Value) -> Result<Value> {
+    const PROVIDER_AUTHORITY_KEYS: [&str; 5] = [
+        "provider_id",
+        "thread_id",
+        "conversation_id",
+        "rfc_message_id",
+        "reply_target",
+    ];
+    let mut merged = if existing.is_null() {
+        serde_json::Map::new()
+    } else {
+        existing
+            .as_object()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("provider message metadata is invalid"))?
+    };
+    let processing = if processing.is_null() {
+        return Ok(Value::Object(merged));
+    } else {
+        processing
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("provider processing metadata is invalid"))?
+    };
+    for (key, value) in processing {
+        if PROVIDER_AUTHORITY_KEYS.contains(&key.as_str()) {
+            anyhow::bail!("provider processing metadata cannot replace provider authority")
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    Ok(Value::Object(merged))
+}
+
+#[cfg(test)]
+mod mailbox_sync_claim_tests {
+    use super::*;
+    use crate::db;
+
+    const TEST_ACCOUNT_ID: &str = "acct-mailbox-scan";
+
+    fn test_pool() -> DbPool {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-mailbox-sync-claim-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = db::open_pool(&path).unwrap();
+        db::run_migrations(&pool).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES (?1, 'mailbox-scan@example.test', 'hash', 0)",
+                params![TEST_ACCOUNT_ID],
+            )
+            .unwrap();
+        pool
+    }
+
+    fn seed_candidates(pool: &DbPool, candidates: &[(String, String, i64)]) {
+        let mut conn = pool.get().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        for (connection_id, provider, next_sync_at_ms) in candidates {
+            let created_at_ms = next_sync_at_ms.saturating_sub(1);
+            let connection = MailboxConnection {
+                id: connection_id.clone(),
+                provider: provider.clone(),
+                status: "connected".to_string(),
+                account_label: format!("{connection_id}@example.test"),
+                aliases: Vec::new(),
+                capabilities: vec!["status_sync".to_string()],
+                created_at_ms,
+                updated_at_ms: created_at_ms,
+            };
+            let state = JobsProviderSyncState {
+                connection_id: connection_id.clone(),
+                provider: provider.clone(),
+                cursor: json!({}),
+                next_sync_at_ms: *next_sync_at_ms,
+                last_synced_at_ms: None,
+                last_error: String::new(),
+                lease_owner: None,
+                lease_expires_at_ms: None,
+                created_at_ms,
+                updated_at_ms: created_at_ms,
+            };
+            tx.execute(
+                "INSERT INTO jobs_mailbox_connections (
+                    id, account_id, provider, provider_subject_hash, status,
+                    connection_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'connected', ?5, ?6, ?6)",
+                params![
+                    connection_id,
+                    TEST_ACCOUNT_ID,
+                    provider,
+                    format!("subject-{connection_id}"),
+                    to_json(&connection, "mailbox connection").unwrap(),
+                    created_at_ms,
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO jobs_provider_sync_state (
+                    connection_id, account_id, provider, sync_json, next_sync_at_ms,
+                    last_synced_at_ms, lease_owner, lease_expires_at_ms,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6, ?6)",
+                params![
+                    connection_id,
+                    TEST_ACCOUNT_ID,
+                    provider,
+                    to_json(&state, "Jobs provider sync state").unwrap(),
+                    next_sync_at_ms,
+                    created_at_ms,
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    fn hold_gmail(pool: &DbPool, event_id: &str) {
+        append_operational_hold_event(
+            pool,
+            &AppendOperationalHoldEventRequest {
+                event_id: event_id.to_string(),
+                capability: OperationalCapability::MailboxSync,
+                scope_kind: OperationalHoldScopeKind::MailboxProvider,
+                scope_id: "gmail".to_string(),
+                transition: OperationalHoldTransition::Held,
+                reason_code: OperationalHoldReasonCode::Incident,
+                reason_ref: Some("INC-606".to_string()),
+                expected_head_revision: 0,
+                expected_current_event_id: None,
+            },
+            "mailbox-test-admin",
+        )
+        .unwrap();
+    }
+
+    fn assert_deferred_payload_matches_columns(pool: &DbPool, connection_id: &str) {
+        let (raw, next_sync_at_ms, updated_at_ms, lease_owner):
+            (String, i64, i64, Option<String>) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT sync_json, next_sync_at_ms, updated_at_ms, lease_owner
+                   FROM jobs_provider_sync_state
+                  WHERE account_id = ?1 AND connection_id = ?2",
+                params![TEST_ACCOUNT_ID, connection_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(raw.starts_with(ENCRYPTED_PAYLOAD_PREFIX));
+        let state: JobsProviderSyncState = parse_json(raw, "Jobs provider sync state").unwrap();
+        assert_eq!(state.next_sync_at_ms, next_sync_at_ms);
+        assert_eq!(state.updated_at_ms, updated_at_ms);
+        assert_eq!(state.lease_owner, lease_owner);
+    }
+
+    fn assert_sync_was_not_leased(pool: &DbPool, connection_id: &str) {
+        let lease_owner: Option<String> = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT lease_owner FROM jobs_provider_sync_state
+                  WHERE account_id = ?1 AND connection_id = ?2",
+                params![TEST_ACCOUNT_ID, connection_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_owner, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn relational_provider_mismatch_fails_closed_before_direct_or_batch_lease() {
+        let pool = test_pool();
+        let connection_id = "relational-provider-mismatch";
+        seed_candidates(
+            &pool,
+            &[(
+                connection_id.to_string(),
+                "gmail".to_string(),
+                now_ms().saturating_sub(10_000),
+            )],
+        );
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_sync_state SET provider = 'outlook'
+                  WHERE account_id = ?1 AND connection_id = ?2",
+                params![TEST_ACCOUNT_ID, connection_id],
+            )
+            .unwrap();
+        hold_gmail(&pool, "mailbox-relational-provider-mismatch");
+
+        assert!(claim_mailbox_sync(
+            &pool,
+            TEST_ACCOUNT_ID,
+            connection_id,
+            "direct-worker",
+            60_000,
+        )
+        .is_err());
+        assert_sync_was_not_leased(&pool, connection_id);
+        assert!(claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 1).is_err());
+        assert_sync_was_not_leased(&pool, connection_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn encrypted_provider_mismatch_fails_closed_before_direct_or_batch_lease() {
+        let pool = test_pool();
+        let connection_id = "encrypted-provider-mismatch";
+        seed_candidates(
+            &pool,
+            &[(
+                connection_id.to_string(),
+                "gmail".to_string(),
+                now_ms().saturating_sub(10_000),
+            )],
+        );
+        let mut state = mailbox_sync_state(&pool, TEST_ACCOUNT_ID, connection_id)
+            .unwrap()
+            .unwrap();
+        state.provider = "outlook".to_string();
+        let payload = to_json(&state, "Jobs provider sync state").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_sync_state SET sync_json = ?3
+                  WHERE account_id = ?1 AND connection_id = ?2",
+                params![TEST_ACCOUNT_ID, connection_id, payload],
+            )
+            .unwrap();
+
+        assert!(claim_mailbox_sync(
+            &pool,
+            TEST_ACCOUNT_ID,
+            connection_id,
+            "direct-worker",
+            60_000,
+        )
+        .is_err());
+        assert_sync_was_not_leased(&pool, connection_id);
+        assert!(claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 1).is_err());
+        assert_sync_was_not_leased(&pool, connection_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn held_mailbox_prefix_is_deferred_without_starving_allowed_provider() {
+        let pool = test_pool();
+        let due_at_ms = now_ms().saturating_sub(10_000);
+        let mut candidates = (0..3)
+            .map(|index| {
+                (
+                    format!("held-gmail-{index:02}"),
+                    "gmail".to_string(),
+                    due_at_ms.saturating_add(index),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.push((
+            "allowed-outlook".to_string(),
+            "outlook".to_string(),
+            due_at_ms.saturating_add(3),
+        ));
+        seed_candidates(&pool, &candidates);
+        hold_gmail(&pool, "mailbox-held-prefix");
+
+        let deferral_floor_ms = now_ms();
+        let claimed = claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 1).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].1.connection_id, "allowed-outlook");
+        for index in 0..3 {
+            let connection_id = format!("held-gmail-{index:02}");
+            let next_sync_at_ms: i64 = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT next_sync_at_ms FROM jobs_provider_sync_state
+                      WHERE account_id = ?1 AND connection_id = ?2",
+                    params![TEST_ACCOUNT_ID, connection_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(next_sync_at_ms > deferral_floor_ms);
+            assert_deferred_payload_matches_columns(&pool, &connection_id);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn all_held_mailbox_scan_stops_at_explicit_budget() {
+        let pool = test_pool();
+        let scan_budget = mailbox_sync_claim_scan_budget(1);
+        let due_at_ms = now_ms().saturating_sub(10_000);
+        let candidates = (0..=scan_budget)
+            .map(|index| {
+                (
+                    format!("held-only-{index:03}"),
+                    "gmail".to_string(),
+                    due_at_ms.saturating_add(index as i64),
+                )
+            })
+            .collect::<Vec<_>>();
+        seed_candidates(&pool, &candidates);
+        hold_gmail(&pool, "mailbox-all-held");
+
+        assert!(claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 1)
+            .unwrap()
+            .is_empty());
+        let deferred_after_first: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_provider_sync_state
+                  WHERE account_id = ?1 AND next_sync_at_ms > ?2",
+                params![TEST_ACCOUNT_ID, due_at_ms.saturating_add(scan_budget as i64)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deferred_after_first, scan_budget as i64);
+        assert_deferred_payload_matches_columns(&pool, "held-only-000");
+
+        assert!(claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 1)
+            .unwrap()
+            .is_empty());
+        let deferred_after_second: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_provider_sync_state
+                  WHERE account_id = ?1 AND next_sync_at_ms > ?2",
+                params![TEST_ACCOUNT_ID, due_at_ms.saturating_add(scan_budget as i64)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deferred_after_second, candidates.len() as i64);
+    }
 }

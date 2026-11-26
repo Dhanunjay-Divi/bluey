@@ -17,7 +17,11 @@ use zip::ZipArchive;
 use crate::{
     api::AppState,
     auth::AuthedAccount,
-    db::jobs::{self, CareerProfile, ResumeSourceAsset},
+    db::{
+        account_data,
+        jobs::{self, CareerProfile, ResumeSourceAsset},
+        object_uploads::{self, NewObjectUpload, ObjectKind, StorageScope, UploadControlError},
+    },
     jobs_resume_template,
     object_storage::{sha256_hex, ObjectStorage},
 };
@@ -33,6 +37,7 @@ const TEXT_MEDIA_TYPE: &str = "text/plain";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UploadResumeSourceRequest {
+    pub request_id: String,
     pub file_name: String,
     pub media_type: String,
     pub bytes_base64: String,
@@ -93,6 +98,12 @@ pub async fn upload_resume_source(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(input): Json<UploadResumeSourceRequest>,
 ) -> Result<Json<UploadResumeSourceResponse>, ApiError> {
+    let request_id = Uuid::parse_str(input.request_id.trim()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid resume upload request identifier.".to_string(),
+        )
+    })?;
     let (file_name, file_type, media_type) =
         validate_source_identity(&input.file_name, &input.media_type, input.page_count)?;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -118,74 +129,285 @@ pub async fn upload_resume_source(
     }
 
     let sha256 = sha256_hex(&bytes);
-    let id = Uuid::new_v4().to_string();
+    let id = request_id.to_string();
+    let logical_id = format!("jobs-resume-source:{id}");
     let storage_key = storage.resume_source_key(&account.id, &id, &sha256, &file_type);
     let now = jobs::now_ms();
+    let size_bytes = i64::try_from(bytes.len()).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Choose a resume smaller than 10 MB.".to_string(),
+        )
+    })?;
+    let _object_writer = account_data::acquire_account_object_writer(&state.pool, &account.id)
+        .await
+        .map_err(internal)?;
+    // A request's predecessor is immutable lineage, not whatever resume is
+    // current when a delayed retry finally reaches publication. Recover the
+    // stored fence for an existing request; otherwise snapshot the current
+    // pointer before reserving the new logical object.
+    let existing_upload =
+        object_uploads::artifact_upload(&state.pool, &account.id, &logical_id).map_err(internal)?;
+    let (stored_profile, stored_profile_revision) =
+        jobs::get_resume_upload_profile(&state.pool, &account.id, &account.email)
+            .map_err(internal)?;
+    let (
+        profile,
+        profile_mode,
+        base_profile_sha256,
+        requested_profile_sha256,
+        replaces_source_asset_id,
+    ) = if let Some(existing) = existing_upload.as_ref() {
+        let authority = resume_upload_authority(existing).map_err(resume_upload_control_error)?;
+        let profile = match (authority.profile_mode.as_str(), input.profile) {
+            ("replace", Some(profile)) => {
+                super::jobs::validate_profile(&profile)?;
+                if requested_resume_profile_sha256(&profile).map_err(internal)?
+                    != authority
+                        .requested_profile_sha256
+                        .as_deref()
+                        .unwrap_or_default()
+                {
+                    return Err(resume_upload_control_error(
+                        UploadControlError::IdempotencyConflict.into(),
+                    ));
+                }
+                profile
+            }
+            ("merge_source", None) => stored_profile,
+            _ => {
+                return Err(resume_upload_control_error(
+                    UploadControlError::IdempotencyConflict.into(),
+                ))
+            }
+        };
+        (
+            profile,
+            authority.profile_mode,
+            authority.base_profile_sha256,
+            authority.requested_profile_sha256,
+            authority.replaces_source_asset_id,
+        )
+    } else {
+        let replaces_source_asset_id = jobs::get_resume_source_asset(&state.pool, &account.id)
+            .map_err(internal)?
+            .map(|asset| asset.id);
+        match input.profile {
+            Some(profile) => {
+                super::jobs::validate_profile(&profile)?;
+                if profile.updated_at_ms != stored_profile.updated_at_ms {
+                    return Err(resume_upload_control_error(
+                        UploadControlError::IdempotencyConflict.into(),
+                    ));
+                }
+                let requested_profile_sha256 =
+                    requested_resume_profile_sha256(&profile).map_err(internal)?;
+                (
+                    profile,
+                    "replace".to_string(),
+                    stored_profile_revision,
+                    Some(requested_profile_sha256),
+                    replaces_source_asset_id,
+                )
+            }
+            None => (
+                stored_profile,
+                "merge_source".to_string(),
+                None,
+                None,
+                replaces_source_asset_id,
+            ),
+        }
+    };
+    let reservation = object_uploads::reserve_account_object_upload(
+        &state.pool,
+        &NewObjectUpload {
+            account_id: account.id.clone(),
+            object_kind: ObjectKind::Artifact,
+            logical_id,
+            session_id: None,
+            storage_scope: StorageScope::Artifact,
+            object_key: storage_key.clone(),
+            size_bytes,
+            sha256: sha256.clone(),
+            content_type: media_type.clone(),
+            expires_at_ms: i64::MAX,
+            metadata_json: serde_json::json!({
+                "artifact_class": "jobs_resume_source",
+                "jobs_resume_source_asset_id": id,
+                "request_id": request_id,
+                "profile_mode": profile_mode,
+                "base_profile_sha256": base_profile_sha256,
+                "requested_profile_sha256": requested_profile_sha256,
+                "replaces_source_asset_id": replaces_source_asset_id,
+                "file_name": file_name,
+                "file_type": file_type,
+                "media_type": media_type,
+                "page_count": input.page_count,
+                "retention_policy": "account_lifetime_until_deletion",
+            }),
+            now_ms: now,
+            limits: storage.upload_limits(),
+        },
+    )
+    .map_err(resume_upload_control_error)?;
     let asset = ResumeSourceAsset {
         id,
         file_name,
-        media_type,
+        media_type: reservation.upload.content_type.clone(),
         file_type: file_type.clone(),
-        storage_key: storage_key.clone(),
-        sha256,
-        size_bytes: i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+        storage_key: reservation.upload.object_key.clone(),
+        sha256: reservation.upload.sha256.clone(),
+        size_bytes: reservation.upload.size_bytes,
         page_count: input.page_count,
         template_status: template_status(&file_type).to_string(),
-        created_at_ms: now,
-        updated_at_ms: now,
+        created_at_ms: reservation.upload.created_at_ms,
+        updated_at_ms: reservation.upload.created_at_ms,
     };
-
-    storage
-        .put(&storage_key, Bytes::from(bytes), &asset.media_type)
-        .await
-        .map_err(|error| {
+    let upload_bytes = Bytes::from(bytes);
+    if reservation.needs_put {
+        object_uploads::begin_upload_put(&state.pool, &reservation.upload.id, jobs::now_ms())
+            .map_err(resume_upload_control_error)?;
+        if let Err(error) = storage
+            .put(&asset.storage_key, upload_bytes.clone(), &asset.media_type)
+            .await
+        {
+            let _ = object_uploads::record_put_failure(
+                &state.pool,
+                &reservation.upload.id,
+                &error.to_string(),
+                jobs::now_ms(),
+            );
             tracing::warn!(error = %error, "source resume upload failed");
-            (
+            return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Bluey could not store this resume right now. Try again shortly.".to_string(),
-            )
-        })?;
-
-    let mut profile = match input.profile {
-        Some(profile) => {
-            super::jobs::validate_profile(&profile)?;
-            profile
+            ));
         }
-        None => jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?,
-    };
-    profile.source_resume_name = asset.file_name.clone();
-    profile.source_resume_asset_id = asset.id.clone();
-    profile.source_resume_sha256 = asset.sha256.clone();
-    profile.source_resume_media_type = asset.media_type.clone();
-    profile.source_resume_template_status = asset.template_status.clone();
-
-    let (previous, saved_profile) = match jobs::save_resume_source_asset(
+    }
+    let stored = storage.get(&asset.storage_key).await.map_err(|error| {
+        let _ = object_uploads::record_put_failure(
+            &state.pool,
+            &reservation.upload.id,
+            &error.to_string(),
+            jobs::now_ms(),
+        );
+        tracing::warn!(error = %error, "source resume read-back failed");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey could not verify this resume right now. Try again shortly.".to_string(),
+        )
+    })?;
+    if stored.bytes != upload_bytes
+        || sha256_hex(&stored.bytes) != asset.sha256
+        || !stored
+            .content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.eq_ignore_ascii_case(&asset.media_type))
+    {
+        let _ = object_uploads::record_put_failure(
+            &state.pool,
+            &reservation.upload.id,
+            "source resume read-back verification failed",
+            jobs::now_ms(),
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "Stored resume failed integrity verification. Try again shortly.".to_string(),
+        ));
+    }
+    if reservation.needs_put {
+        object_uploads::release_verified_upload_put(
+            &state.pool,
+            &reservation.upload.id,
+            jobs::now_ms(),
+        )
+        .map_err(resume_upload_control_error)?;
+    }
+    let publication = match jobs::publish_resume_source_asset(
         &state.pool,
         &account.id,
         &asset,
         &profile,
+        &reservation.upload.id,
     ) {
         Ok(saved) => saved,
         Err(error) => {
-            if let Err(cleanup_error) = storage.delete(&storage_key).await {
-                tracing::warn!(error = %cleanup_error, "failed to clean up source resume upload");
-            }
-            return Err(internal(error));
+            // Publication, the profile pointer, and replacement cleanup share
+            // one database transaction. On a definite or uncertain commit
+            // error, leave the verified object pending: an exact retry can
+            // reconcile it, and the stale-upload worker can delete it later.
+            return Err(resume_upload_control_error(error));
         }
     };
 
-    if let Some(previous) = previous.filter(|previous| previous.storage_key != storage_key) {
-        if storage.key_belongs_to_account(&previous.storage_key, &account.id) {
-            if let Err(error) = storage.delete(&previous.storage_key).await {
-                tracing::warn!(error = %error, "failed to remove replaced source resume");
-            }
-        }
-    }
-
     Ok(Json(UploadResumeSourceResponse {
-        asset: ResumeSourceMetadata::from(&asset),
-        profile: saved_profile,
+        asset: ResumeSourceMetadata::from(&publication.asset),
+        profile: publication.profile,
     }))
+}
+
+struct ResumeUploadRequestAuthority {
+    profile_mode: String,
+    base_profile_sha256: Option<String>,
+    requested_profile_sha256: Option<String>,
+    replaces_source_asset_id: Option<String>,
+}
+
+fn resume_upload_authority(
+    upload: &object_uploads::ObjectUpload,
+) -> anyhow::Result<ResumeUploadRequestAuthority> {
+    let metadata = serde_json::from_str::<serde_json::Value>(&upload.metadata_json)
+        .map_err(|_| UploadControlError::IdempotencyConflict)?;
+    let profile_mode = metadata
+        .get("profile_mode")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| matches!(*value, "replace" | "merge_source"))
+        .ok_or(UploadControlError::IdempotencyConflict)?
+        .to_string();
+    let base_profile_sha256 = optional_resume_upload_hash(&metadata, "base_profile_sha256")?;
+    let requested_profile_sha256 =
+        optional_resume_upload_hash(&metadata, "requested_profile_sha256")?;
+    if (profile_mode == "replace" && requested_profile_sha256.is_none())
+        || (profile_mode == "merge_source"
+            && (base_profile_sha256.is_some() || requested_profile_sha256.is_some()))
+    {
+        return Err(UploadControlError::IdempotencyConflict.into());
+    }
+    let replaces_source_asset_id = match metadata.get("replaces_source_asset_id") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        _ => return Err(UploadControlError::IdempotencyConflict.into()),
+    };
+    Ok(ResumeUploadRequestAuthority {
+        profile_mode,
+        base_profile_sha256,
+        requested_profile_sha256,
+        replaces_source_asset_id,
+    })
+}
+
+fn optional_resume_upload_hash(
+    metadata: &serde_json::Value,
+    field: &'static str,
+) -> anyhow::Result<Option<String>> {
+    match metadata.get(field) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value))
+            if value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            Ok(Some(value.clone()))
+        }
+        _ => Err(UploadControlError::IdempotencyConflict.into()),
+    }
+}
+
+fn requested_resume_profile_sha256(profile: &CareerProfile) -> anyhow::Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(profile)?))
 }
 
 pub async fn download_template_docx(
@@ -362,6 +584,39 @@ fn internal(error: anyhow::Error) -> ApiError {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Bluey could not complete that resume request.".to_string(),
     )
+}
+
+fn resume_upload_control_error(error: anyhow::Error) -> ApiError {
+    match error.downcast_ref::<UploadControlError>() {
+        Some(UploadControlError::ObjectTooLarge) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Choose a resume smaller than 10 MB.".to_string(),
+        ),
+        Some(
+            UploadControlError::AccountBytesQuotaExceeded
+            | UploadControlError::AccountObjectQuotaExceeded,
+        ) => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "Resume storage is full. Remove older account data and try again.".to_string(),
+        ),
+        Some(UploadControlError::DailyQuotaExceeded) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Resume upload capacity is temporarily unavailable. Try again later.".to_string(),
+        ),
+        Some(UploadControlError::AccountDeleting) => (
+            StatusCode::CONFLICT,
+            "Account deletion has already fenced new resume uploads.".to_string(),
+        ),
+        Some(
+            UploadControlError::IdempotencyConflict
+            | UploadControlError::UploadInProgress
+            | UploadControlError::UploadGone,
+        ) => (
+            StatusCode::CONFLICT,
+            "This resume upload can no longer be completed. Choose the file again.".to_string(),
+        ),
+        _ => internal(error),
+    }
 }
 
 #[cfg(test)]

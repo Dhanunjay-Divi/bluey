@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { rm } from "node:fs/promises";
+import { normalizeTypedFeedCategories } from "@bluey/jobs-automation/discovery-runtime";
 import {
   DEFAULT_JOBHIVE_MAX_ARTIFACT_BYTES,
   downloadJobhiveArtifact,
@@ -118,6 +119,8 @@ export class GlobalDiscoveryWorkerRuntime {
   private readonly logger: GlobalDiscoveryWorkerLogger;
   private readonly stopController = new AbortController();
   private manifestSnapshot?: ManifestSnapshot;
+  private lastPollCompletedAtMs = 0;
+  private lastPollFailedAtMs = 0;
   private stopping = false;
 
   constructor(options: GlobalDiscoveryWorkerRuntimeOptions) {
@@ -183,7 +186,9 @@ export class GlobalDiscoveryWorkerRuntime {
       while (!this.stopping) {
         try {
           await this.pollOnce();
+          this.lastPollCompletedAtMs = this.now();
         } catch (error) {
+          this.lastPollFailedAtMs = this.now();
           this.logger.log({
             event: "global_discovery_poll_failed",
             error_code: safeRuntimeErrorCode(error),
@@ -202,6 +207,12 @@ export class GlobalDiscoveryWorkerRuntime {
     this.stopController.abort();
   }
 
+  managedCloudReady(nowMs: number = this.now()): boolean {
+    const maximumAgeMs = Math.max(15_000, this.pollIntervalMs * 3);
+    return this.lastPollCompletedAtMs > this.lastPollFailedAtMs
+      && nowMs - this.lastPollCompletedAtMs <= maximumAgeMs;
+  }
+
   async pollOnce(): Promise<GlobalDiscoveryPollOutcome> {
     const manifest = await this.refreshManifestIfNeeded();
     const lease = await this.api.lease();
@@ -215,6 +226,7 @@ export class GlobalDiscoveryWorkerRuntime {
     }
 
     let verifiedPath: string | undefined;
+    let batchRunId: string | undefined;
     try {
       const verified = await downloadJobhiveArtifact({
         artifact: source.csv,
@@ -259,9 +271,17 @@ export class GlobalDiscoveryWorkerRuntime {
               artifact_sha256: verified.sha256,
               jobs,
             });
-            if (result.batch_index !== batchIndex || result.row_count !== jobs.length) {
-              throw new Error("global_batch_ack_mismatch");
+            // A replay may include later stored batches, but must cover this prefix.
+            if (
+              (batchRunId !== undefined && result.run_id !== batchRunId)
+              || result.batch_index !== batchIndex
+              || result.row_count !== jobs.length
+              || result.received_rows < uploadedRows + jobs.length
+              || result.received_batches < batchIndex + 1
+            ) {
+              throw new GlobalDiscoveryApiError("invalid_response", "Global discovery batch acknowledgement mismatch");
             }
+            batchRunId = result.run_id;
             batchIndex += 1;
             uploadedRows += jobs.length;
           }
@@ -288,12 +308,16 @@ export class GlobalDiscoveryWorkerRuntime {
         complete_snapshot: true,
       });
       if (
-        result.received_rows !== uploadedRows
+        result.run_id !== batchRunId
+        || result.replay_key !== lease.replay_key
+        || result.status !== "completed"
+        || result.received_rows !== uploadedRows
         || result.received_batches !== batchIndex
         || result.rejected_rows !== rejectedRows
         || !sameIntegerRecord(result.rejection_reasons, rejectionReasons)
       ) {
-        throw new Error("global_completion_ack_mismatch");
+        // A malformed acknowledgement does not establish whether the write committed.
+        throw new GlobalDiscoveryApiError("invalid_response", "Global discovery completion acknowledgement mismatch");
       }
       this.logger.log({
         event: "global_discovery_source_completed",
@@ -308,7 +332,8 @@ export class GlobalDiscoveryWorkerRuntime {
     } catch (error) {
       if (error instanceof GlobalDiscoveryApiError) throw error;
       const errorCode = safeRuntimeErrorCode(error);
-      return this.reportFailure(lease, sourceConfig.artifactSha256, errorCode, sourceFingerprint);
+      // Attach the rejection handler before file cleanup awaits in finally.
+      return await this.reportFailure(lease, sourceConfig.artifactSha256, errorCode, sourceFingerprint, batchRunId);
     } finally {
       if (verifiedPath) await rm(verifiedPath, { force: true }).catch(() => undefined);
     }
@@ -361,14 +386,22 @@ export class GlobalDiscoveryWorkerRuntime {
     artifactSha256: string,
     errorCode: string,
     sourceFingerprint: string,
+    batchRunId?: string,
   ): Promise<"failed"> {
-    await this.api.fail(lease.source.id, {
+    const result = await this.api.fail(lease.source.id, {
       lease_token: lease.lease_token,
       replay_key: lease.replay_key,
       scheduled_for_ms: lease.scheduled_for_ms,
       artifact_sha256: artifactSha256,
       error_code: safeErrorCode(errorCode),
     });
+    if (
+      (batchRunId !== undefined && result.run_id !== batchRunId)
+      || result.replay_key !== lease.replay_key
+      || result.status !== "failed"
+    ) {
+      throw new GlobalDiscoveryApiError("invalid_response", "Global discovery failure acknowledgement mismatch");
+    }
     this.logger.log({
       event: "global_discovery_source_failed",
       source_fingerprint: sourceFingerprint,
@@ -431,7 +464,7 @@ function globalJob(row: JobhiveCandidateRow, sourceFamily: string): GlobalRowCla
   if (!canonicalUrl || !row.company || !row.title) {
     return { kind: "rejected", reason: "missing_identity" };
   }
-  const employmentEvidence = `${row.employmentType} ${row.commitment}`.trim();
+  const categories = normalizeTypedFeedCategories(row.employmentType, row.commitment);
   return {
     kind: "accepted",
     job: {
@@ -445,8 +478,8 @@ function globalJob(row: JobhiveCandidateRow, sourceFamily: string): GlobalRowCla
       workplace: workplace(row),
       description: row.description,
       compensation: compensation(row),
-      employment_type: employmentType(employmentEvidence),
-      engagement_type: engagementType(employmentEvidence),
+      employment_type: categories.employmentType,
+      engagement_type: categories.engagementType,
       posted_at_ms: postedAt(row.postedAt),
     },
   };
@@ -463,28 +496,6 @@ function workplace(row: JobhiveCandidateRow): string {
   if (row.isRemote === true || /\bremote\b/.test(evidence)) return "remote";
   if (/\bhybrid\b/.test(evidence)) return "hybrid";
   if (/\bon[ -]?site\b|\bin[ -]?office\b/.test(evidence)) return "onsite";
-  return "";
-}
-
-function employmentType(value: string): string {
-  const normalized = value.toLowerCase();
-  if (/\bintern(ship)?\b/.test(normalized)) return "internship";
-  if (/\bapprentice(ship)?\b/.test(normalized)) return "apprenticeship";
-  if (/\bpart[ -]?time\b/.test(normalized)) return "part_time";
-  if (/\bfull[ -]?time\b|\bpermanent\b|\bdirect[ -]?hire\b/.test(normalized)) return "full_time";
-  if (/\btemporary\b|\btemp\b/.test(normalized)) return "temporary";
-  if (/\bseasonal\b/.test(normalized)) return "seasonal";
-  if (/\bper[ -]?diem\b/.test(normalized)) return "per_diem";
-  if (/\bcontract(or)?\b|\bc2c\b|\bw-?2\b|\b1099\b/.test(normalized)) return "contract";
-  return "";
-}
-
-function engagementType(value: string): string {
-  const normalized = value.toLowerCase();
-  if (/\bc2c\b|\bcorp(?:oration)?[ -]?to[ -]?corp(?:oration)?\b/.test(normalized)) return "c2c";
-  if (/\b1099\b|\bindependent contractor\b/.test(normalized)) return "1099";
-  if (/\bw-?2\b/.test(normalized)) return "w2";
-  if (/\bdirect[ -]?hire\b/.test(normalized)) return "direct_hire";
   return "";
 }
 

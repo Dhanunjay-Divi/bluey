@@ -604,17 +604,29 @@ pub async fn sign_out(db: State<'_, DbState>, app: AppHandle) -> Result<(), Stri
     Ok(())
 }
 
-#[tauri::command]
-pub async fn delete_account_now(db: State<'_, DbState>, app: AppHandle) -> Result<(), String> {
-    #[derive(serde::Deserialize)]
-    struct DeleteAck {
-        deleted: bool,
-    }
+#[derive(Deserialize)]
+struct DeleteAccountResponse {
+    deleted: bool,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    deleted_at: Option<String>,
+}
 
-    let trace_id = dashboard_trace_id();
-    let client = cloud_client_with_trace(&trace_id)?;
-    let ack: DeleteAck = client
-        .auth_post(
+#[derive(Clone, Debug, Serialize)]
+pub struct DeleteAccountCommandResult {
+    deleted: bool,
+    state: String,
+    message: String,
+}
+
+async fn request_account_deletion(
+    client: &cue_cloud_client::CloudClient,
+) -> Result<(u16, DeleteAccountResponse), String> {
+    let response = client
+        .auth_post_raw(
             "/account/delete",
             &serde_json::json!({
                 "confirm_text": "DELETE",
@@ -623,8 +635,46 @@ pub async fn delete_account_now(db: State<'_, DbState>, app: AppHandle) -> Resul
             }),
         )
         .await
-        .map_err(|e| format!("delete account failed: {e}"))?;
-    if ack.deleted {
+        .map_err(|error| format!("delete account failed: {error}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .json::<DeleteAccountResponse>()
+        .await
+        .map_err(|error| format!("invalid delete account response: {error}"))?;
+    Ok((status, body))
+}
+
+fn account_deletion_completed(
+    status: u16,
+    response: &DeleteAccountResponse,
+) -> Result<bool, String> {
+    if status == 200
+        && response.deleted
+        && response.state.as_deref() == Some("deleted")
+        && response
+            .deleted_at
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Ok(true);
+    }
+    if status == 202 && !response.deleted {
+        return Ok(false);
+    }
+    Err(format!(
+        "Account deletion returned an inconsistent completion response (HTTP {status}); local account tokens were kept."
+    ))
+}
+
+#[tauri::command]
+pub async fn delete_account_now(
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<DeleteAccountCommandResult, String> {
+    let trace_id = dashboard_trace_id();
+    let client = cloud_client_with_trace(&trace_id)?;
+    let (status, ack) = request_account_deletion(&client).await?;
+    if account_deletion_completed(status, &ack)? {
         begin_dashboard_owner_change(&app)?;
         if let Err(error) = daemon_ipc_with_trace(DaemonRequest::CloudLogout, &trace_id).await {
             tracing::warn!(%error, "daemon cleanup failed after account deletion");
@@ -644,8 +694,26 @@ pub async fn delete_account_now(db: State<'_, DbState>, app: AppHandle) -> Resul
             return Err(error);
         }
         install_dashboard_owner(&app, Some(DashboardOwner::Local), true)?;
+        return Ok(DeleteAccountCommandResult {
+            deleted: true,
+            state: "deleted".to_string(),
+            message: "Account deleted and local account tokens cleared.".to_string(),
+        });
     }
-    Ok(())
+
+    Ok(DeleteAccountCommandResult {
+        deleted: false,
+        state: ack
+            .state
+            .unwrap_or_else(|| "pending_account_deletion".to_string()),
+        message: ack.note.unwrap_or_else(|| {
+            concat!(
+                "Account deletion is securely pending runner-volume and storage cleanup. ",
+                "Your local account tokens were kept."
+            )
+            .to_string()
+        }),
+    })
 }
 
 #[tauri::command]
@@ -2128,6 +2196,122 @@ pub fn set_llm_chain(providers: Vec<String>, db: State<DbState>) -> Result<(), S
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn dashboard_deletion_client(origin: String) -> cue_cloud_client::CloudClient {
+        let store = Arc::new(cue_cloud_client::tokens::MemoryStore::new());
+        let client = cue_cloud_client::CloudClient::new(
+            cue_cloud_client::client::ClientConfig {
+                base_url: origin,
+                user_agent: "bluey-dashboard-delete-test".to_string(),
+                timeout: Duration::from_secs(5),
+                trace_id: None,
+            },
+            store,
+        )
+        .unwrap();
+        client
+            .save_tokens(cue_cloud_client::Tokens {
+                access: "access-token".to_string(),
+                refresh: "refresh-token".to_string(),
+                email: "owner@example.test".to_string(),
+            })
+            .unwrap();
+        client
+    }
+
+    #[test]
+    fn pending_account_deletion_response_is_not_a_delete_ack() {
+        let response: DeleteAccountResponse = serde_json::from_value(serde_json::json!({
+            "deleted": false,
+            "state": "pending_runner_volume_purge",
+            "note": "Runner cleanup is pending."
+        }))
+        .unwrap();
+        assert!(!response.deleted);
+        assert_eq!(
+            response.state.as_deref(),
+            Some("pending_runner_volume_purge")
+        );
+        assert_eq!(response.note.as_deref(), Some("Runner cleanup is pending."));
+    }
+
+    #[tokio::test]
+    async fn dashboard_parses_actual_pending_delete_http_response_without_clearing_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/account/delete"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "deleted": false,
+                "state": "pending_runner_volume_purge",
+                "retry_after_ms": 5_000,
+                "note": "Runner cleanup is pending."
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = dashboard_deletion_client(server.uri());
+
+        let (status, response) = request_account_deletion(&client).await.unwrap();
+
+        assert_eq!(status, 202);
+        assert!(!response.deleted);
+        assert_eq!(
+            response.state.as_deref(),
+            Some("pending_runner_volume_purge")
+        );
+        assert!(!account_deletion_completed(status, &response).unwrap());
+        assert!(client.current_tokens().is_some());
+    }
+
+    #[tokio::test]
+    async fn dashboard_rejects_accepted_delete_claim_without_clearing_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/account/delete"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "deleted": true,
+                "state": "deleted",
+                "deleted_at": "2026-08-05T12:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = dashboard_deletion_client(server.uri());
+
+        let (status, response) = request_account_deletion(&client).await.unwrap();
+        let error = account_deletion_completed(status, &response)
+            .expect_err("202 must never prove hard deletion");
+
+        assert!(error.contains("inconsistent completion response"));
+        assert!(client.current_tokens().is_some());
+    }
+
+    #[tokio::test]
+    async fn dashboard_accepts_only_actual_ok_hard_delete_completion() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/account/delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deleted": true,
+                "state": "deleted",
+                "deleted_at": "2026-08-05T12:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = dashboard_deletion_client(server.uri());
+
+        let (status, response) = request_account_deletion(&client).await.unwrap();
+
+        if account_deletion_completed(status, &response).unwrap() {
+            client.clear_tokens().unwrap();
+        }
+        assert!(client.current_tokens().is_none());
+    }
 
     struct FakeDaemon {
         responses: VecDeque<Result<DaemonResponse, String>>,

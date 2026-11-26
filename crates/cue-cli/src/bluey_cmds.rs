@@ -5,7 +5,7 @@
 //! customer-facing summaries to stdout matching the format documented
 //! in `docs/PRICING-MODEL.md` Section 4.3.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use cue_cloud_client::{AccountMe, CloudClient, UsageWindow};
 
 /// Print the user's current balance + auto-top-up status + tier
@@ -197,6 +197,19 @@ pub async fn export_data(client: &CloudClient) -> Result<()> {
 }
 
 /// Codex Stage 16: bluey delete-account. REQUIRES interactive confirmation.
+#[derive(serde::Deserialize)]
+struct DeleteAccountResponse {
+    deleted: bool,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    deleted_at: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    retry_after_ms: Option<u64>,
+}
+
 pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
     if !force {
         println!();
@@ -214,13 +227,8 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
             return Ok(());
         }
     }
-    #[derive(serde::Deserialize)]
-    struct DeleteAck {
-        deleted: bool,
-        deleted_at: String,
-    }
-    let ack: DeleteAck = client
-        .auth_post(
+    let response = client
+        .auth_post_raw(
             "/account/delete",
             &serde_json::json!({
                 "confirm_text": "DELETE",
@@ -230,10 +238,48 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
         )
         .await
         .context("/account/delete")?;
-    if ack.deleted {
+    let status = response.status();
+    let ack: DeleteAccountResponse = response
+        .json()
+        .await
+        .context("parse /account/delete response")?;
+    let verified_deleted = status == reqwest::StatusCode::OK
+        && ack.deleted
+        && ack.state.as_deref() == Some("deleted")
+        && ack
+            .deleted_at
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    if verified_deleted {
         let _ = client.clear_tokens();
-        println!("Account deleted at {}.", ack.deleted_at);
+        println!(
+            "Account deleted at {}.",
+            ack.deleted_at
+                .as_deref()
+                .unwrap_or("the server-confirmed time")
+        );
         println!("Local account tokens cleared.");
+    } else if status == reqwest::StatusCode::ACCEPTED && !ack.deleted {
+        println!(
+            "{}",
+            ack.note.as_deref().unwrap_or(
+                "Account deletion is securely pending runner-volume and storage cleanup."
+            )
+        );
+        if let Some(retry_after_ms) = ack.retry_after_ms {
+            println!(
+                "Retry after about {} seconds.",
+                retry_after_ms.div_ceil(1_000)
+            );
+        }
+        if let Some(state) = ack.state.as_deref() {
+            println!("Deletion state: {state}.");
+        }
+        println!("Local account tokens were kept so deletion can be checked again.");
+    } else {
+        bail!(
+            "Account deletion returned an inconsistent completion response (HTTP {status}); local account tokens were kept."
+        );
     }
     Ok(())
 }
@@ -241,6 +287,122 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cue_cloud_client::{
+        client::ClientConfig,
+        tokens::{MemoryStore, Tokens},
+    };
+    use std::{sync::Arc, time::Duration};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    fn deletion_client(origin: String) -> (CloudClient, Tokens) {
+        let tokens = Tokens {
+            access: "access-token".to_string(),
+            refresh: "refresh-token".to_string(),
+            email: "owner@example.test".to_string(),
+        };
+        let store = Arc::new(MemoryStore::new());
+        let client = CloudClient::new(
+            ClientConfig {
+                base_url: origin,
+                user_agent: "bluey-delete-test".to_string(),
+                timeout: Duration::from_secs(5),
+                trace_id: None,
+            },
+            store,
+        )
+        .unwrap();
+        client.save_tokens(tokens.clone()).unwrap();
+        (client, tokens)
+    }
+
+    #[test]
+    fn pending_account_deletion_response_never_looks_deleted() {
+        let response: DeleteAccountResponse = serde_json::from_value(serde_json::json!({
+            "deleted": false,
+            "state": "pending_runner_volume_purge",
+            "retry_after_ms": 5_000,
+            "note": "Runner cleanup is pending."
+        }))
+        .unwrap();
+        assert!(!response.deleted);
+        assert_eq!(response.deleted_at, None);
+        assert_eq!(
+            response.state.as_deref(),
+            Some("pending_runner_volume_purge")
+        );
+        assert_eq!(response.retry_after_ms, Some(5_000));
+    }
+
+    #[tokio::test]
+    async fn pending_account_delete_http_response_keeps_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/account/delete"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "deleted": false,
+                "state": "pending_runner_volume_purge",
+                "retry_after_ms": 5_000,
+                "note": "Runner cleanup is pending."
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (client, expected_tokens) = deletion_client(server.uri());
+
+        delete_account(&client, true).await.unwrap();
+
+        assert_eq!(client.current_tokens(), Some(expected_tokens));
+    }
+
+    #[tokio::test]
+    async fn completed_account_delete_http_response_clears_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/account/delete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deleted": true,
+                "state": "deleted",
+                "deleted_at": "2026-08-05T12:00:00Z",
+                "object_count_deleted": 0,
+                "note": "Deleted."
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (client, _) = deletion_client(server.uri());
+
+        delete_account(&client, true).await.unwrap();
+
+        assert_eq!(client.current_tokens(), None);
+    }
+
+    #[tokio::test]
+    async fn accepted_delete_claim_cannot_clear_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/account/delete"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "deleted": true,
+                "state": "deleted",
+                "deleted_at": "2026-08-05T12:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (client, expected_tokens) = deletion_client(server.uri());
+
+        let error = delete_account(&client, true)
+            .await
+            .expect_err("202 must never prove hard deletion");
+
+        assert!(error
+            .to_string()
+            .contains("inconsistent completion response"));
+        assert_eq!(client.current_tokens(), Some(expected_tokens));
+    }
 
     fn account_me(auto_topup_enabled: bool) -> AccountMe {
         AccountMe {

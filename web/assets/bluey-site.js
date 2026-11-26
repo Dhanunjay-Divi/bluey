@@ -25,6 +25,29 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const isAccountRoute = accountRoutes.has(currentPath);
     const isPolicyRoute = policyRoutes.has(currentPath);
     const isDownloadRoute = downloadRoutes.has(currentPath);
+
+    // This is intentionally not a general return URL. Jobs is the only
+    // cross-page handoff currently emitted by the Jobs public entry.
+    function jobsReturnTarget(search = location.search) {
+      const values = new URLSearchParams(search).getAll('next');
+      return values.length === 1 && (values[0] === '/jobs' || values[0] === '/jobs/')
+        ? '/jobs/'
+        : null;
+    }
+
+    function jobsSignupRequested(search = location.search) {
+      const values = new URLSearchParams(search).getAll('mode');
+      return currentPath === '/login' && !pendingDeviceCode()
+        && jobsReturnTarget(search) === '/jobs/' && values.length === 1 && values[0] === 'signup';
+    }
+
+    function navigateToJobsAfterAuth() {
+      const target = jobsReturnTarget();
+      if (!target) return false;
+      window.location.assign(target);
+      return true;
+    }
+
     let pendingSignupEmail = '';
     let pendingTrialConvertEmail = '';
     let trialCredentials = null;
@@ -64,6 +87,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let captchaConfig = { provider: null, site_key: null };
     let signupTurnstileWidgetId = null;
     let signupTurnstileToken = '';
+    let signupStartInFlight = false;
+    let signupConfirmInFlight = false;
+    let signupModeRevision = 0;
     let trialTurnstileWidgetId = null;
     let trialTurnstileToken = '';
     let pendingTrialButton = null;
@@ -774,12 +800,19 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
-    async function apiJson(path, options = {}, hasRetriedAuth = false) {
+    async function apiJsonResponse(path, options = {}, hasRetriedAuth = false) {
       const { skipAuthRefresh, ...fetchOptions } = options;
+      const passwordLogin = path === '/auth/login' && fetchOptions.method === 'POST';
       const headers = new Headers(options.headers || {});
       headers.set('Content-Type', 'application/json');
-      const token = accountToken();
-      if (token) headers.set('Authorization', `Bearer ${token}`);
+      if (passwordLogin) {
+        // The password request must not carry or refresh a different browser session.
+        headers.delete('Authorization');
+        fetchOptions.credentials = 'omit';
+      } else {
+        const token = accountToken();
+        if (token) headers.set('Authorization', `Bearer ${token}`);
+      }
       const response = await fetch(path, { ...fetchOptions, headers });
       let body = null;
       try {
@@ -787,16 +820,21 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       } catch {
         body = null;
       }
-      if (response.status === 401 && !hasRetriedAuth && !skipAuthRefresh) {
+      if (response.status === 401 && !passwordLogin && !hasRetriedAuth && !skipAuthRefresh) {
         const refreshed = await refreshAccountToken();
         if (refreshed) {
-          return apiJson(path, options, true);
+          return apiJsonResponse(path, options, true);
         }
       }
       if (!response.ok) {
         throw new Error(body?.error || `${response.status} ${response.statusText}`);
       }
-      return body;
+      return { status: response.status, body };
+    }
+
+    async function apiJson(path, options = {}, hasRetriedAuth = false) {
+      const response = await apiJsonResponse(path, options, hasRetriedAuth);
+      return response.body;
     }
 
     function setTrialModal(open) {
@@ -1173,63 +1211,91 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     async function loadCaptchaConfig() {
       if (!captchaConfigPromise) {
         captchaConfigPromise = fetch('/auth/captcha/config')
-          .then((response) => response.ok ? response.json() : { provider: null, site_key: null })
+          .then((response) => {
+            if (!response.ok) throw new Error('Captcha configuration unavailable.');
+            return response.json();
+          })
           .then((config) => {
-            captchaConfig = config || { provider: null, site_key: null };
+            const disabled = config?.provider === null && config.site_key === null;
+            const enabled = config?.provider === 'turnstile'
+              && typeof config.site_key === 'string' && config.site_key.trim().length > 0;
+            if (!disabled && !enabled) throw new Error('Invalid captcha configuration.');
+            captchaConfig = { provider: config.provider, site_key: config.site_key };
             return captchaConfig;
           })
           .catch(() => {
-            captchaConfig = { provider: null, site_key: null };
-            return captchaConfig;
+            captchaConfigPromise = null;
+            throw new Error('Could not load the security check. Try again.');
           });
       }
       return captchaConfigPromise;
     }
 
     function loadTurnstileScript() {
-      if (window.turnstile) return Promise.resolve();
+      if (typeof window.turnstile?.render === 'function') return Promise.resolve();
       if (window.__blueyTurnstileScriptPromise) return window.__blueyTurnstileScriptPromise;
-      window.__blueyTurnstileScriptPromise = new Promise((resolve, reject) => {
-        const script = document.createElement('script');
-        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-        script.async = true;
-        script.defer = true;
-        script.onload = () => resolve();
-        script.onerror = () => reject(new Error('Could not load captcha.'));
+      const script = document.createElement('script');
+      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      script.async = true;
+      script.defer = true;
+      const request = new Promise((resolve, reject) => {
+        const fail = () => reject(new Error('Could not load the security check. Try again.'));
+        script.onload = () => typeof window.turnstile?.render === 'function' ? resolve() : fail();
+        script.onerror = fail;
         document.head.appendChild(script);
+      }).catch((error) => {
+        if (window.__blueyTurnstileScriptPromise === request) window.__blueyTurnstileScriptPromise = null;
+        script.remove();
+        throw error;
       });
-      return window.__blueyTurnstileScriptPromise;
+      window.__blueyTurnstileScriptPromise = request;
+      return request;
     }
 
     async function refreshSignupCaptcha() {
       const el = document.getElementById('signupCaptcha');
+      if (accountAuthMode !== 'signup') {
+        if (el) el.hidden = true;
+        signupTurnstileToken = '';
+        return;
+      }
       if (!el) return;
-      const config = await loadCaptchaConfig();
-      const enabled = accountAuthMode === 'signup' && config.provider === 'turnstile' && config.site_key;
-      el.hidden = !enabled;
-      if (!enabled) {
-        signupTurnstileToken = '';
-        return;
-      }
-      await loadTurnstileScript();
-      if (signupTurnstileWidgetId !== null && window.turnstile) {
-        window.turnstile.reset(signupTurnstileWidgetId);
-        signupTurnstileToken = '';
-        return;
-      }
-      signupTurnstileWidgetId = window.turnstile.render(el, {
-        sitekey: config.site_key,
-        theme: 'dark',
-        callback: (token) => {
-          signupTurnstileToken = token || '';
-        },
-        'expired-callback': () => {
+      // An initial signup refresh must not reopen the widget in the OTP
+      // step. An explicit resend may refresh in the step where it starts.
+      const signupStep = pendingSignupEmail;
+      const stepIsCurrent = () => accountAuthMode === 'signup' && pendingSignupEmail === signupStep;
+      try {
+        const config = await loadCaptchaConfig();
+        if (!stepIsCurrent()) return;
+        const enabled = config.provider === 'turnstile' && config.site_key;
+        el.hidden = !enabled;
+        if (!enabled) {
           signupTurnstileToken = '';
-        },
-        'error-callback': () => {
+          return;
+        }
+        await loadTurnstileScript();
+        if (!stepIsCurrent()) return;
+        if (signupTurnstileWidgetId !== null && window.turnstile) {
+          window.turnstile.reset(signupTurnstileWidgetId);
           signupTurnstileToken = '';
-        },
-      });
+          return;
+        }
+        signupTurnstileWidgetId = window.turnstile.render(el, {
+          sitekey: config.site_key,
+          theme: 'dark',
+          callback: (token) => {
+            if (accountAuthMode === 'signup' && !el.hidden) signupTurnstileToken = token || '';
+          },
+          'expired-callback': () => {
+            signupTurnstileToken = '';
+          },
+          'error-callback': () => {
+            signupTurnstileToken = '';
+          },
+        });
+      } catch (error) {
+        if (stepIsCurrent()) throw error;
+      }
     }
 
     function signupTurnstilePayload() {
@@ -1238,6 +1304,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function setAccountAuthMode(mode) {
+      signupModeRevision += 1;
       accountAuthMode = mode === 'signup' ? 'signup' : 'login';
       const title = document.getElementById('accountAuthTitle');
       const copy = document.getElementById('accountAuthCopy');
@@ -1279,7 +1346,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (accountAuthMode !== 'signup') {
         setSignupOtpMode(false);
       }
-      refreshSignupCaptcha().catch((error) => accountMessage(error.message, true, 'error'));
+      refreshSignupCaptcha().catch((error) => {
+        if (accountAuthMode === 'signup') accountMessage(error.message, true, 'error');
+      });
       accountMessage('', true);
     }
 
@@ -1573,6 +1642,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       setAccountToken(auth, remember);
       if (currentPath === '/login' && !pendingDeviceCode()) {
+        if (navigateToJobsAfterAuth()) return;
         history.replaceState(history.state, '', '/account');
       }
       accountMessage('', true);
@@ -1580,6 +1650,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function startSignupOtp() {
+      if (signupStartInFlight || signupConfirmInFlight || accountAuthMode !== 'signup') return;
       const email = document.getElementById('accountEmail').value.trim();
       const password = document.getElementById('accountPassword').value;
       const passwordConfirm = document.getElementById('accountPasswordConfirm')?.value || '';
@@ -1593,51 +1664,85 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       if (!requireSignupTerms()) return;
-      await loadCaptchaConfig();
-      const turnstileToken = signupTurnstilePayload();
-      if (captchaConfig.provider === 'turnstile' && captchaConfig.site_key && !turnstileToken) {
-        accountMessage('Complete the security check to create an account.', true, 'error');
-        refreshSignupCaptcha().catch(() => {});
-        return;
+      const revision = signupModeRevision;
+      const isCurrent = () => accountAuthMode === 'signup' && signupModeRevision === revision;
+      signupStartInFlight = true;
+      try {
+        await loadCaptchaConfig();
+        if (!isCurrent()) return;
+        const turnstileToken = signupTurnstilePayload();
+        if (captchaConfig.provider === 'turnstile' && captchaConfig.site_key && !turnstileToken) {
+          await refreshSignupCaptcha();
+          if (!isCurrent()) return;
+          accountMessage('Complete the security check to create an account.', true, 'error');
+          return;
+        }
+        accountMessage('Sending verification code...', true);
+        // A response failure does not establish that the server did not
+        // consume the challenge or send the code. Never replay this POST.
+        if (turnstileToken) signupTurnstileToken = '';
+        const result = await apiJson('/auth/signup/start', {
+          method: 'POST',
+          skipAuthRefresh: true,
+          body: JSON.stringify({
+            email,
+            password,
+            terms_accepted: true,
+            turnstile_token: turnstileToken,
+            device_fingerprint: browserTrialDeviceId(),
+          }),
+        });
+        if (!isCurrent()) return;
+        setSignupOtpMode(true, result.email || email);
+        if (result.trial_seconds === 0 || result.no_trial_reason) {
+          accountMessage(
+            'Verification code sent. This email already used its free trial, so the account will start without free trial minutes.',
+            true
+          );
+        } else {
+          accountMessage('', true);
+        }
+        document.getElementById('signupOtp')?.focus();
+      } catch (error) {
+        if (isCurrent()) throw error;
+      } finally {
+        signupStartInFlight = false;
       }
-      accountMessage('Sending verification code...', true);
-      const result = await apiJson('/auth/signup/start', {
-        method: 'POST',
-        body: JSON.stringify({
-          email,
-          password,
-          terms_accepted: true,
-          turnstile_token: turnstileToken,
-          device_fingerprint: browserTrialDeviceId(),
-        }),
-      });
-      setSignupOtpMode(true, result.email || email);
-      if (result.trial_seconds === 0 || result.no_trial_reason) {
-        accountMessage(
-          'Verification code sent. This email already used its free trial, so the account will start without free trial minutes.',
-          true
-        );
-      } else {
-        accountMessage('', true);
-      }
-      document.getElementById('signupOtp')?.focus();
     }
 
     async function confirmSignupOtp() {
-      const email = (pendingSignupEmail || document.getElementById('accountEmail').value).trim();
+      if (signupStartInFlight || signupConfirmInFlight || accountAuthMode !== 'signup' || !pendingSignupEmail) return;
+      const email = pendingSignupEmail;
       const otp = document.getElementById('signupOtp').value.trim();
-      if (!email || !otp) {
+      if (!/^\d{6}$/.test(otp)) {
         accountMessage('Enter the 6-digit verification code.', true, 'error');
         return;
       }
       if (!requireSignupTerms()) return;
-      accountMessage('Verifying code...', true);
-      const auth = await apiJson('/auth/signup/confirm', {
-        method: 'POST',
-        body: JSON.stringify({ email, otp, device_fingerprint: browserTrialDeviceId() }),
-      });
+      const revision = signupModeRevision;
+      const epoch = accountAuthEpoch;
+      const isCurrent = () => accountAuthMode === 'signup' && signupModeRevision === revision
+        && accountAuthEpoch === epoch && pendingSignupEmail === email;
+      let auth;
+      signupConfirmInFlight = true;
+      try {
+        accountMessage('Verifying code...', true);
+        // Confirmation can create the account once. Never replay the code as part of an auth refresh.
+        auth = await apiJson('/auth/signup/confirm', {
+          method: 'POST',
+          skipAuthRefresh: true,
+          body: JSON.stringify({ email, otp, device_fingerprint: browserTrialDeviceId() }),
+        });
+      } catch (error) {
+        if (isCurrent()) throw error;
+        return;
+      } finally {
+        signupConfirmInFlight = false;
+      }
+      if (!isCurrent()) return;
       setAccountToken(auth, document.getElementById('rememberMe')?.checked !== false);
       setSignupOtpMode(false);
+      if (currentPath === '/login' && !pendingDeviceCode() && navigateToJobsAfterAuth()) return;
       accountMessage('', true);
       await loadAccount();
     }
@@ -1947,17 +2052,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       accountMessage('Deleting account...');
-      await apiJson('/account/delete', {
-        method: 'POST',
-        body: JSON.stringify({
-          confirm_text: 'DELETE',
-          accept_data_loss: true,
-          accept_credit_loss: true,
+      await window.BlueyAccountDeletion.run({
+        request: () => apiJsonResponse('/account/delete', {
+          method: 'POST',
+          body: JSON.stringify({
+            confirm_text: 'DELETE',
+            accept_data_loss: true,
+            accept_credit_loss: true,
+          }),
         }),
+        onPending: (message) => accountMessage(message),
+        onDeleted: async () => {
+          resetDeleteAccountDialog();
+          clearAccountToken();
+          await loadAccount();
+        },
       });
-      resetDeleteAccountDialog();
-      clearAccountToken();
-      await loadAccount();
     }
 
     async function confirmEmailVerification(token) {
@@ -4038,9 +4148,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountApp.hidden = false;
       downloadApp.hidden = true;
       renderDeviceLinkHint();
-      loadCaptchaConfig()
-        .then(() => refreshSignupCaptcha())
-        .catch(() => {});
+      if (jobsSignupRequested()) setAccountAuthMode('signup');
       initDashboardTabs();
       installBillingMoneyInputGuards();
 
@@ -4516,7 +4624,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     initSiteTheme();
     initProfileMenus();
     initProductJoinForm();
-    loadReleaseManifest();
+    // Jobs authentication never shows desktop release cards.
+    if (!(currentPath === '/login' && jobsReturnTarget())) loadReleaseManifest();
     syncAccountNav();
     initDownloadInstructions();
     initAccountApp();

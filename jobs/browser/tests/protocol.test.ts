@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseBlueyJobsProtocol } from "../src/protocol.js";
+import { localRunCapabilityFixture } from "./fixtures/local-run-capability.js";
 
 describe("Bluey Browser protocol", () => {
   it("parses application-scoped run tickets", () => {
@@ -43,16 +44,5 @@ describe("Bluey Browser protocol", () => {
 });
 
 function resumeCapability(expiresAtMs = 2_000): string {
-  const claims = {
-    version: 1,
-    audience: "bluey-jobs-local-run",
-    account_id: "account-123",
-    application_id: "application-123",
-    run_id: "run-123",
-    browser_profile_id: "profile-123",
-    operation: "resume",
-    expires_at_ms: expiresAtMs,
-    nonce: "n".repeat(32),
-  };
-  return `${Buffer.from(JSON.stringify(claims)).toString("base64url")}.${"a".repeat(64)}`;
+  return localRunCapabilityFixture("resume", expiresAtMs);
 }

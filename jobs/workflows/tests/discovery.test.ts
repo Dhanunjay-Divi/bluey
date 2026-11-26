@@ -153,6 +153,7 @@ describe("scheduled discovery loop", () => {
             externalId: "closed",
             canonicalUrl: "https://jobs.acme.test/roles/closed",
             availability: "closed",
+            postedAt: undefined,
           }),
         ],
       });
@@ -181,6 +182,76 @@ describe("scheduled discovery loop", () => {
       removedClosed: 2,
       active: 0,
     });
+  });
+
+  it("does not replace existing state on an undated open or malformed posting", async () => {
+    const clock = new FakeClock(SLOT_ONE);
+    let jobs = [job()];
+    const loop = new ScheduledDiscoveryLoop({
+      source: SOURCE, provider: provider(async () => ({ jobs })), clock,
+    });
+    const seeded = await loop.run({ scheduledFor: SLOT_ONE });
+    for (const [availability, postedAt] of [
+      ["open", undefined], ["closed", "not-a-date"],
+    ] as const) {
+      jobs = [job({ availability, postedAt })];
+      clock.set(SLOT_TWO);
+      const result = await loop.run({ scheduledFor: SLOT_TWO, state: seeded.state });
+      expect(result.mutations).toEqual([]);
+      expect(result.state.activeJobs).toEqual(seeded.state.activeJobs);
+      expect(result.state.health.automationPaused).toBe(true);
+      expect(result.telemetry.at(-1)?.failureCode).toBe("invalid_response");
+    }
+  });
+
+  it("retains an explicitly review-only undated open posting without marking it stale", async () => {
+    const clock = new FakeClock(SLOT_ONE);
+    const discover = vi.fn(async () => ({ jobs: [job({ postedAt: undefined })] }));
+    const loop = new ScheduledDiscoveryLoop({
+      source: SOURCE,
+      provider: {
+        ...provider(discover),
+        missingPublicationDatePolicy: "review_only",
+      },
+      clock,
+    });
+
+    const result = await loop.run({ scheduledFor: SLOT_ONE });
+
+    expect(result.mutations).toHaveLength(1);
+    expect(result.mutations[0]).toMatchObject({
+      type: "job_upserted",
+      job: { externalId: "job-1", availability: "open" },
+      proof: { availability: "open", verification: "listed_open" },
+    });
+    expect(result.mutations[0]?.type === "job_upserted"
+      ? result.mutations[0].job.postedAt
+      : "unexpected").toBeUndefined();
+    expect(Object.values(result.state.activeJobs)[0]?.postedAt).toBeUndefined();
+    expect(result.telemetry.at(-1)?.counts).toMatchObject({
+      upserted: 1,
+      removedStale: 0,
+      active: 1,
+    });
+  });
+
+  it("still rejects a supplied malformed date under the review-only policy", async () => {
+    const clock = new FakeClock(SLOT_ONE);
+    const discover = vi.fn(async () => ({ jobs: [job({ postedAt: "not-a-date" })] }));
+    const loop = new ScheduledDiscoveryLoop({
+      source: SOURCE,
+      provider: {
+        ...provider(discover),
+        missingPublicationDatePolicy: "review_only",
+      },
+      clock,
+    });
+
+    const result = await loop.run({ scheduledFor: SLOT_ONE });
+
+    expect(result.mutations).toEqual([]);
+    expect(result.state.activeJobs).toEqual({});
+    expect(result.telemetry.at(-1)?.failureCode).toBe("invalid_response");
   });
 
   it("bounds retries, honors provider throttles, and excludes raw errors from telemetry", async () => {

@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import { app } from "electron";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { BrowserContext, Page } from "playwright";
 import {
   PlaywrightBrowserPage,
   assertPublicApplicationUrl,
+  createApprovedExecutionSnapshot,
   createDefaultAdapterRegistry,
   createApplicationReceipt,
   executeApplication,
@@ -12,24 +14,29 @@ import {
   submissionPolicy,
   type EvidenceObjectUpload,
   type ExecutionResult,
+  type NormalizedJob,
+  type ProviderFinalSubmitProof,
 } from "@bluey/jobs-automation";
 import {
   finalSubmitMarkerExists,
-  recordReconciledSubmitConfirmation,
 } from "./irreversible-submit.js";
 import {
   authorizedFinalSubmitHooks,
+  certifiedAutoProviderApproval,
 } from "./authorized-final-submit.js";
 import {
   classifyLocalFailure,
+  isLocalSideEffectReason,
   LocalBrowserError,
   safeLocalFailure,
   type LocalFailureClassification,
+  type LocalSideEffectReason,
 } from "./local-failure.js";
 import { LocalCheckpointStore, type LocalRunCheckpoint } from "./local-checkpoint-store.js";
 import { identityContextKey } from "./profile.js";
 import {
   isApprovedLocalResumeAction,
+  localProviderConfirmationDisposition,
   localProviderFinalReview,
   pendingProviderReviewReceipt,
   providerOptionsForApprovedReview,
@@ -42,6 +49,7 @@ import { BrowserContextRegistry } from "./browser-context-registry.js";
 import {
   localResumeUrl,
   localRunAuthorization,
+  localRunReconciliationAuthorization,
   localRunDirectory,
   localRunDirectoryIfValid,
   safeJobContext,
@@ -52,7 +60,6 @@ import {
 import {
   evidenceObject,
   handoffExecution,
-  resolveJob,
 } from "./execution-result.js";
 import {
   RunControllerView,
@@ -65,19 +72,23 @@ import {
 import type { ActiveLocalRun } from "./local-run-state.js";
 import { reconcileLocalRunCheckpoints as recoverCheckpoints } from "./checkpoint-recovery.js";
 import { ExecutionSingleFlight } from "./execution-single-flight.js";
+import type { BrowserBuildProof } from "./release-authority.js";
 
 let checkpointStore: LocalCheckpointStore | undefined;
 let browserContexts: BrowserContextRegistry | undefined;
 const activeLocalRuns = new Map<string, ActiveLocalRun>();
 let browserShell: BrowserShell | undefined;
 let runView: RunControllerView | undefined;
+let packagedBuildProof: BrowserBuildProof | undefined;
 const admission = new LocalRunAdmission();
 const executionFlights = new ExecutionSingleFlight();
 
 export async function initializeLocalRunController(
   shell: BrowserShell,
+  buildProof?: BrowserBuildProof,
 ): Promise<void> {
   browserShell = shell;
+  packagedBuildProof = buildProof;
   runView = new RunControllerView(shell, () => [...activeLocalRuns.values()].map(displayForRun));
   browserContexts = new BrowserContextRegistry(
     app.getPath("userData"),
@@ -121,8 +132,7 @@ async function executeLocalRequestWithFailureBoundary(
       const failure = safeLocalFailure(error);
       view().showFailure(
         view().current(),
-        failure.code === "submit_outcome_unknown"
-          || failure.code === "submit_marker_state_unavailable",
+        isLocalSideEffectReason(failure.code),
         activeLocalRuns.size > 0,
       );
       return { status: "failed", errorCode: failure.code };
@@ -135,10 +145,50 @@ async function executeLocalRequestSingleFlight(
   delivery: LocalRunDelivery,
   resume: boolean,
 ) {
+  if (!request.job) throw new LocalBrowserError("run_request_invalid");
+  const approved = createApprovedExecutionSnapshot(request.packet, request.job);
+  const approvedJob = approved.approvedJob;
+  const certifiedProviderApproval = certifiedAutoProviderApproval(
+    approved.approvedPacket,
+    approvedJob,
+  );
+  request = Object.freeze({
+    ...request,
+    packet: approved.approvedPacket,
+    job: approved.approvedJob,
+  });
   const decision = submissionPolicy(request.url);
   if (decision.policy === "blocked") return { status: decision.policy, reason: decision.reason };
   const active = activeLocalRuns.get(request.runId);
   if (resume && !active) throw new LocalBrowserError("run_not_active");
+  if (active?.uiInterventionKind === "side_effect_unknown") {
+    await active.page.bringToFront().catch(() => undefined);
+    view().showFailure(displayForRun(active), true, true);
+    return { status: "side_effect_unknown" };
+  }
+  // Consume and durably checkpoint the one-shot approval before document,
+  // page, or provider continuation work begins.
+  if (resume && active?.providerFinalReview && !active.approvedSubmitActionConsumed) {
+    const approved = await consumeApprovedLocalSubmitAction(request.runId, delivery);
+    if (!approved) {
+      const pending = pendingProviderReviewReceipt();
+      pending.intervention!.takeoverUrl = localResumeUrl(request.runId, delivery);
+      active.uiInterventionKind = pending.intervention?.kind;
+      view().showNeedsYou(
+        displayForRequest(request, pending.intervention?.kind),
+        activeLocalRuns.size || 1,
+      );
+      return {
+        status: pending.status,
+        runId: request.runId,
+        applicationId: request.applicationId,
+        applicationIdentityId: request.applicationIdentityId,
+        receipt: pending,
+      };
+    }
+    active.approvedSubmitActionConsumed = true;
+    await checkpointActiveLocalRun(request.runId, "provider_review", "provider_review");
+  }
   if (!active && [...activeLocalRuns.values()].some((run) => (
     run.request.applicationIdentityId === request.applicationIdentityId
   ))) {
@@ -169,12 +219,14 @@ async function executeLocalRequestSingleFlight(
     browserProfileId: request.browserProfileId
       || identityContextKey(request.accountId, request.applicationIdentityId),
   }, join(runDirectory, "documents"));
-  request.packet = documents.packet;
   const context = await requiredBrowserContexts().contextFor(
     request.accountId,
     request.applicationIdentityId,
   );
-  const page = active?.page ?? await context.newPage();
+  const preparedPage = active
+    ? await wrapActiveLocalPage(active.page, approvedJob)
+    : await prepareFreshLocalPage(context, approvedJob);
+  const { page, browserPage } = preparedPage;
   const events = active?.events ?? [];
   if (!active) {
     activeLocalRuns.set(request.runId, {
@@ -202,17 +254,18 @@ async function executeLocalRequestSingleFlight(
     admission.isPaused,
   );
   await checkpointActiveLocalRun(request.runId, "prepared", "prepared");
-  const browserPage = new PlaywrightBrowserPage(page);
   const durableHooks = authorizedFinalSubmitHooks(
     runDirectory,
     request,
     delivery,
+    documents,
+    () => browserPage.url(),
   );
   const finalSubmitHooks = {
-    async beforeFinalSubmit() {
-      // The exclusive marker is written first. A crash before the encrypted
-      // checkpoint update still fails closed during startup reconciliation.
-      await durableHooks.beforeFinalSubmit();
+    async beforeFinalSubmit(proof: ProviderFinalSubmitProof) {
+      // The server consumes the one-use pre-click authority first. Only its
+      // successful response permits the durable local marker to be written.
+      await durableHooks.beforeFinalSubmit(proof);
       await checkpointActiveLocalRun(request.runId, "final_submit_started", "side_effect_unknown");
     },
     async afterFinalSubmit(outcome: "activated" | "activation_uncertain") {
@@ -228,48 +281,19 @@ async function executeLocalRequestSingleFlight(
   let approvedProviderReview: LocalProviderFinalReview | undefined;
   if (resume && active?.providerFinalReview) {
     // The resume capability proves run access, not server-side submit approval.
-    execution = reconcileLocalProviderConfirmation(
+    const markerExistsBeforeContinuation = await finalSubmitMarkerExists(runDirectory);
+    const reconciliation = reconcileLocalProviderConfirmation(
       active.providerFinalReview,
+      approvedJob.canonicalUrl,
       await browserPage.bodyText(),
       browserPage.url(),
     );
-    if (execution && !await finalSubmitMarkerExists(runDirectory)) {
-      try {
-        await recordReconciledSubmitConfirmation(runDirectory);
-      } catch {
-        throw new LocalBrowserError("submit_outcome_unknown");
-      }
-    }
-    if (!execution && await finalSubmitMarkerExists(runDirectory)) {
-      throw new LocalBrowserError("submit_outcome_unknown");
-    }
-    if (!execution && !active.approvedSubmitActionConsumed) {
-      const approved = await consumeApprovedLocalSubmitAction(request.runId, delivery);
-      if (approved) {
-        active.approvedSubmitActionConsumed = true;
-        await checkpointActiveLocalRun(request.runId, "provider_review", "provider_review");
-      }
-      if (!approved) {
-        const pending = pendingProviderReviewReceipt();
-        pending.intervention!.takeoverUrl = localResumeUrl(request.runId, delivery);
-        const current = activeLocalRuns.get(request.runId);
-        if (current) current.uiInterventionKind = pending.intervention?.kind;
-        view().showNeedsYou(
-          displayForRequest(request, pending.intervention?.kind),
-          activeLocalRuns.size || 1,
-        );
-        return {
-          status: pending.status,
-          runId: request.runId,
-          applicationId: request.applicationId,
-          applicationIdentityId: request.applicationIdentityId,
-          receipt: pending,
-        };
-      }
-    }
-    if (!execution) {
-      approvedProviderReview = active.providerFinalReview;
-    }
+    const disposition = localProviderConfirmationDisposition(
+      reconciliation,
+      markerExistsBeforeContinuation,
+    );
+    if (disposition !== "continue") throw new LocalBrowserError(disposition);
+    approvedProviderReview = active.providerFinalReview;
   }
   if (!execution && decision.policy === "handoff") {
     execution = await handoffExecution(browserPage, decision.reason, resume);
@@ -278,23 +302,25 @@ async function executeLocalRequestSingleFlight(
       runner: "local" as const,
       runId: request.runId,
       accountId: request.accountId,
+      approvedCanonicalUrl: approvedJob.canonicalUrl,
       page: browserPage,
-      packet: {
-        ...request.packet,
-        applicationIdentityId: request.applicationIdentityId,
-        browserProfileId: request.browserProfileId
-          || identityContextKey(request.accountId, request.applicationIdentityId),
-      },
+      // Runtime-only document paths must never mutate the checksum-bound
+      // packet later embedded in the immutable receipt.
+      packet: documents.packet,
       async log(event: string, details: Record<string, unknown> = {}) {
         events.push({ event, details, at: new Date().toISOString() });
       },
       beforeFinalSubmit: finalSubmitHooks.beforeFinalSubmit,
       afterFinalSubmit: finalSubmitHooks.afterFinalSubmit,
     };
-    execution = approvedProviderReview
+    const providerApproval = approvedProviderReview ?? certifiedProviderApproval;
+    execution = providerApproval
       ? await executeApplication(
           adapterContext,
-          createDefaultAdapterRegistry(undefined, providerOptionsForApprovedReview(approvedProviderReview)),
+          createDefaultAdapterRegistry(
+            undefined,
+            providerOptionsForApprovedReview(providerApproval),
+          ),
         )
       : await executeApplication(adapterContext);
   }
@@ -311,11 +337,11 @@ async function executeLocalRequestSingleFlight(
   }
   const markerExists = await finalSubmitMarkerExists(runDirectory);
   if (execution.receipt.status === "submitted" && !markerExists) {
-    try {
-      await recordReconciledSubmitConfirmation(runDirectory);
-    } catch {
-      throw new LocalBrowserError("submit_outcome_unknown");
-    }
+    throw new LocalBrowserError(
+      resume && active?.providerFinalReview
+        ? "manual_submission_observed"
+        : "submit_outcome_unknown",
+    );
   } else if (execution.receipt.status !== "submitted" && markerExists) {
     throw new LocalBrowserError("submit_outcome_unknown");
   }
@@ -332,11 +358,13 @@ async function executeLocalRequestSingleFlight(
       execution.adapter,
     );
   }
-  const job = request.job ?? await resolveJob(execution.adapter, browserPage);
+  const job = approvedJob;
   const screenshotPath = join(runDirectory, "final.png");
   const screenshotBytes = Buffer.from(await browserPage.screenshot({ fullPage: true }));
   await writeFile(screenshotPath, screenshotBytes, { mode: 0o600 });
   execution.receipt.screenshotPath = screenshotPath;
+  const atsCertifiedReceiptAuthority =
+    durableHooks.atsCertifiedReceiptAuthority();
   const bundle = createApplicationReceipt({
     receiptId: `receipt-${request.runId}`,
     runId: request.runId,
@@ -371,16 +399,16 @@ async function executeLocalRequestSingleFlight(
     })),
     finalUrl: page.url(),
     screenshotKeys: [screenshotPath],
+    ...(atsCertifiedReceiptAuthority ? { atsCertifiedReceiptAuthority } : {}),
   });
   const receiptPath = join(runDirectory, "receipt.json");
   await writeFile(receiptPath, `${JSON.stringify(bundle, null, 2)}\n`, { mode: 0o600 });
   const evidenceObjects: EvidenceObjectUpload[] = [
-    await evidenceObject(documents.resume.path, "resume", "application/pdf", documents.resume.sha256),
+    await evidenceObject(documents.resume, "resume", "application/pdf"),
     ...(documents.coverLetter ? [await evidenceObject(
-      documents.coverLetter.path,
+      documents.coverLetter,
       "cover_letter",
       "application/pdf",
-      documents.coverLetter.sha256,
     )] : []),
     {
       original_key: screenshotPath,
@@ -396,7 +424,9 @@ async function executeLocalRequestSingleFlight(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      ...localRunAuthorization(delivery, "result"),
+      ...(markerExists
+        ? localRunReconciliationAuthorization(delivery)
+        : localRunAuthorization(delivery, "result")),
       receipt: execution.receipt,
       receiptBundle: bundle,
       evidenceObjects,
@@ -430,8 +460,49 @@ async function executeLocalRequestSingleFlight(
   };
 }
 
+async function wrapActiveLocalPage(
+  page: Page,
+  job: NormalizedJob,
+): Promise<{ page: Page; browserPage: PlaywrightBrowserPage }> {
+  const browserPage = new PlaywrightBrowserPage(page);
+  await installCertifiedLocalSubmitGuard(browserPage, job);
+  return { page, browserPage };
+}
+
+async function prepareFreshLocalPage(
+  context: BrowserContext,
+  job: NormalizedJob,
+): Promise<{ page: Page; browserPage: PlaywrightBrowserPage }> {
+  await context.setOffline(true);
+  const existingPages = context.pages();
+  const page = existingPages[0] ?? await context.newPage();
+  await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10_000 });
+  for (const candidate of existingPages) {
+    if (candidate !== page) await candidate.close();
+  }
+  if (context.serviceWorkers().length > 0
+    || context.pages().length !== 1
+    || context.pages()[0] !== page) {
+    throw new LocalBrowserError("configuration_invalid");
+  }
+  const browserPage = new PlaywrightBrowserPage(page);
+  await installCertifiedLocalSubmitGuard(browserPage, job);
+  await context.setOffline(false);
+  return { page, browserPage };
+}
+
+async function installCertifiedLocalSubmitGuard(
+  browserPage: PlaywrightBrowserPage,
+  job: NormalizedJob,
+): Promise<void> {
+  if (job.source === "greenhouse" || job.source === "lever") {
+    await browserPage.installExactSubmitGuard(job.source, job.canonicalUrl);
+  }
+}
+
 export async function handleLocalProtocolUrl(rawUrl: string): Promise<void> {
   await handleLocalProtocol(rawUrl, {
+    buildProof: packagedBuildProof,
     showController: () => shell().show(),
     isOnline: () => shell().online,
     admissionDecision: () => admission.decision(shell().online),
@@ -462,7 +533,7 @@ export async function handleLocalProtocolUrl(rawUrl: string): Promise<void> {
       const failure = safeLocalFailure(error);
       view().showFailure(
         view().current(),
-        failure.code === "submit_outcome_unknown" || failure.code === "submit_marker_state_unavailable",
+        isLocalSideEffectReason(failure.code),
         activeLocalRuns.size > 0,
       );
     },
@@ -480,10 +551,13 @@ async function reportLocalFailure(
     error,
   );
   if (active && failure.status === "side_effect_unknown") {
+    active.uiInterventionKind = "side_effect_unknown";
     await checkpointActiveLocalRun(
       request.runId,
       "side_effect_unknown",
       "side_effect_unknown",
+      undefined,
+      isLocalSideEffectReason(failure.code) ? failure.code : "submit_outcome_unknown",
     ).catch(() => undefined);
   }
   if (!failure.preservePage) {
@@ -495,8 +569,7 @@ async function reportLocalFailure(
         kind: "browser_takeover",
         title: "Confirm the application result",
         detail: failure.message,
-        takeoverUrl: localResumeUrl(request.runId, delivery),
-        resolution: { kind: "browser_takeover", resumeAfter: true },
+        resolution: { kind: "browser_takeover", resumeAfter: false },
       }
     : undefined;
   try {
@@ -504,7 +577,9 @@ async function reportLocalFailure(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        ...localRunAuthorization(delivery, "result"),
+        ...(failure.status === "side_effect_unknown"
+          ? localRunReconciliationAuthorization(delivery)
+          : localRunAuthorization(delivery, "result")),
         receipt: {
           status: failure.status,
           errorCode: failure.code,
@@ -554,6 +629,7 @@ async function checkpointActiveLocalRun(
   phase: LocalRunCheckpoint["phase"],
   status: LocalRunCheckpoint["workflow"]["status"],
   adapter?: string,
+  sideEffectReason?: LocalSideEffectReason,
 ): Promise<void> {
   const active = activeLocalRuns.get(runId);
   if (!active) throw new LocalBrowserError("run_not_active");
@@ -566,6 +642,7 @@ async function checkpointActiveLocalRun(
     status,
     browserUrl: active.page.url() || active.request.url,
     adapter,
+    sideEffectReason,
     providerFinalReview: active.providerFinalReview,
   });
 }
@@ -579,6 +656,7 @@ async function writeLocalCheckpoint(input: {
   status: LocalRunCheckpoint["workflow"]["status"];
   browserUrl: string;
   adapter?: string;
+  sideEffectReason?: LocalSideEffectReason;
   providerFinalReview?: LocalProviderFinalReview;
 }): Promise<void> {
   const now = Date.now();
@@ -597,6 +675,9 @@ async function writeLocalCheckpoint(input: {
       ...(activeLocalRuns.get(input.request.runId)?.approvedSubmitActionConsumed
         ? { approvedSubmitActionConsumed: true }
         : {}),
+      ...(input.status === "side_effect_unknown" ? {
+        sideEffectReason: input.sideEffectReason ?? "submit_outcome_unknown",
+      } : {}),
     },
     ...(input.providerFinalReview ? { providerFinalReview: input.providerFinalReview } : {}),
     events: activeLocalRuns.get(input.request.runId)?.events ?? [],
@@ -642,6 +723,11 @@ export async function continueCurrentLocalRun(): Promise<void> {
   const active = activeForController();
   if (!active) {
     view().showReady(admission.isPaused);
+    return;
+  }
+  if (active.uiInterventionKind === "side_effect_unknown") {
+    await active.page.bringToFront().catch(() => undefined);
+    view().showFailure(displayForRun(active), true, true);
     return;
   }
   if (!shell().online) {
@@ -741,6 +827,7 @@ export async function shutdownLocalRunController(): Promise<void> {
   activeLocalRuns.clear();
   runView = undefined;
   browserShell = undefined;
+  packagedBuildProof = undefined;
 }
 
 export function localApplicationCount(): number {

@@ -1,0 +1,52 @@
+{
+  "vectors": [
+    {
+      "name": "greenhouse public application form",
+      "proof": {
+        "schemaVersion": 3,
+        "adapter": "greenhouse",
+        "adapterVersion": "2026.07.1-beta.1",
+        "control": "greenhouse_submit_application",
+        "job": {
+          "approvedCanonicalUrl": "https://boards.greenhouse.io/acme/jobs/123",
+          "pageUrl": "https://job-boards.greenhouse.io/embed/job_app?for=acme&token=123"
+        },
+        "target": {
+          "actionUrl": "https://job-boards.greenhouse.io/embed/job_app?for=acme&token=123",
+          "method": "post",
+          "enctype": "multipart/form-data",
+          "formTarget": "_self",
+          "providerJobKey": "greenhouse:acme:123",
+          "formIdentity": "[0,\"application_form\",\"\",\"application-form\",\"\",\"123\"]"
+        },
+        "files": [
+          {
+            "fieldName": "resume",
+            "name": "resume-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.pdf",
+            "byteLength": 1234,
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "fields": [
+          {
+            "fieldName": "job_id",
+            "valueByteLength": 3,
+            "valueSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          }
+        ],
+        "partOrder": [
+          { "kind": "field", "index": 0 },
+          { "kind": "file", "index": 0 }
+        ],
+        "documents": [
+          {
+            "kind": "resume",
+            "versionId": "resume-version-123",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ]
+      },
+      "expectedSurfaceSha256": "a88a8916beb511abb11af4acd27242723f8387ea8bebf639dde83a5629f92a68"
+    }
+  ]
+}

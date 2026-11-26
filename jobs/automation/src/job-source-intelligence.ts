@@ -60,6 +60,7 @@ export type SourceTrustFlag =
   | "invalid_application_url"
   | "insecure_application_url"
   | "redirector_application_url"
+  | "unverified_company_domain"
   | "company_domain_mismatch";
 
 export type SourceTrustLevel = "high" | "medium" | "low";
@@ -102,7 +103,7 @@ export function assessJobSourceTrust(input: {
     return trustResult(30, ["invalid_application_url"], null);
   }
 
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) {
     return trustResult(30, ["invalid_application_url"], parsed.hostname.toLowerCase() || null);
   }
 
@@ -120,8 +121,11 @@ export function assessJobSourceTrust(input: {
   }
 
   const company = input.company?.trim() ?? "";
-  if (company && !matchesHost(hostname, KNOWN_ATS_HOSTS) && !companyMatchesHost(company, hostname)) {
-    flags.push("company_domain_mismatch");
+  if (!matchesHost(hostname, KNOWN_ATS_HOSTS)) {
+    // A company label, including a plausible employer domain, is not evidence
+    // of domain ownership. Only a separate original-source check can prove it.
+    const labelMismatch = company && !companyMatchesHost(company, hostname);
+    flags.push(labelMismatch ? "company_domain_mismatch" : "unverified_company_domain");
     score -= 15;
   }
 

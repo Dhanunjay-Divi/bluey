@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { EmploymentEntry } from "../types";
-import { experienceRange, roleExperienceRange } from "./search-policy";
+import { experienceRange, roleExperienceAssessment, roleExperienceRange } from "./search-policy";
 
 function role(
   start_date: string,
@@ -63,5 +63,70 @@ describe("Bluey search policy", () => {
       "Software Engineer",
       new Date("2026-01-01T00:00:00Z"),
     )).toEqual({ years: 3, minimum: 2, maximum: 5 });
+  });
+
+  it("uses token-safe posting-title spans without classifying highlights", () => {
+    const unrelated = {
+      ...role("2015-01", "2020-01", false, "Sweeper"),
+      highlights: ["Prepared SWE status reports"],
+    };
+    expect(roleExperienceRange(
+      [unrelated, role("2022-01", "2024-01")],
+      "Software Engineer",
+      new Date("2026-01-01T00:00:00Z"),
+    )).toEqual({ years: 2, minimum: 1, maximum: 4 });
+  });
+
+  it("counts composite titles only when their posting evidence proves one target family", () => {
+    expect(roleExperienceAssessment(
+      [
+        role("2020-01", "2022-01", false, "Software Engineer, Backend"),
+        role("2017-01", "2019-01", false, "Product Manager / Project Manager"),
+      ],
+      "Software Engineer",
+      new Date("2026-01-01T00:00:00Z"),
+    )).toMatchObject({
+      range: { years: 2, minimum: 1, maximum: 4 },
+      relevant_entry_count: 1,
+    });
+  });
+
+  it("does not count terse QA or DE aliases embedded in unrelated employment titles", () => {
+    expect(roleExperienceAssessment(
+      [
+        role("2015-01", "2020-01", false, "QA Coordinator"),
+        role("2020-01", "2024-01", false, "DE&I Specialist"),
+      ],
+      "Software Engineer",
+      new Date("2026-01-01T00:00:00Z"),
+    )).toMatchObject({
+      range: { years: 0, minimum: 0, maximum: 2 },
+      relevant_entry_count: 0,
+    });
+  });
+
+  it("marks ambiguous and custom targets for review without silently assigning a family", () => {
+    const employment = [role("2022-01", "2024-01")];
+    expect(roleExperienceAssessment(
+      employment,
+      "PM",
+      new Date("2026-01-01T00:00:00Z"),
+    )).toMatchObject({
+      review_required: true,
+      relevant_entry_count: 1,
+      target_role: { status: "ambiguous" },
+    });
+    expect(roleExperienceAssessment(
+      employment,
+      "Clinical AI Workflow Specialist",
+      new Date("2026-01-01T00:00:00Z"),
+    )).toMatchObject({
+      review_required: true,
+      relevant_entry_count: 1,
+      target_role: {
+        status: "custom",
+        custom_label: "Clinical AI Workflow Specialist",
+      },
+    });
   });
 });

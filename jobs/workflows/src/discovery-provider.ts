@@ -84,6 +84,9 @@ export function preparePublicAtsDiscovery(
       name: "public-ats",
       version: PROVIDER_VERSION,
       minimumRequestIntervalMs: MINIMUM_REQUEST_INTERVAL_MS,
+      ...(configured.atsSource.kind === "greenhouse"
+        ? { missingPublicationDatePolicy: "review_only" as const }
+        : {}),
       discover: async (request) => discoverSnapshot(publicAts, configured.atsSource, request),
       classifyError: classifyPublicAtsError,
     },
@@ -209,11 +212,13 @@ function scheduledJob(
   job: NormalizedJob,
   scheduledFor: Date,
 ): DiscoveryJob<PublicAtsDiscoveryPayload> {
-  const postedAt = parsePostedAt(job.postedAt, scheduledFor)?.toISOString();
+  // Preserve a supplied but malformed date for the complete-snapshot
+  // validator. Only a truly absent value can use the review-only path.
+  const postedAt = parsePostedAt(job.postedAt, scheduledFor)?.toISOString() ?? job.postedAt;
   return {
     externalId: job.externalId,
     canonicalUrl: job.canonicalUrl,
-    ...(postedAt ? { postedAt } : {}),
+    ...(postedAt === undefined ? {} : { postedAt }),
     availability: "open",
     payload: {
       company: job.company,

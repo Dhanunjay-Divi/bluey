@@ -1,6 +1,13 @@
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 
+/** Defense in depth; production egress must independently deny browser UDP. */
+export const CERTIFIED_BROWSER_TRANSPORT_HARDENING_ARGS = Object.freeze([
+  "--disable-quic",
+  "--disable-features=WebTransport",
+  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+] as const);
+
 export async function assertPublicApplicationUrl(rawUrl: string): Promise<URL> {
   const url = new URL(rawUrl);
   if (url.protocol !== "https:") throw new Error("Application links must use HTTPS");

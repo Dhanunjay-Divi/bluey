@@ -5,12 +5,26 @@ import { basename, dirname, join, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import { encryptFile } from "../src/crypto-envelope.js";
 import {
+  durableResultScope,
+  promoteManagedStagedResult,
+  promoteStagedResult,
+  readManagedResult,
+  readManagedResultState,
   readResult,
+  readResultState,
   resultPath,
+  stageManagedResult,
   stageResult,
+  writeManagedResult,
   writeResult,
   type DurableResultContext,
 } from "../src/result-store.js";
+import { subjectStoragePaths } from "../src/subject-storage-layout.js";
+import type { ManagedResultStorage } from "../src/subject-storage-manager.js";
+import type {
+  NativeRunnerInventory,
+  NativeRunnerStorageDirectory,
+} from "../src/native-runner-storage.js";
 
 const PROFILE_SCOPE = createHash("sha256").update("account-a\0identity-a").digest("hex").slice(0, 40);
 const OTHER_PROFILE_SCOPE = createHash("sha256").update("account-b\0identity-b").digest("hex").slice(0, 40);
@@ -49,7 +63,7 @@ describe("runner step result store", () => {
     })).toThrow(expect.objectContaining({ code: "invalid_result_scope" }));
   });
 
-  it("does not expose a staged terminal result until it is committed", async () => {
+  it("promotes only the exact staged terminal result", async () => {
     const root = await mkdtemp(join(tmpdir(), "bluey-jobs-result-stage-"));
     const key = randomBytes(32);
     const result = { receipt: { status: "submitted" }, receiptPath: "/receipt.json" };
@@ -57,9 +71,25 @@ describe("runner step result store", () => {
 
     await stageResult(root, context, result, key);
     await expect(readResult(root, context, key)).resolves.toBeUndefined();
+    const staged = await readResultState<typeof result>(root, context, key);
+    expect(staged).toMatchObject({ state: "staged", result });
 
-    await writeResult(root, context, result, key);
+    await expect(promoteStagedResult(
+      root,
+      context,
+      "0".repeat(64),
+      key,
+    )).rejects.toMatchObject({ code: "result_promotion_conflict" });
+    await expect(readResult(root, context, key)).resolves.toBeUndefined();
+
+    await promoteStagedResult(root, context, staged!.resultSha256, key);
     await expect(readResult(root, context, key)).resolves.toEqual(result);
+    await expect(promoteStagedResult(
+      root,
+      context,
+      staged!.resultSha256,
+      key,
+    )).resolves.toEqual(result);
   });
 
   it("rejects ciphertext swapped between durable request scopes", async () => {
@@ -167,6 +197,40 @@ describe("runner step result store", () => {
       expect((await stat(path)).mode & 0o777).toBe(0o600);
     }
   });
+
+  it("stages, promotes, and verifies a managed v2 result through retained handles", async () => {
+    const key = randomBytes(32);
+    const context = resultContext("run-managed:initial");
+    const storage = managedResultStorage(durableResultScope(context));
+    const result = { receipt: { status: "submitted" }, managed: true };
+
+    await stageManagedResult(storage.capability, context, result, key);
+    await expect(readManagedResult(storage.capability, context, key)).resolves.toBeUndefined();
+    const staged = await readManagedResultState<typeof result>(storage.capability, context, key);
+    expect(staged).toMatchObject({ state: "staged", result });
+    await expect(promoteManagedStagedResult(
+      storage.capability,
+      context,
+      "0".repeat(64),
+      key,
+    )).rejects.toMatchObject({ code: "result_promotion_conflict" });
+
+    await promoteManagedStagedResult(storage.capability, context, staged!.resultSha256, key);
+    await expect(readManagedResult(storage.capability, context, key)).resolves.toEqual(result);
+    expect(storage.root.fileNames()).toEqual(["step-result.json.enc"]);
+    expect(storage.temporary.fileNames()).toEqual([]);
+  });
+
+  it("binds managed v2 result ciphertext to the exact derived result scope", async () => {
+    const key = randomBytes(32);
+    const context = resultContext("run-managed-binding:initial");
+    const correct = managedResultStorage(durableResultScope(context));
+    const wrong = managedResultStorage("f".repeat(64));
+    await writeManagedResult(correct.capability, context, { revision: 1 }, key);
+
+    await expect(readManagedResult(wrong.capability, context, key))
+      .rejects.toMatchObject({ code: "invalid_result_scope" });
+  });
 });
 
 function resultContext(requestId: string, profileScope = PROFILE_SCOPE): DurableResultContext {
@@ -215,4 +279,72 @@ async function writeLegacyResult(
     ciphertext,
     cipher.getAuthTag(),
   ]));
+}
+
+class MemoryNativeDirectory {
+  readonly deviceId = "unix:602:mount:7";
+  readonly linkCount = 2;
+  readonly canonicalPath: string;
+  private readonly files = new Map<string, Buffer>();
+
+  constructor(readonly relativePath: string) {
+    this.canonicalPath = `/srv/bluey-runner/${relativePath}`;
+  }
+
+  fileNames(): string[] {
+    return [...this.files.keys()].sort();
+  }
+
+  async replaceFile(name: string, contents: Buffer): Promise<void> {
+    this.files.set(name, Buffer.from(contents));
+  }
+
+  async readFileBounded(name: string, maximumBytes: number): Promise<Buffer> {
+    const contents = this.files.get(name);
+    if (!contents || contents.length > maximumBytes) throw new Error("missing memory file");
+    return Buffer.from(contents);
+  }
+
+  async inventory(): Promise<NativeRunnerInventory> {
+    const entries = this.fileNames().map((name) => {
+      const contents = this.files.get(name)!;
+      return {
+        relativePath: name,
+        kind: "file" as const,
+        deviceId: this.deviceId,
+        linkCount: 1,
+        sizeBytes: contents.length,
+        sha256: createHash("sha256").update(contents).digest("hex"),
+      };
+    });
+    return {
+      entries,
+      count: entries.length,
+      bytes: entries.reduce((total, entry) => total + entry.sizeBytes, 0),
+      sha256: "c".repeat(64),
+    };
+  }
+}
+
+function managedResultStorage(scope: string): {
+  capability: ManagedResultStorage;
+  root: MemoryNativeDirectory;
+  temporary: MemoryNativeDirectory;
+} {
+  const subject = "1".repeat(64);
+  const paths = subjectStoragePaths(subject).result(scope);
+  const root = new MemoryNativeDirectory(paths.root.relativePath);
+  const temporary = new MemoryNativeDirectory(paths.temporary.relativePath);
+  return {
+    root,
+    temporary,
+    capability: {
+      kind: "result",
+      subjectSha256: subject,
+      scope,
+      paths,
+      root: root as unknown as NativeRunnerStorageDirectory,
+      temporary: temporary as unknown as NativeRunnerStorageDirectory,
+    },
+  };
 }

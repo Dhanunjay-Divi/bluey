@@ -62,6 +62,7 @@ function receipt(): ApplicationReceiptBundle {
     events: [{ id: "event-1", occurredAt: "2026-07-10T11:59:00.000Z", type: "submitted" }],
     result: {
       status: "submitted",
+      submitHttpStatus: 200,
       confirmationText: "Application received",
       confirmationUrl: "https://boards.greenhouse.io/acme/jobs/1/confirmation",
       submittedAt: "2026-07-10T11:59:00.000Z",
@@ -210,6 +211,17 @@ describe("interview preparation packets", () => {
     };
     const packet = buildInterviewPrepPacket({ receipt: receipt(), resume: imported });
     expect(packet.sources.some((source) => source.id === "resume-claim-claim-collaboration")).toBe(true);
+  });
+
+  it("rejects a submitted resume import after the claim has been explicitly rejected", () => {
+    const rejected = resume();
+    rejected.claims[1] = {
+      ...rejected.claims[1],
+      status: "rejected",
+      source: "resume_import",
+    };
+    expect(() => buildInterviewPrepPacket({ receipt: receipt(), resume: rejected }))
+      .toThrow("claim-collaboration was rejected");
   });
 
   it("requires the evidence-complete receipt boundary", () => {

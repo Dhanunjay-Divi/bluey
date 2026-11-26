@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, open, rename, rm } from "node:fs/promises";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 
 import { parse } from "csv-parse";
 
@@ -246,7 +247,7 @@ export async function streamVerifiedJobhiveCsv(
     "record bytes",
   );
   let headersValidated = false;
-  const parser = createReadStream(options.verified.path, { highWaterMark: 256 * 1024 }).pipe(parse({
+  const parser = parse({
     bom: true,
     columns: (headers: string[]) => {
       validateHeaders(headers);
@@ -256,25 +257,35 @@ export async function streamVerifiedJobhiveCsv(
     max_record_size: maxRecordBytes,
     relax_column_count: false,
     skip_empty_lines: true,
-  }));
+  });
 
   let batch: JobhiveCandidateRow[] = [];
   let rows = 0;
   let batches = 0;
+  let consumerFailure: { reason: unknown } | undefined;
   try {
-    for await (const record of parser) {
-      rows += 1;
-      if (rows > options.verified.artifact.rows) {
-        throw new JobhiveArtifactError("row_count_mismatch", "Jobhive artifact contains more rows than its manifest");
+    await pipeline(createReadStream(options.verified.path, { highWaterMark: 256 * 1024 }), parser, async (records) => {
+      for await (const record of records) {
+        rows += 1;
+        if (rows > options.verified.artifact.rows) {
+          throw new JobhiveArtifactError("row_count_mismatch", "Jobhive artifact contains more rows than its manifest");
+        }
+        batch.push(normalizeCandidate(record as Record<string, string>));
+        if (batch.length >= batchRows) {
+          try {
+            await options.onBatch(batch);
+          } catch (reason) {
+            consumerFailure = { reason };
+            throw reason;
+          }
+          batches += 1;
+          batch = [];
+        }
       }
-      batch.push(normalizeCandidate(record as Record<string, string>));
-      if (batch.length >= batchRows) {
-        await options.onBatch(batch);
-        batches += 1;
-        batch = [];
-      }
-    }
+    });
   } catch (error) {
+    // A downstream acknowledgement/transport failure is not corrupt CSV.
+    if (consumerFailure) throw consumerFailure.reason;
     if (error instanceof JobhiveArtifactError) throw error;
     throw new JobhiveArtifactError("invalid_artifact", "Jobhive CSV could not be parsed safely");
   }

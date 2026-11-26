@@ -58,6 +58,8 @@ export interface ScheduledDiscoveryProvider<TPayload extends JsonValue = JsonObj
   readonly version: string;
   /** Minimum spacing between request starts, including retries and later cycles. */
   readonly minimumRequestIntervalMs?: number;
+  /** A missing publication date may be retained only as review-only evidence. */
+  readonly missingPublicationDatePolicy?: "review_only";
   discover(request: DiscoveryProviderRequest): Promise<DiscoveryProviderSnapshot<TPayload>>;
   classifyError?(error: unknown): DiscoveryProviderFailure;
 }
@@ -408,7 +410,12 @@ export class ScheduledDiscoveryLoop<TPayload extends JsonValue = JsonObject> {
           attempt,
         });
         const fetchedAtMs = now();
-        projection = normalizeSnapshot(snapshot, fetchedAtMs, this.policy.maximumJobsPerSnapshot);
+        projection = normalizeSnapshot(
+          snapshot,
+          fetchedAtMs,
+          this.policy.maximumJobsPerSnapshot,
+          this.provider.missingPublicationDatePolicy,
+        );
         fetchedAt = new Date(fetchedAtMs).toISOString();
         const successThrottle = normalizedDelay(snapshot.nextRequestAfterMs, "snapshot next request delay");
         nextProviderRequestAtMs = Math.max(
@@ -552,7 +559,12 @@ export class ScheduledDiscoveryLoop<TPayload extends JsonValue = JsonObject> {
 
     for (const discovered of snapshot.jobs) {
       seen.add(discovered.canonicalKey);
-      const stale = isStale(discovered.postedAtMs, fetchedAtMs, this.policy.maximumJobAgeMs);
+      const stale = isStale(
+        discovered.postedAtMs,
+        fetchedAtMs,
+        this.policy.maximumJobAgeMs,
+        this.provider.missingPublicationDatePolicy,
+      );
       if (discovered.job.availability === "closed" || stale) {
         const reason: DiscoveryRemovalReason = discovered.job.availability === "closed" ? "closed" : "stale";
         const verification: DiscoveryVerification = reason === "closed" ? "listed_closed" : "posted_at_expired";
@@ -721,6 +733,7 @@ function normalizeSnapshot<TPayload extends JsonValue>(
   snapshot: DiscoveryProviderSnapshot<TPayload>,
   fetchedAtMs: number,
   maximumJobs: number,
+  missingPublicationDatePolicy?: "review_only",
 ): SnapshotProjection<TPayload> {
   if (!snapshot || !Array.isArray(snapshot.jobs)) {
     throw new InvalidDiscoverySnapshotError("Discovery provider did not return a job snapshot");
@@ -746,11 +759,24 @@ function normalizeSnapshot<TPayload extends JsonValue>(
       throw new InvalidDiscoverySnapshotError("Discovery job availability is invalid");
     }
     const canonicalUrl = canonicalizeDiscoveryUrl(raw.canonicalUrl);
-    const postedAtMs = parseOptionalTimestamp(raw.postedAt);
+    const rawPostedAt = raw.postedAt;
+    if (rawPostedAt !== undefined && typeof rawPostedAt !== "string") {
+      throw new InvalidDiscoverySnapshotError("Discovery job posting date is invalid");
+    }
+    const postedAtMs = parseOptionalTimestamp(rawPostedAt);
+    // A closed listing needs no publication date to prove closure. Undated
+    // open listings still need an explicit review-only fence in server eligibility.
+    const suppliedInvalidDate = rawPostedAt !== undefined && postedAtMs === undefined;
+    const missingOpenDate = rawPostedAt === undefined
+      && raw.availability === "open"
+      && missingPublicationDatePolicy !== "review_only";
+    if (suppliedInvalidDate || missingOpenDate) {
+      throw new InvalidDiscoverySnapshotError("Discovery job posting date is invalid or missing");
+    }
     const job: DiscoveryJob<TPayload> = {
       externalId: raw.externalId.trim(),
       canonicalUrl,
-      postedAt: postedAtMs === undefined ? undefined : new Date(postedAtMs).toISOString(),
+      ...(postedAtMs === undefined ? {} : { postedAt: new Date(postedAtMs).toISOString() }),
       availability: raw.availability,
       payload: raw.payload,
     };
@@ -841,8 +867,13 @@ function retryDelay(policy: DiscoveryPolicy, failedAttempt: number): number {
   );
 }
 
-function isStale(postedAtMs: number | undefined, fetchedAtMs: number, maximumAgeMs: number): boolean {
-  if (postedAtMs === undefined) return true;
+function isStale(
+  postedAtMs: number | undefined,
+  fetchedAtMs: number,
+  maximumAgeMs: number,
+  missingPublicationDatePolicy?: "review_only",
+): boolean {
+  if (postedAtMs === undefined) return missingPublicationDatePolicy !== "review_only";
   if (postedAtMs > fetchedAtMs + MAX_FUTURE_POSTING_SKEW_MS) return true;
   return fetchedAtMs - postedAtMs > maximumAgeMs;
 }

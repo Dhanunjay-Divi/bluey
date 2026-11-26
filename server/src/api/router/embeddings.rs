@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     billing_restricted_error, prior_provider_exposure_error, provider_accounting_pending_error,
-    provider_cost_guard, release_and_capacity_error, settle_provider_attempt_before_customer,
-    spawn_usage_expiry_reconciler, ApiError, AppState,
+    provider_cost_guard, reject_jobs_interview_prep_request_id, release_and_capacity_error,
+    settle_provider_attempt_before_customer, spawn_usage_expiry_reconciler, ApiError, AppState,
 };
 use crate::auth::AuthedAccount;
 use crate::db::{
@@ -118,6 +118,7 @@ async fn embed_batch_inner(
     _trace_id: &str,
     req: EmbedBatchRequest,
 ) -> Result<EmbedBatchResponse, (StatusCode, Json<ApiError>)> {
+    reject_jobs_interview_prep_request_id(&req.request_id)?;
     if let Some(err) = billing_restricted_error(account) {
         return Err(err);
     }

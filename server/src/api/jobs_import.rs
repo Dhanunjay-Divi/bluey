@@ -3,10 +3,11 @@
 //! Only exact, allowlisted ATS hosts are resolved. User-controlled hosts are
 //! never fetched by the API; unsupported links remain manual Review-only jobs.
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::{redirect::Policy, StatusCode, Url};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 const MAX_JOB_RESPONSE_BYTES: u64 = 1_048_576;
@@ -25,6 +26,8 @@ pub(super) struct ImportedJob {
     pub compensation: String,
     pub employment_type: String,
     pub posted_at_ms: Option<i64>,
+    pub verified_at_ms: i64,
+    pub evidence_hash: String,
 }
 
 #[derive(Debug)]
@@ -34,9 +37,9 @@ pub(super) enum JobImportError {
     Temporary(String),
 }
 
-pub(super) async fn import_supported_job(
+fn canonical_supported_import_target(
     raw_url: &str,
-) -> Result<Option<ImportedJob>, JobImportError> {
+) -> Result<Option<(&'static str, Url)>, JobImportError> {
     let parsed_url = Url::parse(raw_url)
         .map_err(|_| JobImportError::Invalid("Use a complete https job link.".to_string()))?;
     if parsed_url.scheme() != "https"
@@ -64,25 +67,72 @@ pub(super) async fn import_supported_job(
         _ if host.ends_with(".myworkdayjobs.com") => "workday",
         _ => return Ok(None),
     };
-    // The scheduler resolves precisely the same public URL grammar. Normalize
-    // it before any fetch so a verified import cannot later be rejected during
-    // discovery enrollment (for example, repeated `jobs` or `job` segments).
-    let canonical_url =
-        crate::db::jobs::canonical_public_discovery_url(provider, parsed_url.as_str())
-            .map_err(|_| {
-                JobImportError::Invalid("Use a direct public employer job link.".to_string())
-            })?
-            .0;
+    // Normalize with the scheduler before fetching. For Greenhouse and Lever
+    // also require the stricter identity used by the original-source verifier.
+    let (canonical_url, source_key) =
+        crate::db::jobs::canonical_public_discovery_url(provider, parsed_url.as_str()).map_err(
+            |_| JobImportError::Invalid("Use a direct public employer job link.".to_string()),
+        )?;
+    if matches!(provider, "greenhouse" | "lever") {
+        use crate::jobs_ats_target::{
+            parse_provider_application_target, ProviderApplicationTargetPurpose,
+        };
+        if !parse_provider_application_target(
+            &canonical_url,
+            ProviderApplicationTargetPurpose::Submit,
+        )
+        .is_some_and(|target| target.provider == provider && target.tenant == source_key)
+        {
+            return Err(JobImportError::Invalid(
+                "Use a direct employer job link with one unambiguous job ID.".to_string(),
+            ));
+        }
+    }
     let url = Url::parse(&canonical_url)
         .map_err(|_| JobImportError::Invalid("Use a complete https job link.".to_string()))?;
-    match provider {
+    Ok(Some((provider, url)))
+}
+
+pub(super) async fn import_supported_job(
+    raw_url: &str,
+) -> Result<Option<ImportedJob>, JobImportError> {
+    let Some((provider, url)) = canonical_supported_import_target(raw_url)? else {
+        return Ok(None);
+    };
+    let mut imported = match provider {
         "lever" => import_lever(&url).await.map(Some),
         "greenhouse" => import_greenhouse(&url).await.map(Some),
         "ashby" => import_ashby(&url).await.map(Some),
         "smartrecruiters" => import_smartrecruiters(&url).await.map(Some),
         "workday" => import_workday(&url).await.map(Some),
         _ => unreachable!(),
+    }?;
+    if let Some(imported) = imported.as_mut() {
+        imported.verified_at_ms = Utc::now().timestamp_millis();
+        imported.evidence_hash = imported_job_evidence_hash(imported);
     }
+    Ok(imported)
+}
+
+fn imported_job_evidence_hash(imported: &ImportedJob) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        imported.source.as_str(),
+        imported.external_id.as_str(),
+        imported.company.as_str(),
+        imported.title.as_str(),
+        imported.location.as_str(),
+        imported.workplace.as_str(),
+        imported.canonical_url.as_str(),
+        imported.description.as_str(),
+        imported.compensation.as_str(),
+        imported.employment_type.as_str(),
+    ] {
+        hasher.update(field.as_bytes());
+        hasher.update([0]);
+    }
+    hasher.update(imported.posted_at_ms.unwrap_or_default().to_le_bytes());
+    hex::encode(hasher.finalize())
 }
 
 async fn import_lever(url: &Url) -> Result<ImportedJob, JobImportError> {
@@ -171,6 +221,8 @@ fn lever_job_from_payload(
                 .unwrap_or_default(),
         ),
         posted_at_ms: payload.get("createdAt").and_then(Value::as_i64),
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 
@@ -238,6 +290,8 @@ async fn import_greenhouse(url: &Url) -> Result<ImportedJob, JobImportError> {
         compensation: String::new(),
         employment_type: String::new(),
         posted_at_ms,
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 
@@ -337,24 +391,211 @@ fn ashby_job_from_payload(
             .get("publishedAt")
             .and_then(Value::as_str)
             .and_then(parse_timestamp_ms),
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 
 async fn import_smartrecruiters(url: &Url) -> Result<ImportedJob, JobImportError> {
-    let segments = path_segments(url)?;
-    if segments.len() < 2 {
+    let (company_id, posting_id) = smartrecruiters_import_identity(url)?;
+    let target = smartrecruiters_detail_target(company_id, posting_id)?;
+    let payload = fetch_json(target.as_str()).await?;
+    smartrecruiters_job_from_payload(url, company_id, posting_id, &payload)
+}
+
+fn smartrecruiters_detail_target(
+    company_id: &str,
+    posting_id: &str,
+) -> Result<Url, JobImportError> {
+    let company_id = checked_identifier(company_id)?;
+    let posting_id = checked_identifier(posting_id)?;
+    Url::parse(&format!(
+        "https://api.smartrecruiters.com/v1/companies/{company_id}/postings/{posting_id}"
+    ))
+    .map_err(|_| JobImportError::Invalid("Invalid SmartRecruiters detail target.".to_string()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SmartRecruitersHydrationError {
+    DetailUnavailable,
+    RateLimited,
+    CapacityUnavailable,
+    Store,
+}
+
+pub(super) async fn load_saved_smartrecruiters_requirements(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    job_id: &str,
+    provider_budget: &crate::rate_limit::SharedLimiter,
+) -> Result<Option<crate::db::jobs::JobPosting>, SmartRecruitersHydrationError> {
+    hydrate_saved_smartrecruiters_using(pool, account_id, job_id, |target| async move {
+        reserve_smartrecruiters_detail_read(provider_budget).await?;
+        fetch_json(target.as_str())
+            .await
+            .map_err(|_| SmartRecruitersHydrationError::DetailUnavailable)
+    })
+    .await
+}
+
+pub(super) async fn reserve_smartrecruiters_detail_read(
+    provider_budget: &crate::rate_limit::SharedLimiter,
+) -> Result<(), SmartRecruitersHydrationError> {
+    // Separate provider-wide key, not an account+IP key. Charge only
+    // after capturing an owned, current summary, including failed reads.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        provider_budget.check("smartrecruiters-summary-provider"),
+    )
+    .await
+    .map_err(|_| SmartRecruitersHydrationError::CapacityUnavailable)?
+    .map_err(|_| SmartRecruitersHydrationError::RateLimited)
+}
+
+/// The reader receives only the fixed detail target derived from an owned,
+/// current posting. The response can change description, not authority.
+pub(super) async fn hydrate_saved_smartrecruiters_using<F, Fut>(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    job_id: &str,
+    read_detail: F,
+) -> Result<Option<crate::db::jobs::JobPosting>, SmartRecruitersHydrationError>
+where
+    F: FnOnce(Url) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, SmartRecruitersHydrationError>>,
+{
+    use crate::db::jobs::{
+        get_posting,
+        smartrecruiters_requirements::{
+            capture_smartrecruiters_summary, commit_smartrecruiters_summary_description,
+        },
+    };
+    use SmartRecruitersHydrationError::{DetailUnavailable, Store};
+
+    let Some(stored) = get_posting(pool, account_id, job_id).map_err(|_| Store)? else {
+        return Ok(None);
+    };
+    if !stored.description.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(capture) = capture_smartrecruiters_summary(pool, account_id, job_id, &stored.track_id)
+        .map_err(|_| Store)?
+    else {
+        return Ok(None);
+    };
+    let original = Url::parse(capture.canonical_url()).map_err(|_| Store)?;
+    let target = smartrecruiters_detail_target(capture.tenant(), capture.external_id())
+        .map_err(|_| Store)?;
+    let payload = read_detail(target).await?;
+    let typed = smartrecruiters_job_from_payload(
+        &original,
+        capture.tenant(),
+        capture.external_id(),
+        &payload,
+    )
+    .map_err(|_| DetailUnavailable)?;
+    if !smartrecruiters_hydration_destinations_match(
+        &payload,
+        capture.tenant(),
+        capture.external_id(),
+    ) {
+        return Err(DetailUnavailable);
+    }
+    commit_smartrecruiters_summary_description(pool, account_id, &capture, &typed.description)
+        .map(Some)
+        .map_err(|_| Store)
+}
+
+fn smartrecruiters_hydration_destinations_match(payload: &Value, tenant: &str, id: &str) -> bool {
+    fn exact_url(raw: &Value, host: &str, allow_oga: bool) -> Option<Url> {
+        let value = raw.as_str()?;
+        let authority = value.strip_prefix("https://")?.split_once('/')?.0;
+        if authority != host {
+            return None;
+        }
+        let url = Url::parse(value).ok()?;
+        if url.as_str() != value {
+            return None;
+        }
+        let query_allowed = url.query().is_none() || (allow_oga && url.query() == Some("oga=true"));
+        (url.scheme() == "https"
+            && url.host_str() == Some(host)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && query_allowed
+            && url.fragment().is_none())
+        .then_some(url)
+    }
+
+    fn listing_path_matches(url: &Url, tenant: &str, id: &str) -> bool {
+        let path = url.path().split('/').collect::<Vec<_>>();
+        matches!(path.as_slice(), ["", observed, record]
+            if *observed == tenant && (*record == id || record.strip_prefix(id)
+                .and_then(|suffix| suffix.strip_prefix('-'))
+                .is_some_and(|slug| !slug.is_empty() && checked_identifier(slug).is_ok())))
+    }
+
+    let reference_matches = match payload.get("ref") {
+        None | Some(Value::Null) => true,
+        Some(raw) => exact_url(raw, "api.smartrecruiters.com", false).is_some_and(|url| {
+            let reference = url.path().split('/').collect::<Vec<_>>();
+            matches!(reference.as_slice(), ["", "v1" | "api-v1", "companies", employer,
+                "postings", posting] if *employer == tenant && *posting == id)
+        }),
+    };
+    if !reference_matches {
+        return false;
+    }
+
+    match (payload.get("postingUrl"), payload.get("applyUrl")) {
+        (None, None) => false,
+        (None, Some(apply_raw)) => exact_url(apply_raw, "www.smartrecruiters.com", false)
+            .is_some_and(|apply| listing_path_matches(&apply, tenant, id)),
+        (Some(posting_raw), Some(apply_raw)) => {
+            let Some(posting) = exact_url(posting_raw, "jobs.smartrecruiters.com", false) else {
+                return false;
+            };
+            let Some(apply) = exact_url(apply_raw, "jobs.smartrecruiters.com", true) else {
+                return false;
+            };
+            posting.path() == apply.path()
+                && listing_path_matches(&posting, tenant, id)
+                && listing_path_matches(&apply, tenant, id)
+        }
+        _ => false,
+    }
+}
+
+fn smartrecruiters_import_identity(url: &Url) -> Result<(&str, &str), JobImportError> {
+    let invalid = || {
+        JobImportError::Invalid(
+            "Use the direct SmartRecruiters job link, including its job ID.".to_string(),
+        )
+    };
+    let mut segments = url.path().trim_start_matches('/').split('/');
+    let company_id = checked_identifier(segments.next().ok_or_else(invalid)?)?;
+    let posting_slug = checked_identifier(segments.next().ok_or_else(invalid)?)?;
+    if segments.next().is_some() || url.query().is_some() || url.path().starts_with("//") {
+        return Err(invalid());
+    }
+    // Public pretty links use a numeric record followed by a title slug.
+    // Non-numeric stable record IDs may themselves contain hyphens.
+    let posting_id = match posting_slug.split_once('-') {
+        Some((id, slug)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+            if slug.is_empty() {
+                return Err(invalid());
+            }
+            id
+        }
+        _ => posting_slug,
+    };
+    if !posting_id.as_bytes()[0].is_ascii_alphanumeric() {
         return Err(JobImportError::Invalid(
             "Use the direct SmartRecruiters job link, including its job ID.".to_string(),
         ));
     }
-    let company_id = checked_identifier(&segments[0])?;
-    let posting_slug = checked_identifier(&segments[1])?;
-    let posting_id = checked_identifier(posting_slug.split('-').next().unwrap_or_default())?;
-    let payload = fetch_json(&format!(
-        "https://api.smartrecruiters.com/v1/companies/{company_id}/postings/{posting_id}"
-    ))
-    .await?;
-    smartrecruiters_job_from_payload(url, company_id, posting_id, &payload)
+    Ok((company_id, posting_id))
 }
 
 fn smartrecruiters_job_from_payload(
@@ -363,6 +604,32 @@ fn smartrecruiters_job_from_payload(
     posting_id: &str,
     payload: &Value,
 ) -> Result<ImportedJob, JobImportError> {
+    let response_id_matches = payload.get("id").is_some_and(|id| {
+        id.as_str() == Some(posting_id)
+            || id.as_u64().is_some_and(|id| id.to_string() == posting_id)
+    });
+    let response_company = payload
+        .get("company")
+        .and_then(|company| company.get("identifier"))
+        .and_then(Value::as_str);
+    if !response_id_matches || response_company != Some(company_id) {
+        return Err(JobImportError::Temporary(
+            "The job site's response did not match this SmartRecruiters listing.".to_string(),
+        ));
+    }
+    match payload.get("active") {
+        None | Some(Value::Bool(true)) => {}
+        Some(Value::Bool(false)) => {
+            return Err(JobImportError::NotFound(
+                "That job is no longer available.".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(JobImportError::Temporary(
+                "The job site returned an unreadable listing state.".to_string(),
+            ));
+        }
+    }
     let title = required_text(
         payload,
         "name",
@@ -393,21 +660,59 @@ fn smartrecruiters_job_from_payload(
             .unwrap_or_default()
     };
     let mut sections = Vec::new();
+    let mut has_role_requirements = false;
     if let Some(job_sections) = payload
         .get("jobAd")
         .and_then(|value| value.get("sections"))
         .and_then(Value::as_object)
     {
-        for section in job_sections.values() {
-            if let Some(text) = section
-                .get("text")
-                .and_then(Value::as_str)
-                .map(strip_html)
-                .filter(|value| !value.is_empty())
+        for (name, section) in job_sections {
+            if name.is_empty()
+                || !name.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+                || !section.is_object()
             {
+                return Err(smartrecruiters_requirements_unavailable());
+            }
+            let mut value = None;
+            for key in ["text", "description"] {
+                match section.get(key) {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(html)) => {
+                        let markup = html.to_ascii_lowercase();
+                        if markup.contains("<script") || markup.contains("<style") {
+                            return Err(smartrecruiters_requirements_unavailable());
+                        }
+                        let text = strip_html(html);
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if value.as_ref().is_some_and(|prior| prior != &text) {
+                            return Err(smartrecruiters_requirements_unavailable());
+                        }
+                        value = Some(text);
+                    }
+                    Some(_) => return Err(smartrecruiters_requirements_unavailable()),
+                }
+            }
+            if let Some(text) = value {
+                has_role_requirements |= matches!(
+                    name.as_str(),
+                    "jobDescription" | "description" | "qualifications"
+                );
                 sections.push(text);
             }
         }
+    }
+    // The independent verifier rejects control characters in the frozen
+    // subject. Each section was flattened already; keep their boundary a
+    // space rather than introducing newlines here.
+    let description = sections.join(" ");
+    if !has_role_requirements
+        || description.len() > 64 * 1_024
+        || description.contains('\u{fffd}')
+        || description.chars().any(char::is_control)
+    {
+        return Err(smartrecruiters_requirements_unavailable());
     }
 
     Ok(ImportedJob {
@@ -425,7 +730,7 @@ fn smartrecruiters_job_from_payload(
         location: location.clone(),
         workplace: normalize_workplace(workplace_value, &location),
         canonical_url: url.as_str().to_string(),
-        description: sections.join("\n\n"),
+        description,
         compensation: String::new(),
         employment_type: normalize_employment_type(
             payload
@@ -438,7 +743,15 @@ fn smartrecruiters_job_from_payload(
             .get("releasedDate")
             .and_then(Value::as_str)
             .and_then(parse_timestamp_ms),
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
+}
+
+fn smartrecruiters_requirements_unavailable() -> JobImportError {
+    JobImportError::Temporary(
+        "The job site did not return clear SmartRecruiters posting requirements.".to_string(),
+    )
 }
 
 async fn import_workday(url: &Url) -> Result<ImportedJob, JobImportError> {
@@ -548,6 +861,8 @@ fn workday_job_from_payload(
             .get("startDate")
             .and_then(Value::as_str)
             .and_then(parse_timestamp_ms),
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 
@@ -802,6 +1117,56 @@ fn decode_entities(value: &str) -> String {
 }
 
 #[cfg(test)]
+mod canonical_supported_import_target_tests {
+    use super::{canonical_supported_import_target, JobImportError};
+
+    #[test]
+    fn rejects_ambiguous_greenhouse_and_lever_identity() {
+        for url in [
+            "https://job-boards.greenhouse.io/fixture/jobs/job-1?gh_jid=job-2",
+            "https://boards.greenhouse.io/fixture/jobs/job-1?for=other",
+            "https://jobs.lever.co/fixture/job-1?postingId=job-2",
+            "https://jobs.lever.co/fixture/job-1/details",
+        ] {
+            assert!(matches!(
+                canonical_supported_import_target(url),
+                Err(JobImportError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn preserves_unambiguous_targets_and_manual_only_links() {
+        for (raw, provider, canonical) in [
+            (
+                "https://job-boards.greenhouse.io:443/fixture/jobs/job-1?utm_source=feed&gh_jid=job-1",
+                "greenhouse",
+                "https://job-boards.greenhouse.io/fixture/jobs/job-1?gh_jid=job-1",
+            ),
+            (
+                "https://jobs.eu.lever.co/fixture/job-1/apply",
+                "lever",
+                "https://jobs.eu.lever.co/fixture/job-1/apply",
+            ),
+            (
+                "https://jobs.ashbyhq.com/fixture/job-1",
+                "ashby",
+                "https://jobs.ashbyhq.com/fixture/job-1",
+            ),
+        ] {
+            let (resolved, url) = canonical_supported_import_target(raw).unwrap().unwrap();
+            assert_eq!(resolved, provider);
+            assert_eq!(url.as_str(), canonical);
+        }
+        assert!(
+            canonical_supported_import_target("https://careers.example/opening")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::{
@@ -958,7 +1323,7 @@ mod tests {
         let payload = serde_json::json!({
             "id": "744000123456789",
             "name": "Platform Engineer",
-            "company": { "name": "Acme Corp" },
+            "company": { "identifier": "Acme", "name": "Acme Corp" },
             "location": { "city": "Austin", "region": "TX", "country": "US", "remote": true },
             "typeOfEmployment": { "label": "Full-time" },
             "releasedDate": "2026-07-16T14:30:00Z",
@@ -975,6 +1340,135 @@ mod tests {
         assert_eq!(imported.employment_type, "full_time");
         assert!(imported.description.contains("Build platform services."));
         assert!(imported.description.contains("Go and Kubernetes."));
+    }
+
+    #[test]
+    fn smartrecruiters_shared_detail_observation_has_stable_section_order() {
+        let url = Url::parse("https://jobs.smartrecruiters.com/acme/smart-1").unwrap();
+        let detail: Value = serde_json::from_str(include_str!(
+            "../../../jobs/automation/tests/fixtures/smartrecruiters-hydration-detail.json"
+        ))
+        .unwrap();
+        assert!(smartrecruiters_hydration_destinations_match(
+            &detail, "acme", "smart-1"
+        ));
+        let parsed = smartrecruiters_job_from_payload(&url, "acme", "smart-1", &detail).unwrap();
+        assert_eq!(parsed.description, "Build reliable systems. SQL & Rust.");
+    }
+
+    #[test]
+    fn smartrecruiters_detail_must_observe_the_exact_record_and_employer() {
+        let url = Url::parse("https://jobs.smartrecruiters.com/Acme/744000123456789").unwrap();
+        let mut payload = serde_json::json!({
+            "id": 744000123456789_u64,
+            "company": { "identifier": "Acme", "name": "Acme Corp" },
+            "name": "Platform Engineer",
+            "jobAd": { "sections": { "jobDescription": { "text": "Build APIs." } } }
+        });
+        let import = |value: &Value| {
+            smartrecruiters_job_from_payload(&url, "Acme", "744000123456789", value)
+        };
+        assert_eq!(import(&payload).unwrap().description, "Build APIs.");
+        payload["active"] = serde_json::json!(true);
+        assert_eq!(import(&payload).unwrap().description, "Build APIs.");
+        payload["active"] = serde_json::json!(false);
+        assert!(matches!(import(&payload), Err(JobImportError::NotFound(_))));
+        payload["active"] = serde_json::json!("true");
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+        payload["active"] = Value::Null;
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+        payload.as_object_mut().unwrap().remove("active");
+        assert_eq!(import(&payload).unwrap().description, "Build APIs.");
+        payload["id"] = serde_json::json!("744000123456788");
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+        payload["id"] = serde_json::json!("744000123456789");
+        payload["company"]["identifier"] = serde_json::json!("DifferentEmployer");
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+        payload["company"]["identifier"] = Value::Null;
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+        payload["company"]["identifier"] = serde_json::json!("Acme");
+        payload["id"] = Value::Null;
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+        payload["id"] = serde_json::json!("744000123456789");
+        payload["jobAd"]["sections"]["jobDescription"]["text"] = serde_json::json!("<p>&nbsp;</p>");
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+        payload["jobAd"]["sections"]["jobDescription"]["text"] = Value::Null;
+        payload["jobAd"]["sections"]["jobDescription"]["description"] =
+            serde_json::json!("<p>Design APIs.</p>");
+        assert_eq!(import(&payload).unwrap().description, "Design APIs.");
+        payload["jobAd"]["sections"]["jobDescription"]["text"] = serde_json::json!("Other role.");
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+    }
+
+    #[test]
+    fn smartrecruiters_detail_rejects_company_bio_or_script_as_role_requirements() {
+        let url = Url::parse("https://jobs.smartrecruiters.com/Acme/1234").unwrap();
+        let mut payload = serde_json::json!({
+            "id": "1234",
+            "company": { "identifier": "Acme" },
+            "name": "Platform Engineer",
+            "jobAd": { "sections": { "companyDescription": { "text": "About Acme." } } }
+        });
+        let import = |value: &Value| smartrecruiters_job_from_payload(&url, "Acme", "1234", value);
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+        payload["jobAd"]["sections"]["jobDescription"] =
+            serde_json::json!({ "text": "<SCRIPT>not role requirements</SCRIPT>" });
+        assert!(matches!(
+            import(&payload),
+            Err(JobImportError::Temporary(_))
+        ));
+    }
+
+    #[test]
+    fn smartrecruiters_import_preserves_stable_ids_and_rejects_selectors() {
+        for (path, expected) in [
+            ("Acme/744000123456789-platform-engineer", "744000123456789"),
+            ("Acme/fixture-role-123", "fixture-role-123"),
+        ] {
+            let url = Url::parse(&format!("https://jobs.smartrecruiters.com/{path}")).unwrap();
+            assert_eq!(
+                smartrecruiters_import_identity(&url).unwrap(),
+                ("Acme", expected)
+            );
+        }
+        for path in [
+            "Acme//fixture-123",
+            "Acme/fixture-123/apply",
+            "Acme/123?job=456",
+        ] {
+            let url = Url::parse(&format!("https://jobs.smartrecruiters.com/{path}")).unwrap();
+            assert!(matches!(
+                smartrecruiters_import_identity(&url),
+                Err(JobImportError::Invalid(_))
+            ));
+        }
     }
 
     #[test]

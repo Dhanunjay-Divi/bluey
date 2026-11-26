@@ -1,52 +1,10 @@
-export const TARGET_ROLE_SUGGESTIONS = [
-  "Clinical Research Coordinator",
-  "Clinical Research Associate",
-  "Clinical Research Analyst",
-  "Clinical Operations Manager",
-  "Healthcare Data Analyst",
-  "Health Informatics Analyst",
-  "Epic Analyst",
-  "Medical Records Analyst",
-  "Regulatory Affairs Specialist",
-  "Research Program Manager",
-  "Software Engineer",
-  "Full Stack Engineer",
-  "Frontend Engineer",
-  "Backend Engineer",
-  "Mobile Engineer",
-  "DevOps Engineer",
-  "Site Reliability Engineer",
-  "Cloud Engineer",
-  "Security Engineer",
-  "Data Engineer",
-  "Data Analyst",
-  "Data Scientist",
-  "Machine Learning Engineer",
-  "AI Engineer",
-  "Business Intelligence Analyst",
-  "Product Manager",
-  "Technical Product Manager",
-  "Program Manager",
-  "Project Manager",
-  "UX Designer",
-  "Product Designer",
-  "UX Researcher",
-  "Business Analyst",
-  "Operations Manager",
-  "Strategy Consultant",
-  "Financial Analyst",
-  "Accountant",
-  "Marketing Manager",
-  "Growth Marketing Manager",
-  "Sales Development Representative",
-  "Account Executive",
-  "Customer Success Manager",
-  "Human Resources Business Partner",
-  "Recruiter",
-  "Quality Assurance Engineer",
-  "Solutions Architect",
-  "Solutions Engineer",
-];
+import {
+  CANONICAL_ROLE_SUGGESTIONS,
+  canonicalRoleSuggestions,
+  resolveTargetRole,
+} from "../lib/canonical-taxonomy";
+
+export const TARGET_ROLE_SUGGESTIONS = [...CANONICAL_ROLE_SUGGESTIONS];
 
 export const ROLE_SUGGESTIONS = [
   ...TARGET_ROLE_SUGGESTIONS,
@@ -58,47 +16,11 @@ export const ROLE_SUGGESTIONS = [
   "Director of Clinical Operations",
 ];
 
-const canonicalRoleAliases: Array<[RegExp, string]> = [
-  [/^(?:sde|swe|software developer|application developer)$/i, "Software Engineer"],
-  [/^(?:frontend|front[- ]end)(?: developer| engineer)?$/i, "Frontend Engineer"],
-  [/^(?:backend|back[- ]end)(?: developer| engineer)?$/i, "Backend Engineer"],
-  [/^(?:full[- ]?stack)(?: developer| engineer)?$/i, "Full Stack Engineer"],
-  [/^(?:devops)(?: developer| engineer)?$/i, "DevOps Engineer"],
-  [/^(?:sre)$/i, "Site Reliability Engineer"],
-  [/^(?:de|data developer)$/i, "Data Engineer"],
-  [/^(?:ml engineer|mle)$/i, "Machine Learning Engineer"],
-  [/^(?:qa|qa engineer|test engineer)$/i, "Quality Assurance Engineer"],
-  [/^(?:tpm)$/i, "Technical Product Manager"],
-  [/^(?:pm)$/i, "Product Manager"],
-  [/^(?:product owner)$/i, "Product Manager"],
-  [/^(?:cra)$/i, "Clinical Research Associate"],
-  [/^(?:crc)$/i, "Clinical Research Coordinator"],
-];
-
-const roleQueryAliases: Record<string, string[]> = {
-  pm: ["Product Manager", "Project Manager", "Program Manager"],
-  sde: ["Software Engineer"],
-  swe: ["Software Engineer"],
-  de: ["Data Engineer"],
-  sre: ["Site Reliability Engineer"],
-  tpm: ["Technical Product Manager"],
-  qa: ["Quality Assurance Engineer"],
-  cra: ["Clinical Research Associate"],
-  crc: ["Clinical Research Coordinator"],
-};
-
+// Compatibility display helper. The server and resolveTargetRole retain canonical/review authority.
 export function canonicalizeTargetRole(value: string): string {
-  const parts = value.split(/\s*,\s*/).map((part) => part.trim()).filter(Boolean);
-  const rolePattern = /\b(?:engineer|developer|manager|director|analyst|scientist|designer|consultant|specialist|architect|research|coordinator|recruiter|accountant)\b/i;
-  const roleOnly = parts.length > 1
-    ? parts.find((part) => rolePattern.test(part)) || value
-    : value;
-  const clean = roleOnly
-    .trim()
-    .replace(/^(?:entry[- ]level|junior|jr\.?|mid[- ]level|senior|sr\.?|staff|lead|principal)\s+/i, "")
-    .replace(/\s+(?:i|ii|iii|iv|1|2|3|4)$/i, "")
-    .trim();
-  return canonicalRoleAliases.find(([pattern]) => pattern.test(clean))?.[1] || clean;
+  const resolution = resolveTargetRole(value);
+  if (resolution.status === "resolved") return resolution.role.label;
+  return resolution.input;
 }
 
 export function canonicalTargetRoles(values: string[]): string[] {
@@ -106,13 +28,7 @@ export function canonicalTargetRoles(values: string[]): string[] {
 }
 
 export function targetRoleSuggestions(query: string, selected: string[] = [], limit = 8): string[] {
-  const aliasMatches = roleQueryAliases[query.trim().toLocaleLowerCase()] || [];
-  const selectedSet = new Set(selected.map((value) => value.trim().toLocaleLowerCase()));
-  const exactAliases = aliasMatches.filter((value) => !selectedSet.has(value.toLocaleLowerCase()));
-  return mergeCareerSuggestions(
-    exactAliases,
-    filterCareerSuggestions(query, TARGET_ROLE_SUGGESTIONS, selected, limit),
-  ).slice(0, limit);
+  return canonicalRoleSuggestions(query, selected, limit);
 }
 
 export const LOCATION_SUGGESTIONS = [
@@ -244,7 +160,15 @@ export function filterCareerSuggestions(
     .map((value, index) => {
       const normalized = value.toLocaleLowerCase();
       const wordStarts = normalized.split(/[^a-z0-9]+/).some((word) => word.startsWith(needle));
-      const rank = !needle ? 3 : normalized.startsWith(needle) ? 0 : wordStarts ? 1 : normalized.includes(needle) ? 2 : 4;
+      const rank = !needle
+        ? 3
+        : normalized.startsWith(needle)
+          ? 0
+          : wordStarts
+            ? 1
+            : normalized.includes(needle)
+              ? 2
+              : 4;
       return { value, rank, index };
     })
     .filter((item) => item.rank < 4)

@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  GlobalDiscoveryApiError,
   GlobalDiscoveryApiClient,
   type GlobalDiscoveryApiFetch,
   type GlobalDiscoverySourceInput,
@@ -216,6 +217,53 @@ describe("global discovery worker runtime", () => {
     }));
   });
 
+  it.each([
+    ["", "C2C not accepted", "", ""],
+    ["Contract", "C2C / 1099 not accepted", "contract", ""],
+    ["", "C2C or W2", "", ""],
+    ["Contract", "Not C2C", "contract", ""],
+    ["", "C2C, 1099 not accepted; W2 only", "", "w2"],
+    ["Contract", "C2C only", "contract", "c2c"],
+    ["W2", "W2 not accepted", "", ""],
+    ["C2C,", "1099 not accepted", "", "c2c"],
+    ["", "W2 only", "", "w2"],
+    ["", "1099", "", "1099"],
+    ["", "No independent contractor", "", ""],
+    ["Full-time", "Part-time W2", "", "w2"],
+    ["Full-time", "W-2", "full_time", "w2"],
+    ["", "", "", ""],
+  ])("projects typed CSV categories %j and %j without inventing evidence", async (
+    employment, commitment, expectedEmployment, expectedEngagement,
+  ) => {
+    const csv = candidateCsv(employment, commitment, "C2C and W2 are mentioned in this description.");
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(lease(sha256));
+    const stagingDirectory = await temporaryDirectory();
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      stagingDirectory,
+      manifestFetch: (async () => jsonResponse(manifestFixture(csv, sha256))) as typeof fetch,
+      artifactFetch: (async () => new Response(csv, {
+        headers: { "content-length": String(Buffer.byteLength(csv)) },
+      })) as typeof fetch,
+      logger: new RecordingLogger(),
+      now: () => SNAPSHOT_AT_MS,
+    });
+
+    await expect(runtime.pollOnce()).resolves.toBe("completed");
+
+    expect(api.failed).toEqual([]);
+    expect(api.batches).toHaveLength(1);
+    expect(api.batches[0]?.jobs).toHaveLength(1);
+    const observed = api.batches[0]?.jobs[0];
+    expect(observed?.external_id).toBe("lever-123");
+    expect(observed?.requires_original_revalidation).toBe(true);
+    expect(observed?.engagement_type, "observed batch engagement").toBe(expectedEngagement);
+    expect(observed?.employment_type, "observed batch employment").toBe(expectedEmployment);
+    expect(api.completed[0]).toMatchObject({ accepted_rows: 1, rejected_rows: 0, complete_snapshot: true });
+    expect(await readdir(stagingDirectory)).toEqual([]);
+  });
+
   it("quarantines a bounded missing-identity row while committing valid jobs", async () => {
     const csv = candidateCsvWithMalformedIdentity();
     const sha256 = createHash("sha256").update(csv).digest("hex");
@@ -298,6 +346,162 @@ describe("global discovery worker runtime", () => {
     expect(api.failed[0]?.error_code).toBe("source_snapshot_mismatch");
   });
 
+  it.each([
+    { status: "failed" },
+    { replay_key: "unrelated-replay" },
+    { run_id: "unrelated-run" },
+    { received_batches: 0 },
+  ])("does not report completion after a mismatched acknowledgement %j", async (override) => {
+    const csv = candidateCsv();
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(lease(sha256));
+    const complete = api.complete.bind(api);
+    vi.spyOn(api, "complete").mockImplementation(async (...args) => ({
+      ...await complete(...args),
+      ...override,
+    }));
+    const stagingDirectory = await temporaryDirectory();
+    const logger = new RecordingLogger();
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      stagingDirectory,
+      logger,
+      manifestFetch: async () => jsonResponse(manifestFixture(csv, sha256)),
+      artifactFetch: async () => new Response(csv),
+    });
+
+    await expect(runtime.pollOnce()).rejects.toMatchObject({ code: "invalid_response" });
+
+    expect(api.completed).toHaveLength(1);
+    expect(api.failed).toEqual([]);
+    expect(logger.events.some(({ event }) => (
+      event === "global_discovery_source_completed" || event === "global_discovery_source_failed"
+    ))).toBe(false);
+    expect(await readdir(stagingDirectory)).toEqual([]);
+  });
+
+  it.each([
+    {},
+    { run_id: "unrelated-run" },
+    { batch_index: 0 },
+    { received_rows: 1 },
+    { received_batches: 1 },
+  ])("accepts a replayed prefix but requires matching later acknowledgements %j", async (override) => {
+    const first = candidateCsv();
+    const second = first.trimEnd().split("\n")[1]!.replaceAll("lever-123", "lever-456");
+    const csv = `${first}${second}\n`;
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(lease(sha256, 2));
+    const ingestBatch = api.ingestBatch.bind(api);
+    vi.spyOn(api, "ingestBatch").mockImplementation(async (...args) => {
+      const result = await ingestBatch(...args);
+      // An exact prefix replay can report work already recorded beyond it.
+      return result.batch_index === 0
+        ? { ...result, received_batches: 2, received_rows: 2, replayed: true }
+        : { ...result, ...override };
+    });
+    const stagingDirectory = await temporaryDirectory();
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      stagingDirectory,
+      uploadBatchRows: 1,
+      manifestFetch: async () => jsonResponse(manifestFixture(csv, sha256, 2)),
+      artifactFetch: async () => new Response(csv),
+    });
+
+    const isMismatch = Object.keys(override).length > 0;
+    if (isMismatch) await expect(runtime.pollOnce()).rejects.toMatchObject({ code: "invalid_response" });
+    else await expect(runtime.pollOnce()).resolves.toBe("completed");
+
+    expect(api.batches.map(({ batch_index }) => batch_index)).toEqual([0, 1]);
+    expect(api.completed).toHaveLength(isMismatch ? 0 : 1);
+    expect(api.failed).toEqual([]);
+    expect(await readdir(stagingDirectory)).toEqual([]);
+  });
+
+  it.each([
+    { status: "completed" },
+    { replay_key: "unrelated-replay" },
+  ])("does not report failure after a mismatched failure acknowledgement %j", async (override) => {
+    const csv = candidateCsv();
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(lease(sha256, 2));
+    const fail = api.fail.bind(api);
+    vi.spyOn(api, "fail").mockImplementation(async (...args) => ({
+      ...await fail(...args),
+      ...override,
+    }));
+    const artifactFetch = vi.fn(async () => new Response(csv));
+    const logger = new RecordingLogger();
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      logger,
+      stagingDirectory: await temporaryDirectory(),
+      manifestFetch: async () => jsonResponse(manifestFixture(csv, sha256)),
+      artifactFetch,
+    });
+
+    await expect(runtime.pollOnce()).rejects.toMatchObject({ code: "invalid_response" });
+
+    expect(api.failed).toHaveLength(1);
+    expect(api.completed).toEqual([]);
+    expect(artifactFetch).not.toHaveBeenCalled();
+    expect(logger.events.some(({ event }) => event === "global_discovery_source_failed")).toBe(false);
+  });
+
+  it("preserves a lost batch response without declaring the source failed", async () => {
+    const csv = candidateCsv();
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(lease(sha256));
+    const lost = new GlobalDiscoveryApiError("api_timeout", "synthetic response lost");
+    const ingestBatch = api.ingestBatch.bind(api);
+    vi.spyOn(api, "ingestBatch").mockImplementation(async (...args) => {
+      await ingestBatch(...args);
+      throw lost;
+    });
+    const stagingDirectory = await temporaryDirectory();
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      stagingDirectory,
+      uploadBatchRows: 1,
+      manifestFetch: async () => jsonResponse(manifestFixture(csv, sha256)),
+      artifactFetch: async () => new Response(csv),
+    });
+
+    await expect(runtime.pollOnce()).rejects.toBe(lost);
+    expect(api.batches).toHaveLength(1);
+    expect(api.completed).toEqual([]);
+    expect(api.failed).toEqual([]);
+    expect(await readdir(stagingDirectory)).toEqual([]);
+  });
+
+  it.each(["run-global-test", "unrelated-run"])("binds a partial failure acknowledgement to %s", async (runId) => {
+    // The manifest and lease match, but the verified CSV stops one row early.
+    const csv = candidateCsv();
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(lease(sha256, 2));
+    const fail = api.fail.bind(api);
+    vi.spyOn(api, "fail").mockImplementation(async (...args) => ({
+      ...await fail(...args),
+      run_id: runId,
+      received_rows: 1,
+      received_batches: 1,
+    }));
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      stagingDirectory: await temporaryDirectory(),
+      uploadBatchRows: 1,
+      manifestFetch: async () => jsonResponse(manifestFixture(csv, sha256, 2)),
+      artifactFetch: async () => new Response(csv),
+    });
+
+    if (runId === "run-global-test") await expect(runtime.pollOnce()).resolves.toBe("failed");
+    else await expect(runtime.pollOnce()).rejects.toMatchObject({ code: "invalid_response" });
+    expect(api.batches).toHaveLength(1);
+    expect(api.completed).toEqual([]);
+    expect(api.failed).toHaveLength(1);
+  });
+
   it("signs and retries an idempotent batch with the exact same body", async () => {
     const requests: Array<{ input: string; init?: RequestInit }> = [];
     const fetcher: GlobalDiscoveryApiFetch = vi.fn(async (input, init) => {
@@ -349,6 +553,27 @@ describe("global discovery worker runtime", () => {
     for (const request of requests) expectSignedRequest(request);
     expect(new Headers(requests[0]?.init?.headers).get("x-bluey-jobs-worker-nonce"))
       .not.toBe(new Headers(requests[1]?.init?.headers).get("x-bluey-jobs-worker-nonce"));
+  });
+
+  it("treats a lost success response body as an uncertain acknowledgement", async () => {
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({
+      pull(controller) {
+        controller.error(new Error("private synthetic transport detail"));
+      },
+    })));
+    const client = new GlobalDiscoveryApiClient({
+      origin: "https://jobs.internal",
+      signingKey: WORKER_KEY,
+      workerId: "global-discovery-test",
+      fetch: fetcher,
+      reportRetryMs: 0,
+    });
+
+    await expect(client.complete("source-global-lever", completionInput())).rejects.toMatchObject({
+      code: "invalid_response",
+      message: "Global discovery API response could not be read",
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("accepts a legacy completion response with no quarantine evidence", async () => {
@@ -484,7 +709,11 @@ async function temporaryDirectory(): Promise<string> {
   return directory;
 }
 
-function candidateCsv(): string {
+function candidateCsv(
+  employment = "Contract",
+  commitment = "W2 contract",
+  description = "Build reliable systems.",
+): string {
   const row = [
     "https://jobs.lever.co/acme/lever-123",
     "Platform Engineer",
@@ -498,14 +727,14 @@ function candidateCsv(): string {
     "USD",
     "year",
     "",
-    "Contract",
+    employment,
     "Engineering",
     "Platform",
-    "Build reliable systems.",
+    description,
     SNAPSHOT_AT,
     "REQ-123",
     "https://jobs.lever.co/acme/lever-123/apply",
-    "W2 contract",
+    commitment,
     "{}",
     "US",
   ];

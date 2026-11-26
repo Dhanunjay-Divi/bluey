@@ -7,10 +7,22 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db, jobs_mailbox_sync, object_storage,
+    db, jobs_communication_dispatch, jobs_mailbox_sync, jobs_managed_cloud_runtime,
+    jobs_workflow_cleanup, jobs_workflow_dispatch, object_storage,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
+
+fn validate_runtime_config() -> anyhow::Result<()> {
+    db::jobs::validate_data_encryption_config().context("validate Jobs data encryption")?;
+    api::jobs_local_capability::validate_runtime_config()
+        .context("validate Bluey Browser capability configuration")?;
+    api::jobs_runner_volumes::validate_runtime_config()
+        .context("validate managed runner-volume purge signing configuration")?;
+    jobs_managed_cloud_runtime::validate_runtime_config()
+        .context("validate managed cloud launch configuration")?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,8 +36,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Config
     let config = Config::from_env().context("load config")?;
-    api::jobs_local_capability::validate_runtime_config()
-        .context("validate Bluey Browser capability configuration")?;
+    validate_runtime_config()?;
     tracing::info!(
         port = config.port,
         db_backend = ?config.db_backend,
@@ -46,6 +57,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     db::run_migrations(&pool).context("run migrations")?;
+    // Verify the process context before any startup reconciliation or workers
+    // can dispatch business work. It is immutable for this router's lifetime.
+    let app = api::build_router_from_environment(pool.clone(), config.clone())
+        .context("build router with Jobs provisioning process context")?;
     let expired_usage_released =
         db::usage_reservations::reconcile_expired_usage_reservations(&pool)
             .context("reconcile expired managed usage reservations at startup")?;
@@ -53,8 +68,6 @@ async fn main() -> anyhow::Result<()> {
         expired_usage_released,
         "startup managed usage reservation reconciliation completed"
     );
-    let usage_reservation_janitor =
-        db::usage_reservations::spawn_expired_usage_reservation_janitor(pool.clone());
     let startup_spend_cleanup = db::jobs_provider_cost_holds::prune_expired_spend_truth(&pool)
         .context("prune expired upstream spend truth at startup")?;
     tracing::info!(
@@ -62,9 +75,18 @@ async fn main() -> anyhow::Result<()> {
         cutover_baseline_rows_deleted = startup_spend_cleanup.cutover_baseline_rows_deleted,
         "startup upstream spend truth cleanup completed"
     );
+    let workflow_cleanup_dispatcher =
+        jobs_workflow_cleanup::spawn_jobs_workflow_cleanup_dispatcher(pool.clone())
+            .context("start Jobs workflow cleanup dispatcher")?;
+    let usage_reservation_janitor =
+        db::usage_reservations::spawn_expired_usage_reservation_janitor(pool.clone());
     let spend_truth_janitor = db::jobs_provider_cost_holds::spawn_spend_truth_janitor(pool.clone());
     let mailbox_sync_worker = jobs_mailbox_sync::spawn_mailbox_sync_worker(pool.clone());
-
+    let communication_workers =
+        jobs_communication_dispatch::spawn_communication_workers(pool.clone());
+    let workflow_command_dispatcher =
+        jobs_workflow_dispatch::spawn_jobs_workflow_command_dispatcher(pool.clone())
+            .context("start Jobs workflow command dispatcher")?;
     let cleanup_worker = object_storage::spawn_cleanup_worker(
         pool.clone(),
         config.object_storage.clone(),
@@ -73,9 +95,6 @@ async fn main() -> anyhow::Result<()> {
             .clone()
             .or_else(|| config.object_storage.clone()),
     );
-
-    // Router
-    let app = api::build_router(pool.clone(), config.clone());
 
     // Bind
     let host = std::env::var("BLUEY_API_HOST")
@@ -90,6 +109,14 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {addr}"))?;
 
     tracing::info!(%addr, "listening");
+    let managed_cloud_runtime_reporters =
+        jobs_managed_cloud_runtime::start_jobs_api_managed_cloud_runtime_reporters(
+            pool.clone(),
+            &listener,
+            workflow_command_dispatcher.as_ref(),
+            workflow_cleanup_dispatcher.as_ref(),
+        )
+        .context("start managed-cloud Jobs API runtime reporters")?;
 
     let serve_result = axum::serve(
         listener,
@@ -98,10 +125,20 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("axum serve");
+    if let Some(reporters) = managed_cloud_runtime_reporters {
+        reporters.shutdown().await;
+    }
     if let Some(worker) = cleanup_worker {
         worker.abort();
     }
     if let Some(worker) = mailbox_sync_worker {
+        worker.abort();
+    }
+    communication_workers.abort();
+    if let Some(worker) = workflow_command_dispatcher {
+        worker.abort();
+    }
+    if let Some(worker) = workflow_cleanup_dispatcher {
         worker.abort();
     }
     spend_truth_janitor.abort();
@@ -131,5 +168,23 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c    => tracing::info!("ctrl-c received"),
         _ = terminate => tracing::info!("SIGTERM received"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn full_server_startup_rejects_an_invalid_jobs_data_key() {
+        let previous = std::env::var_os("BLUEY_JOBS_DATA_KEY");
+        std::env::set_var("BLUEY_JOBS_DATA_KEY", "malformed-key");
+        let error = validate_runtime_config().unwrap_err().to_string();
+        match previous {
+            Some(value) => std::env::set_var("BLUEY_JOBS_DATA_KEY", value),
+            None => std::env::remove_var("BLUEY_JOBS_DATA_KEY"),
+        }
+        assert!(error.contains("validate Jobs data encryption"));
     }
 }

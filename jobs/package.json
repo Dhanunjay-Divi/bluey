@@ -10,13 +10,32 @@
     "workflows"
   ],
   "scripts": {
+    "audit:dependencies": "npm audit --audit-level=moderate",
     "build": "npm run build --workspace @bluey/jobs-automation && npm run build --workspace @bluey/jobs-browser && npm run build --workspace @bluey/jobs-runner && npm run build --workspace @bluey/jobs-workflows && npm run build --workspace @bluey/jobs-portal",
-    "test": "npm run build --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-browser && npm run test --workspace @bluey/jobs-runner && npm run test --workspace @bluey/jobs-workflows && npm run test --workspace @bluey/jobs-portal",
+    "test:managed-cloud-release": "node --test scripts/managed-cloud-release-gate.test.mjs scripts/check-managed-cloud-observability-policy.test.mjs scripts/check-managed-cloud-authorization-origin.test.mjs",
+    "test:native-packaging-inventory": "node --test scripts/native-packaging-inventory.test.mjs",
+    "test:local-qa": "node --test scripts/local-qa-build-binding.test.mjs scripts/local-qa-durable-draft.test.mjs scripts/local-qa-durable-posting-seeder.test.mjs scripts/local-qa-session-binding-order.test.mjs scripts/local-qa-gateway.test.mjs scripts/local-qa-c2c-handoff.test.mjs scripts/local-qa-linux-c2c-session.test.mjs scripts/local-qa-linux-postmaster-observer.test.mjs scripts/local-qa-linux-pg-runtime.test.mjs scripts/local-qa-linux-owned-api-session.test.mjs scripts/local-qa-browser-signup.test.mjs scripts/local-qa-browser-sample-resume.test.mjs scripts/local-qa-browser-sample-prepare.test.mjs scripts/local-qa-imported-resume-prepare.test.mjs scripts/local-qa-linux-signup-gateway.test.mjs scripts/local-qa-linux-signup-sample-native.test.mjs scripts/local-qa-linux-signup-prepare-native.test.mjs scripts/local-qa-linux-signup-mock-receipt-native.test.mjs scripts/local-qa-mock-receipt-checkpoint.test.mjs scripts/local-qa-browser-mock-receipt.test.mjs && python3 -I -S -B scripts/test-local-qa-linux-signup-sample-terminal.py && python3 -I -S -B scripts/test-local-qa-linux-signup-sample-code-packet.py && python3 -I -S -B scripts/test-local-qa-linux-signup-prepare-packet.py && python3 -I -S -B scripts/test-local-qa-linux-signup-mock-receipt-terminal.py",
+    "test:nonprod-reports": "node --test scripts/nonprod-browser-api-report.test.mjs scripts/nonprod-temporal-boundary.test.mjs scripts/nonprod-runner-control-plane.test.mjs scripts/nonprod-postgres-identity.test.mjs scripts/provider-exposure.test.mjs scripts/provider-yield.test.mjs scripts/jobs-recurring-cost-forecast.test.mjs scripts/managed-receipt-postgres-proof.test.mjs scripts/nonprod-jobs-mcp-stdio.test.mjs scripts/jobs-mcp-install-v1.test.mjs scripts/nonprod-c2c-rights-db.test.mjs scripts/nonprod-c2c-contract-track-current.test.mjs scripts/interview-prep-witness.test.mjs",
+    "test:nonprod-storage": "node --test scripts/nonprod-object-store.test.mjs scripts/local-qa-object-store.test.mjs scripts/local-qa-object-store-receipt.test.mjs",
+    "test:nonprod-linux-harness": "node --test scripts/run-nonprod-linux-runner-tests.test.mjs",
+    "test:nonprod-managed-vm-harness": "node --test scripts/nonprod-managed-runner-vm.test.mjs scripts/nonprod-managed-runner-image-inspect.test.mjs scripts/managed-runner-image-workload.test.mjs scripts/managed-runner-artifact-stream.test.mjs && python3 -I -S -B scripts/managed-runner-host-processes.test.py && python3 -I -S -B scripts/managed-runner-artifacts.test.py",
+    "test": "npm run test:native-packaging-inventory && npm run test:nonprod-reports && npm run test:nonprod-storage && npm run test:nonprod-linux-harness && npm run test:nonprod-managed-vm-harness && npm run build --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-browser && npm run test --workspace @bluey/jobs-runner && npm run test --workspace @bluey/jobs-workflows && npm run test --workspace @bluey/jobs-portal",
     "typecheck": "npm run build --workspace @bluey/jobs-automation && npm run typecheck --workspace @bluey/jobs-automation && npm run typecheck --workspace @bluey/jobs-browser && npm run typecheck --workspace @bluey/jobs-runner && npm run typecheck --workspace @bluey/jobs-workflows && npm run typecheck --workspace @bluey/jobs-portal"
   },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "devDependencies": {
+    "@electron/asar": "4.3.1"
+  },
   "overrides": {
-    "dompurify": "3.4.12",
-    "fast-uri": "3.1.5",
-    "postcss": "8.5.25"
+    "@electron/asar@4.3.1": {
+      "glob": "14.0.3",
+      "minimatch": "11.0.3"
+    },
+    "dompurify": "3.4.17",
+    "fast-uri": "3.1.9",
+    "postcss": "8.5.26",
+    "source-map-js": "1.2.2"
   }
 }

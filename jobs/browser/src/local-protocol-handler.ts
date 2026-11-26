@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { parseLocalRunClaim } from "./local-capabilities.js";
 import {
   jobsApiOrigin,
@@ -8,6 +9,7 @@ import { LocalBrowserError } from "./local-failure.js";
 import { parseBlueyJobsProtocol } from "./protocol.js";
 import type { AdmissionBlockReason } from "./run-admission.js";
 import { ProtocolCommandSingleFlight } from "./protocol-command-single-flight.js";
+import type { BrowserBuildProof } from "./release-authority.js";
 
 const protocolCommands = new ProtocolCommandSingleFlight();
 
@@ -17,6 +19,7 @@ export interface ProtocolActiveRun {
 }
 
 export interface LocalProtocolDependencies {
+  readonly buildProof?: BrowserBuildProof;
   showController(): void;
   isOnline(): boolean;
   admissionDecision(): { allowed: true } | { allowed: false; reason: AdmissionBlockReason };
@@ -67,18 +70,35 @@ async function handleLocalProtocolSingleFlight(
         dependencies.showPaused(decision.reason === "paused" ? "manual" : decision.reason);
         return;
       }
+      if (!dependencies.buildProof) {
+        dependencies.showPaused("unavailable");
+        return;
+      }
       dependencies.showPreparing();
       const apiOrigin = jobsApiOrigin();
+      const claimNonce = localClaimNonce(
+        command.runId,
+        command.ticket,
+        dependencies.buildProof,
+      );
       const response = await fetch(
         `${apiOrigin}/api/jobs/local-runs/${encodeURIComponent(command.runId)}/claim`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ticket: command.ticket }),
+          body: JSON.stringify({
+            ticket: command.ticket,
+            claimNonce,
+            buildProof: dependencies.buildProof,
+          }),
         },
       );
       if (!response.ok) {
-        if (response.status === 401 || response.status === 403) {
+        if (
+          response.status === 401 ||
+          response.status === 403 ||
+          response.status === 426
+        ) {
           dependencies.showPaused("unavailable");
           return;
         }
@@ -124,4 +144,21 @@ async function handleLocalProtocolSingleFlight(
   } catch (error) {
     dependencies.handleUnexpected(error);
   }
+}
+
+export function localClaimNonce(
+  runId: string,
+  ticket: string,
+  proof: BrowserBuildProof,
+): string {
+  return createHash("sha256")
+    .update("bluey-jobs-browser-claim-v1\0", "utf8")
+    .update(runId, "utf8")
+    .update("\0", "utf8")
+    .update(ticket, "utf8")
+    .update("\0", "utf8")
+    .update(proof.descriptor, "utf8")
+    .update("\0", "utf8")
+    .update(proof.signature, "utf8")
+    .digest("hex");
 }

@@ -1,16 +1,34 @@
 import type {
+  ExactSubmitFileEvidence,
   FormControl,
+  FormFileEvidence,
   FormControlKind,
+  TrustedSubmitFieldValue,
   ValidationIssue,
 } from "./contracts.js";
+
+export const FORM_FILE_READBACK_LIMITS = Object.freeze({
+  maxFileCount: 2,
+  maxFileBytes: 12 * 1024 * 1024,
+  maxAggregateBytes: 24 * 1024 * 1024,
+  maxFileNameChars: 255,
+} as const);
+
+export interface ExpectedFormFileEvidence {
+  name: string;
+  byteLength: number | null;
+  sha256: string;
+}
 
 export interface FormFillExpectation {
   selector: string;
   kind: FormControlKind;
   field: string;
+  controlName?: string;
   expectedValue?: string;
   expectedChecked?: boolean;
-  expectedFileName?: string;
+  expectedSubmitValue?: string;
+  expectedFiles?: ExpectedFormFileEvidence[];
 }
 
 export function valueExpectation(
@@ -18,12 +36,14 @@ export function valueExpectation(
   field: string,
   expectedValue: string,
 ): FormFillExpectation {
-  return {
+  return Object.freeze({
     selector: control.selector,
     kind: control.kind,
     field,
+    controlName: control.name,
     expectedValue,
-  };
+    expectedSubmitValue: expectedValue,
+  });
 }
 
 export function checkedExpectation(
@@ -31,25 +51,71 @@ export function checkedExpectation(
   field: string,
   expectedChecked: boolean,
 ): FormFillExpectation {
-  return {
+  return Object.freeze({
     selector: control.selector,
     kind: control.kind,
     field,
+    controlName: control.name,
     expectedChecked,
-  };
+    expectedSubmitValue: expectedChecked ? (control.value || "on") : undefined,
+  });
 }
 
 export function fileExpectation(
   control: FormControl,
   field: string,
-  expectedPath: string,
+  expectedPaths: string | readonly string[],
+  selectedFiles: readonly FormFileEvidence[] = control.files ?? [],
 ): FormFillExpectation {
-  return {
+  const paths = typeof expectedPaths === "string" ? [expectedPaths] : [...expectedPaths];
+  const expectedFiles = paths.map((path, index) => {
+    const identity = snapshotFileIdentity(path);
+    const selected = selectedFiles[index];
+    const exactIdentity = selected?.name === identity.name
+      && selected.sha256 === identity.sha256
+      && validSelectedFileByteLength(selected.byteLength);
+    return {
+      ...identity,
+      // The exact DOM File size becomes expected evidence only when its bytes
+      // match the immutable content address. Size can never stand in for hash.
+      byteLength: exactIdentity ? selected.byteLength : null,
+    };
+  });
+  return Object.freeze({
     selector: control.selector,
     kind: control.kind,
     field,
-    expectedFileName: fileName(expectedPath),
-  };
+    controlName: control.name,
+    expectedFiles,
+  });
+}
+
+export function exactSubmitTrustedFieldValues(
+  expectations: readonly FormFillExpectation[],
+): ReadonlyArray<Readonly<TrustedSubmitFieldValue>> {
+  const values: TrustedSubmitFieldValue[] = [];
+  for (const expectation of expectations) {
+    if (expectation.expectedFiles !== undefined || expectation.expectedChecked === false) continue;
+    const value = expectation.expectedSubmitValue;
+    if (value === undefined) continue;
+    const fieldName = expectation.controlName;
+    if (!fieldName
+      || fieldName.length > 240
+      || /[\u0000-\u001f\u007f]/u.test(fieldName)) {
+      throw new Error("Application answer submit field is invalid");
+    }
+    values.push(Object.freeze({ fieldName, value }));
+  }
+  return Object.freeze(values);
+}
+
+export function snapshotFileIdentity(path: string): Pick<FormFileEvidence, "name" | "sha256"> {
+  const name = fileName(path);
+  const match = /^(?:resume|cover-letter)-([a-f0-9]{64})\.pdf$/u.exec(name);
+  if (!match || name.length > FORM_FILE_READBACK_LIMITS.maxFileNameChars) {
+    throw new Error("Application document path is not an immutable content-addressed snapshot");
+  }
+  return { name, sha256: match[1]! };
 }
 
 export function verifyFillExpectations(
@@ -78,6 +144,51 @@ export function verifyFillExpectations(
   return issues;
 }
 
+export function exactSubmitFileEvidence(
+  expectations: readonly FormFillExpectation[],
+  controls: readonly FormControl[],
+): ReadonlyArray<Readonly<ExactSubmitFileEvidence>> {
+  const controlsBySelector = new Map(controls.map((control) => [control.selector, control]));
+  const expectedSelectors = new Set(
+    expectations.filter((expectation) => expectation.expectedFiles !== undefined)
+      .map((expectation) => expectation.selector),
+  );
+  if (controls.some((control) => control.kind === "file"
+    && (control.files?.length ?? 0) > 0
+    && !expectedSelectors.has(control.selector))) {
+    throw new Error("Application form contains an unexpected selected document");
+  }
+
+  const evidence: ExactSubmitFileEvidence[] = [];
+  for (const expectation of expectations) {
+    if (expectation.expectedFiles === undefined) continue;
+    const control = controlsBySelector.get(expectation.selector);
+    if (!control
+      || !control.name
+      || control.name.length > 240
+      || /[\u0000-\u001f\u007f]/u.test(control.name)) {
+      throw new Error("Application document submit field is invalid");
+    }
+    for (const file of expectation.expectedFiles) {
+      if (file.byteLength === null) {
+        throw new Error("Application document evidence is incomplete");
+      }
+      evidence.push(Object.freeze({
+        fieldName: control.name,
+        name: file.name,
+        byteLength: file.byteLength,
+        sha256: file.sha256,
+      }));
+    }
+  }
+  const aggregateBytes = evidence.reduce((total, file) => total + file.byteLength, 0);
+  if (evidence.length > FORM_FILE_READBACK_LIMITS.maxFileCount
+    || aggregateBytes > FORM_FILE_READBACK_LIMITS.maxAggregateBytes) {
+    throw new Error("Application document submit evidence exceeds its bounds");
+  }
+  return Object.freeze(evidence);
+}
+
 function expectationMatches(
   expectation: FormFillExpectation,
   control: FormControl,
@@ -86,8 +197,17 @@ function expectationMatches(
     return Boolean(control.checked) === expectation.expectedChecked;
   }
 
-  if (expectation.expectedFileName !== undefined) {
-    return fileName(control.value) === expectation.expectedFileName;
+  if (expectation.expectedFiles !== undefined) {
+    const actualFiles = control.files;
+    return actualFiles !== undefined
+      && actualFiles.length === expectation.expectedFiles.length
+      && expectation.expectedFiles.every((expected, index) => {
+        const actual = actualFiles[index];
+        return expected.byteLength !== null
+          && actual?.name === expected.name
+          && actual.byteLength === expected.byteLength
+          && actual.sha256 === expected.sha256;
+      });
   }
 
   if (expectation.expectedValue === undefined) return false;
@@ -106,4 +226,10 @@ function normalizeValue(kind: FormControlKind, value: string): string {
 
 function fileName(value: string): string {
   return value.split(/[\\/]/).filter(Boolean).at(-1) ?? "";
+}
+
+function validSelectedFileByteLength(value: number): boolean {
+  return Number.isSafeInteger(value)
+    && value > 0
+    && value <= FORM_FILE_READBACK_LIMITS.maxFileBytes;
 }

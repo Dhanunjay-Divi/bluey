@@ -65,6 +65,8 @@ pub(crate) struct SettledUsage {
     pub trial_seconds_remaining: i64,
 }
 
+type CompletionEncoder<'a> = &'a dyn Fn(&SettledUsage) -> Result<String, serde_json::Error>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct SettlementUsageEvent {
     pub event: UsageEvent,
@@ -829,6 +831,56 @@ pub(crate) fn settle_with_events(
     settled_at_ms: i64,
     components: &[SettlementUsageEvent],
 ) -> Result<SettledUsage, UsageReservationError> {
+    settle_with_events_internal(
+        pool,
+        account_id,
+        request_id,
+        actual_customer_cents,
+        elapsed_ms,
+        reason,
+        settled_at_ms,
+        components,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settle_with_events_and_completion(
+    pool: &DbPool,
+    account_id: &str,
+    request_id: &str,
+    actual_customer_cents: i64,
+    elapsed_ms: i64,
+    reason: &str,
+    settled_at_ms: i64,
+    components: &[SettlementUsageEvent],
+    encode: &dyn Fn(&SettledUsage) -> Result<String, serde_json::Error>,
+) -> Result<SettledUsage, UsageReservationError> {
+    settle_with_events_internal(
+        pool,
+        account_id,
+        request_id,
+        actual_customer_cents,
+        elapsed_ms,
+        reason,
+        settled_at_ms,
+        components,
+        Some(encode),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_with_events_internal(
+    pool: &DbPool,
+    account_id: &str,
+    request_id: &str,
+    actual_customer_cents: i64,
+    elapsed_ms: i64,
+    reason: &str,
+    settled_at_ms: i64,
+    components: &[SettlementUsageEvent],
+    completion_encoder: Option<CompletionEncoder<'_>>,
+) -> Result<SettledUsage, UsageReservationError> {
     if account_id.trim().is_empty()
         || request_id.trim().is_empty()
         || reason.trim().is_empty()
@@ -857,6 +909,7 @@ pub(crate) fn settle_with_events(
             reason,
             settled_at_ms,
             components,
+            completion_encoder,
         ),
         DbPool::Postgres(_) => settle_postgres(
             pool,
@@ -867,6 +920,7 @@ pub(crate) fn settle_with_events(
             reason,
             settled_at_ms,
             components,
+            completion_encoder,
         ),
     })
 }
@@ -881,6 +935,7 @@ fn settle_sqlite(
     reason: &str,
     _settled_at_ms: i64,
     components: &[SettlementUsageEvent],
+    completion_encoder: Option<CompletionEncoder<'_>>,
 ) -> Result<SettledUsage, UsageReservationError> {
     let mut conn = pool.get().map_err(UsageReservationError::Db)?;
     let tx = conn
@@ -904,6 +959,14 @@ fn settle_sqlite(
             settled.charged_customer_cents,
             true,
         )?;
+        if let Some(encode) = completion_encoder {
+            verify_completed_idempotency_sqlite(
+                &tx,
+                account_id,
+                request_id,
+                &encode(&settled).map_err(|error| UsageReservationError::Db(error.into()))?,
+            )?;
+        }
         tx.commit()
             .map_err(|error| UsageReservationError::Db(error.into()))?;
         return Ok(settled);
@@ -1009,10 +1072,7 @@ fn settle_sqlite(
         charged_customer_cents,
         false,
     )?;
-    tx.commit()
-        .map_err(|error| UsageReservationError::Db(error.into()))?;
-
-    Ok(SettledUsage {
+    let settled = SettledUsage {
         attempt: reservation.attempt,
         actual_customer_cents,
         charged_customer_cents,
@@ -1021,7 +1081,19 @@ fn settle_sqlite(
         refunded_trial_seconds,
         balance_cents_after: balance_after,
         trial_seconds_remaining: trial_after,
-    })
+    };
+    if let Some(encode) = completion_encoder {
+        complete_idempotency_sqlite(
+            &tx,
+            account_id,
+            request_id,
+            &encode(&settled).map_err(|error| UsageReservationError::Db(error.into()))?,
+        )?;
+    }
+    tx.commit()
+        .map_err(|error| UsageReservationError::Db(error.into()))?;
+
+    Ok(settled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1034,6 +1106,7 @@ fn settle_postgres(
     reason: &str,
     _settled_at_ms: i64,
     components: &[SettlementUsageEvent],
+    completion_encoder: Option<CompletionEncoder<'_>>,
 ) -> Result<SettledUsage, UsageReservationError> {
     let mut conn = pool.get_pg().map_err(UsageReservationError::Db)?;
     let mut tx = conn
@@ -1062,6 +1135,14 @@ fn settle_postgres(
             settled.charged_customer_cents,
             true,
         )?;
+        if let Some(encode) = completion_encoder {
+            verify_completed_idempotency_postgres(
+                &mut tx,
+                account_id,
+                request_id,
+                &encode(&settled).map_err(|error| UsageReservationError::Db(error.into()))?,
+            )?;
+        }
         tx.commit()
             .map_err(|error| UsageReservationError::Db(error.into()))?;
         return Ok(settled);
@@ -1167,10 +1248,7 @@ fn settle_postgres(
         charged_customer_cents,
         false,
     )?;
-    tx.commit()
-        .map_err(|error| UsageReservationError::Db(error.into()))?;
-
-    Ok(SettledUsage {
+    let settled = SettledUsage {
         attempt: reservation.attempt,
         actual_customer_cents,
         charged_customer_cents,
@@ -1179,7 +1257,125 @@ fn settle_postgres(
         refunded_trial_seconds,
         balance_cents_after: balance_after,
         trial_seconds_remaining: trial_after,
-    })
+    };
+    if let Some(encode) = completion_encoder {
+        complete_idempotency_postgres(
+            &mut tx,
+            account_id,
+            request_id,
+            &encode(&settled).map_err(|error| UsageReservationError::Db(error.into()))?,
+        )?;
+    }
+    tx.commit()
+        .map_err(|error| UsageReservationError::Db(error.into()))?;
+
+    Ok(settled)
+}
+
+fn complete_idempotency_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    request_id: &str,
+    response_json: &str,
+) -> Result<(), UsageReservationError> {
+    let updated = tx
+        .execute(
+            "UPDATE request_idempotency
+                SET status = 'complete',
+                    response_json = ?3,
+                    http_status = 200,
+                    completed_at = datetime('now')
+              WHERE account_id = ?1 AND request_id = ?2
+                AND status = 'in_progress'
+                AND response_json IS NULL
+                AND http_status IS NULL
+                AND completed_at IS NULL",
+            params![account_id, request_id, response_json],
+        )
+        .map_err(|error| UsageReservationError::Db(error.into()))?;
+    if updated != 1 {
+        return Err(UsageReservationError::InvalidReservation);
+    }
+    Ok(())
+}
+
+fn verify_completed_idempotency_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    request_id: &str,
+    response_json: &str,
+) -> Result<(), UsageReservationError> {
+    let exact = tx
+        .query_row(
+            "SELECT 1
+               FROM request_idempotency
+              WHERE account_id = ?1 AND request_id = ?2
+                AND status = 'complete'
+                AND response_json = ?3
+                AND http_status = 200
+                AND completed_at IS NOT NULL",
+            params![account_id, request_id, response_json],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| UsageReservationError::Db(error.into()))?
+        .is_some();
+    if !exact {
+        return Err(UsageReservationError::InvalidReservation);
+    }
+    Ok(())
+}
+
+fn complete_idempotency_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    request_id: &str,
+    response_json: &str,
+) -> Result<(), UsageReservationError> {
+    let updated = tx
+        .execute(
+            "UPDATE request_idempotency
+                SET status = 'complete',
+                    response_json = $3,
+                    http_status = 200,
+                    completed_at = now()
+              WHERE account_id = $1 AND request_id = $2
+                AND status = 'in_progress'
+                AND response_json IS NULL
+                AND http_status IS NULL
+                AND completed_at IS NULL",
+            &[&account_id, &request_id, &response_json],
+        )
+        .map_err(|error| UsageReservationError::Db(error.into()))?;
+    if updated != 1 {
+        return Err(UsageReservationError::InvalidReservation);
+    }
+    Ok(())
+}
+
+fn verify_completed_idempotency_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    request_id: &str,
+    response_json: &str,
+) -> Result<(), UsageReservationError> {
+    let exact = tx
+        .query_opt(
+            "SELECT 1
+               FROM request_idempotency
+              WHERE account_id = $1 AND request_id = $2
+                AND status = 'complete'
+                AND response_json = $3
+                AND http_status = 200
+                AND completed_at IS NOT NULL",
+            &[&account_id, &request_id, &response_json],
+        )
+        .map_err(|error| UsageReservationError::Db(error.into()))?
+        .is_some();
+    if !exact {
+        return Err(UsageReservationError::InvalidReservation);
+    }
+    Ok(())
 }
 
 fn allocated_settlement_events(

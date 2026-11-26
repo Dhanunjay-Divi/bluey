@@ -118,7 +118,7 @@ function detectSection(
     ["employment", /^(?:work history|career history)(?:\s*[:|-]\s*(.*))?$/i],
     ["education", /^(?:education|academic background|academics)(?:\s*[:|-]\s*(.*))?$/i],
     ["skills", /^(?:technical\s+)?(?:skills|core competencies|technologies|expertise)(?:\s*(?:&|and)\s*(?:interests?|tools?|technologies))?(?:\s*[:|-]\s*(.*))?$/i],
-    ["certifications", /^(?:certifications?|licenses?|credentials)(?:\s*[:|-]\s*(.*))?$/i],
+    ["certifications", /^(?:(?:awards?\s*(?:&|and)\s*)?certifications?|certifications?\s*(?:&|and)\s*awards?|licenses?|credentials)(?:\s*[:|-]\s*(.*))?$/i],
     ["projects", /^(?:selected\s+)?projects?(?:\s*(?:&|and)\s*(?:leadership|research|publications?))?(?:\s*[:|-]\s*(.*))?$/i],
     ["other", /^(?:(?:professional|selected)\s+)?(?:affiliations?|memberships?|awards?|honors?|recognition|achievements?|accomplishments?|publications?|languages?|volunteer(?:ing)?|interests?|references?)(?:\s*[:|-]\s*(.*))?$/i],
   ];
@@ -298,15 +298,19 @@ function parseListSection(lines: string[]): string[] {
 
 function parseCertificationSection(lines: string[]): string[] {
   const suffix = /^(?:professional|specialty|associate|expert|foundational|practitioner|level\s+(?:i|ii|iii|1|2|3))$/i;
+  const awardNarrative = /\b(?:award(?:ed|s)?|scholarship|prize|recognition|honou?rs?|achievement|accomplishment)\b/i;
+  const awardLabel = /^(?:awards?|scholarships?|prizes?|recognition|honou?rs?|achievements?|accomplishments?)\s*:/i;
   return uniqueStrings(
     lines
       .flatMap((line) => {
-        const value = stripBullet(line).replace(/^[A-Za-z &/+.-]{2,30}:\s*/, "");
-        return parseDelimitedList(value);
+        const raw = stripBullet(line);
+        if (awardLabel.test(raw)) return [];
+        const value = raw.replace(/^[A-Za-z &/+.-]{2,30}:\s*/, "");
+        return parseDelimitedList(value).filter((entry) => !awardNarrative.test(entry));
       })
       .reduce<string[]>((certifications, value) => {
         const clean = value.trim();
-        if (!clean) return certifications;
+        if (!clean || awardNarrative.test(clean)) return certifications;
         if (suffix.test(clean) && certifications.length) {
           certifications[certifications.length - 1] = `${certifications.at(-1)}, ${clean}`;
         } else {
@@ -319,6 +323,7 @@ function parseCertificationSection(lines: string[]): string[] {
 
 interface DatedBlock {
   header: string[];
+  postDateHeader: string[];
   dateRemainder: string;
   body: string[];
   start: string;
@@ -327,27 +332,32 @@ interface DatedBlock {
 }
 
 function datedBlocks(lines: string[], allowSingleYear: boolean): DatedBlock[] {
-  const dates = lines
-    .map((line, index) => ({ index, range: extractDateRange(line, allowSingleYear) }))
-    .filter((item): item is { index: number; range: NonNullable<ReturnType<typeof extractDateRange>> } => (
-      Boolean(item.range) && (allowSingleYear || !isNestedAssignmentLine(item.index >= 0 ? lines[item.index] : ""))
-    ));
+  const dates = lines.flatMap((line, index) => extractDateRanges(line, allowSingleYear)
+    .slice(0, allowSingleYear ? 1 : undefined)
+    .map((range) => ({ index, range }))
+    .filter(() => allowSingleYear || !isNestedAssignmentLine(line)));
   if (!dates.length) return [];
-  const firstInlineRemainder = lines[dates[0].index]
-    .replace(dates[0].range.raw, "")
-    .replace(/^[|,; -]+|[|,; -]+$/g, "")
-    .trim();
+  const firstInlineRemainder = stripDateRanges(lines[dates[0].index], allowSingleYear);
   const inlineEducationDateStartsBlock =
     allowSingleYear && Boolean(firstInlineRemainder) && dates[0].index === 0;
-  const headerStarts = dates.map(({ index }, dateIndex) => {
-    const inlineRemainder = lines[index]
-      .replace(dates[dateIndex].range.raw, "")
-      .replace(/^[|,; -]+|[|,; -]+$/g, "")
-      .trim();
-    if (allowSingleYear && inlineRemainder && inlineEducationDateStartsBlock) {
-      return index;
+  const headerStarts: number[] = [];
+  dates.forEach(({ index }, dateIndex) => {
+    const firstDateOnLine = dates.findIndex((date) => date.index === index);
+    if (firstDateOnLine !== dateIndex) {
+      headerStarts.push(headerStarts[firstDateOnLine]);
+      return;
     }
-    const lowerBound = dateIndex ? dates[dateIndex - 1].index + 1 : 0;
+    const previousDateIndex = dates
+      .slice(0, dateIndex)
+      .map((date) => date.index)
+      .filter((previousIndex) => previousIndex < index)
+      .at(-1);
+    const inlineRemainder = stripDateRanges(lines[index], allowSingleYear);
+    if (allowSingleYear && inlineRemainder && inlineEducationDateStartsBlock) {
+      headerStarts.push(index);
+      return;
+    }
+    const lowerBound = previousDateIndex === undefined ? 0 : previousDateIndex + 1;
     let start = index;
     while (start > lowerBound && index - start < 3) {
       const candidate = lines[start - 1];
@@ -358,16 +368,26 @@ function datedBlocks(lines: string[], allowSingleYear: boolean): DatedBlock[] {
       ) break;
       start -= 1;
     }
-    return start;
+    headerStarts.push(start);
   });
-  return dates.map(({ index, range }, dateIndex) => ({
-    header: lines.slice(headerStarts[dateIndex], index),
-    dateRemainder: lines[index].replace(range.raw, "").replace(/^[|,; -]+|[|,; -]+$/g, "").trim(),
-    body: lines.slice(index + 1, headerStarts[dateIndex + 1] ?? lines.length),
-    start: range.start,
-    end: range.end,
-    current: /present|current|now/i.test(range.end),
-  }));
+  return dates.map(({ index, range }, dateIndex) => {
+    const nextDifferentDate = dates.findIndex((date, indexAfter) => (
+      indexAfter > dateIndex && date.index !== index
+    ));
+    const bodyEnd = headerStarts[nextDifferentDate] ?? lines.length;
+    const hasMultipleIntervals = dates.filter((date) => date.index === index).length > 1;
+    return {
+      header: lines.slice(headerStarts[dateIndex], index),
+      postDateHeader: !allowSingleYear && hasMultipleIntervals
+        ? employmentHeaderLines(lines.slice(index + 1, bodyEnd))
+        : [],
+      dateRemainder: stripDateRanges(lines[index], allowSingleYear),
+      body: lines.slice(index + 1, headerStarts[dateIndex + 1] ?? lines.length),
+      start: range.start,
+      end: range.end,
+      current: /present|current|now/i.test(range.end),
+    };
+  });
 }
 
 function undatedEducationBlocks(lines: string[]): DatedBlock[] {
@@ -376,6 +396,7 @@ function undatedEducationBlocks(lines: string[]): DatedBlock[] {
     .filter(({ line }) => schoolScore(line) > 0);
   return schoolIndexes.map(({ index }, itemIndex) => ({
     header: lines.slice(index, schoolIndexes[itemIndex + 1]?.index ?? lines.length),
+    postDateHeader: [],
     dateRemainder: "",
     body: [],
     start: "",
@@ -391,15 +412,31 @@ function extractDateRange(
   line: string,
   allowSingleYear = false,
 ): { raw: string; start: string; end: string } | null {
+  return extractDateRanges(line, allowSingleYear)[0] || null;
+}
+
+function extractDateRanges(
+  line: string,
+  allowSingleYear = false,
+): Array<{ raw: string; start: string; end: string }> {
   const month = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
   const point = `(?:${month}\\s+)?(?:19|20)\\d{2}`;
-  const match = line.match(new RegExp(`(${point})\\s*(?:-|–|—|to)\\s*(${point}|Present|Current|Now)`, "i"));
-  if (match) return { raw: match[0], start: match[1], end: match[2] };
+  const matches = [...line.matchAll(new RegExp(`(${point})\\s*(?:-|–|—|to)\\s*(${point}|Present|Current|Now)`, "gi"))];
+  if (matches.length) {
+    return matches.map((match) => ({ raw: match[0], start: match[1], end: match[2] }));
+  }
   const years = line.match(/\b(?:19|20)\d{2}\b/g);
   if (allowSingleYear && years?.length === 1 && stripBullet(line).length <= 80) {
-    return { raw: years[0], start: "", end: years[0] };
+    return [{ raw: years[0], start: "", end: years[0] }];
   }
-  return null;
+  return [];
+}
+
+function stripDateRanges(line: string, allowSingleYear: boolean): string {
+  return extractDateRanges(line, allowSingleYear)
+    .reduce((value, range) => value.replace(range.raw, ""), line)
+    .replace(/^[|,; &-]+|[|,; &-]+$/g, "")
+    .trim();
 }
 
 function normalizeDate(value: string): string {
@@ -726,7 +763,7 @@ function parseDelimitedList(value: string): string[] {
 }
 
 function augmentEmploymentBlock(block: DatedBlock): { candidates: string[]; body: string[] } {
-  const candidates = [...block.header, block.dateRemainder];
+  const candidates = [...block.header, block.dateRemainder, ...block.postDateHeader];
   const consumed = new Set<number>();
   for (let index = 0; index < Math.min(block.body.length, 5); index += 1) {
     const line = block.body[index];
@@ -749,6 +786,20 @@ function augmentEmploymentBlock(block: DatedBlock): { candidates: string[]; body
     candidates,
     body: block.body.filter((_, index) => !consumed.has(index)),
   };
+}
+
+function employmentHeaderLines(lines: string[]): string[] {
+  const headers: string[] = [];
+  for (const line of lines.slice(0, 5)) {
+    const clean = stripBullet(line).replace(/[.]$/, "").trim();
+    if (!clean || isNestedAssignmentLine(clean) || isBullet(line) || looksLikeEmploymentNarrative(line)) break;
+    const parsed = splitEmploymentCandidate(clean);
+    if (clean.length > 120 || (!titleScore(parsed.value) && !companyScore(parsed.value) && !parsed.location)) {
+      break;
+    }
+    headers.push(clean);
+  }
+  return headers;
 }
 
 function mergeDuplicateEmployment(entries: EmploymentEntry[]): EmploymentEntry[] {

@@ -7,6 +7,15 @@ edition = "2021"
 description = "Bluey product server: auth, billing, license, managed Auto Router endpoint, admin"
 license = "Proprietary"
 
+[features]
+default = []
+integration-test-support = ["dep:serial_test"]
+jobs-local-qa-unix = ["integration-test-support", "dep:hyper-util"]
+jobs-mcp-read = []
+jobs-mcp-operator = ["jobs-mcp-read"]
+jobs-submission-observation = []
+business-messaging-simulator-test-support = []
+
 [[bin]]
 name = "bluey-server"
 path = "src/main.rs"
@@ -15,6 +24,40 @@ path = "src/main.rs"
 name = "bluey-jobs-api"
 path = "src/bin/bluey-jobs-api.rs"
 
+[[bin]]
+name = "bluey-postgres-audience-operator"
+path = "src/bin/bluey-postgres-audience-operator.rs"
+
+[[bin]]
+name = "bluey-postgres-mcp-read-operator"
+path = "src/bin/bluey-postgres-mcp-read-operator.rs"
+required-features = ["jobs-mcp-operator"]
+
+[[example]]
+name = "jobs-nonprod-browser-fixture"
+path = "examples/jobs-nonprod-browser-fixture.rs"
+required-features = ["integration-test-support"]
+
+[[example]]
+name = "jobs-nonprod-runner-control-plane-fixture"
+path = "examples/jobs-nonprod-runner-control-plane-fixture.rs"
+required-features = ["integration-test-support"]
+
+[[example]]
+name = "jobs-local-qa-unix-api"
+path = "examples/jobs-local-qa-unix-api.rs"
+required-features = ["jobs-local-qa-unix"]
+
+[[test]]
+name = "integration_e2e"
+path = "tests/integration_e2e.rs"
+required-features = ["integration-test-support"]
+
+[[test]]
+name = "business_messaging_simulator"
+path = "tests/business_messaging_simulator.rs"
+required-features = ["business-messaging-simulator-test-support"]
+
 [dependencies]
 tower = { version = "0.4", features = ["util"] }
 # Web framework
@@ -22,6 +65,7 @@ axum = { version = "0.7", features = ["macros", "tracing", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "compression-gzip"] }
 hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -44,6 +88,9 @@ getrandom = "0.2"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+unicode-general-category = "1"
+unicode-normalization = "0.1"
 
 # Error handling
 anyhow = "1"
@@ -60,6 +107,7 @@ sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
 aes-gcm = "0.10"
+ed25519-dalek = "2"
 governor = "0.6"
 base64 = "0.22"
 rand = "0.8"
@@ -74,6 +122,9 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
+lopdf = { version = "0.44", default-features = false }
+png = "0.18"
+serial_test = { version = "3", optional = true }
 
 # CLI / config
 clap = { version = "4", features = ["derive", "env"] }
@@ -82,7 +133,11 @@ clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["trace"] }
 wiremock = "0.6"
 serial_test = "3"
 bluey-server = { path = "." }
 tokio-test = "0.4"
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "=1.1.4", features = ["process"] }

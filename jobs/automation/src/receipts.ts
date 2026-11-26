@@ -1,4 +1,11 @@
-import type { ApplicationPacket, NormalizedJob, SubmissionReceipt } from "./contracts.js";
+import type {
+  ApplicationPacket,
+  AtsCertificationAdmission,
+  CertifiedFinalSubmitAdapter,
+  NormalizedJob,
+  RunnerKind,
+  SubmissionReceipt,
+} from "./contracts.js";
 import { assertApprovedExecutionChecksum } from "./approved-execution.js";
 import { assertSubmissionReceiptComplete } from "./packet-guards.js";
 
@@ -27,6 +34,22 @@ export interface ReceiptEvent {
   detail?: Record<string, unknown>;
 }
 
+export interface StoredReceiptObject {
+  storageKey: string;
+  sha256: string;
+  mediaType: "application/json";
+  sizeBytes: number;
+  schemaVersion: 1 | 2;
+}
+
+export interface StoredEvidenceObject {
+  kind: "resume" | "cover_letter" | "attachment" | "screenshot";
+  storageKey: string;
+  sha256: string;
+  mediaType: "application/pdf" | "image/png";
+  sizeBytes: number;
+}
+
 export interface EvidenceObjectUpload {
   original_key: string;
   kind: "resume" | "cover_letter" | "attachment" | "screenshot";
@@ -35,39 +58,79 @@ export interface EvidenceObjectUpload {
   bytes_base64: string;
 }
 
-export interface ApplicationReceiptBundle {
+export interface AtsCertifiedReceiptAuthority {
   schemaVersion: 1;
+  accountId: string;
+  applicationId: string;
+  runId: string;
+  provider: CertifiedFinalSubmitAdapter;
+  adapter: CertifiedFinalSubmitAdapter;
+  adapterVersion: string;
+  manifestSha256: string;
+  activationSha256: string;
+  activationGeneration: number;
+  targetKeySha256: string;
+  layoutSetSha256: string;
+  layoutObservationSha256: string;
+  observedSurfaceSha256: string;
+  adapterBundleSha256: string;
+  runnerKind: RunnerKind;
+  runnerTargetSha256: string;
+  bindingSha256: string;
+  bindingFence: number;
+  bindingConsumedAtMs: number;
+  applicationAttemptId: string;
+  phaseBRequestId: string;
+  rolloutChannel: "canary" | "general";
+  canaryReservationSha256: string;
+  meteringReservationSha256: string;
+}
+
+export type CertifiedAutoSubmitAdmission = Extract<
+  NonNullable<ApplicationPacket["approvedExecutionAdmission"]>,
+  { kind: "track_auto_submit" }
+> & { ats_certification: AtsCertificationAdmission };
+
+export interface ReceiptPacketSnapshot {
+  jobId: string;
+  resumeVersionId: string;
+  approvedPacketChecksum: string;
+  answers: Record<string, string>;
+  verifiedClaimIds: string[];
+  applicationEmail?: string;
+  approvedExecutionSchemaVersion?: 3;
+  approvedExecutionAdmission?: CertifiedAutoSubmitAdmission;
+}
+
+export interface ApplicationReceiptBundle {
+  schemaVersion: 1 | 2;
   receiptId: string;
   accountId: string;
   applicationId: string;
   runId: string;
   generatedAt: string;
-  runner: "local" | "cloud";
+  runner: RunnerKind;
   applicationIdentityId?: string;
   browserProfileId?: string;
   adapter?: string;
   adapterVersion?: string;
   job: NormalizedJob;
-  packet: {
-    jobId: string;
-    resumeVersionId: string;
-    approvedPacketChecksum: string;
-    answers: Record<string, string>;
-    verifiedClaimIds: string[];
-    applicationEmail?: string;
-  };
+  packet: ReceiptPacketSnapshot;
   documents: ReceiptDocument[];
   events: ReceiptEvent[];
   result: SubmissionReceipt;
   finalUrl?: string;
   screenshotKeys: string[];
+  evidenceObjects?: StoredEvidenceObject[];
+  receiptObject?: StoredReceiptObject;
+  atsCertifiedReceiptAuthority?: AtsCertifiedReceiptAuthority;
 }
 
 export interface CreateReceiptInput {
   receiptId: string;
   accountId: string;
   runId: string;
-  runner: "local" | "cloud";
+  runner: RunnerKind;
   applicationIdentityId?: string;
   browserProfileId?: string;
   adapter?: string;
@@ -80,12 +143,20 @@ export interface CreateReceiptInput {
   generatedAt?: string;
   finalUrl?: string;
   screenshotKeys?: string[];
+  atsCertifiedReceiptAuthority?: AtsCertifiedReceiptAuthority;
 }
 
 export interface ApplicationEvidenceRecord {
   id: string;
   application_id: string;
-  kind: "resume" | "cover_letter" | "attachment" | "submission_confirmation" | "status_email" | "interview_event";
+  kind:
+    | "resume"
+    | "cover_letter"
+    | "attachment"
+    | "application_receipt"
+    | "submission_confirmation"
+    | "status_email"
+    | "interview_event";
   label: string;
   provider: string;
   file_name: string;
@@ -110,35 +181,76 @@ export interface LinkedProviderEvidenceInput {
 
 export function createApplicationReceipt(input: CreateReceiptInput): ApplicationReceiptBundle {
   assertApprovedExecutionChecksum(input.packet, input.job);
+  const certifiedAdmission = certifiedAutoSubmitAdmission(input.packet);
+  const certifiedReceipt = Boolean(certifiedAdmission
+    && (input.atsCertifiedReceiptAuthority !== undefined
+      || input.result.status === "submitted"));
+  const bindingConsumedAtMs = certifiedReceipt
+    ? input.atsCertifiedReceiptAuthority?.bindingConsumedAtMs
+    : undefined;
+  let generatedAt = input.generatedAt;
+  if (generatedAt === undefined) {
+    if (bindingConsumedAtMs !== undefined
+      && (!Number.isSafeInteger(bindingConsumedAtMs)
+        || bindingConsumedAtMs <= 0
+        || bindingConsumedAtMs > 8_640_000_000_000_000)) {
+      throw new Error("Certified submission receipt binding time is invalid");
+    }
+    // The authority is consumed before browser activation. Do not move the
+    // separately observed submission or event times to the server clock.
+    generatedAt = new Date(Math.max(Date.now(), bindingConsumedAtMs ?? 0)).toISOString();
+  }
+  const packet: ReceiptPacketSnapshot = {
+    jobId: input.packet.jobId,
+    resumeVersionId: input.packet.resumeVersionId,
+    approvedPacketChecksum: input.packet.approvedPacketChecksum,
+    answers: sortRecord(input.packet.answers),
+    verifiedClaimIds: [...input.packet.verifiedClaimIds].sort(),
+    applicationEmail: input.packet.applicationEmail,
+    ...(certifiedReceipt && certifiedAdmission ? {
+      approvedExecutionSchemaVersion: 3 as const,
+      approvedExecutionAdmission: structuredClone(certifiedAdmission),
+    } : {}),
+  };
   const receipt: ApplicationReceiptBundle = {
-    schemaVersion: 1,
+    schemaVersion: certifiedReceipt ? 2 : 1,
     receiptId: input.receiptId,
     accountId: input.accountId,
     applicationId: input.packet.applicationId,
     runId: input.runId,
-    generatedAt: input.generatedAt ?? new Date().toISOString(),
+    generatedAt,
     runner: input.runner,
     applicationIdentityId: input.applicationIdentityId ?? input.packet.applicationIdentityId,
     browserProfileId: input.browserProfileId ?? input.packet.browserProfileId,
     adapter: input.adapter,
     adapterVersion: input.adapterVersion,
     job: structuredClone(input.job),
-    packet: {
-      jobId: input.packet.jobId,
-      resumeVersionId: input.packet.resumeVersionId,
-      approvedPacketChecksum: input.packet.approvedPacketChecksum,
-      answers: sortRecord(input.packet.answers),
-      verifiedClaimIds: [...input.packet.verifiedClaimIds].sort(),
-      applicationEmail: input.packet.applicationEmail,
-    },
+    packet,
     documents: [...input.documents].sort((left, right) => left.storageKey.localeCompare(right.storageKey)),
     events: [...input.events].sort((left, right) => left.occurredAt.localeCompare(right.occurredAt) || left.id.localeCompare(right.id)),
     result: structuredClone(input.result),
     finalUrl: input.finalUrl,
     screenshotKeys: [...(input.screenshotKeys ?? [])].sort(),
+    ...(input.atsCertifiedReceiptAuthority !== undefined ? {
+      atsCertifiedReceiptAuthority: structuredClone(
+        input.atsCertifiedReceiptAuthority,
+      ),
+    } : {}),
   };
   assertSubmissionReceiptComplete(receipt);
   return receipt;
+}
+
+function certifiedAutoSubmitAdmission(
+  packet: ApplicationPacket,
+): CertifiedAutoSubmitAdmission | undefined {
+  const admission = packet.approvedExecutionAdmission;
+  if (packet.approvedExecutionSchemaVersion !== 3
+    || admission?.kind !== "track_auto_submit"
+    || !admission.ats_certification) {
+    return undefined;
+  }
+  return admission as CertifiedAutoSubmitAdmission;
 }
 
 export function applicationEvidenceFromReceipt(receipt: ApplicationReceiptBundle): ApplicationEvidenceRecord[] {
@@ -177,8 +289,33 @@ export function applicationEvidenceFromReceipt(receipt: ApplicationReceiptBundle
         external_id: receipt.result.confirmationUrl || receipt.receiptId,
         confirmation,
         confirmation_url: receipt.result.confirmationUrl,
+        submit_http_status: receipt.result.submitHttpStatus,
         final_url: receipt.finalUrl,
         screenshot_keys: receipt.screenshotKeys,
+      },
+      created_at_ms: createdAt,
+    });
+  }
+  if (receipt.receiptObject) {
+    documents.push({
+      id: `${receipt.receiptId}:receipt`,
+      application_id: receipt.applicationId,
+      kind: "application_receipt",
+      label: "Application receipt bundle",
+      provider: receipt.job.source,
+      file_name: `${receipt.receiptId}.json`,
+      media_type: receipt.receiptObject.mediaType,
+      storage_key: receipt.receiptObject.storageKey,
+      sha256: receipt.receiptObject.sha256,
+      resume_version_id: receipt.packet.resumeVersionId,
+      occurred_at_ms: occurredAt,
+      metadata: {
+        immutable: true,
+        receipt_id: receipt.receiptId,
+        schema_version: receipt.receiptObject.schemaVersion,
+        size_bytes: receipt.receiptObject.sizeBytes,
+        runner: receipt.runner,
+        run_id: receipt.runId,
       },
       created_at_ms: createdAt,
     });

@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added an opt-in original-source check for saved Jobs feed listings. It
+  verifies the existing listing in place and never creates or submits an
+  application.
 - Added a one-time, keyboard-accessible macOS shortcut coachmark after visible
   desktop sign-in, anchored to the real Shortcuts control without enlarging the
   112 by 30 Bluey pill.
@@ -24,6 +27,8 @@ under `docs/release/`.
 
 ### Changed
 
+- Kept signed C2C job preparation in candidate review. Local and cloud
+  runners cannot reserve a C2C submission.
 - Simplified desktop account linking to one explicit `Connect this Bluey`
   confirmation because the browser URL already carries the one-time code;
   manual code entry remains an explicit fallback.
@@ -52,6 +57,12 @@ under `docs/release/`.
 
 ### Fixed
 
+- Isolated Jobs password sign-in from any previous browser session. A failed
+  password sign-in no longer refreshes or replays an earlier session.
+- Prevented duplicate Jobs application reservations when verified employer
+  aliases or concurrent runner requests refer to the same company.
+- Kept runner-volume deletion pending while a volume is offline or a purge
+  is interrupted, and prevented stale restores from reviving deleted data.
 - Kept shortcut help fully readable in macOS light mode at every overlay
   opacity, including live theme changes, while delayed onboarding now preserves
   active modals, history, and composer focus.

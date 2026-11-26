@@ -1,3 +1,111 @@
+pub(crate) const JOBS_INTERVIEW_PREP_REQUEST_PREFIX: &str =
+    "bluey-internal:jobs-interview-prep-v3-";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompletionScope {
+    General,
+    JobsInterviewPrep,
+}
+
+impl CompletionScope {
+    fn managed_system_authority(self) -> ManagedSystemAuthority {
+        match self {
+            Self::General => ManagedSystemAuthority::ExternalClientContract,
+            Self::JobsInterviewPrep => ManagedSystemAuthority::TrustedServerSystem,
+        }
+    }
+
+    fn upstream_failure_detail(self, error: &anyhow::Error) -> String {
+        match self {
+            Self::General => error.to_string(),
+            // Provider bodies can echo candidate evidence. Keep only the closed
+            // diagnostic category and non-content counters for Jobs requests.
+            Self::JobsInterviewPrep => "redacted_private_prep_provider_error".into(),
+        }
+    }
+
+    fn finish_before_dispatch_failure(self, pool: &crate::db::DbPool, account: &str, id: &str) {
+        match self {
+            Self::General => {
+                let _ = idempotency::mark_failed(pool, account, id);
+            }
+            Self::JobsInterviewPrep => {
+                let _ = idempotency::release(pool, account, id);
+            }
+        }
+    }
+
+    fn decode_cached(self, json: &str) -> serde_json::Result<CompleteResponse> {
+        match self {
+            Self::General => serde_json::from_str(json),
+            Self::JobsInterviewPrep => {
+                let (namespace, response): (String, CompleteResponse) = serde_json::from_str(json)?;
+                if namespace != JOBS_INTERVIEW_PREP_REQUEST_PREFIX {
+                    return Err(serde::de::Error::custom(
+                        "unexpected interview prep cache scope",
+                    ));
+                }
+                Ok(response)
+            }
+        }
+    }
+
+    fn encode_cached(self, response: &CompleteResponse) -> serde_json::Result<String> {
+        match self {
+            Self::General => serde_json::to_string(response),
+            Self::JobsInterviewPrep => {
+                serde_json::to_string(&(JOBS_INTERVIEW_PREP_REQUEST_PREFIX, response))
+            }
+        }
+    }
+
+    fn fixed_answer_plan(self) -> Option<AnswerPlan> {
+        match self {
+            Self::General => None,
+            Self::JobsInterviewPrep => Some(AnswerPlan {
+                intent: AnswerIntent::Writing,
+                output: AnswerOutput::Compact,
+                recommended_lane: "balanced",
+                confidence: 1.0,
+                interview_context: false,
+                needs_screen: false,
+                needs_docs: false,
+                needs_transcript: false,
+                needs_memory: false,
+                needs_web_search: false,
+            }),
+        }
+    }
+}
+
+fn is_jobs_interview_prep_request_id(request_id: &str) -> bool {
+    request_id
+        .strip_prefix(JOBS_INTERVIEW_PREP_REQUEST_PREFIX)
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+// These Router endpoints share account-level idempotency and provider accounting.
+#[allow(clippy::result_large_err)]
+fn reject_jobs_interview_prep_request_id(
+    request_id: &str,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if request_id.starts_with(JOBS_INTERVIEW_PREP_REQUEST_PREFIX) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "request_id uses a reserved internal prefix".into(),
+                reason: Some("reserved_request_id".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+    Ok(())
+}
 
 #[allow(clippy::result_large_err)]
 async fn complete_inner(
@@ -5,8 +113,20 @@ async fn complete_inner(
     account: Account,
     req: CompleteRequest,
     trace_id: String,
-    system_authority: ManagedSystemAuthority,
+    scope: CompletionScope,
 ) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
+    if scope == CompletionScope::JobsInterviewPrep
+        && !is_jobs_interview_prep_request_id(&req.request_id)
+    {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "interview prep request identity is invalid".into(),
+                reason: Some("invalid_interview_prep_request_id".into()),
+                ..Default::default()
+            }),
+        ));
+    }
     reconcile_expired_llm_usage(&state.pool, &account.id).map_err(|error| *error)?;
     if let Some(err) = billing_restricted_error(&account) {
         return Err(err);
@@ -22,8 +142,9 @@ async fn complete_inner(
             }),
         ));
     }
-    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(&req, system_authority)
-        .map_err(InternalDisclosureBlocked::into_api_error)?;
+    let trusted_envelope =
+        TrustedInternalEnvelope::validate_direct_request(&req, scope.managed_system_authority())
+            .map_err(InternalDisclosureBlocked::into_api_error)?;
 
     validate_complete_images(&req.image_data_urls)
         .map_err(|error| image_validation_error(error.error, error.reason.unwrap_or_default()))?;
@@ -93,7 +214,7 @@ async fn complete_inner(
         }
         idempotency::ReserveOutcome::CachedComplete(json) => {
             // Replay: return the cached terminal response.
-            let cached: CompleteResponse = serde_json::from_str(&json).map_err(|e| {
+            let cached = scope.decode_cached(&json).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ApiError {
@@ -139,8 +260,15 @@ async fn complete_inner(
             return Err((
                 StatusCode::CONFLICT,
                 Json(ApiError {
-                    error: "previous attempt with this request_id failed; use a new request_id"
-                        .into(),
+                    error: match scope {
+                        CompletionScope::General => {
+                            "previous attempt with this request_id failed; use a new request_id"
+                        }
+                        CompletionScope::JobsInterviewPrep => {
+                            "This draft could not be recovered safely. Contact support for help."
+                        }
+                    }
+                    .into(),
                     reason: Some("request_failed_terminal".into()),
                     ..Default::default()
                 }),
@@ -165,7 +293,10 @@ async fn complete_inner(
         return Err(err);
     }
 
-    let preliminary_answer_plan = answer_plan_for_request(&req, &requested_effective_lane, &[]);
+    let fixed_plan = scope.fixed_answer_plan();
+    let preliminary_answer_plan = fixed_plan
+        .clone()
+        .unwrap_or_else(|| answer_plan_for_request(&req, &requested_effective_lane, &[]));
     let story_grounding = behavioral_story_grounding(&req, &preliminary_answer_plan);
     if let BehavioralStoryGrounding::Missing { fields } = &story_grounding {
         let response =
@@ -191,7 +322,8 @@ async fn complete_inner(
         false,
     )
     .await?;
-    let should_lookup_memory = story_provider_user.is_none()
+    let should_lookup_memory = scope == CompletionScope::General
+        && story_provider_user.is_none()
         && answer_plan_allows_memory_lookup(&preliminary_answer_plan)
         && should_lookup_completion_memory(&req, &requested_effective_lane);
     let rag_matches = if should_lookup_memory {
@@ -214,14 +346,19 @@ async fn complete_inner(
         streaming = false,
         "managed chat memory context prepared"
     );
-    let resolved_answer_plan = resolve_answer_plan_for_request(
-        &state,
-        &account,
-        &req,
-        &requested_effective_lane,
-        &rag_matches,
-    )
-    .await;
+    let resolved_answer_plan = match fixed_plan {
+        Some(plan) => ResolvedAnswerPlan::rules(plan, "jobs_interview_prep"),
+        None => {
+            resolve_answer_plan_for_request(
+                &state,
+                &account,
+                &req,
+                &requested_effective_lane,
+                &rag_matches,
+            )
+            .await
+        }
+    };
     if resolved_answer_plan.provider_accounting_pending {
         return Err(provider_accounting_pending_error(
             &state.pool,
@@ -283,15 +420,20 @@ async fn complete_inner(
         image_count = req.image_data_urls.len(),
         "managed chat answer plan resolved"
     );
-    let web_search = completion_web_search_budgeted(
-        &state.pool,
-        state.config.upstream_spend_guard,
-        &account,
-        &req.request_id,
-        &req.user,
-        &answer_plan,
-    )
-    .await;
+    let web_search = match scope {
+        CompletionScope::JobsInterviewPrep => WebSearchOutcome::default(),
+        CompletionScope::General => {
+            completion_web_search_budgeted(
+                &state.pool,
+                state.config.upstream_spend_guard,
+                &account,
+                &req.request_id,
+                &req.user,
+                &answer_plan,
+            )
+            .await
+        }
+    };
     if web_search.provider_accounting_pending {
         return Err(provider_accounting_pending_error(
             &state.pool,
@@ -300,28 +442,36 @@ async fn complete_inner(
         ));
     }
     let web_sources = web_search.sources.clone();
-    let provider_rag_matches = if resolved_story_provider_user.is_some() {
-        &[][..]
-    } else {
-        rag_matches.as_slice()
+    let (provider_system, provider_user) = match scope {
+        CompletionScope::JobsInterviewPrep => (
+            trusted_envelope.system.to_owned(),
+            trusted_envelope.user.to_owned(),
+        ),
+        CompletionScope::General => {
+            let provider_rag_matches = if resolved_story_provider_user.is_some() {
+                &[][..]
+            } else {
+                rag_matches.as_slice()
+            };
+            let (provider_system, provider_user) = prompt_with_rag_context(
+                trusted_envelope.system,
+                resolved_story_provider_user
+                    .as_deref()
+                    .unwrap_or(trusted_envelope.user),
+                provider_rag_matches,
+            );
+            let (provider_system, provider_user) =
+                prompt_with_web_context(&provider_system, &provider_user, &web_sources);
+            prompt_with_answer_plan_context(
+                &provider_system,
+                &provider_user,
+                &req.context,
+                &answer_plan,
+                &web_search,
+                req.max_tokens,
+            )
+        }
     };
-    let (provider_system, provider_user) = prompt_with_rag_context(
-        trusted_envelope.system,
-        resolved_story_provider_user
-            .as_deref()
-            .unwrap_or(trusted_envelope.user),
-        provider_rag_matches,
-    );
-    let (provider_system, provider_user) =
-        prompt_with_web_context(&provider_system, &provider_user, &web_sources);
-    let (provider_system, provider_user) = prompt_with_answer_plan_context(
-        &provider_system,
-        &provider_user,
-        &req.context,
-        &answer_plan,
-        &web_search,
-        req.max_tokens,
-    );
 
     // 2. Resolve lane → provider+model candidates. The reservation uses the
     // maximum candidate estimate so provider failover cannot overrun a
@@ -382,7 +532,7 @@ async fn complete_inner(
         !env_flag_is_false("BLUEY_BALANCED_DESIGN_QUALITY_ROUTE"),
     );
     if routes.is_empty() {
-        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        scope.finish_before_dispatch_failure(&state.pool, &account.id, &req.request_id);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
@@ -427,7 +577,7 @@ async fn complete_inner(
 
     // 4. Atomically reserve the maximum customer charge before dispatch.
     let usage_reservation =
-        reserve_llm_usage(&state, &account, &req.request_id, est_cost, 0, "llm")
+        reserve_llm_usage(&state, &account, &req.request_id, est_cost, "llm", scope)
             .map_err(|error| *error)?;
     let on_trial = usage_reservation.is_trial();
     tracing::info!(
@@ -729,7 +879,7 @@ async fn complete_inner(
                                 request_id = %req.request_id,
                                 provider = %route.provider,
                                 model = %route.model,
-                                error = %e,
+                                error = %scope.upstream_failure_detail(&e),
                                 "managed vision request explicitly rejected media; trying remaining vision routes"
                             );
                             last_error = Some(e);
@@ -755,7 +905,7 @@ async fn complete_inner(
                                 model = %route.model,
                                 key_fingerprint = %selected_key.fingerprint,
                                 retry_after_secs = cooldown_secs,
-                                error = %e,
+                                error = %scope.upstream_failure_detail(&e),
                                 "upstream capacity response; cooled key and retrying route"
                             );
                             last_capacity = Some(crate::rate_limit::CapacityDenied {
@@ -770,7 +920,7 @@ async fn complete_inner(
                             request_id = %req.request_id,
                             provider = %route.provider,
                             model = %route.model,
-                            error = %e,
+                            error = %scope.upstream_failure_detail(&e),
                             "upstream dispatch failed; trying next route"
                         );
                         last_error = Some(e);
@@ -858,6 +1008,7 @@ async fn complete_inner(
                 return Err(capacity_error(denied.reason, denied.retry_after_secs));
             }
             if let Some(e) = last_error {
+                let error_detail = scope.upstream_failure_detail(&e);
                 // Codex S4.6: log raw upstream details, return sanitized
                 // message to the customer. We DO NOT mark the idempotency
                 // row as failed-terminal because a transient upstream error
@@ -867,7 +1018,7 @@ async fn complete_inner(
                     request_id = %req.request_id,
                     request_ref = %request_ref_log,
                     session_ref = %session_ref_log,
-                    error = %e,
+                    error = %error_detail,
                     "all upstream dispatch routes failed"
                 );
                 record_answer_ops_event(
@@ -884,7 +1035,7 @@ async fn complete_inner(
                         "effective_lane": effective_lane_log.as_str(),
                         "streaming": false,
                         "error_kind": "all_routes_failed",
-                        "error_preview": truncate_chars(&e.to_string(), 180),
+                        "error_preview": truncate_chars(&error_detail, 180),
                         "candidate_routes": routes.len()
                         }),
                     },
@@ -1049,7 +1200,31 @@ async fn complete_inner(
         &web_search,
     );
 
-    // 7. Settle actual usage and atomically refund the unused ceiling.
+    let visible_response_text =
+        visible_response_text_for_plan(&response_text, artifact.as_ref(), &answer_plan);
+    let make_response = |settled: &SettledUsage| CompleteResponse {
+        text: visible_response_text.clone(),
+        provider: comp.provider.clone(),
+        model: comp.model.clone(),
+        input_tokens: comp.input_tokens,
+        output_tokens: comp.output_tokens,
+        cost_cents: settled.charged_customer_cents,
+        balance_cents_after: settled.balance_cents_after,
+        trial_seconds_remaining: settled.trial_seconds_remaining,
+        artifact_type: artifact
+            .as_ref()
+            .map(|artifact| artifact.artifact_type.to_string()),
+        artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
+        cost_label: Some(router_cost_label_with_web_search(
+            settled.charged_customer_cents,
+            settled.balance_cents_after,
+            &web_search,
+        )),
+        confidence: artifact.as_ref().map(|artifact| artifact.confidence),
+        sources: web_sources.clone(),
+    };
+    // A customer debit is terminal only with its matching replay record.
+    // The provider attempt is already durable and is never re-dispatched here.
     let settled_usage = settle_llm_usage_with_retry(
         &state.pool,
         &account.id,
@@ -1058,6 +1233,7 @@ async fn complete_inner(
         elapsed_ms,
         "completed",
         &settlement_events,
+        &|settled| scope.encode_cached(&make_response(settled)),
     )
     .await
     .map_err(|error| {
@@ -1093,7 +1269,7 @@ async fn complete_inner(
     // resulting payment_intent.succeeded credits the balance via the
     // existing /billing/webhook flow. This closes the v0.2 dealbreaker
     // gap: customers no longer hit hard-stop without an obvious recovery.
-    if !on_trial {
+    if !on_trial && scope == CompletionScope::General {
         crate::billing::topup::maybe_spawn(
             state.pool.clone(),
             state.config.clone(),
@@ -1183,61 +1359,5 @@ async fn complete_inner(
         "managed chat completed and billed"
     );
 
-    let visible_response_text =
-        visible_response_text_for_plan(&response_text, artifact.as_ref(), &answer_plan);
-    let response = CompleteResponse {
-        text: visible_response_text,
-        provider: comp.provider,
-        model: comp.model,
-        input_tokens: comp.input_tokens,
-        output_tokens: comp.output_tokens,
-        cost_cents: charged_customer_cost,
-        balance_cents_after: balance_after,
-        trial_seconds_remaining: trial_remaining,
-        artifact_type: artifact
-            .as_ref()
-            .map(|artifact| artifact.artifact_type.to_string()),
-        artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
-        cost_label: Some(router_cost_label_with_web_search(
-            charged_customer_cost,
-            balance_after,
-            &web_search,
-        )),
-        confidence: artifact.as_ref().map(|artifact| artifact.confidence),
-        sources: web_sources,
-    };
-
-    // 9. Cache the terminal response in the idempotency row so a retry
-    //    returns this exact body without re-dispatching.
-    // Codex Stage 9c (S4 round-2 nit): mark_complete failure must NOT
-    // be silently dropped. The customer has been billed and the upstream
-    // call has finished; if we cannot persist the cached response, a
-    // retry hits the in_progress reservation and 409s the customer
-    // permanently. Log at error with the request_id so SREs can
-    // reconcile manually. A future stage adds a Prometheus counter at
-    // /admin/metrics.
-    match serde_json::to_string(&response) {
-        Ok(json) => {
-            if let Err(e) =
-                idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json)
-            {
-                tracing::error!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    request_id = %req.request_id,
-                    error = %e,
-                    "idempotency::mark_complete failed AFTER customer billed; retry will return 409 — manual reconciliation required"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                request_id = %req.request_id,
-                error = %e,
-                "failed to serialize response for idempotency cache; retry will return 409 — manual reconciliation required"
-            );
-        }
-    }
-
-    Ok(response)
+    Ok(make_response(&settled_usage))
 }

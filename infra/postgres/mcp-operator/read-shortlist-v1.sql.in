@@ -1,0 +1,26 @@
+-- A transaction fragment for the dedicated MCP operator, not a migration.
+-- A verified operator must lock and check the target, roles, and ACLs first.
+-- This fragment must never be used as a standalone psql script.
+CREATE SCHEMA jobs_mcp;
+REVOKE ALL ON SCHEMA jobs_mcp FROM PUBLIC;
+GRANT USAGE ON SCHEMA jobs_mcp TO bluey_jobs_mcp_owner, bluey_jobs_mcp_reader;
+
+CREATE FUNCTION jobs_mcp.read_shortlist(text)
+RETURNS TABLE (account_id text, track_id text, input_generation bigint,
+               input_transition_sha256 text, issued_at_ms bigint, expires_at_ms bigint,
+               inputs_updated_at_ms bigint, job_id text, title text, company text,
+               location text, match_score bigint, candidate_updated_at_ms bigint)
+LANGUAGE sql STABLE STRICT SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+SET row_security = on
+BEGIN ATOMIC
+-- @CLOSED_SHORTLIST_V1_QUERY@
+END;
+
+REVOKE ALL ON FUNCTION jobs_mcp.read_shortlist(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION jobs_mcp.read_shortlist(text) TO bluey_jobs_mcp_reader;
+-- PostgreSQL ownership transfer by a non-superuser needs CREATE for the
+-- target owner. No other connection may see this transient grant.
+GRANT CREATE ON SCHEMA jobs_mcp TO bluey_jobs_mcp_owner;
+ALTER FUNCTION jobs_mcp.read_shortlist(text) OWNER TO bluey_jobs_mcp_owner;
+REVOKE CREATE ON SCHEMA jobs_mcp FROM bluey_jobs_mcp_owner;

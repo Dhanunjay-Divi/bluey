@@ -8,18 +8,28 @@ pub async fn complete(
     >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>, (StatusCode, Json<ApiError>)> {
-    match tokio::spawn(complete_inner(
-        state,
-        account,
-        req,
-        trace_id,
-        ManagedSystemAuthority::ExternalClientContract,
-    ))
-    .await
-    {
-        Ok(result) => result.map(Json),
+    reject_jobs_interview_prep_request_id(&req.request_id)?;
+    complete_detached(state, account, req, trace_id, CompletionScope::General)
+        .await
+        .map(Json)
+}
+
+#[allow(clippy::result_large_err)]
+async fn complete_detached(
+    state: AppState,
+    account: Account,
+    req: CompleteRequest,
+    trace_id: String,
+    scope: CompletionScope,
+) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
+    match tokio::spawn(complete_inner(state, account, req, trace_id, scope)).await {
+        Ok(result) => result,
         Err(error) => {
-            tracing::error!(error = %error, "detached managed completion task failed");
+            tracing::error!(
+                panicked = error.is_panic(),
+                cancelled = error.is_cancelled(),
+                "detached managed completion task failed"
+            );
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError {
@@ -48,6 +58,7 @@ pub async fn complete_stream(
     >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
+    reject_jobs_interview_prep_request_id(&req.request_id)?;
     match tokio::spawn(complete_stream_inner(state, account, req, trace_id)).await {
         Ok(result) => result,
         Err(error) => {
@@ -536,9 +547,15 @@ async fn complete_stream_inner(
         return Err(err);
     }
 
-    let usage_reservation =
-        reserve_llm_usage(&state, &account, &req.request_id, est_cost, 0, "llm_stream")
-            .map_err(|error| *error)?;
+    let usage_reservation = reserve_llm_usage(
+        &state,
+        &account,
+        &req.request_id,
+        est_cost,
+        "llm_stream",
+        CompletionScope::General,
+    )
+    .map_err(|error| *error)?;
     let on_trial = usage_reservation.is_trial();
     tracing::info!(
         account_id_hash = %account_id_hash,
@@ -1957,6 +1974,35 @@ async fn complete_stream_inner(
             llm_customer_cost,
             &web_search,
         );
+        let response_text =
+            visible_response_text_for_plan(&text, artifact.as_ref(), &answer_plan);
+        let response_provider = streaming.provider.clone();
+        let response_model = streaming.model.clone();
+        let response_artifact_type = artifact
+            .as_ref()
+            .map(|artifact| artifact.artifact_type.to_string());
+        let response_artifact_body = artifact.as_ref().map(|artifact| artifact.body.clone());
+        let response_confidence = artifact.as_ref().map(|artifact| artifact.confidence);
+        let response_sources = stream_sources.clone();
+        let make_response = |settled: &SettledUsage| CompleteResponse {
+            text: response_text.clone(),
+            provider: response_provider.clone(),
+            model: response_model.clone(),
+            input_tokens,
+            output_tokens,
+            cost_cents: settled.charged_customer_cents,
+            balance_cents_after: settled.balance_cents_after,
+            trial_seconds_remaining: settled.trial_seconds_remaining,
+            artifact_type: response_artifact_type.clone(),
+            artifact_body: response_artifact_body.clone(),
+            cost_label: Some(router_cost_label_with_web_search(
+                settled.charged_customer_cents,
+                settled.balance_cents_after,
+                &web_search,
+            )),
+            confidence: response_confidence,
+            sources: response_sources.clone(),
+        };
 
         let settled_usage = match settle_llm_usage_with_retry(
             &state.pool,
@@ -1966,6 +2012,7 @@ async fn complete_stream_inner(
             elapsed_ms,
             "completed",
             &settlement_events,
+            &|settled| serde_json::to_string(&make_response(settled)),
         )
         .await
         {
@@ -1987,6 +2034,7 @@ async fn complete_stream_inner(
                 return;
             }
         };
+        let response = make_response(&settled_usage);
         let charged_customer_cost = settled_usage.charged_customer_cents;
         let charged_llm_customer_cost = if on_trial {
             0
@@ -2087,53 +2135,6 @@ async fn complete_stream_inner(
             "managed chat completed and billed"
         );
 
-        let response_text =
-            visible_response_text_for_plan(&text, artifact.as_ref(), &answer_plan);
-        let response = CompleteResponse {
-            text: response_text,
-            provider: streaming.provider,
-            model: streaming.model,
-            input_tokens,
-            output_tokens,
-            cost_cents: charged_customer_cost,
-            balance_cents_after: balance_after,
-            trial_seconds_remaining: trial_remaining,
-            artifact_type: artifact
-                .as_ref()
-                .map(|artifact| artifact.artifact_type.to_string()),
-            artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
-            cost_label: Some(router_cost_label_with_web_search(
-                charged_customer_cost,
-                balance_after,
-                &web_search,
-            )),
-            confidence: artifact.as_ref().map(|artifact| artifact.confidence),
-            sources: stream_sources.clone(),
-        };
-
-        match serde_json::to_string(&response) {
-            Ok(json) => {
-                if let Err(e) =
-                    idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json)
-                {
-                    tracing::error!(
-                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        request_id = %req.request_id,
-                        error = %e,
-                        "streaming idempotency::mark_complete failed AFTER customer billed; retry will return 409 — manual reconciliation required"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    request_id = %req.request_id,
-                    error = %e,
-                    "failed to serialize streaming response for idempotency cache; retry will return 409 — manual reconciliation required"
-                );
-            }
-        }
-
         if split_canvas_stream {
             let visible_tail = canvas_visible.finish(&canvas_overlay_text(&text));
             if !visible_tail.trim().is_empty() {
@@ -2150,18 +2151,18 @@ async fn complete_stream_inner(
 }
 
 #[allow(clippy::result_large_err)]
-pub(crate) async fn complete_for_account(
+pub(crate) async fn complete_jobs_interview_prep_for_account(
     state: AppState,
     account: Account,
     req: CompleteRequest,
     trace_id: String,
 ) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
-    complete_inner(
+    complete_detached(
         state,
         account,
         req,
         trace_id,
-        ManagedSystemAuthority::TrustedServerSystem,
+        CompletionScope::JobsInterviewPrep,
     )
     .await
 }

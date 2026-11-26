@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use super::{
     billing_restricted_error, capacity_error, missing_provider_key_error,
     priced_transcribe_routes_for, prior_provider_exposure_error, provider_accounting_pending_error,
-    provider_cost_guard, release_and_capacity_error, release_and_upstream_spend_guard_error,
-    settle_provider_attempt_before_customer, spawn_usage_expiry_reconciler, ApiError, AppState,
-    PricedTranscribeRoute,
+    provider_cost_guard, reject_jobs_interview_prep_request_id, release_and_capacity_error,
+    release_and_upstream_spend_guard_error, settle_provider_attempt_before_customer,
+    spawn_usage_expiry_reconciler, ApiError, AppState, PricedTranscribeRoute,
 };
 use crate::auth::AuthedAccount;
 use crate::db::{
@@ -202,6 +202,7 @@ pub async fn transcribe(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<TranscribeResponse>, (StatusCode, Json<ApiError>)> {
+    reject_jobs_interview_prep_request_id(&q.request_id)?;
     if let Some(err) = billing_restricted_error(&account) {
         return Err(err);
     }

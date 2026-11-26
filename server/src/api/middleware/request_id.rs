@@ -16,7 +16,10 @@ pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Respon
     let trace_id = header_id(req.headers(), cue_core::BLUEY_TRACE_ID_HEADER)
         .unwrap_or_else(cue_core::new_trace_id);
     let method = req.method().clone();
-    let path = req.uri().path().to_string();
+    let raw_path = req.uri().path();
+    let path = crate::rate_limit::jobs_match_provider_action_path(raw_path)
+        .unwrap_or(raw_path)
+        .to_owned();
     let started = Instant::now();
 
     req.extensions_mut().insert(RequestId(request_id.clone()));
@@ -77,8 +80,29 @@ fn insert_header(headers: &mut axum::http::HeaderMap, name: &'static str, value:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{extract::Extension, routing::get, Router};
+    use axum::{
+        extract::Extension,
+        routing::{get, post},
+        Router,
+    };
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
     use tower::ServiceExt;
+
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     async fn echo_ids(
         Extension(request_id): Extension<RequestId>,
@@ -151,5 +175,48 @@ mod tests {
             .unwrap();
         assert!(uuid::Uuid::parse_str(request_id).is_ok());
         assert!(uuid::Uuid::parse_str(trace_id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn jobs_match_provider_action_request_logs_use_route_templates() {
+        let capture = Arc::new(Mutex::new(Vec::new()));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || LogCapture(writer.clone()))
+            .finish();
+        let _scope = tracing::subscriber::set_default(subscriber);
+        let router = Router::new()
+            .route("/api/jobs/matches/:job_id/:action", post(echo_ids))
+            .layer(axum::middleware::from_fn(request_id_middleware));
+
+        for action in ["load-requirements", "verify-original"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::post(format!(
+                        "/api/jobs/matches/synthetic-private-match/{action}?fixture-query=hidden"
+                    ))
+                    .header(cue_core::BLUEY_REQUEST_ID_HEADER, "safe-request-id")
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
+
+        let bytes = capture.lock().unwrap();
+        let logs = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(logs.matches("request received").count(), 2);
+        assert_eq!(logs.matches("request done").count(), 2);
+        assert_eq!(logs.matches("safe-request-id").count(), 4);
+        for action in ["load-requirements", "verify-original"] {
+            let route = format!("/api/jobs/matches/:job_id/{action}");
+            assert_eq!(logs.matches(route.as_str()).count(), 2);
+        }
+        assert!(!logs.contains("synthetic-private-match"));
+        assert!(!logs.contains("fixture-query"));
     }
 }

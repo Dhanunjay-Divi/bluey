@@ -1,4 +1,3 @@
-
 pub fn list_browser_sessions(pool: &DbPool, account_id: &str) -> Result<Vec<BrowserSession>> {
     list_payloads(
         pool,
@@ -8,6 +7,34 @@ pub fn list_browser_sessions(pool: &DbPool, account_id: &str) -> Result<Vec<Brow
         "updated_at_ms DESC",
         "browser session",
     )
+}
+
+pub fn get_browser_session(
+    pool: &DbPool,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Option<BrowserSession>> {
+    let raw = crate::db::run_blocking_db(|| -> Result<Option<String>> {
+        match pool {
+            DbPool::Sqlite(_) => Ok(pool
+                .get()?
+                .query_row(
+                    "SELECT session_json FROM jobs_browser_sessions WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?),
+            DbPool::Postgres(_) => Ok(pool
+                .get_pg()?
+                .query_opt(
+                    "SELECT session_json FROM jobs_browser_sessions WHERE account_id = $1 AND id = $2",
+                    &[&account_id, &session_id],
+                )?
+                .map(|row| row.get::<_, String>(0))),
+        }
+    })?;
+    raw.map(|raw| parse_json(raw, "browser session"))
+        .transpose()
 }
 
 pub fn upsert_browser_session(
@@ -27,7 +54,12 @@ pub fn upsert_browser_session(
     let payload = to_json(&value, "browser session")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_browser_sessions (
                     id, account_id, runner, status, session_json, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -44,10 +76,16 @@ pub fn upsert_browser_session(
                     value.updated_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_browser_sessions (
                     id, account_id, runner, status, session_json, created_at_ms, updated_at_ms
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -64,6 +102,7 @@ pub fn upsert_browser_session(
                     &value.updated_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
     })
@@ -155,7 +194,12 @@ pub fn save_intervention(
     let payload = to_json(&value, "intervention")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_interventions (
                     id, account_id, application_id, kind, status, intervention_json,
                     created_at_ms, resolved_at_ms
@@ -175,10 +219,16 @@ pub fn save_intervention(
                     value.resolved_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_interventions (
                     id, account_id, application_id, kind, status, intervention_json,
                     created_at_ms, resolved_at_ms
@@ -198,7 +248,635 @@ pub fn save_intervention(
                     &value.resolved_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
+        }
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct InterventionAnswerRevisionResult {
+    pub intervention: Intervention,
+    pub application: JobApplication,
+    pub question: String,
+    pub answer_revision: ApplicationAnswerRevision,
+}
+
+fn prepare_intervention_answer_revision(
+    mut intervention: Intervention,
+    mut application: JobApplication,
+    answer: &str,
+    now: i64,
+) -> Result<(InterventionAnswerRevisionResult, Option<String>)> {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        anyhow::bail!("enter the answer Bluey should use")
+    }
+    if answer.len() > 10_000 {
+        anyhow::bail!("application answer is too long")
+    }
+    if intervention.status != "open" {
+        anyhow::bail!("this intervention has already been resolved")
+    }
+    if intervention.resolution_kind != "answer"
+        || !matches!(
+            intervention.kind.as_str(),
+            "unknown_question" | "missing_fact" | "sensitive_question"
+        )
+    {
+        anyhow::bail!("this intervention is not waiting for an application answer")
+    }
+    if application.state != "needs_input" {
+        anyhow::bail!("this application is no longer waiting for an answer")
+    }
+    validate_application_transition(&application.state, "awaiting_review")?;
+    let previous_answers = application.answers.clone();
+
+    let field = intervention
+        .metadata
+        .pointer("/receipt/intervention/field")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim);
+    let question = intervention
+        .metadata
+        .pointer("/receipt/intervention/question")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or(field)
+        .unwrap_or(&intervention.title)
+        .trim()
+        .to_string();
+    let answer_key = normalize_answer_memory_key(&question);
+    if answer_key.is_empty() {
+        anyhow::bail!("application question is missing")
+    }
+    let selector_key = field
+        .map(normalize_answer_memory_key)
+        .filter(|key| !key.is_empty());
+    if let Some(selector_key) = selector_key
+        .as_ref()
+        .filter(|key| key.as_str() != answer_key)
+    {
+        let ambiguous = application.answers.iter().any(|candidate| {
+            let key = ["key", "question", "field", "name"]
+                .iter()
+                .find_map(|name| candidate.get(*name).and_then(Value::as_str))
+                .unwrap_or_default();
+            let value = ["value", "answer"]
+                .iter()
+                .find_map(|name| candidate.get(*name).and_then(Value::as_str))
+                .unwrap_or_default();
+            normalize_answer_memory_key(key) == *selector_key
+                && !value.trim().is_empty()
+                && candidate
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    != Some(question.as_str())
+        });
+        if ambiguous {
+            return Err(attempt_review_required(
+                "intervention_selector_answer_review_required",
+            ));
+        }
+    }
+    let answer_value = json!({
+        "key": answer_key,
+        "question": question,
+        "value": answer,
+        "source": "intervention",
+        "confirmed": true,
+        "intervention_id": intervention.id,
+        "updated_at_ms": now,
+    });
+    let matching_answer = application.answers.iter_mut().find(|candidate| {
+        let existing = candidate
+            .get("key")
+            .or_else(|| candidate.get("question"))
+            .or_else(|| candidate.get("field"))
+            .or_else(|| candidate.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let existing_key = normalize_answer_memory_key(existing);
+        existing_key == answer_key
+            || (selector_key.as_deref() == Some(existing_key.as_str())
+                && candidate
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    == Some(question.as_str()))
+    });
+    if let Some(existing) = matching_answer {
+        *existing = answer_value;
+    } else {
+        application.answers.push(answer_value);
+    }
+
+    let answers = Value::Array(application.answers.clone());
+    let receipt = application.receipt.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("application receipt is unavailable; prepare the packet again")
+    })?;
+    receipt.insert("final_answers".to_string(), answers);
+    let invalidated_checksum = receipt
+        .remove("approved_execution")
+        .and_then(|value| value.get("checksum").cloned())
+        .unwrap_or(Value::Null);
+    if !invalidated_checksum.is_null() && !invalidated_checksum.is_string() {
+        anyhow::bail!("application packet revision history is invalid")
+    }
+    let answer_revision = ApplicationAnswerRevision {
+        id: uuid::Uuid::new_v4().to_string(),
+        application_id: application.id.clone(),
+        intervention_id: intervention.id.clone(),
+        previous_answers,
+        revised_answers: application.answers.clone(),
+        invalidated_packet_checksum: invalidated_checksum.as_str().map(str::to_owned),
+        revised_at_ms: now,
+    };
+    let revision = json!({
+        "reason": "intervention_answer",
+        "intervention_id": intervention.id,
+        "revised_at_ms": now,
+        "reapproval_required": true,
+        "invalidated_packet_checksum": invalidated_checksum,
+        "answer_revision_id": answer_revision.id,
+    });
+    let revisions = receipt
+        .entry("packet_revisions".to_string())
+        .or_insert_with(|| json!([]));
+    let revisions = revisions
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("application packet revision history is invalid"))?;
+    revisions.push(revision.clone());
+    receipt.insert("packet_revision".to_string(), revision);
+
+    let metadata = intervention
+        .metadata
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("this intervention cannot be answered"))?;
+    metadata.insert("resolved_answer".to_string(), json!(answer));
+    metadata.insert("answered_at_ms".to_string(), json!(now));
+    metadata.insert("reapproval_required".to_string(), json!(true));
+    intervention.status = "resolved".to_string();
+    intervention.resolved_at_ms = Some(now);
+
+    let previous_run_id = application.run_id.take();
+    application.state = "awaiting_review".to_string();
+    application.updated_at_ms = now;
+    Ok((
+        InterventionAnswerRevisionResult {
+            intervention,
+            application,
+            question,
+            answer_revision,
+        },
+        previous_run_id,
+    ))
+}
+
+fn reject_irreversible_answer_revision(
+    lease_phase: Option<&str>,
+    local_ticket_status: Option<&str>,
+) -> Result<()> {
+    if matches!(
+        lease_phase,
+        Some("click_started" | "submitted" | "side_effect_unknown")
+    ) || matches!(
+        local_ticket_status,
+        Some("click_started" | "complete" | "side_effect_unknown")
+    ) {
+        anyhow::bail!(
+            "application submission is awaiting reconciliation; answers cannot change yet"
+        )
+    }
+    Ok(())
+}
+
+pub fn resolve_intervention_answer_for_review(
+    pool: &DbPool,
+    account_id: &str,
+    intervention_id: &str,
+    answer: &str,
+) -> Result<InterventionAnswerRevisionResult> {
+    let account_id = account_id.trim();
+    let intervention_id = intervention_id.trim();
+    if account_id.is_empty() || intervention_id.is_empty() {
+        anyhow::bail!("intervention not found")
+    }
+    let now = now_ms();
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let row: Option<(Option<String>, String)> = tx
+                .query_row(
+                    "SELECT application_id, intervention_json FROM jobs_interventions
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, intervention_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((application_id, raw)) = row else {
+                anyhow::bail!("intervention not found")
+            };
+            let application_id = application_id
+                .ok_or_else(|| anyhow::anyhow!("intervention is not attached to an application"))?;
+            let mut intervention: Intervention = parse_json(raw, "intervention")?;
+            intervention.id = intervention_id.to_string();
+            intervention.application_id = Some(application_id.clone());
+            let row: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT job_id, application_json FROM jobs_applications
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, application_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((job_id, raw)) = row else {
+                anyhow::bail!("application not found")
+            };
+            let application =
+                parse_application_json(raw, &application_id, &job_id, "job application")?;
+            let (revision, previous_run_id) =
+                prepare_intervention_answer_revision(intervention, application, answer, now)?;
+
+            let mut browser_session: Option<BrowserSession> = None;
+            let mut lease_phase: Option<String> = None;
+            let mut local_ticket_status: Option<String> = None;
+            if let Some(run_id) = previous_run_id.as_deref() {
+                lease_phase = tx
+                    .query_row(
+                        "SELECT phase FROM jobs_execution_leases
+                          WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                        params![account_id, application_id, run_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                local_ticket_status = tx
+                    .query_row(
+                        "SELECT status FROM jobs_local_run_tickets
+                          WHERE account_id = ?1 AND application_id = ?2 AND id = ?3",
+                        params![account_id, application_id, run_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                browser_session = tx
+                    .query_row(
+                        "SELECT session_json FROM jobs_browser_sessions
+                          WHERE account_id = ?1 AND id = ?2",
+                        params![account_id, run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|raw| parse_json(raw, "browser session"))
+                    .transpose()?;
+            }
+            reject_irreversible_answer_revision(
+                lease_phase.as_deref(),
+                local_ticket_status.as_deref(),
+            )?;
+
+            if let Some(run_id) = previous_run_id.as_deref() {
+                let ats_binding = tx
+                    .query_row(
+                        "SELECT binding_id, attempt_id, nonce_sha256
+                           FROM jobs_application_ats_certification_bindings
+                          WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                        params![account_id, application_id, run_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((binding_id, application_attempt_id, nonce_sha256)) = ats_binding {
+                    invalidate_ats_application_certification_binding_sqlite_tx(
+                        &tx,
+                        &AtsCertificationBindingInvalidationRequest {
+                            binding_id,
+                            account_id: account_id.to_string(),
+                            application_id: application_id.clone(),
+                            run_id: run_id.to_string(),
+                            application_attempt_id,
+                            nonce_sha256,
+                            expected_fence: 0,
+                            invalidation_kind: "packet_changed".to_string(),
+                        },
+                        now,
+                    )?;
+                }
+                if lease_phase.as_deref() == Some("prepared")
+                    && tx.execute(
+                        "UPDATE jobs_execution_leases
+                            SET phase = 'released', updated_at_ms = ?4, finished_at_ms = ?4
+                          WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3
+                            AND phase = 'prepared'",
+                        params![account_id, application_id, run_id, now],
+                    )? != 1
+                {
+                    anyhow::bail!("cloud execution authority changed")
+                }
+                if matches!(
+                    local_ticket_status.as_deref(),
+                    Some("queued" | "claimed" | "needs_input")
+                ) && tx.execute(
+                    "UPDATE jobs_local_run_tickets SET status = 'failed', updated_at_ms = ?4
+                      WHERE account_id = ?1 AND application_id = ?2 AND id = ?3
+                        AND status IN ('queued', 'claimed', 'needs_input')",
+                    params![account_id, application_id, run_id, now],
+                )? != 1
+                {
+                    anyhow::bail!("local execution authority changed")
+                }
+                tx.execute(
+                    "DELETE FROM jobs_local_run_resume_actions
+                      WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3
+                        AND status = 'approved'",
+                    params![account_id, application_id, run_id],
+                )?;
+                tx.execute(
+                    "UPDATE jobs_attempt_reservations
+                        SET status = 'released', updated_at_ms = ?3
+                      WHERE account_id = ?1 AND application_id = ?2
+                        AND status IN ('reserved', 'running')",
+                    params![account_id, application_id, now],
+                )?;
+                if let Some(mut session) = browser_session {
+                    session.status = "paused".to_string();
+                    session.current_step = "Application kit changed; review required".to_string();
+                    session.updated_at_ms = now;
+                    let payload = to_json(&session, "browser session")?;
+                    if tx.execute(
+                        "UPDATE jobs_browser_sessions SET status = 'paused',
+                            session_json = ?3, updated_at_ms = ?4
+                          WHERE account_id = ?1 AND id = ?2",
+                        params![account_id, run_id, payload, now],
+                    )? != 1
+                    {
+                        anyhow::bail!("browser session changed")
+                    }
+                }
+            }
+
+            let application_payload = to_json(&revision.application, "job application")?;
+            if tx.execute(
+                "UPDATE jobs_applications SET state = 'awaiting_review',
+                    application_json = ?3, updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2 AND state = 'needs_input'",
+                params![account_id, application_id, application_payload, now],
+            )? != 1
+            {
+                anyhow::bail!("application no longer waiting for an answer")
+            }
+            persist_application_answer_revision_sqlite_tx(
+                &tx,
+                account_id,
+                &revision.answer_revision,
+            )?;
+            let intervention_payload = to_json(&revision.intervention, "intervention")?;
+            if tx.execute(
+                "UPDATE jobs_interventions SET status = 'resolved',
+                    intervention_json = ?3, resolved_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2 AND status = 'open'",
+                params![account_id, intervention_id, intervention_payload, now],
+            )? != 1
+            {
+                anyhow::bail!("intervention has already been resolved")
+            }
+            tx.commit()?;
+            Ok(revision)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_postgres_ats_certification(&mut tx)?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+
+            // Discover the scope without row locks, then acquire every row in
+            // the same order as certified pre-click authorization: cloud
+            // lease, local ticket, ATS binding, and application. The ATS
+            // advisory lock keeps the binding set stable while the scope is
+            // discovered. Every authoritative value is re-read under its row
+            // lock before mutation.
+            let row = tx.query_opt(
+                "SELECT intervention.application_id, application.job_id,
+                        application.application_json
+                   FROM jobs_interventions intervention
+                   LEFT JOIN jobs_applications application
+                     ON application.account_id = intervention.account_id
+                    AND application.id = intervention.application_id
+                  WHERE intervention.account_id = $1 AND intervention.id = $2",
+                &[&account_id, &intervention_id],
+            )?;
+            let Some(row) = row else {
+                anyhow::bail!("intervention not found")
+            };
+            let application_id: Option<String> = row.get(0);
+            let application_id = application_id
+                .ok_or_else(|| anyhow::anyhow!("intervention is not attached to an application"))?;
+            let job_id: Option<String> = row.get(1);
+            let application_json: Option<String> = row.get(2);
+            let (Some(job_id), Some(application_json)) = (job_id, application_json) else {
+                anyhow::bail!("application not found")
+            };
+            let discovered_application = parse_application_json(
+                application_json,
+                &application_id,
+                &job_id,
+                "job application",
+            )?;
+            let discovered_run_id = discovered_application.run_id.clone();
+
+            let mut lease_phase: Option<String> = None;
+            let mut local_ticket_status: Option<String> = None;
+            let mut ats_binding: Option<(String, String, String)> = None;
+            if let Some(run_id) = discovered_run_id.as_deref() {
+                lease_phase = tx
+                    .query_opt(
+                        "SELECT phase FROM jobs_execution_leases
+                          WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                          FOR UPDATE",
+                        &[&account_id, &application_id, &run_id],
+                    )?
+                    .map(|row| row.get::<_, String>(0));
+                local_ticket_status = tx
+                    .query_opt(
+                        "SELECT status FROM jobs_local_run_tickets
+                          WHERE account_id = $1 AND application_id = $2 AND id = $3
+                          FOR UPDATE",
+                        &[&account_id, &application_id, &run_id],
+                    )?
+                    .map(|row| row.get::<_, String>(0));
+                ats_binding = tx
+                    .query_opt(
+                        "SELECT binding_id, attempt_id, nonce_sha256
+                           FROM jobs_application_ats_certification_bindings
+                          WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                          FOR UPDATE",
+                        &[&account_id, &application_id, &run_id],
+                    )?
+                    .map(|row| (row.get(0), row.get(1), row.get(2)));
+            }
+
+            let row = tx.query_opt(
+                "SELECT job_id, application_json FROM jobs_applications
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &application_id],
+            )?;
+            let Some(row) = row else {
+                anyhow::bail!("application not found")
+            };
+            let job_id: String = row.get(0);
+            let application =
+                parse_application_json(row.get(1), &application_id, &job_id, "job application")?;
+            if application.run_id.as_deref() != discovered_run_id.as_deref() {
+                anyhow::bail!("application execution authority changed")
+            }
+
+            let row = tx.query_opt(
+                "SELECT application_id, intervention_json FROM jobs_interventions
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &intervention_id],
+            )?;
+            let Some(row) = row else {
+                anyhow::bail!("intervention not found")
+            };
+            if row.get::<_, Option<String>>(0).as_deref() != Some(application_id.as_str()) {
+                anyhow::bail!("intervention is not attached to this application")
+            }
+            let mut intervention: Intervention = parse_json(row.get(1), "intervention")?;
+            intervention.id = intervention_id.to_string();
+            intervention.application_id = Some(application_id.clone());
+            let (revision, previous_run_id) =
+                prepare_intervention_answer_revision(intervention, application, answer, now)?;
+            if previous_run_id.as_deref() != discovered_run_id.as_deref() {
+                anyhow::bail!("application execution authority changed")
+            }
+
+            let browser_session: Option<BrowserSession> =
+                if let Some(run_id) = previous_run_id.as_deref() {
+                    tx.query_opt(
+                        "SELECT session_json FROM jobs_browser_sessions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                        &[&account_id, &run_id],
+                    )?
+                    .map(|row| parse_json(row.get(0), "browser session"))
+                    .transpose()?
+                } else {
+                    None
+                };
+            reject_irreversible_answer_revision(
+                lease_phase.as_deref(),
+                local_ticket_status.as_deref(),
+            )?;
+
+            if let Some(run_id) = previous_run_id.as_deref() {
+                if let Some((binding_id, application_attempt_id, nonce_sha256)) = ats_binding {
+                    invalidate_ats_application_certification_binding_postgres_tx(
+                        &mut tx,
+                        &AtsCertificationBindingInvalidationRequest {
+                            binding_id,
+                            account_id: account_id.to_string(),
+                            application_id: application_id.clone(),
+                            run_id: run_id.to_string(),
+                            application_attempt_id,
+                            nonce_sha256,
+                            expected_fence: 0,
+                            invalidation_kind: "packet_changed".to_string(),
+                        },
+                        now,
+                    )?;
+                }
+                if lease_phase.as_deref() == Some("prepared")
+                    && tx.execute(
+                        "UPDATE jobs_execution_leases
+                            SET phase = 'released', updated_at_ms = $4, finished_at_ms = $4
+                          WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                            AND phase = 'prepared'",
+                        &[&account_id, &application_id, &run_id, &now],
+                    )? != 1
+                {
+                    anyhow::bail!("cloud execution authority changed")
+                }
+                if matches!(
+                    local_ticket_status.as_deref(),
+                    Some("queued" | "claimed" | "needs_input")
+                ) && tx.execute(
+                    "UPDATE jobs_local_run_tickets SET status = 'failed', updated_at_ms = $4
+                      WHERE account_id = $1 AND application_id = $2 AND id = $3
+                        AND status IN ('queued', 'claimed', 'needs_input')",
+                    &[&account_id, &application_id, &run_id, &now],
+                )? != 1
+                {
+                    anyhow::bail!("local execution authority changed")
+                }
+                tx.execute(
+                    "DELETE FROM jobs_local_run_resume_actions
+                      WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                        AND status = 'approved'",
+                    &[&account_id, &application_id, &run_id],
+                )?;
+                tx.execute(
+                    "UPDATE jobs_attempt_reservations
+                        SET status = 'released', updated_at_ms = $3
+                      WHERE account_id = $1 AND application_id = $2
+                        AND status IN ('reserved', 'running')",
+                    &[&account_id, &application_id, &now],
+                )?;
+                if let Some(mut session) = browser_session {
+                    session.status = "paused".to_string();
+                    session.current_step = "Application kit changed; review required".to_string();
+                    session.updated_at_ms = now;
+                    let payload = to_json(&session, "browser session")?;
+                    if tx.execute(
+                        "UPDATE jobs_browser_sessions SET status = 'paused',
+                            session_json = $3, updated_at_ms = $4
+                          WHERE account_id = $1 AND id = $2",
+                        &[&account_id, &run_id, &payload, &now],
+                    )? != 1
+                    {
+                        anyhow::bail!("browser session changed")
+                    }
+                }
+            }
+
+            let application_payload = to_json(&revision.application, "job application")?;
+            if tx.execute(
+                "UPDATE jobs_applications SET state = 'awaiting_review',
+                    application_json = $3, updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2 AND state = 'needs_input'",
+                &[&account_id, &application_id, &application_payload, &now],
+            )? != 1
+            {
+                anyhow::bail!("application no longer waiting for an answer")
+            }
+            persist_application_answer_revision_postgres_tx(
+                &mut tx,
+                account_id,
+                &revision.answer_revision,
+            )?;
+            let intervention_payload = to_json(&revision.intervention, "intervention")?;
+            if tx.execute(
+                "UPDATE jobs_interventions SET status = 'resolved',
+                    intervention_json = $3, resolved_at_ms = $4
+                  WHERE account_id = $1 AND id = $2 AND status = 'open'",
+                &[&account_id, &intervention_id, &intervention_payload, &now],
+            )? != 1
+            {
+                anyhow::bail!("intervention has already been resolved")
+            }
+            tx.commit()?;
+            Ok(revision)
         }
     })
 }
@@ -231,10 +909,92 @@ pub fn list_answer_memory(pool: &DbPool, account_id: &str) -> Result<Vec<AnswerM
     )
 }
 
+#[derive(Debug, Error)]
+pub enum AnswerMemoryEmployerError {
+    #[error("verified job not found")]
+    MissingJob,
+    #[error("current verified employer required")]
+    AuthorityChanged,
+    #[error("verified employer confirmation required")]
+    InvalidConfirmation,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnswerMemoryCompanyScope {
+    pub job_id: String,
+    pub scope_id: String,
+    pub company: String,
+    pub domain: String,
+}
+
+// This value is constructed from the current composed projection, never deserialized from a client.
+struct VerifiedCompanyMemoryBinding {
+    scope_id: String,
+}
+
+fn resolve_answer_memory_company_scope(
+    pool: &DbPool,
+    account_id: &str,
+    job_id: &str,
+) -> Result<(VerifiedCompanyMemoryBinding, AnswerMemoryCompanyScope)> {
+    let posting =
+        get_posting(pool, account_id, job_id)?.ok_or(AnswerMemoryEmployerError::MissingJob)?;
+    let composed = resolve_composed_job_integrity_projection(pool, account_id, &posting)?;
+    let scope_id = verified_company_memory_scope(account_id, &composed)?
+        .ok_or(AnswerMemoryEmployerError::AuthorityChanged)?;
+    let authority = composed
+        .job_integrity
+        .authority
+        .as_ref()
+        .ok_or(AnswerMemoryEmployerError::AuthorityChanged)?;
+    let scope = AnswerMemoryCompanyScope {
+        job_id: posting.id.clone(),
+        scope_id: scope_id.clone(),
+        company: posting.company,
+        domain: authority.canonical_employer_domain.clone(),
+    };
+    Ok((VerifiedCompanyMemoryBinding { scope_id }, scope))
+}
+
+pub fn lookup_answer_memory_company_scope(
+    pool: &DbPool,
+    account_id: &str,
+    job_id: &str,
+) -> Result<AnswerMemoryCompanyScope> {
+    resolve_answer_memory_company_scope(pool, account_id, job_id).map(|(_, scope)| scope)
+}
+
+pub fn save_verified_company_answer_memory(
+    pool: &DbPool,
+    account_id: &str,
+    job_id: &str,
+    expected_scope: &str,
+    answer: &AnswerMemory,
+) -> Result<AnswerMemory> {
+    if job_id.trim().is_empty() || expected_scope.trim().is_empty() {
+        return Err(AnswerMemoryEmployerError::InvalidConfirmation.into());
+    }
+    let (binding, _) = resolve_answer_memory_company_scope(pool, account_id, job_id)?;
+    if expected_scope != binding.scope_id {
+        return Err(AnswerMemoryEmployerError::AuthorityChanged.into());
+    }
+    // The binding is a snapshot; consumers must recheck current authority before use.
+    save_answer_memory_inner(pool, account_id, answer, Some(&binding))
+}
+
 pub fn save_answer_memory(
     pool: &DbPool,
     account_id: &str,
     answer: &AnswerMemory,
+) -> Result<AnswerMemory> {
+    save_answer_memory_inner(pool, account_id, answer, None)
+}
+
+fn save_answer_memory_inner(
+    pool: &DbPool,
+    account_id: &str,
+    answer: &AnswerMemory,
+    binding: Option<&VerifiedCompanyMemoryBinding>,
 ) -> Result<AnswerMemory> {
     let mut value = answer.clone();
     value.question = value.question.trim().to_string();
@@ -249,6 +1009,9 @@ pub fn save_answer_memory(
     if value.question.is_empty() || value.key.is_empty() {
         anyhow::bail!("enter the application question")
     }
+    if value.key != normalize_answer_memory_key(&value.question) {
+        anyhow::bail!("answer memory question does not match its key")
+    }
     if value.value.is_empty() {
         anyhow::bail!("enter the answer Bluey should remember")
     }
@@ -257,6 +1020,20 @@ pub fn save_answer_memory(
     }
     if !matches!(value.scope.as_str(), "account" | "track" | "company") {
         anyhow::bail!("invalid answer memory scope")
+    }
+    let scope_id = value
+        .scope_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if let Some(binding) = binding {
+        if value.scope != "company" || (!scope_id.is_empty() && scope_id != binding.scope_id) {
+            return Err(AnswerMemoryEmployerError::InvalidConfirmation.into());
+        }
+        value.scope_id = Some(binding.scope_id.clone());
+    } else if scope_id.to_ascii_lowercase().starts_with("company-v1-") {
+        return Err(AnswerMemoryEmployerError::InvalidConfirmation.into());
     }
     let scope_id = value
         .scope_id
@@ -283,14 +1060,38 @@ pub fn save_answer_memory(
     }
     value.confirmed = true;
 
-    let existing = list_answer_memory(pool, account_id)?
-        .into_iter()
-        .find(|item| {
-            item.scope == value.scope
-                && item.scope_id.as_deref().unwrap_or_default()
-                    == value.scope_id.as_deref().unwrap_or_default()
-                && item.key == value.key
-        });
+    let memories = list_answer_memory(pool, account_id)?;
+    if let Some(prior) = memories
+        .iter()
+        .find(|item| !value.id.is_empty() && item.id == value.id)
+    {
+        let prior_bound = prior
+            .scope_id
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .starts_with("company-v1-");
+        if prior_bound
+            && binding.is_none_or(|b| {
+                prior.scope != "company" || prior.scope_id.as_deref() != Some(b.scope_id.as_str())
+            })
+        {
+            return Err(AnswerMemoryEmployerError::InvalidConfirmation.into());
+        }
+        if binding.is_some() && !prior_bound {
+            // Explicitly upgrading a legacy memory creates a new record; it never rebinds it.
+            value.id.clear();
+            value.created_at_ms = 0;
+            value.last_used_at_ms = None;
+            value.use_count = 0;
+        }
+    }
+    let existing = memories.into_iter().find(|item| {
+        item.scope == value.scope
+            && item.scope_id.as_deref().unwrap_or_default()
+                == value.scope_id.as_deref().unwrap_or_default()
+            && item.key == value.key
+    });
     if let Some(existing) = existing {
         value.id = existing.id;
         if value.created_at_ms == 0 {
@@ -316,9 +1117,10 @@ pub fn save_answer_memory(
         &value.key,
     )?;
     let payload = to_json(&value, "answer memory")?;
+    let bound = i64::from(binding.is_some());
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let changed = pool.get()?.execute(
                 "INSERT INTO jobs_answer_memory (
                     id, account_id, scope, scope_id, question_hash, answer_json,
                     created_at_ms, updated_at_ms
@@ -326,7 +1128,10 @@ pub fn save_answer_memory(
                  ON CONFLICT(id) DO UPDATE SET scope = excluded.scope,
                     scope_id = excluded.scope_id, question_hash = excluded.question_hash,
                     answer_json = excluded.answer_json, updated_at_ms = excluded.updated_at_ms
-                 WHERE jobs_answer_memory.account_id = excluded.account_id",
+                 WHERE jobs_answer_memory.account_id = excluded.account_id
+                   AND ((?9 = 0 AND lower(jobs_answer_memory.scope_id) NOT LIKE 'company-v1-%')
+                     OR (?9 = 1 AND jobs_answer_memory.scope = 'company'
+                         AND jobs_answer_memory.scope_id = ?10))",
                 params![
                     value.id,
                     account_id,
@@ -336,12 +1141,17 @@ pub fn save_answer_memory(
                     payload,
                     value.created_at_ms,
                     value.updated_at_ms,
+                    bound,
+                    scope_id,
                 ],
             )?;
+            if changed != 1 {
+                anyhow::bail!("answer memory update was refused")
+            }
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let changed = pool.get_pg()?.execute(
                 "INSERT INTO jobs_answer_memory (
                     id, account_id, scope, scope_id, question_hash, answer_json,
                     created_at_ms, updated_at_ms
@@ -349,7 +1159,10 @@ pub fn save_answer_memory(
                  ON CONFLICT(id) DO UPDATE SET scope = EXCLUDED.scope,
                     scope_id = EXCLUDED.scope_id, question_hash = EXCLUDED.question_hash,
                     answer_json = EXCLUDED.answer_json, updated_at_ms = EXCLUDED.updated_at_ms
-                 WHERE jobs_answer_memory.account_id = EXCLUDED.account_id",
+                 WHERE jobs_answer_memory.account_id = EXCLUDED.account_id
+                   AND (($9::bigint = 0 AND lower(jobs_answer_memory.scope_id) NOT LIKE 'company-v1-%')
+                     OR ($9::bigint = 1 AND jobs_answer_memory.scope = 'company'
+                         AND jobs_answer_memory.scope_id = $10))",
                 &[
                     &value.id,
                     &account_id,
@@ -359,8 +1172,13 @@ pub fn save_answer_memory(
                     &payload,
                     &value.created_at_ms,
                     &value.updated_at_ms,
+                    &bound,
+                    &scope_id,
                 ],
             )?;
+            if changed != 1 {
+                anyhow::bail!("answer memory update was refused")
+            }
             Ok(value)
         }
     })
@@ -634,6 +1452,7 @@ pub fn save_application_evidence(
         "resume"
             | "cover_letter"
             | "attachment"
+            | "application_receipt"
             | "submission_confirmation"
             | "status_email"
             | "interview_event"
@@ -673,6 +1492,22 @@ pub fn save_application_evidence(
         "cover_letter" | "attachment" => {
             validate_document_evidence(&value)?;
             format!("{}:{}", value.storage_key, value.sha256)
+        }
+        "application_receipt" => {
+            let resume_version_id = value
+                .resume_version_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("application receipt needs a resume version"))?;
+            if application.resume_version_id.as_deref() != Some(resume_version_id) {
+                anyhow::bail!("application receipt does not match this application's resume")
+            }
+            validate_application_receipt_evidence(&value)?;
+            let receipt_id = value
+                .metadata
+                .get("receipt_id")
+                .and_then(Value::as_str)
+                .expect("application receipt validation checks receipt_id");
+            format!("{}:{}", receipt_id, value.sha256)
         }
         "status_email" | "interview_event" => {
             if value.provider.trim().is_empty() {
@@ -741,7 +1576,54 @@ pub fn save_application_evidence(
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            conn.execute(
+            let mut tx = conn.transaction()?;
+            match crate::db::account_data::account_write_fence_postgres_tx(&mut tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced application evidence")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => {
+                    anyhow::bail!("account not found")
+                }
+            }
+            let application_row = tx
+                .query_opt(
+                    "SELECT job_id, application_json FROM jobs_applications
+                      WHERE account_id = $1 AND id = $2 FOR SHARE",
+                    &[&account_id, &value.application_id],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("application not found"))?;
+            let locked_job_id: String = application_row.get(0);
+            let locked_application = parse_application_json(
+                application_row.get(1),
+                &value.application_id,
+                &locked_job_id,
+                "application evidence application",
+            )?;
+            if locked_application.job_id != application.job_id
+                || locked_application.resume_version_id != application.resume_version_id
+            {
+                anyhow::bail!("application changed before evidence persistence")
+            }
+            lock_application_evidence_namespaces_postgres_tx(
+                &mut tx,
+                account_id,
+                &[(value.id.as_str(), provider_event_hash.as_str())],
+            )?;
+            if let Some(row) = tx.query_opt(
+                "SELECT account_id, provider_event_hash FROM jobs_application_evidence
+                  WHERE id = $1 FOR SHARE",
+                &[&value.id],
+            )? {
+                let stored_account_id: String = row.get(0);
+                let stored_provider_event_hash: String = row.get(1);
+                if stored_account_id != account_id
+                    || stored_provider_event_hash != provider_event_hash
+                {
+                    anyhow::bail!("application evidence id is already bound")
+                }
+            }
+            tx.execute(
                 "INSERT INTO jobs_application_evidence (
                     id, account_id, application_id, kind, provider_event_hash,
                     evidence_json, occurred_at_ms, created_at_ms
@@ -758,12 +1640,14 @@ pub fn save_application_evidence(
                     &value.created_at_ms,
                 ],
             )?;
-            let row = conn.query_one(
+            let row = tx.query_one(
                 "SELECT evidence_json FROM jobs_application_evidence
                   WHERE account_id = $1 AND provider_event_hash = $2",
                 &[&account_id, &provider_event_hash],
             )?;
-            parse_json(row.get(0), "application evidence")
+            let stored = parse_json(row.get(0), "application evidence")?;
+            tx.commit()?;
+            Ok(stored)
         }
     })
 }
@@ -779,11 +1663,90 @@ fn validate_document_evidence(evidence: &ApplicationEvidence) -> Result<()> {
     Ok(())
 }
 
+fn validate_application_receipt_evidence(evidence: &ApplicationEvidence) -> Result<()> {
+    validate_document_evidence(evidence)?;
+    if evidence.media_type != "application/json" || !evidence.file_name.ends_with(".json") {
+        anyhow::bail!("application receipt needs a JSON evidence object")
+    }
+    if evidence
+        .metadata
+        .get("receipt_id")
+        .and_then(Value::as_str)
+        .is_none_or(|receipt_id| receipt_id.trim().is_empty())
+        || evidence
+            .metadata
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            != Some(1)
+        || evidence.metadata.get("immutable").and_then(Value::as_bool) != Some(true)
+        || evidence
+            .metadata
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            .is_none_or(|size_bytes| size_bytes <= 0)
+    {
+        anyhow::bail!("application receipt metadata is incomplete")
+    }
+    Ok(())
+}
+
 struct PreparedSubmissionEvidence {
     value: ApplicationEvidence,
     provider_event_hash: String,
     payload: String,
 }
+
+fn application_evidence_namespace_keys(
+    account_id: &str,
+    evidence_ids_and_hashes: &[(&str, &str)],
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(evidence_ids_and_hashes.len().saturating_mul(2));
+    for (evidence_id, provider_event_hash) in evidence_ids_and_hashes {
+        keys.push(format!(
+            "jobs-application-evidence:id:{}:{evidence_id}",
+            evidence_id.len()
+        ));
+        keys.push(format!(
+            "jobs-application-evidence:account-provider:{}:{account_id}:{provider_event_hash}",
+            account_id.len()
+        ));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn lock_application_evidence_namespaces_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    evidence_ids_and_hashes: &[(&str, &str)],
+) -> Result<()> {
+    for key in application_evidence_namespace_keys(account_id, evidence_ids_and_hashes) {
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&key],
+        )?;
+    }
+    Ok(())
+}
+
+fn bind_prepared_submission_evidence_time_at_ms(
+    evidence: &mut [PreparedSubmissionEvidence],
+    now_ms: i64,
+) -> Result<()> {
+    for item in evidence {
+        if item.value.occurred_at_ms == 0 {
+            item.value.occurred_at_ms = now_ms;
+        }
+        if item.value.created_at_ms == 0 {
+            item.value.created_at_ms = now_ms;
+        }
+        item.payload = to_json(&item.value, "application evidence")?;
+    }
+    Ok(())
+}
+
+const MAX_SUBMISSION_CONFIRMATIONS: usize = 4;
 
 fn prepare_submission_evidence(
     application_id: &str,
@@ -791,25 +1754,35 @@ fn prepare_submission_evidence(
     evidence: &[ApplicationEvidence],
     now: i64,
 ) -> Result<Vec<PreparedSubmissionEvidence>> {
-    if evidence.is_empty() || evidence.len() > 9 {
+    if evidence.is_empty() || evidence.len() > 14 {
         anyhow::bail!("invalid final submission evidence")
     }
     let mut resume_count = 0usize;
     let mut confirmation_count = 0usize;
+    let mut receipt_count = 0usize;
     let mut prepared = Vec::with_capacity(evidence.len());
     for (index, item) in evidence.iter().enumerate() {
         let mut value = item.clone();
         if value.application_id != application_id
             || !matches!(
                 value.kind.as_str(),
-                "resume" | "cover_letter" | "attachment" | "submission_confirmation"
+                "resume"
+                    | "cover_letter"
+                    | "attachment"
+                    | "application_receipt"
+                    | "submission_confirmation"
             )
         {
             anyhow::bail!("invalid final submission evidence")
         }
         resume_count += usize::from(value.kind == "resume");
         confirmation_count += usize::from(value.kind == "submission_confirmation");
-        validate_document_evidence(&value)?;
+        receipt_count += usize::from(value.kind == "application_receipt");
+        if value.kind == "application_receipt" {
+            validate_application_receipt_evidence(&value)?;
+        } else {
+            validate_document_evidence(&value)?;
+        }
         if value.kind == "submission_confirmation"
             && value
                 .metadata
@@ -845,10 +1818,1380 @@ fn prepare_submission_evidence(
             payload,
         });
     }
-    if resume_count != 1 || confirmation_count != 1 {
-        anyhow::bail!("final submission needs one resume and one confirmation")
+    if resume_count != 1
+        || !(1..=MAX_SUBMISSION_CONFIRMATIONS).contains(&confirmation_count)
+        || receipt_count != 1
+    {
+        anyhow::bail!(
+            "final submission needs one resume, one to four confirmations, and one receipt"
+        )
     }
     Ok(prepared)
+}
+
+fn validate_submission_evidence_resume_bindings(
+    evidence: &[PreparedSubmissionEvidence],
+    resume_version_id: &str,
+) -> Result<()> {
+    for (kind, message) in [
+        (
+            "resume",
+            "final receipt resume does not match the application",
+        ),
+        (
+            "application_receipt",
+            "final receipt bundle does not match the application resume",
+        ),
+        (
+            "submission_confirmation",
+            "final receipt confirmation does not match the application resume",
+        ),
+    ] {
+        if evidence.iter().any(|item| {
+            item.value.kind == kind
+                && item.value.resume_version_id.as_deref() != Some(resume_version_id)
+        }) {
+            anyhow::bail!(message)
+        }
+        if !evidence.iter().any(|item| {
+            item.value.kind == kind
+                && item.value.resume_version_id.as_deref() == Some(resume_version_id)
+        }) {
+            anyhow::bail!(message)
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod submission_evidence_resume_binding_tests {
+    use super::*;
+
+    fn prepared(kind: &str, resume_version_id: Option<&str>) -> PreparedSubmissionEvidence {
+        PreparedSubmissionEvidence {
+            value: ApplicationEvidence {
+                id: format!("evidence-{kind}"),
+                application_id: "application-1".to_string(),
+                kind: kind.to_string(),
+                label: kind.to_string(),
+                provider: "test".to_string(),
+                file_name: format!("{kind}.bin"),
+                media_type: "application/octet-stream".to_string(),
+                storage_key: format!("objects/{kind}"),
+                sha256: "a".repeat(64),
+                resume_version_id: resume_version_id.map(str::to_string),
+                occurred_at_ms: 1,
+                metadata: json!({}),
+                created_at_ms: 1,
+            },
+            provider_event_hash: format!("hash-{kind}"),
+            payload: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn submission_confirmation_requires_the_exact_application_resume_revision() {
+        let mut evidence = vec![
+            prepared("resume", Some("resume-exact")),
+            prepared("application_receipt", Some("resume-exact")),
+            prepared("submission_confirmation", Some("resume-exact")),
+        ];
+        validate_submission_evidence_resume_bindings(&evidence, "resume-exact").unwrap();
+
+        evidence[2].value.resume_version_id = Some("resume-stale".to_string());
+        let error = validate_submission_evidence_resume_bindings(&evidence, "resume-exact")
+            .expect_err("confirmation from a stale resume revision must fail closed");
+        assert!(error
+            .to_string()
+            .contains("confirmation does not match the application resume"));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SubmissionManifestObject {
+    kind: String,
+    sha256: String,
+    media_type: String,
+    size_bytes: i64,
+}
+
+fn submission_evidence_manifest(
+    receipt: &Value,
+) -> Result<BTreeMap<String, SubmissionManifestObject>> {
+    let values = receipt
+        .get("evidenceObjects")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest is missing"))?;
+    if values.is_empty() || values.len() > 12 {
+        anyhow::bail!("final receipt evidence manifest has an invalid object count")
+    }
+    let mut manifest = BTreeMap::new();
+    let mut previous_key: Option<&str> = None;
+    for value in values {
+        let key = value
+            .get("storageKey")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest key is invalid"))?;
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "resume" | "cover_letter" | "attachment" | "screenshot"
+                )
+            })
+            .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest kind is invalid"))?;
+        let sha256 = value
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("final receipt evidence manifest checksum is invalid")
+            })?;
+        let media_type = value
+            .get("mediaType")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "application/pdf" | "image/png"))
+            .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest media is invalid"))?;
+        let size_bytes = value
+            .get("sizeBytes")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest size is invalid"))?;
+        if previous_key.is_some_and(|previous| previous >= key)
+            || (kind == "screenshot") != (media_type == "image/png")
+            || manifest
+                .insert(
+                    key.to_string(),
+                    SubmissionManifestObject {
+                        kind: kind.to_string(),
+                        sha256: sha256.to_ascii_lowercase(),
+                        media_type: media_type.to_string(),
+                        size_bytes,
+                    },
+                )
+                .is_some()
+        {
+            anyhow::bail!("final receipt evidence manifest is not canonical")
+        }
+        previous_key = Some(key);
+    }
+    Ok(manifest)
+}
+
+fn validate_submission_receipt_evidence(
+    receipt: &Value,
+    evidence: &[PreparedSubmissionEvidence],
+) -> Result<()> {
+    let receipt_schema_version = receipt
+        .get("schemaVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| matches!(*version, 1 | 2))
+        .ok_or_else(|| anyhow::anyhow!("final receipt schema is invalid"))?;
+    let receipt_id = receipt
+        .get("receiptId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("final receipt id is missing"))?;
+    let receipt_object = receipt
+        .get("receiptObject")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt object is missing"))?;
+    let storage_key = receipt_object
+        .get("storageKey")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("final receipt object key is missing"))?;
+    let sha256 = receipt_object
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("final receipt object checksum is invalid"))?;
+    let size_bytes = receipt_object
+        .get("sizeBytes")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow::anyhow!("final receipt object size is invalid"))?;
+    if receipt_object.get("mediaType").and_then(Value::as_str) != Some("application/json")
+        || receipt_object.get("schemaVersion").and_then(Value::as_i64)
+            != Some(receipt_schema_version)
+    {
+        anyhow::bail!("final receipt object metadata is invalid")
+    }
+    let stored_receipt = evidence
+        .iter()
+        .find(|item| item.value.kind == "application_receipt")
+        .ok_or_else(|| anyhow::anyhow!("final receipt evidence is missing"))?;
+    if stored_receipt.value.storage_key != storage_key
+        || stored_receipt.value.sha256 != sha256
+        || stored_receipt.value.media_type != "application/json"
+        || stored_receipt
+            .value
+            .metadata
+            .get("receipt_id")
+            .and_then(Value::as_str)
+            != Some(receipt_id)
+        || stored_receipt
+            .value
+            .metadata
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            != Some(1)
+        || stored_receipt
+            .value
+            .metadata
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            != Some(size_bytes)
+    {
+        anyhow::bail!("final receipt evidence does not match its immutable object")
+    }
+    let screenshots = receipt
+        .get("screenshotKeys")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty() && items.len() <= MAX_SUBMISSION_CONFIRMATIONS)
+        .ok_or_else(|| anyhow::anyhow!("final receipt confirmation is missing"))?;
+    let mut screenshot_keys = Vec::with_capacity(screenshots.len());
+    let mut unique_screenshot_keys = BTreeSet::new();
+    for screenshot in screenshots {
+        let key = screenshot
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("final receipt confirmation key is invalid"))?;
+        if !unique_screenshot_keys.insert(key) {
+            anyhow::bail!("final receipt confirmation keys are duplicated")
+        }
+        screenshot_keys.push(key);
+    }
+    let confirmations = evidence
+        .iter()
+        .filter(|item| item.value.kind == "submission_confirmation")
+        .collect::<Vec<_>>();
+    if confirmations.len() != screenshot_keys.len() {
+        anyhow::bail!("final receipt confirmation evidence count is incomplete")
+    }
+    let mut seen_indexes = BTreeSet::new();
+    let mut seen_storage_keys = BTreeSet::new();
+    let mut seen_file_names = BTreeSet::new();
+    for confirmation in confirmations {
+        let value = &confirmation.value;
+        let index = value
+            .metadata
+            .get("screenshot_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| (1..=screenshot_keys.len()).contains(index))
+            .ok_or_else(|| anyhow::anyhow!("final receipt confirmation index is invalid"))?;
+        let count = value
+            .metadata
+            .get("screenshot_count")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count == screenshot_keys.len())
+            .ok_or_else(|| anyhow::anyhow!("final receipt confirmation count is invalid"))?;
+        let evidence_screenshot_keys = value
+            .metadata
+            .get("screenshot_keys")
+            .and_then(Value::as_array)
+            .filter(|keys| {
+                keys.len() == screenshot_keys.len()
+                    && keys
+                        .iter()
+                        .zip(&screenshot_keys)
+                        .all(|(actual, expected)| actual.as_str() == Some(*expected))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("final receipt confirmation screenshot set is invalid")
+            })?;
+        debug_assert_eq!(evidence_screenshot_keys.len(), count);
+        if value.storage_key != screenshot_keys[index - 1]
+            || value.media_type != "image/png"
+            || !value.file_name.to_ascii_lowercase().ends_with(".png")
+            || value.metadata.get("immutable").and_then(Value::as_bool) != Some(true)
+            || value
+                .metadata
+                .get("evidence_strength")
+                .and_then(Value::as_str)
+                != Some("browser_confirmed")
+            || value.metadata.get("receipt_id").and_then(Value::as_str) != Some(receipt_id)
+            || value
+                .metadata
+                .get("size_bytes")
+                .and_then(Value::as_i64)
+                .is_none_or(|size| size <= 0)
+            || !seen_indexes.insert(index)
+            || !seen_storage_keys.insert(value.storage_key.as_str())
+            || !seen_file_names.insert(value.file_name.as_str())
+        {
+            anyhow::bail!("final receipt confirmation does not match its immutable object")
+        }
+    }
+    for document in receipt
+        .get("documents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("final receipt documents are missing"))?
+    {
+        let kind = document
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let key = document
+            .get("storageKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let hash = document
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !evidence.iter().any(|item| {
+            item.value.kind == kind && item.value.storage_key == key && item.value.sha256 == hash
+        }) {
+            anyhow::bail!("final receipt document does not match its immutable evidence")
+        }
+    }
+    Ok(())
+}
+
+fn validate_submission_object_bindings(
+    receipt: &Value,
+    evidence: &[PreparedSubmissionEvidence],
+    bindings: &[crate::db::object_uploads::ApplicationObjectBinding],
+) -> Result<()> {
+    let mut expected = submission_evidence_manifest(receipt)?;
+    let mut referenced = BTreeSet::new();
+    let documents = receipt
+        .get("documents")
+        .and_then(Value::as_array)
+        .filter(|documents| !documents.is_empty() && documents.len() <= 12)
+        .ok_or_else(|| anyhow::anyhow!("final receipt documents are missing"))?;
+    let mut resume_count = 0usize;
+    for document in documents {
+        let kind = document
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|kind| matches!(*kind, "resume" | "cover_letter" | "attachment"))
+            .ok_or_else(|| anyhow::anyhow!("final receipt document kind is invalid"))?;
+        let key = document
+            .get("storageKey")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("final receipt document key is invalid"))?;
+        let sha256 = document
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| anyhow::anyhow!("final receipt document checksum is invalid"))?;
+        resume_count += usize::from(kind == "resume");
+        let Some(object) = expected.get(key) else {
+            anyhow::bail!("final receipt document is missing from its evidence manifest")
+        };
+        if !referenced.insert(key)
+            || object.kind != kind
+            || object.media_type != "application/pdf"
+            || !object.sha256.eq_ignore_ascii_case(sha256)
+        {
+            anyhow::bail!("final receipt document does not match its evidence manifest")
+        }
+    }
+    if resume_count != 1 {
+        anyhow::bail!("final receipt needs exactly one submitted resume")
+    }
+    let screenshots = receipt
+        .get("screenshotKeys")
+        .and_then(Value::as_array)
+        .filter(|screenshots| {
+            !screenshots.is_empty() && screenshots.len() <= MAX_SUBMISSION_CONFIRMATIONS
+        })
+        .ok_or_else(|| anyhow::anyhow!("final receipt screenshots are missing"))?;
+    for screenshot in screenshots {
+        let key = screenshot
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("final receipt screenshot key is invalid"))?;
+        let Some(object) = expected.get(key) else {
+            anyhow::bail!("final receipt screenshot is missing from its evidence manifest")
+        };
+        if !referenced.insert(key)
+            || object.kind != "screenshot"
+            || object.media_type != "image/png"
+        {
+            anyhow::bail!("final receipt screenshot does not match its evidence manifest")
+        }
+    }
+    if referenced.len() != expected.len() {
+        anyhow::bail!("final receipt evidence manifest has unreferenced objects")
+    }
+    let receipt_object = receipt
+        .get("receiptObject")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt object is missing"))?;
+    let receipt_key = receipt_object
+        .get("storageKey")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let receipt_sha256 = receipt_object
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let receipt_size = receipt_object
+        .get("sizeBytes")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if receipt_key.is_empty()
+        || expected
+            .insert(
+                receipt_key.to_string(),
+                SubmissionManifestObject {
+                    kind: "application_receipt".to_string(),
+                    sha256: receipt_sha256.to_ascii_lowercase(),
+                    media_type: "application/json".to_string(),
+                    size_bytes: receipt_size,
+                },
+            )
+            .is_some()
+        || bindings.len() != expected.len()
+    {
+        anyhow::bail!("final receipt object bindings are incomplete")
+    }
+    let mut seen_uploads = BTreeSet::new();
+    let mut seen_binding_keys = BTreeSet::new();
+    for binding in bindings {
+        let Some(object) = expected.get(&binding.object_key) else {
+            anyhow::bail!("final receipt has an unreferenced durable object")
+        };
+        if !seen_uploads.insert(binding.upload_id.as_str())
+            || !seen_binding_keys.insert(binding.object_key.as_str())
+            || binding.content_type != object.media_type
+            || binding.size_bytes != object.size_bytes
+            || !binding.sha256.eq_ignore_ascii_case(&object.sha256)
+        {
+            anyhow::bail!("final receipt durable object binding is invalid")
+        }
+    }
+    if seen_binding_keys.len() != expected.len()
+        || expected
+            .keys()
+            .any(|key| !seen_binding_keys.contains(key.as_str()))
+    {
+        anyhow::bail!("final receipt durable object bindings are incomplete")
+    }
+    let mut expected_evidence_keys = documents
+        .iter()
+        .filter_map(|document| document.get("storageKey").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    expected_evidence_keys.insert(receipt_key);
+    expected_evidence_keys.extend(screenshots.iter().filter_map(Value::as_str));
+    let mut seen_evidence = BTreeSet::new();
+    for item in evidence {
+        let Some(object) = expected.get(&item.value.storage_key) else {
+            anyhow::bail!("final submission evidence is not durably tracked")
+        };
+        let expected_kind = if item.value.kind == "submission_confirmation" {
+            "screenshot"
+        } else {
+            item.value.kind.as_str()
+        };
+        if !seen_evidence.insert(item.value.storage_key.as_str())
+            || object.kind != expected_kind
+            || item.value.media_type != object.media_type
+            || !item.value.sha256.eq_ignore_ascii_case(&object.sha256)
+            || item
+                .value
+                .metadata
+                .get("size_bytes")
+                .and_then(Value::as_i64)
+                != Some(object.size_bytes)
+        {
+            anyhow::bail!("final submission evidence does not match its durable object")
+        }
+    }
+    if seen_evidence != expected_evidence_keys {
+        anyhow::bail!("final submission evidence records are incomplete")
+    }
+    Ok(())
+}
+
+struct ApprovedSubmissionSnapshot<'a> {
+    packet: &'a Value,
+    job: &'a Value,
+    checksum: &'a str,
+}
+
+fn canonical_submission_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(canonical_submission_json).collect())
+        }
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_submission_json(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+pub(crate) fn submission_pre_receipt_sha256(receipt: &Value) -> Result<String> {
+    if !receipt.is_object() {
+        anyhow::bail!("pre-submission receipt is invalid")
+    }
+    let bytes = serde_json::to_vec(&canonical_submission_json(receipt))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn bind_submission_pre_receipt_sha256(receipt: &mut Value) -> Result<()> {
+    let authority = receipt
+        .get_mut(SERVER_SUBMISSION_AUTHORITY_KEY)
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("final receipt submission authority is missing"))?;
+    let pre_submission_receipt = authority
+        .get("preSubmissionReceipt")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| anyhow::anyhow!("final receipt pre-submission authority is missing"))?;
+    let sha256 = submission_pre_receipt_sha256(pre_submission_receipt)?;
+    authority.insert(
+        "preSubmissionReceiptSha256".to_string(),
+        Value::String(sha256),
+    );
+    Ok(())
+}
+
+fn approved_submission_checksum(
+    schema_version: i64,
+    packet: &Value,
+    job: &Value,
+    admission: Option<&Value>,
+) -> Result<String> {
+    let value = match (schema_version, admission) {
+        (1, None) => json!({
+            "schema_version": 1,
+            "packet": packet,
+            "job": job,
+        }),
+        (schema_version @ (2 | 3), Some(admission)) => json!({
+            "schema_version": schema_version,
+            "admission": admission,
+            "packet": packet,
+            "job": job,
+        }),
+        _ => anyhow::bail!("approved execution checksum inputs are invalid"),
+    };
+    let bytes = serde_json::to_vec(&canonical_submission_json(&value))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn validate_approved_submission_admission(
+    application: &JobApplication,
+    schema_version: i64,
+    admission: Option<&Value>,
+) -> Result<()> {
+    if schema_version == 1 {
+        if application.submission_mode == "auto_submit" {
+            anyhow::bail!("legacy approval cannot grant Auto-submit authority")
+        }
+        return Ok(());
+    }
+    let admission = admission
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?;
+    let kind = admission
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if application.submission_mode == "auto_submit" {
+        let complete = kind == "track_auto_submit"
+            && approved_submission_object_has_keys(
+                admission,
+                if schema_version == 3 {
+                    &[
+                        "ats_certification",
+                        "authority_fingerprint",
+                        "authorization_id",
+                        "career_track_id",
+                        "kind",
+                        "revision_no",
+                    ]
+                } else {
+                    &[
+                        "authority_fingerprint",
+                        "authorization_id",
+                        "career_track_id",
+                        "kind",
+                        "revision_no",
+                    ]
+                },
+            )
+            && admission
+                .get("authorization_id")
+                .and_then(Value::as_str)
+                .is_some_and(valid_approved_submission_identifier)
+            && admission
+                .get("career_track_id")
+                .and_then(Value::as_str)
+                .is_some_and(valid_approved_submission_identifier)
+            && admission
+                .get("revision_no")
+                .and_then(Value::as_i64)
+                .is_some_and(|value| value > 0)
+            && admission
+                .get("authority_fingerprint")
+                .and_then(Value::as_str)
+                .is_some_and(valid_approved_submission_sha256)
+            && (schema_version != 3
+                || admission
+                    .get("ats_certification")
+                    .is_some_and(valid_approved_submission_ats_certification));
+        if !complete {
+            anyhow::bail!("approved Auto-submit admission is incomplete")
+        }
+    } else if kind != "review_approval"
+        || !approved_submission_object_has_keys(admission, &["kind"])
+    {
+        anyhow::bail!("approved execution does not contain review authority")
+    }
+    Ok(())
+}
+
+fn valid_approved_submission_ats_certification(value: &Value) -> bool {
+    let Some(certification) = value.as_object() else {
+        return false;
+    };
+    if !approved_submission_object_has_keys(
+        certification,
+        &[
+            "activation_generation",
+            "activation_sha256",
+            "adapter_bundle_sha256",
+            "adapter_version",
+            "expires_at_ms",
+            "layout_contract_version",
+            "layout_set_sha256",
+            "manifest_sha256",
+            "provider",
+            "runner_target_sha256s",
+            "schema_version",
+            "surface_sha256",
+            "target_key_sha256",
+            "variant_key",
+        ],
+    ) || certification.get("schema_version").and_then(Value::as_i64) != Some(1)
+    {
+        return false;
+    }
+    let provider = certification
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let adapter_version = certification
+        .get("adapter_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        (provider, adapter_version),
+        ("greenhouse", "2026.07.1-beta.1") | ("lever", "2026.07.0-beta.1")
+    ) || certification
+        .get("variant_key")
+        .and_then(Value::as_str)
+        .is_none_or(|value| !valid_approved_submission_identifier(value))
+        || certification
+            .get("layout_contract_version")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+        || certification
+            .get("activation_generation")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+        || certification
+            .get("expires_at_ms")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+    {
+        return false;
+    }
+    for key in [
+        "activation_sha256",
+        "adapter_bundle_sha256",
+        "layout_set_sha256",
+        "manifest_sha256",
+        "surface_sha256",
+        "target_key_sha256",
+    ] {
+        if !certification
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(valid_approved_submission_sha256)
+        {
+            return false;
+        }
+    }
+    let Some(targets) = certification
+        .get("runner_target_sha256s")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if targets.is_empty() || targets.len() > 2 {
+        return false;
+    }
+    let mut previous: Option<&str> = None;
+    for target in targets {
+        let Some(target) = target.as_str().filter(|value| {
+            valid_approved_submission_sha256(value)
+                && previous.is_none_or(|previous| previous < *value)
+        }) else {
+            return false;
+        };
+        previous = Some(target);
+    }
+    true
+}
+
+#[cfg(test)]
+mod approved_submission_ats_certification_tests {
+    use super::*;
+
+    fn exact_schema_three_certification() -> Value {
+        json!({
+            "schema_version": 1,
+            "provider": "greenhouse",
+            "adapter_version": "2026.07.1-beta.1",
+            "variant_key": "greenhouse_public",
+            "layout_contract_version": 1,
+            "activation_generation": 1,
+            "expires_at_ms": 1,
+            "activation_sha256": "1".repeat(64),
+            "adapter_bundle_sha256": "2".repeat(64),
+            "layout_set_sha256": "3".repeat(64),
+            "manifest_sha256": "4".repeat(64),
+            "surface_sha256": "5".repeat(64),
+            "target_key_sha256": "6".repeat(64),
+            "runner_target_sha256s": ["7".repeat(64)],
+        })
+    }
+
+    #[test]
+    fn schema_three_ats_certification_accepts_exact_keys_and_rejects_extra_keys() {
+        let exact = exact_schema_three_certification();
+        assert!(valid_approved_submission_ats_certification(&exact));
+
+        let mut extra = exact;
+        extra["unexpected"] = json!(true);
+        assert!(!valid_approved_submission_ats_certification(&extra));
+    }
+}
+
+fn approved_submission_object_has_keys(
+    value: &serde_json::Map<String, Value>,
+    expected: &[&str],
+) -> bool {
+    value.len() == expected.len() && expected.iter().all(|key| value.contains_key(*key))
+}
+
+fn valid_approved_submission_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 240
+        && value.trim() == value
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn valid_approved_submission_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_canonical_claim_ids(value: Option<&Value>) -> Result<()> {
+    let claims = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("approved execution verified claims are missing"))?;
+    let mut previous: Option<&str> = None;
+    for claim in claims {
+        let claim = claim
+            .as_str()
+            .filter(|claim| !claim.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("approved execution verified claims are invalid"))?;
+        if previous.is_some_and(|previous| previous >= claim) {
+            anyhow::bail!("approved execution verified claims are not canonical")
+        }
+        previous = Some(claim);
+    }
+    Ok(())
+}
+
+fn approved_submission_snapshot<'a>(
+    account_id: &str,
+    application: &'a JobApplication,
+) -> Result<ApprovedSubmissionSnapshot<'a>> {
+    let approved = application
+        .receipt
+        .get("approved_execution")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("approved execution snapshot is missing"))?;
+    let schema_version = approved
+        .get("schema_version")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if !matches!(schema_version, 1..=3) {
+        anyhow::bail!("approved execution schema is unsupported")
+    }
+    let packet = approved
+        .get("packet")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| anyhow::anyhow!("approved execution packet is missing"))?;
+    let job = approved
+        .get("job")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| anyhow::anyhow!("approved execution job is missing"))?;
+    let checksum = approved
+        .get("checksum")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("approved execution checksum is invalid"))?;
+    let admission = approved.get("admission");
+    validate_approved_submission_admission(application, schema_version, admission)?;
+    let checksum_admission = if matches!(schema_version, 2 | 3) {
+        Some(admission.ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?)
+    } else {
+        None
+    };
+    let expected_checksum =
+        approved_submission_checksum(schema_version, packet, job, checksum_admission)?;
+    if !constant_time_equal(checksum, &expected_checksum) {
+        anyhow::bail!("approved execution checksum does not match its exact packet")
+    }
+
+    let resume_version_id = application
+        .resume_version_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("application resume version is missing"))?;
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("application identity binding is missing"))?;
+    let identity_email = application
+        .receipt
+        .pointer("/application_identity/email")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("application email binding is missing"))?;
+    let expected_browser_profile_id = execution_browser_profile_id(account_id, identity_id);
+    if packet.get("applicationId").and_then(Value::as_str) != Some(application.id.as_str())
+        || packet.get("jobId").and_then(Value::as_str) != Some(application.job_id.as_str())
+        || packet.get("resumeVersionId").and_then(Value::as_str) != Some(resume_version_id)
+        || packet.get("applicationIdentityId").and_then(Value::as_str) != Some(identity_id)
+        || packet.get("applicationEmail").and_then(Value::as_str) != Some(identity_email)
+        || packet.get("browserProfileId").and_then(Value::as_str)
+            != Some(expected_browser_profile_id.as_str())
+        || packet.get("answers").is_none_or(|value| !value.is_object())
+    {
+        anyhow::bail!("approved execution is not bound to this application")
+    }
+    validate_canonical_claim_ids(packet.get("verifiedClaimIds"))?;
+
+    Ok(ApprovedSubmissionSnapshot {
+        packet,
+        job,
+        checksum,
+    })
+}
+
+fn validate_submission_authority_snapshot(
+    account_id: &str,
+    application: &JobApplication,
+    run_id: &str,
+    receipt: &Value,
+    runner: &str,
+) -> Result<()> {
+    let authority = receipt
+        .get(SERVER_SUBMISSION_AUTHORITY_KEY)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt submission authority is missing"))?;
+    let execution = authority
+        .get("executionAuthority")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt execution authority is missing"))?;
+    let pre_submission_receipt_sha256 = submission_pre_receipt_sha256(&application.receipt)?;
+    let approved = approved_submission_snapshot(account_id, application)?;
+    let certified_execution = application_has_frozen_ats_certification(application);
+    let expected_receipt_schema_version = if certified_execution { 2 } else { 1 };
+    let presented_ats_authority = submission_ats_certified_receipt_authority(receipt)?;
+    let receipt_packet = receipt
+        .get("packet")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt approved packet is missing"))?;
+    let identity_id = approved
+        .packet
+        .get("applicationIdentityId")
+        .and_then(Value::as_str)
+        .expect("approved packet identity checked above");
+    let browser_profile_id = approved
+        .packet
+        .get("browserProfileId")
+        .and_then(Value::as_str)
+        .expect("approved packet browser profile checked above");
+    let resume_version_id = approved
+        .packet
+        .get("resumeVersionId")
+        .and_then(Value::as_str)
+        .expect("approved packet resume checked above");
+    let submitted_resume =
+        receipt
+            .get("documents")
+            .and_then(Value::as_array)
+            .and_then(|documents| {
+                let mut resumes = documents.iter().filter(|document| {
+                    document.get("kind").and_then(Value::as_str) == Some("resume")
+                });
+                let resume = resumes.next()?;
+                resumes.next().is_none().then_some(resume)
+            });
+    let confirmation = receipt
+        .get("result")
+        .and_then(Value::as_object)
+        .filter(|result| result.get("status").and_then(Value::as_str) == Some("submitted"))
+        .filter(|result| {
+            result
+                .get("confirmationText")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                || result
+                    .get("confirmationUrl")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+        });
+    let certified_packet_matches = if certified_execution {
+        receipt_packet
+            .get("approvedExecutionSchemaVersion")
+            .and_then(Value::as_i64)
+            == Some(3)
+            && receipt_packet.get("approvedExecutionAdmission")
+                == application.receipt.pointer("/approved_execution/admission")
+            && presented_ats_authority.is_some()
+    } else {
+        receipt_packet
+            .get("approvedExecutionSchemaVersion")
+            .is_none()
+            && receipt_packet.get("approvedExecutionAdmission").is_none()
+            && presented_ats_authority.is_none()
+    };
+    if receipt.get("schemaVersion").and_then(Value::as_i64) != Some(expected_receipt_schema_version)
+        || receipt.get("accountId").and_then(Value::as_str) != Some(account_id)
+        || receipt.get("applicationId").and_then(Value::as_str) != Some(application.id.as_str())
+        || receipt.get("runId").and_then(Value::as_str) != Some(run_id)
+        || receipt.get("runner").and_then(Value::as_str) != Some(runner)
+        || receipt.get("applicationIdentityId").and_then(Value::as_str) != Some(identity_id)
+        || receipt.get("browserProfileId").and_then(Value::as_str) != Some(browser_profile_id)
+        || receipt
+            .get("adapter")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || receipt
+            .get("adapterVersion")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || confirmation.is_none()
+        || receipt_packet.get("jobId") != approved.packet.get("jobId")
+        || receipt_packet.get("resumeVersionId") != approved.packet.get("resumeVersionId")
+        || receipt_packet.get("applicationEmail") != approved.packet.get("applicationEmail")
+        || receipt_packet
+            .get("approvedPacketChecksum")
+            .and_then(Value::as_str)
+            != Some(approved.checksum)
+        || receipt_packet.get("answers") != approved.packet.get("answers")
+        || receipt_packet.get("verifiedClaimIds") != approved.packet.get("verifiedClaimIds")
+        || receipt.get("job") != Some(approved.job)
+        || submitted_resume
+            .and_then(|resume| resume.get("versionId"))
+            .and_then(Value::as_str)
+            != Some(resume_version_id)
+        || authority.get("schemaVersion").and_then(Value::as_i64) != Some(1)
+        || authority.get("preSubmissionReceipt") != Some(&application.receipt)
+        || authority
+            .get("preSubmissionReceiptSha256")
+            .and_then(Value::as_str)
+            != Some(pre_submission_receipt_sha256.as_str())
+        || !certified_packet_matches
+        || match runner {
+            "cloud" => {
+                execution.get("kind").and_then(Value::as_str) != Some("cloud_execution_lease")
+            }
+            "local" => execution.get("kind").and_then(Value::as_str) != Some("local_run_ticket"),
+            _ => true,
+        }
+    {
+        anyhow::bail!("final receipt submission authority does not match the approved packet")
+    }
+    Ok(())
+}
+
+fn submission_ats_certified_receipt_authority(
+    receipt: &Value,
+) -> Result<Option<AtsCertifiedReceiptAuthority>> {
+    receipt
+        .get("atsCertifiedReceiptAuthority")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(value)
+                .context("decode final receipt ATS certification authority")
+        })
+        .transpose()
+}
+
+/// Authenticate a submitted final-receipt envelope and recover the exact pre-submission
+/// application snapshot that the server bound into it.
+pub(crate) fn validated_submitted_pre_submission_application(
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<JobApplication> {
+    if application.state != "submitted" {
+        anyhow::bail!("submitted execution receipt is unavailable")
+    }
+    let authority = application
+        .receipt
+        .get(SERVER_SUBMISSION_AUTHORITY_KEY)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt submission authority is missing"))?;
+    let pre_submission_receipt = authority
+        .get("preSubmissionReceipt")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("final receipt pre-submission authority is missing"))?;
+    let run_id = application
+        .receipt
+        .get("runId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("final receipt run authority is missing"))?;
+    let runner = application
+        .receipt
+        .get("runner")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "cloud" | "local"))
+        .ok_or_else(|| anyhow::anyhow!("final receipt runner authority is missing"))?;
+    if application.run_id.as_deref() != Some(run_id) {
+        anyhow::bail!("final receipt run authority does not match the application")
+    }
+    let mut pre_submission_application = application.clone();
+    pre_submission_application.receipt = pre_submission_receipt;
+    validate_submission_authority_snapshot(
+        account_id,
+        &pre_submission_application,
+        run_id,
+        &application.receipt,
+        runner,
+    )?;
+    Ok(pre_submission_application)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_submission_execution_authority_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+    receipt: &Value,
+    local_ticket_hash: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let execution = receipt
+        .pointer(&format!(
+            "/{SERVER_SUBMISSION_AUTHORITY_KEY}/executionAuthority"
+        ))
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt execution authority is missing"))?;
+    if runner == "cloud" {
+        let stored = tx
+            .query_row(
+                "SELECT owner_id, lease_token_sha256, fence, phase, finished_at_ms
+                   FROM jobs_execution_leases
+                  WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                params![account_id, application_id, run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner_id, token_sha256, fence, phase, finished_at_ms)) = stored else {
+            anyhow::bail!("final receipt cloud execution authority is missing")
+        };
+        validate_cloud_submission_execution_authority(
+            execution,
+            &owner_id,
+            &token_sha256,
+            fence,
+            &phase,
+            finished_at_ms,
+            now,
+        )?;
+    } else {
+        let supplied_ticket_hash = local_ticket_hash
+            .ok_or_else(|| anyhow::anyhow!("final receipt local authority is missing"))?;
+        let stored = tx
+            .query_row(
+                "SELECT ticket_hash, status, expires_at_ms
+                   FROM jobs_local_run_tickets
+                  WHERE id = ?1 AND account_id = ?2 AND application_id = ?3",
+                params![run_id, account_id, application_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((stored_ticket_hash, status, expires_at_ms)) = stored else {
+            anyhow::bail!("final receipt local execution authority is missing")
+        };
+        let active = (matches!(status.as_str(), "claimed" | "needs_input") && expires_at_ms > now)
+            || (matches!(status.as_str(), "click_started" | "side_effect_unknown")
+                && expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now);
+        if execution
+            .get("ticketHash")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !constant_time_equal(value, &stored_ticket_hash))
+            || !constant_time_equal(supplied_ticket_hash, &stored_ticket_hash)
+            || execution.get("runId").and_then(Value::as_str) != Some(run_id)
+            || !active
+        {
+            anyhow::bail!("final receipt local execution authority changed")
+        }
+    }
+    if let Some(authority) = submission_ats_certified_receipt_authority(receipt)? {
+        lookup_ats_certification_terminal_receipt_authority_sqlite_tx(
+            tx,
+            account_id,
+            application_id,
+            run_id,
+            &authority,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_submission_execution_authority_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+    receipt: &Value,
+    local_ticket_hash: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let execution = receipt
+        .pointer(&format!(
+            "/{SERVER_SUBMISSION_AUTHORITY_KEY}/executionAuthority"
+        ))
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt execution authority is missing"))?;
+    if runner == "cloud" {
+        let stored = tx.query_opt(
+            "SELECT owner_id, lease_token_sha256, fence, phase, finished_at_ms
+               FROM jobs_execution_leases
+              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+              FOR UPDATE",
+            &[&account_id, &application_id, &run_id],
+        )?;
+        let Some(stored) = stored else {
+            anyhow::bail!("final receipt cloud execution authority is missing")
+        };
+        let owner_id: String = stored.try_get(0)?;
+        let token_sha256: String = stored.try_get(1)?;
+        let fence: i64 = stored.try_get(2)?;
+        let phase: String = stored.try_get(3)?;
+        let finished_at_ms: Option<i64> = stored.try_get(4)?;
+        validate_cloud_submission_execution_authority(
+            execution,
+            &owner_id,
+            &token_sha256,
+            fence,
+            &phase,
+            finished_at_ms,
+            now,
+        )?;
+    } else {
+        let supplied_ticket_hash = local_ticket_hash
+            .ok_or_else(|| anyhow::anyhow!("final receipt local authority is missing"))?;
+        let stored = tx.query_opt(
+            "SELECT ticket_hash, status, expires_at_ms
+               FROM jobs_local_run_tickets
+              WHERE id = $1 AND account_id = $2 AND application_id = $3
+              FOR UPDATE",
+            &[&run_id, &account_id, &application_id],
+        )?;
+        let Some(stored) = stored else {
+            anyhow::bail!("final receipt local execution authority is missing")
+        };
+        let stored_ticket_hash: String = stored.try_get(0)?;
+        let status: String = stored.try_get(1)?;
+        let expires_at_ms: i64 = stored.try_get(2)?;
+        let active = (matches!(status.as_str(), "claimed" | "needs_input") && expires_at_ms > now)
+            || (matches!(status.as_str(), "click_started" | "side_effect_unknown")
+                && expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now);
+        if execution
+            .get("ticketHash")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !constant_time_equal(value, &stored_ticket_hash))
+            || !constant_time_equal(supplied_ticket_hash, &stored_ticket_hash)
+            || execution.get("runId").and_then(Value::as_str) != Some(run_id)
+            || !active
+        {
+            anyhow::bail!("final receipt local execution authority changed")
+        }
+    }
+    if let Some(authority) = submission_ats_certified_receipt_authority(receipt)? {
+        lookup_ats_certification_terminal_receipt_authority_postgres_tx(
+            tx,
+            account_id,
+            application_id,
+            run_id,
+            &authority,
+        )?;
+    }
+    Ok(())
+}
+
+fn prelock_submission_execution_authority_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+) -> Result<()> {
+    let locked = if runner == "cloud" {
+        tx.query_opt(
+            "SELECT run_id FROM jobs_execution_leases
+              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+              FOR UPDATE",
+            &[&account_id, &application_id, &run_id],
+        )?
+    } else {
+        tx.query_opt(
+            "SELECT id FROM jobs_local_run_tickets
+              WHERE id = $1 AND account_id = $2 AND application_id = $3
+              FOR UPDATE",
+            &[&run_id, &account_id, &application_id],
+        )?
+    };
+    if locked.is_none() {
+        anyhow::bail!("final receipt execution authority is missing")
+    }
+    Ok(())
+}
+
+fn prelock_submission_object_publication_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> Result<()> {
+    // Final publication locks the complete pending account-upload set after the application row.
+    // Holding that row already prevents a new upload reservation for this application, while the
+    // deterministic upload/outbox order closes waits inside the publication helper before time is
+    // sampled for its capacity and expiry checks.
+    tx.query(
+        "SELECT id FROM object_uploads
+          WHERE account_id = $1 AND object_kind = 'artifact'
+            AND session_id IS NULL AND state = 'pending'
+          ORDER BY id FOR UPDATE",
+        &[&account_id],
+    )?;
+    tx.query(
+        "SELECT outbox.upload_id, outbox.operation
+           FROM object_storage_outbox outbox
+           JOIN object_uploads upload ON upload.id = outbox.upload_id
+          WHERE upload.account_id = $1 AND upload.object_kind = 'artifact'
+            AND upload.session_id IS NULL AND upload.state = 'pending'
+          ORDER BY outbox.upload_id, outbox.operation FOR UPDATE OF outbox",
+        &[&account_id],
+    )?;
+    if tx
+        .query_opt(
+            "SELECT application_id FROM jobs_submission_evidence_capacity
+              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+              FOR UPDATE",
+            &[&account_id, &application_id, &run_id],
+        )?
+        .is_none()
+    {
+        anyhow::bail!("submission evidence capacity is missing")
+    }
+    Ok(())
+}
+
+fn validate_cloud_submission_execution_authority(
+    execution: &serde_json::Map<String, Value>,
+    owner_id: &str,
+    token_sha256: &str,
+    fence: i64,
+    phase: &str,
+    finished_at_ms: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    let token_matches = execution
+        .get("leaseTokenSha256")
+        .and_then(Value::as_str)
+        .is_some_and(|value| constant_time_equal(value, token_sha256));
+    if !matches!(phase, "submitted" | "side_effect_unknown")
+        || finished_at_ms.is_none()
+        || (phase == "side_effect_unknown"
+            && finished_at_ms.is_none_or(|finished_at_ms| {
+                finished_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) <= now
+            }))
+        || execution.get("ownerId").and_then(Value::as_str) != Some(owner_id)
+        || !token_matches
+        || execution.get("fence").and_then(Value::as_i64) != Some(fence)
+        || execution.get("phase").and_then(Value::as_str) != Some(phase)
+    {
+        anyhow::bail!("final receipt cloud execution authority changed")
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+#[error("final submission commit outcome is uncertain: {detail}")]
+pub struct SubmissionCommitUncertain {
+    detail: String,
+}
+
+fn submission_commit_uncertain(error: impl std::fmt::Display) -> anyhow::Error {
+    SubmissionCommitUncertain {
+        detail: error.to_string(),
+    }
+    .into()
+}
+
+fn validate_submission_browser_session(
+    session: &BrowserSession,
+    application_id: &str,
+    runner: &str,
+    authorized_session_id: &str,
+) -> Result<()> {
+    if session.id != authorized_session_id
+        || session.application_id.as_deref() != Some(application_id)
+        || session.runner != runner
+    {
+        anyhow::bail!("browser session does not match final submission authority")
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -861,6 +3204,7 @@ pub fn finalize_submission(
     receipt: Value,
     request_fingerprint: &str,
     evidence: &[ApplicationEvidence],
+    object_uploads: &[crate::db::object_uploads::ApplicationObjectBinding],
     terminal_session: &BrowserSession,
     local_ticket_hash: Option<&str>,
 ) -> Result<SubmissionFinalizeResult> {
@@ -882,26 +3226,45 @@ pub fn finalize_submission(
     if (runner == "local") != local_ticket_hash.is_some() {
         anyhow::bail!("invalid final submission runner binding")
     }
-    let now = now_ms();
-    let prepared_evidence =
-        prepare_submission_evidence(application_id, request_fingerprint, evidence, now)?;
-    let mut terminal_session = terminal_session.clone();
+    let mut receipt = receipt;
+    bind_submission_pre_receipt_sha256(&mut receipt)?;
+    let terminal_session = terminal_session.clone();
     if terminal_session.application_id.as_deref() != Some(application_id)
-        || terminal_session.id != run_id
+        || (runner == "local" && terminal_session.id != run_id)
         || terminal_session.runner != runner
     {
         anyhow::bail!("browser session does not match final submission")
     }
-    terminal_session.status = "complete".to_string();
-    terminal_session.current_step = "Application submitted".to_string();
-    terminal_session.takeover_url = None;
-    terminal_session.updated_at_ms = now;
-    let terminal_session_payload = to_json(&terminal_session, "browser session")?;
 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = original_source_db_now_sqlite(&tx)?;
+            let prepared_evidence =
+                prepare_submission_evidence(application_id, request_fingerprint, evidence, now)?;
+            validate_submission_receipt_evidence(&receipt, &prepared_evidence)?;
+            validate_submission_object_bindings(&receipt, &prepared_evidence, object_uploads)?;
+            let mut terminal_session = terminal_session.clone();
+            terminal_session.status = "complete".to_string();
+            terminal_session.current_step = "Application submitted".to_string();
+            terminal_session.takeover_url = None;
+            terminal_session.updated_at_ms = now;
+            let terminal_session_payload = to_json(&terminal_session, "browser session")?;
+            if runner == "cloud" {
+                require_current_runner_volume_identity_sqlite_for_operation(
+                    &tx, account_id, run_id, now,
+                )?;
+            }
+            match crate::db::account_data::account_write_fence_sqlite_tx(&tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced final submission")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => {
+                    anyhow::bail!("account not found")
+                }
+            }
             let raw: Option<(String, String)> = tx
                 .query_row(
                     "SELECT job_id, application_json FROM jobs_applications
@@ -922,7 +3285,8 @@ pub fn finalize_submission(
                     .and_then(Value::as_str)
                     == Some(request_fingerprint)
                 {
-                    tx.commit()?;
+                    validated_submitted_pre_submission_application(account_id, &application)?;
+                    tx.commit().map_err(submission_commit_uncertain)?;
                     return Ok(SubmissionFinalizeResult::Replayed(application));
                 }
                 anyhow::bail!("application already has a different final receipt")
@@ -930,17 +3294,61 @@ pub fn finalize_submission(
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("application browser run does not match final receipt")
             }
+            validate_submission_authority_snapshot(
+                account_id,
+                &application,
+                run_id,
+                &receipt,
+                runner,
+            )?;
+            validate_submission_execution_authority_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+                &receipt,
+                local_ticket_hash,
+                now,
+            )?;
+            let authorized_session_id = if runner == "cloud" {
+                let lease =
+                    sqlite_execution_session_lease(&tx, account_id, application_id, run_id)?;
+                sqlite_checkpoint_browser_session_id(&tx, account_id, &application, run_id, &lease)?
+            } else {
+                run_id.to_string()
+            };
+            validate_submission_browser_session(
+                &terminal_session,
+                application_id,
+                runner,
+                &authorized_session_id,
+            )?;
+            let (stored_session_raw, stored_session_runner): (String, String) = tx
+                .query_row(
+                    "SELECT session_json, runner FROM jobs_browser_sessions
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, authorized_session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("browser session not found"))?;
+            let stored_session: BrowserSession = parse_json(stored_session_raw, "browser session")?;
+            validate_submission_browser_session(
+                &stored_session,
+                application_id,
+                runner,
+                &authorized_session_id,
+            )?;
+            if stored_session_runner != runner {
+                anyhow::bail!("browser session runner does not match final submission")
+            }
             validate_application_transition(&application.state, "submitted")?;
             let resume_version_id = application
                 .resume_version_id
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("application resume version is missing"))?;
-            if !prepared_evidence.iter().any(|item| {
-                item.value.kind == "resume"
-                    && item.value.resume_version_id.as_deref() == Some(resume_version_id)
-            }) {
-                anyhow::bail!("final receipt resume does not match the application")
-            }
+            validate_submission_evidence_resume_bindings(&prepared_evidence, resume_version_id)?;
             if runner == "cloud" {
                 let phase: Option<String> = tx
                     .query_row(
@@ -950,21 +3358,41 @@ pub fn finalize_submission(
                         |row| row.get(0),
                     )
                     .optional()?;
-                if phase.as_deref() != Some("submitted") {
-                    anyhow::bail!("matching cloud execution lease is not terminal submitted")
+                match phase.as_deref() {
+                    Some("submitted") => {}
+                    Some("side_effect_unknown") => {
+                        if tx.execute(
+                            "UPDATE jobs_execution_leases
+                                SET phase = 'submitted', updated_at_ms = ?4,
+                                    finished_at_ms = ?4
+                              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3
+                                AND phase = 'side_effect_unknown'",
+                            params![account_id, application_id, run_id, now],
+                        )? != 1
+                        {
+                            anyhow::bail!("matching cloud execution lease changed")
+                        }
+                    }
+                    _ => anyhow::bail!("matching cloud execution lease cannot accept receipt"),
                 }
             } else if tx.execute(
                 "UPDATE jobs_local_run_tickets
                     SET status = 'complete', updated_at_ms = ?5
                   WHERE id = ?1 AND account_id = ?2 AND application_id = ?3
-                    AND ticket_hash = ?4 AND expires_at_ms > ?5
-                    AND status IN ('claimed', 'needs_input')",
+                    AND ticket_hash = ?4
+                    AND (
+                        (expires_at_ms > ?5
+                            AND status IN ('claimed', 'needs_input'))
+                        OR (status IN ('click_started', 'side_effect_unknown')
+                            AND expires_at_ms + ?6 > ?5)
+                    )",
                 params![
                     run_id,
                     account_id,
                     application_id,
                     local_ticket_hash.expect("local ticket checked above"),
-                    now
+                    now,
+                    SUBMISSION_RECONCILIATION_GRACE_MS,
                 ],
             )? != 1
             {
@@ -990,7 +3418,8 @@ pub fn finalize_submission(
             }
             if tx.execute(
                 "UPDATE jobs_attempt_reservations SET status = 'submitted', updated_at_ms = ?3
-                  WHERE account_id = ?1 AND application_id = ?2",
+                  WHERE account_id = ?1 AND application_id = ?2
+                    AND status IN ('running', 'side_effect_unknown')",
                 params![account_id, application_id, now],
             )? != 1
             {
@@ -1002,7 +3431,7 @@ pub fn finalize_submission(
                       WHERE account_id = ?1 AND id = ?2",
                 params![
                     account_id,
-                    terminal_session.id,
+                    authorized_session_id,
                     terminal_session_payload,
                     now
                 ],
@@ -1010,6 +3439,15 @@ pub fn finalize_submission(
             {
                 anyhow::bail!("browser session not found")
             }
+            crate::db::object_uploads::commit_application_object_uploads_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+                object_uploads,
+                now,
+            )?;
             application.receipt = receipt;
             application.state = "submitted".to_string();
             application.updated_at_ms = now;
@@ -1024,12 +3462,33 @@ pub fn finalize_submission(
             {
                 anyhow::bail!("application not found")
             }
-            tx.commit()?;
+            tx.commit().map_err(submission_commit_uncertain)?;
             Ok(SubmissionFinalizeResult::Committed(application))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // This preliminary scalar is only an early-denial input while the runner-volume
+            // helper acquires its durable rows. No receipt, capacity, CAS, or application effect
+            // is accepted from it; every temporal decision is repeated at `now` below.
+            let preliminary_now = original_source_db_now_postgres(&mut tx)?;
+            if runner == "cloud" {
+                require_current_runner_volume_identity_postgres_for_operation(
+                    &mut tx,
+                    account_id,
+                    run_id,
+                    preliminary_now,
+                )?;
+            }
+            match crate::db::account_data::account_write_fence_postgres_tx(&mut tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced final submission")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => {
+                    anyhow::bail!("account not found")
+                }
+            }
             let row = tx.query_opt(
                 "SELECT job_id, application_json FROM jobs_applications
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
@@ -1048,7 +3507,8 @@ pub fn finalize_submission(
                     .and_then(Value::as_str)
                     == Some(request_fingerprint)
                 {
-                    tx.commit()?;
+                    validated_submitted_pre_submission_application(account_id, &application)?;
+                    tx.commit().map_err(submission_commit_uncertain)?;
                     return Ok(SubmissionFinalizeResult::Replayed(application));
                 }
                 anyhow::bail!("application already has a different final receipt")
@@ -1056,17 +3516,141 @@ pub fn finalize_submission(
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("application browser run does not match final receipt")
             }
+            if tx
+                .query_opt(
+                    "SELECT application_id FROM jobs_attempt_reservations
+                      WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+                    &[&account_id, &application_id],
+                )?
+                .is_none()
+            {
+                anyhow::bail!("application attempt reservation is missing")
+            }
+            prelock_submission_execution_authority_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+            )?;
+            let authorized_session_id = if runner == "cloud" {
+                let lease =
+                    postgres_execution_session_lease(&mut tx, account_id, application_id, run_id)?;
+                postgres_checkpoint_browser_session_id(
+                    &mut tx,
+                    account_id,
+                    &application,
+                    run_id,
+                    &lease,
+                )?
+            } else {
+                run_id.to_string()
+            };
+            validate_submission_browser_session(
+                &terminal_session,
+                application_id,
+                runner,
+                &authorized_session_id,
+            )?;
+            let session_row = tx
+                .query_opt(
+                    "SELECT session_json, runner FROM jobs_browser_sessions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &authorized_session_id],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("browser session not found"))?;
+            let stored_session: BrowserSession = parse_json(session_row.get(0), "browser session")?;
+            let stored_session_runner: String = session_row.get(1);
+            prelock_submission_object_publication_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+            )?;
+            let mut prepared_evidence =
+                prepare_submission_evidence(application_id, request_fingerprint, evidence, 0)?;
+            {
+                let evidence_namespaces = prepared_evidence
+                    .iter()
+                    .map(|item| (item.value.id.as_str(), item.provider_event_hash.as_str()))
+                    .collect::<Vec<_>>();
+                lock_application_evidence_namespaces_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    &evidence_namespaces,
+                )?;
+            }
+            let now = original_source_db_now_postgres(&mut tx)?;
+            if runner == "cloud" {
+                require_current_runner_volume_identity_postgres_for_operation(
+                    &mut tx, account_id, run_id, now,
+                )?;
+            }
+            bind_prepared_submission_evidence_time_at_ms(&mut prepared_evidence, now)?;
+            validate_submission_receipt_evidence(&receipt, &prepared_evidence)?;
+            validate_submission_object_bindings(&receipt, &prepared_evidence, object_uploads)?;
+            let mut terminal_session = terminal_session.clone();
+            terminal_session.status = "complete".to_string();
+            terminal_session.current_step = "Application submitted".to_string();
+            terminal_session.takeover_url = None;
+            terminal_session.updated_at_ms = now;
+            let terminal_session_payload = to_json(&terminal_session, "browser session")?;
+            validate_submission_authority_snapshot(
+                account_id,
+                &application,
+                run_id,
+                &receipt,
+                runner,
+            )?;
+            validate_submission_execution_authority_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+                &receipt,
+                local_ticket_hash,
+                now,
+            )?;
+            // Session/publication/evidence locks may wait. Reassemble historical authority
+            // under the retained application/lease locks before accepting any terminal effect.
+            let revalidated_session_id = if runner == "cloud" {
+                let lease =
+                    postgres_execution_session_lease(&mut tx, account_id, application_id, run_id)?;
+                postgres_checkpoint_browser_session_id(
+                    &mut tx,
+                    account_id,
+                    &application,
+                    run_id,
+                    &lease,
+                )?
+            } else {
+                run_id.to_string()
+            };
+            if revalidated_session_id != authorized_session_id {
+                anyhow::bail!("final receipt browser session authority changed")
+            }
+            validate_submission_browser_session(
+                &terminal_session,
+                application_id,
+                runner,
+                &revalidated_session_id,
+            )?;
+            validate_submission_browser_session(
+                &stored_session,
+                application_id,
+                runner,
+                &revalidated_session_id,
+            )?;
+            if stored_session_runner != runner {
+                anyhow::bail!("browser session runner does not match final submission")
+            }
             validate_application_transition(&application.state, "submitted")?;
             let resume_version_id = application
                 .resume_version_id
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("application resume version is missing"))?;
-            if !prepared_evidence.iter().any(|item| {
-                item.value.kind == "resume"
-                    && item.value.resume_version_id.as_deref() == Some(resume_version_id)
-            }) {
-                anyhow::bail!("final receipt resume does not match the application")
-            }
+            validate_submission_evidence_resume_bindings(&prepared_evidence, resume_version_id)?;
             if runner == "cloud" {
                 let phase = tx
                     .query_opt(
@@ -1076,21 +3660,41 @@ pub fn finalize_submission(
                         &[&account_id, &application_id, &run_id],
                     )?
                     .map(|row| row.get::<_, String>(0));
-                if phase.as_deref() != Some("submitted") {
-                    anyhow::bail!("matching cloud execution lease is not terminal submitted")
+                match phase.as_deref() {
+                    Some("submitted") => {}
+                    Some("side_effect_unknown") => {
+                        if tx.execute(
+                            "UPDATE jobs_execution_leases
+                                SET phase = 'submitted', updated_at_ms = $4,
+                                    finished_at_ms = $4
+                              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                                AND phase = 'side_effect_unknown'",
+                            &[&account_id, &application_id, &run_id, &now],
+                        )? != 1
+                        {
+                            anyhow::bail!("matching cloud execution lease changed")
+                        }
+                    }
+                    _ => anyhow::bail!("matching cloud execution lease cannot accept receipt"),
                 }
             } else if tx.execute(
                 "UPDATE jobs_local_run_tickets
                     SET status = 'complete', updated_at_ms = $5
                   WHERE id = $1 AND account_id = $2 AND application_id = $3
-                    AND ticket_hash = $4 AND expires_at_ms > $5
-                    AND status IN ('claimed', 'needs_input')",
+                    AND ticket_hash = $4
+                    AND (
+                        (expires_at_ms > $5
+                            AND status IN ('claimed', 'needs_input'))
+                        OR (status IN ('click_started', 'side_effect_unknown')
+                            AND expires_at_ms + $6 > $5)
+                    )",
                 &[
                     &run_id,
                     &account_id,
                     &application_id,
                     &local_ticket_hash.expect("local ticket checked above"),
                     &now,
+                    &SUBMISSION_RECONCILIATION_GRACE_MS,
                 ],
             )? != 1
             {
@@ -1116,7 +3720,8 @@ pub fn finalize_submission(
             }
             if tx.execute(
                 "UPDATE jobs_attempt_reservations SET status = 'submitted', updated_at_ms = $3
-                  WHERE account_id = $1 AND application_id = $2",
+                  WHERE account_id = $1 AND application_id = $2
+                    AND status IN ('running', 'side_effect_unknown')",
                 &[&account_id, &application_id, &now],
             )? != 1
             {
@@ -1128,7 +3733,7 @@ pub fn finalize_submission(
                       WHERE account_id = $1 AND id = $2",
                 &[
                     &account_id,
-                    &terminal_session.id,
+                    &revalidated_session_id,
                     &terminal_session_payload,
                     &now,
                 ],
@@ -1136,6 +3741,15 @@ pub fn finalize_submission(
             {
                 anyhow::bail!("browser session not found")
             }
+            crate::db::object_uploads::commit_application_object_uploads_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+                object_uploads,
+                now,
+            )?;
             application.receipt = receipt;
             application.state = "submitted".to_string();
             application.updated_at_ms = now;
@@ -1150,10 +3764,388 @@ pub fn finalize_submission(
             {
                 anyhow::bail!("application not found")
             }
-            tx.commit()?;
+            tx.commit().map_err(submission_commit_uncertain)?;
             Ok(SubmissionFinalizeResult::Committed(application))
         }
     })
+}
+
+#[cfg(test)]
+mod submission_post_lock_time_tests {
+    use super::lock_application_evidence_namespaces_postgres_tx;
+
+    fn bounded<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing section start {start}"))
+            .split(end)
+            .next()
+            .unwrap_or_else(|| panic!("missing section end {end}"))
+    }
+
+    #[test]
+    fn postgres_finalization_uses_one_authoritative_time_after_all_effect_locks() {
+        let source = include_str!("customer_data.rs");
+        let boundary = source
+            .split("pub fn finalize_submission(")
+            .nth(1)
+            .expect("submission finalizer")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("bounded submission finalizer");
+        let before_blocking = boundary
+            .split("crate::db::run_blocking_db")
+            .next()
+            .expect("pre-transaction finalizer section");
+        assert!(!before_blocking.contains("now_ms()"));
+        assert!(!before_blocking.contains("prepare_submission_evidence"));
+
+        let postgres = boundary
+            .rsplit("DbPool::Postgres(_) =>")
+            .next()
+            .expect("PostgreSQL finalizer");
+        let mut previous = 0;
+        for operation in [
+            "require_current_runner_volume_identity_postgres_for_operation",
+            "account_write_fence_postgres_tx",
+            "FROM jobs_applications",
+            "FROM jobs_attempt_reservations",
+            "prelock_submission_execution_authority_postgres_tx",
+            "FROM jobs_browser_sessions",
+            "prelock_submission_object_publication_postgres_tx",
+            "prepare_submission_evidence(application_id, request_fingerprint, evidence, 0)",
+            "lock_application_evidence_namespaces_postgres_tx",
+            "let now = original_source_db_now_postgres",
+            "require_current_runner_volume_identity_postgres_for_operation",
+            "bind_prepared_submission_evidence_time_at_ms",
+            "validate_submission_execution_authority_postgres_tx",
+            "commit_application_object_uploads_postgres_tx",
+            "application.state = \"submitted\"",
+        ] {
+            let relative = postgres[previous..]
+                .find(operation)
+                .unwrap_or_else(|| panic!("missing post-lock finalizer operation {operation}"));
+            previous += relative + operation.len();
+        }
+        let authoritative = postgres
+            .split("let now = original_source_db_now_postgres")
+            .nth(1)
+            .expect("authoritative post-lock database time");
+        assert!(!authoritative.contains("preliminary_now"));
+    }
+
+    #[test]
+    fn finalization_binds_session_prelock_and_update_to_revalidated_history() {
+        let source = include_str!("customer_data.rs");
+        let finalizer = bounded(source, "pub fn finalize_submission(", "\n#[cfg(test)]");
+        let sqlite = finalizer
+            .split("DbPool::Sqlite(_) =>")
+            .nth(1)
+            .unwrap()
+            .split("DbPool::Postgres(_) =>")
+            .next()
+            .unwrap();
+        assert!(sqlite.contains("sqlite_checkpoint_browser_session_id("));
+        assert!(sqlite.contains("params![account_id, authorized_session_id]"));
+        assert!(sqlite.contains("validate_submission_browser_session("));
+        let postgres = finalizer.split("DbPool::Postgres(_) =>").nth(1).unwrap();
+        assert_eq!(
+            postgres
+                .matches("postgres_checkpoint_browser_session_id(")
+                .count(),
+            2
+        );
+        assert!(postgres.contains("&[&account_id, &authorized_session_id]"));
+        let revalidation = postgres.find("let revalidated_session_id").unwrap();
+        assert!(
+            postgres
+                .find("lock_application_evidence_namespaces_postgres_tx(")
+                .unwrap()
+                < revalidation
+        );
+        assert!(
+            postgres
+                .find("validate_submission_execution_authority_postgres_tx(")
+                .unwrap()
+                < revalidation
+        );
+        assert!(revalidation < postgres.find("SET phase = 'submitted'").unwrap());
+        assert!(postgres.contains("&revalidated_session_id,\n"));
+    }
+
+    #[test]
+    fn every_postgres_evidence_writer_uses_account_application_namespace_order() {
+        let source = include_str!("customer_data.rs");
+        let save = bounded(
+            source,
+            "pub fn save_application_evidence(",
+            "fn validate_document_evidence(",
+        );
+        let postgres = save
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL application-evidence writer");
+        let mut previous = 0;
+        for operation in [
+            "let mut tx = conn.transaction()",
+            "account_write_fence_postgres_tx",
+            "FROM jobs_applications",
+            "FOR SHARE",
+            "lock_application_evidence_namespaces_postgres_tx",
+            "WHERE id = $1 FOR SHARE",
+            "INSERT INTO jobs_application_evidence",
+            "tx.commit()",
+        ] {
+            let relative = postgres[previous..]
+                .find(operation)
+                .unwrap_or_else(|| panic!("missing evidence-writer operation {operation}"));
+            previous += relative + operation.len();
+        }
+
+        let namespace = bounded(
+            source,
+            "fn application_evidence_namespace_keys(",
+            "fn bind_prepared_submission_evidence_time_at_ms(",
+        );
+        assert!(namespace.contains("jobs-application-evidence:id:"));
+        assert!(namespace.contains("jobs-application-evidence:account-provider:"));
+        assert!(namespace.contains("keys.sort_unstable()"));
+        assert!(namespace.contains("keys.dedup()"));
+        assert!(namespace.contains("pg_advisory_xact_lock"));
+    }
+
+    #[test]
+    fn postgres_evidence_namespace_wait_precedes_final_expiry_clock() {
+        let Ok(url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let schema = format!("fix753_evidence_{suffix}");
+        let candidate_name = format!("bluey-fix753-evidence-{suffix}");
+        let mut setup =
+            postgres::Client::connect(&url, postgres::NoTls).expect("connect FIX-753 evidence DB");
+        let setup_now_ms: i64 = setup
+            .query_one(
+                "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("sample FIX-753 setup time")
+            .get(0);
+        let expires_at_ms = setup_now_ms.saturating_add(750);
+        setup
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema};
+                 CREATE TABLE {schema}.accounts (id text PRIMARY KEY);
+                 CREATE TABLE {schema}.applications (
+                     id text PRIMARY KEY, account_id text NOT NULL
+                 );
+                 CREATE TABLE {schema}.authority (
+                     account_id text PRIMARY KEY, expires_at_ms bigint NOT NULL
+                 );
+                 CREATE TABLE {schema}.evidence (
+                     id text PRIMARY KEY, account_id text NOT NULL,
+                     provider_event_hash text NOT NULL,
+                     UNIQUE(account_id, provider_event_hash)
+                 );
+                 INSERT INTO {schema}.accounts(id) VALUES ('acct-holder'), ('acct-target');
+                 INSERT INTO {schema}.applications(id, account_id)
+                 VALUES ('app-holder', 'acct-holder'), ('app-target', 'acct-target');
+                 INSERT INTO {schema}.authority(account_id, expires_at_ms)
+                 VALUES ('acct-target', {expires_at_ms});"
+            ))
+            .expect("create isolated FIX-753 evidence fixture");
+
+        let holder_url = url.clone();
+        let holder_schema = schema.clone();
+        let (holder_locked_tx, holder_locked_rx) = std::sync::mpsc::channel();
+        let (release_holder_tx, release_holder_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || -> std::result::Result<(), String> {
+            let mut client = postgres::Client::connect(&holder_url, postgres::NoTls)
+                .map_err(|error| error.to_string())?;
+            let mut tx = client.transaction().map_err(|error| error.to_string())?;
+            tx.batch_execute("SET LOCAL lock_timeout = '5s'")
+                .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!(
+                    "SELECT id FROM {holder_schema}.accounts
+                      WHERE id = 'acct-holder' FOR UPDATE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!(
+                    "SELECT id FROM {holder_schema}.applications
+                      WHERE id = 'app-holder' FOR SHARE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            lock_application_evidence_namespaces_postgres_tx(
+                &mut tx,
+                "acct-holder",
+                &[("evidence-shared", "hash-holder")],
+            )
+            .map_err(|error| error.to_string())?;
+            holder_locked_tx
+                .send(())
+                .map_err(|error| error.to_string())?;
+            release_holder_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| error.to_string())?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO {holder_schema}.evidence(id, account_id, provider_event_hash)
+                     VALUES ('evidence-shared', 'acct-holder', 'hash-holder')"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())
+        });
+        holder_locked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("FIX-753 competing evidence writer acquired namespace");
+
+        let candidate_url = url.clone();
+        let candidate_schema = schema.clone();
+        let candidate_application_name = candidate_name.clone();
+        let (candidate_started_tx, candidate_started_rx) = std::sync::mpsc::channel();
+        let candidate = std::thread::spawn(move || -> std::result::Result<bool, String> {
+            let mut client = postgres::Client::connect(&candidate_url, postgres::NoTls)
+                .map_err(|error| error.to_string())?;
+            client
+                .query_one(
+                    "SELECT set_config('application_name', $1, false)",
+                    &[&candidate_application_name],
+                )
+                .map_err(|error| error.to_string())?;
+            let mut tx = client.transaction().map_err(|error| error.to_string())?;
+            tx.batch_execute("SET LOCAL lock_timeout = '5s'")
+                .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!(
+                    "SELECT id FROM {candidate_schema}.accounts
+                      WHERE id = 'acct-target' FOR UPDATE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!(
+                    "SELECT id FROM {candidate_schema}.applications
+                      WHERE id = 'app-target' FOR UPDATE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            candidate_started_tx
+                .send(())
+                .map_err(|error| error.to_string())?;
+            lock_application_evidence_namespaces_postgres_tx(
+                &mut tx,
+                "acct-target",
+                &[("evidence-shared", "hash-target")],
+            )
+            .map_err(|error| error.to_string())?;
+            let now_ms: i64 = tx
+                .query_one(
+                    "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )
+                .map_err(|error| error.to_string())?
+                .get(0);
+            let stored_expires_at_ms: i64 = tx
+                .query_one(
+                    &format!(
+                        "SELECT expires_at_ms FROM {candidate_schema}.authority
+                          WHERE account_id = 'acct-target'"
+                    ),
+                    &[],
+                )
+                .map_err(|error| error.to_string())?
+                .get(0);
+            if stored_expires_at_ms <= now_ms {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(true);
+            }
+            tx.execute(
+                &format!(
+                    "INSERT INTO {candidate_schema}.evidence(id, account_id, provider_event_hash)
+                     VALUES ('evidence-shared', 'acct-target', 'hash-target')"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(false)
+        });
+        candidate_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("FIX-753 candidate evidence finalizer reached namespace");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let candidate_waited = loop {
+            let waiting: i64 = setup
+                .query_one(
+                    "SELECT COUNT(*)::bigint
+                       FROM pg_locks lock
+                       JOIN pg_stat_activity activity ON activity.pid = lock.pid
+                      WHERE NOT lock.granted AND activity.application_name = $1",
+                    &[&candidate_name],
+                )
+                .expect("observe FIX-753 evidence namespace wait")
+                .get(0);
+            if waiting > 0 {
+                break true;
+            }
+            if candidate.is_finished() || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let current_ms: i64 = setup
+            .query_one(
+                "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("sample FIX-753 contention time")
+            .get(0);
+        let wait_ms = expires_at_ms.saturating_sub(current_ms).saturating_add(100);
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::try_from(wait_ms.max(0)).expect("bounded FIX-753 expiry wait"),
+        ));
+        release_holder_tx
+            .send(())
+            .expect("release FIX-753 competing evidence writer");
+        let holder_result = holder.join().expect("join FIX-753 evidence holder");
+        let candidate_result = candidate.join().expect("join FIX-753 evidence candidate");
+        let target_rows: i64 = setup
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*)::bigint FROM {schema}.evidence
+                      WHERE account_id = 'acct-target'"
+                ),
+                &[],
+            )
+            .expect("read FIX-753 denied evidence rows")
+            .get(0);
+        setup
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .expect("remove isolated FIX-753 evidence fixture");
+
+        assert!(
+            candidate_waited,
+            "candidate did not wait on evidence namespace"
+        );
+        holder_result.expect("competing evidence writer completed");
+        assert!(
+            candidate_result.expect("candidate evidence finalizer completed"),
+            "candidate accepted authority after the namespace wait crossed expiry"
+        );
+        assert_eq!(target_rows, 0, "expiry denial persisted target evidence");
+    }
 }
 
 pub fn list_application_identities(
@@ -1408,12 +4400,21 @@ pub fn save_application_identity(
                     value.updated_at_ms,
                 ],
             )?;
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "identity",
+                &value.id,
+                value.updated_at_ms,
+            )?;
             tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let is_default = i32::from(value.is_default);
             if value.is_default {
                 tx.execute(
@@ -1445,6 +4446,13 @@ pub fn save_application_identity(
                     &value.updated_at_ms,
                 ],
             )?;
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "identity",
+                &value.id,
+                value.updated_at_ms,
+            )?;
             tx.commit()?;
             Ok(value)
         }
@@ -1468,14 +4476,97 @@ pub fn delete_application_identity(
         anyhow::bail!("choose another email for the Career Track before removing this one")
     }
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
-            params![account_id, identity_id],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "DELETE FROM jobs_application_identities WHERE account_id = $1 AND id = $2",
-            &[&account_id, &identity_id],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let is_default: i64 = tx
+                .query_row(
+                    "SELECT is_default FROM jobs_application_identities
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, identity_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .context("application email not found")?;
+            anyhow::ensure!(
+                is_default == 0,
+                "choose another default application email first"
+            );
+            let bound = {
+                let mut stmt = tx.prepare(
+                    "SELECT track_json FROM jobs_tracks WHERE account_id = ?1 ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map(params![account_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|raw| parse_json::<CareerTrack>(raw, "Career Track"))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .any(|track| track.application_identity_id.as_deref() == Some(identity_id))
+            };
+            anyhow::ensure!(!bound, "choose another email for the Career Track first");
+            let changed = tx.execute(
+                "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
+                params![account_id, identity_id],
+            )? > 0;
+            if changed {
+                advance_account_input_generation_sqlite(
+                    &tx,
+                    account_id,
+                    "identity",
+                    identity_id,
+                    now_ms(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
+            let is_default: i32 = tx
+                .query_opt(
+                    "SELECT is_default FROM jobs_application_identities
+                      WHERE account_id = $1 AND id = $2",
+                    &[&account_id, &identity_id],
+                )?
+                .context("application email not found")?
+                .get(0);
+            anyhow::ensure!(
+                is_default == 0,
+                "choose another default application email first"
+            );
+            let bound = tx
+                .query(
+                    "SELECT track_json FROM jobs_tracks
+                      WHERE account_id = $1 ORDER BY id",
+                    &[&account_id],
+                )?
+                .into_iter()
+                .map(|row| parse_json::<CareerTrack>(row.get(0), "Career Track"))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|track| track.application_identity_id.as_deref() == Some(identity_id));
+            anyhow::ensure!(!bound, "choose another email for the Career Track first");
+            let changed = tx.execute(
+                "DELETE FROM jobs_application_identities WHERE account_id = $1 AND id = $2",
+                &[&account_id, &identity_id],
+            )? > 0;
+            if changed {
+                advance_account_input_generation_postgres(
+                    &mut tx,
+                    account_id,
+                    "identity",
+                    identity_id,
+                    now_ms(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        }
     })
 }
 
@@ -1613,6 +4704,13 @@ pub fn verify_application_identity(
                   WHERE account_id = ?1 AND id = ?2",
                 params![account_id, identity_id, payload, identity.updated_at_ms],
             )?;
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "identity",
+                identity_id,
+                identity.updated_at_ms,
+            )?;
             tx.execute(
                 "DELETE FROM jobs_identity_verifications WHERE account_id = ?1 AND identity_id = ?2",
                 params![account_id, identity_id],
@@ -1623,6 +4721,8 @@ pub fn verify_application_identity(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let row = tx
                 .query_opt(
                     "SELECT otp_hash, attempts, expires_at_ms FROM jobs_identity_verifications
@@ -1664,6 +4764,13 @@ pub fn verify_application_identity(
                     identity_json = $3, updated_at_ms = $4
                   WHERE account_id = $1 AND id = $2",
                 &[&account_id, &identity_id, &payload, &identity.updated_at_ms],
+            )?;
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "identity",
+                identity_id,
+                identity.updated_at_ms,
             )?;
             tx.execute(
                 "DELETE FROM jobs_identity_verifications WHERE account_id = $1 AND identity_id = $2",
@@ -1799,10 +4906,8 @@ pub fn save_mailbox_connection_with_credential(
     }
 
     let provider_subject = credential.provider_subject.trim();
-    let subject_hash = private_lookup_hash(
-        &format!("mailbox:{}", mailbox.provider),
-        provider_subject,
-    )?;
+    let subject_hash =
+        private_lookup_hash(&format!("mailbox:{}", mailbox.provider), provider_subject)?;
     let existing =
         mailbox_connection_by_subject(pool, account_id, &mailbox.provider, &subject_hash)?;
     let is_new = existing.is_none();
@@ -1821,6 +4926,37 @@ pub fn save_mailbox_connection_with_credential(
 
     let mut stored_credential = credential.clone();
     stored_credential.connection_id = mailbox.id.clone();
+    stored_credential.scopes = stored_credential
+        .scopes
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    stored_credential.scopes.sort();
+    stored_credential.scopes.dedup();
+    stored_credential.capabilities = stored_credential
+        .capabilities
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    stored_credential.capabilities.sort();
+    stored_credential.capabilities.dedup();
+    if stored_credential.grant_revision < 0 {
+        anyhow::bail!("provider grant revision is invalid")
+    }
+    if stored_credential.grant_revision > 0 {
+        let computed = communication_grant_sha256(&stored_credential)?;
+        if !stored_credential.grant_sha256.is_empty() && stored_credential.grant_sha256 != computed
+        {
+            anyhow::bail!("provider grant digest is invalid")
+        }
+        stored_credential.grant_sha256 = computed;
+    } else if !stored_credential.grant_sha256.is_empty() {
+        anyhow::bail!("legacy provider credential cannot carry a grant digest")
+    }
     if stored_credential.created_at_ms == 0 {
         stored_credential.created_at_ms = now;
     }
@@ -1847,6 +4983,28 @@ pub fn save_mailbox_connection_with_credential(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let was_disconnected = tx
+                .query_row(
+                    "SELECT status FROM jobs_mailbox_connections
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, mailbox.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .is_some_and(|status| status == "disconnected");
+            let unresolved_actions: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, mailbox.id],
+                |row| row.get(0),
+            )?;
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
             if is_new {
                 let active_count: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM jobs_mailbox_connections
@@ -1916,16 +5074,41 @@ pub fn save_mailbox_connection_with_credential(
                     sync_state.updated_at_ms,
                 ],
             )?;
+            if was_disconnected {
+                tx.execute(
+                    "DELETE FROM jobs_communication_write_fences
+                      WHERE account_id = ?1 AND connection_id = ?2
+                        AND reason = 'mailbox_disconnect'",
+                    params![account_id, mailbox.id],
+                )?;
+            }
             tx.commit()?;
             Ok((mailbox, stored_credential))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            tx.query_one(
-                "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
-                &[&account_id],
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
             )?;
+            let was_disconnected = tx
+                .query_opt(
+                    "SELECT status FROM jobs_mailbox_connections
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &mailbox.id],
+                )?
+                .is_some_and(|row| row.get::<_, String>(0) == "disconnected");
+            let unresolved_actions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &mailbox.id],
+                )?
+                .get(0);
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
             if is_new {
                 let active_count: i64 = tx
                     .query_one(
@@ -1996,6 +5179,233 @@ pub fn save_mailbox_connection_with_credential(
                     &sync_state.updated_at_ms,
                 ],
             )?;
+            if was_disconnected {
+                tx.execute(
+                    "DELETE FROM jobs_communication_write_fences
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND reason = 'mailbox_disconnect'",
+                    &[&account_id, &mailbox.id],
+                )?;
+            }
+            tx.commit()?;
+            Ok((mailbox, stored_credential))
+        }
+    })
+}
+
+pub fn save_mailbox_connection_with_credential_cas(
+    pool: &DbPool,
+    account_id: &str,
+    connection: &MailboxConnection,
+    credential: &JobsProviderCredential,
+    expected_grant_revision: i64,
+) -> Result<(MailboxConnection, JobsProviderCredential)> {
+    if connection.id.trim().is_empty()
+        || credential.connection_id != connection.id
+        || connection.provider != credential.provider
+        || !matches!(connection.provider.as_str(), "gmail" | "outlook")
+        || expected_grant_revision < 0
+        || credential.grant_revision != expected_grant_revision.saturating_add(1)
+    {
+        anyhow::bail!("provider write-grant CAS request is invalid")
+    }
+    let mut mailbox = connection.clone();
+    mailbox.status = "connected".to_string();
+    mailbox.capabilities = credential.capabilities.clone();
+    mailbox.capabilities.sort();
+    mailbox.capabilities.dedup();
+    mailbox.updated_at_ms = now_ms();
+
+    let mut stored_credential = credential.clone();
+    stored_credential.scopes.sort();
+    stored_credential.scopes.dedup();
+    stored_credential.capabilities = mailbox.capabilities.clone();
+    stored_credential.grant_sha256 = communication_grant_sha256(&stored_credential)?;
+    let subject_hash = private_lookup_hash(
+        &format!("mailbox:{}", mailbox.provider),
+        stored_credential.provider_subject.trim(),
+    )?;
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let unresolved_actions: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, mailbox.id],
+                |row| row.get(0),
+            )?;
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
+            let raw: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT mailbox.connection_json, credential.credential_json
+                       FROM jobs_mailbox_connections mailbox
+                       JOIN jobs_provider_credentials credential
+                         ON credential.account_id = mailbox.account_id
+                        AND credential.connection_id = mailbox.id
+                      WHERE mailbox.account_id = ?1 AND mailbox.id = ?2
+                        AND mailbox.provider = ?3 AND mailbox.provider_subject_hash = ?4
+                        AND mailbox.status = 'connected'
+                        AND credential.provider = ?3
+                        AND credential.provider_subject_hash = ?4",
+                    params![account_id, mailbox.id, mailbox.provider, subject_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (current_mailbox_json, current_credential_json) =
+                raw.ok_or_else(|| anyhow::anyhow!("connected mailbox provider grant not found"))?;
+            let current_mailbox: MailboxConnection =
+                parse_json(current_mailbox_json, "mailbox connection")?;
+            let current: JobsProviderCredential =
+                parse_json(current_credential_json, "Jobs provider credential")?;
+            if current.grant_revision != expected_grant_revision
+                || current.provider_subject != stored_credential.provider_subject
+                || current_mailbox.status != "connected"
+                || current_mailbox.provider != mailbox.provider
+            {
+                anyhow::bail!("provider grant revision changed during authorization")
+            }
+            if expected_grant_revision > 0
+                && (current.grant_sha256.len() != 64
+                    || communication_grant_sha256(&current)? != current.grant_sha256)
+            {
+                anyhow::bail!("current provider grant digest is invalid")
+            }
+            let authority_updated_at_ms = now_ms()
+                .max(current_mailbox.updated_at_ms.saturating_add(1))
+                .max(current.updated_at_ms.saturating_add(1));
+            mailbox.updated_at_ms = authority_updated_at_ms;
+            stored_credential.updated_at_ms = authority_updated_at_ms;
+            let mailbox_json = to_json(&mailbox, "mailbox connection")?;
+            let credential_json = to_json(&stored_credential, "Jobs provider credential")?;
+            let mailbox_updated = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'connected', connection_json = ?4, updated_at_ms = ?5
+                  WHERE account_id = ?1 AND id = ?2 AND provider = ?3
+                    AND provider_subject_hash = ?6 AND status = 'connected'",
+                params![
+                    account_id,
+                    mailbox.id,
+                    mailbox.provider,
+                    mailbox_json,
+                    mailbox.updated_at_ms,
+                    subject_hash,
+                ],
+            )?;
+            let credential_updated = tx.execute(
+                "UPDATE jobs_provider_credentials
+                    SET credential_json = ?5, updated_at_ms = ?6
+                  WHERE account_id = ?1 AND connection_id = ?2 AND provider = ?3
+                    AND provider_subject_hash = ?4",
+                params![
+                    account_id,
+                    stored_credential.connection_id,
+                    stored_credential.provider,
+                    subject_hash,
+                    credential_json,
+                    stored_credential.updated_at_ms,
+                ],
+            )?;
+            if mailbox_updated != 1 || credential_updated != 1 {
+                anyhow::bail!("provider grant CAS target changed")
+            }
+            tx.commit()?;
+            Ok((mailbox, stored_credential))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let unresolved_actions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &mailbox.id],
+                )?
+                .get(0);
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
+            let row = tx
+                .query_opt(
+                    "SELECT mailbox.connection_json, credential.credential_json
+                       FROM jobs_mailbox_connections mailbox
+                       JOIN jobs_provider_credentials credential
+                         ON credential.account_id = mailbox.account_id
+                        AND credential.connection_id = mailbox.id
+                      WHERE mailbox.account_id = $1 AND mailbox.id = $2
+                        AND mailbox.provider = $3 AND mailbox.provider_subject_hash = $4
+                        AND mailbox.status = 'connected'
+                        AND credential.provider = $3
+                        AND credential.provider_subject_hash = $4
+                      FOR UPDATE OF mailbox, credential",
+                    &[&account_id, &mailbox.id, &mailbox.provider, &subject_hash],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("connected mailbox provider grant not found"))?;
+            let current_mailbox: MailboxConnection = parse_json(row.get(0), "mailbox connection")?;
+            let current: JobsProviderCredential =
+                parse_json(row.get(1), "Jobs provider credential")?;
+            if current.grant_revision != expected_grant_revision
+                || current.provider_subject != stored_credential.provider_subject
+                || current_mailbox.status != "connected"
+                || current_mailbox.provider != mailbox.provider
+            {
+                anyhow::bail!("provider grant revision changed during authorization")
+            }
+            if expected_grant_revision > 0
+                && (current.grant_sha256.len() != 64
+                    || communication_grant_sha256(&current)? != current.grant_sha256)
+            {
+                anyhow::bail!("current provider grant digest is invalid")
+            }
+            let authority_updated_at_ms = now_ms()
+                .max(current_mailbox.updated_at_ms.saturating_add(1))
+                .max(current.updated_at_ms.saturating_add(1));
+            mailbox.updated_at_ms = authority_updated_at_ms;
+            stored_credential.updated_at_ms = authority_updated_at_ms;
+            let mailbox_json = to_json(&mailbox, "mailbox connection")?;
+            let credential_json = to_json(&stored_credential, "Jobs provider credential")?;
+            let mailbox_updated = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'connected', connection_json = $4, updated_at_ms = $5
+                  WHERE account_id = $1 AND id = $2 AND provider = $3
+                    AND provider_subject_hash = $6 AND status = 'connected'",
+                &[
+                    &account_id,
+                    &mailbox.id,
+                    &mailbox.provider,
+                    &mailbox_json,
+                    &mailbox.updated_at_ms,
+                    &subject_hash,
+                ],
+            )?;
+            let credential_updated = tx.execute(
+                "UPDATE jobs_provider_credentials
+                    SET credential_json = $5, updated_at_ms = $6
+                  WHERE account_id = $1 AND connection_id = $2 AND provider = $3
+                    AND provider_subject_hash = $4",
+                &[
+                    &account_id,
+                    &stored_credential.connection_id,
+                    &stored_credential.provider,
+                    &subject_hash,
+                    &credential_json,
+                    &stored_credential.updated_at_ms,
+                ],
+            )?;
+            if mailbox_updated != 1 || credential_updated != 1 {
+                anyhow::bail!("provider grant CAS target changed")
+            }
             tx.commit()?;
             Ok((mailbox, stored_credential))
         }
@@ -2119,15 +5529,186 @@ pub fn delete_mailbox_connection(
     account_id: &str,
     connection_id: &str,
 ) -> Result<bool> {
+    let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "DELETE FROM jobs_mailbox_connections WHERE account_id = ?1 AND id = ?2",
-            params![account_id, connection_id],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "DELETE FROM jobs_mailbox_connections WHERE account_id = $1 AND id = $2",
-            &[&account_id, &connection_id],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT connection_json FROM jobs_mailbox_connections
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, connection_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO jobs_communication_write_fences (
+                    account_id, connection_id, reason, created_at_ms
+                 ) VALUES (?1, ?2, 'mailbox_disconnect', ?3)",
+                params![account_id, connection_id, now],
+            )?;
+            let ambiguous: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, connection_id],
+                |row| row.get(0),
+            )?;
+            if ambiguous > 0 {
+                tx.commit()?;
+                anyhow::bail!(
+                    "mailbox cannot be disconnected while communication outcome is unresolved"
+                )
+            }
+            let exhausted: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                    AND (action_revision >= 9007199254740991
+                         OR updated_at_ms >= 9223372036854775807)",
+                params![account_id, connection_id],
+                |row| row.get(0),
+            )?;
+            if exhausted > 0 {
+                anyhow::bail!("mailbox communication revision authority is exhausted")
+            }
+            let mut mailbox: MailboxConnection = parse_json(raw, "mailbox connection")?;
+            mailbox.status = "disconnected".to_string();
+            mailbox.capabilities.clear();
+            mailbox.updated_at_ms = now;
+            let payload = to_json(&mailbox, "mailbox connection")?;
+            tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'cancelled', lease_owner = NULL, lease_kind = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        active_attempt_id = NULL, approved_authority_sha256 = '',
+                        approved_grant_revision = 0, approved_grant_sha256 = '',
+                        action_revision = action_revision + 1,
+                        updated_at_ms = MAX(?3, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                params![account_id, connection_id, now],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_provider_credentials
+                  WHERE account_id = ?1 AND connection_id = ?2",
+                params![account_id, connection_id],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_provider_sync_state
+                  WHERE account_id = ?1 AND connection_id = ?2",
+                params![account_id, connection_id],
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'disconnected', connection_json = ?3, updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2",
+                params![account_id, connection_id, payload, now],
+            )?;
+            tx.commit()?;
+            Ok(changed == 1)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let Some(row) = tx.query_opt(
+                "SELECT connection_json FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &connection_id],
+            )?
+            else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            tx.execute(
+                "INSERT INTO jobs_communication_write_fences (
+                    account_id, connection_id, reason, created_at_ms
+                 ) VALUES ($1, $2, 'mailbox_disconnect', $3)
+                 ON CONFLICT(account_id, connection_id) DO NOTHING",
+                &[&account_id, &connection_id, &now],
+            )?;
+            let ambiguous: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &connection_id],
+                )?
+                .get(0);
+            if ambiguous > 0 {
+                tx.commit()?;
+                anyhow::bail!(
+                    "mailbox cannot be disconnected while communication outcome is unresolved"
+                )
+            }
+            let exhausted: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                        AND (action_revision >= 9007199254740991
+                             OR updated_at_ms >= 9223372036854775807)",
+                    &[&account_id, &connection_id],
+                )?
+                .get(0);
+            if exhausted > 0 {
+                anyhow::bail!("mailbox communication revision authority is exhausted")
+            }
+            let mut mailbox: MailboxConnection = parse_json(row.get(0), "mailbox connection")?;
+            mailbox.status = "disconnected".to_string();
+            mailbox.capabilities.clear();
+            mailbox.updated_at_ms = now;
+            let payload = to_json(&mailbox, "mailbox connection")?;
+            tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'cancelled', lease_owner = NULL, lease_kind = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        active_attempt_id = NULL, approved_authority_sha256 = '',
+                        approved_grant_revision = 0, approved_grant_sha256 = '',
+                        action_revision = action_revision + 1,
+                        updated_at_ms = GREATEST($3, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = $1 AND connection_id = $2
+                    AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                &[&account_id, &connection_id, &now],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_provider_credentials
+                  WHERE account_id = $1 AND connection_id = $2",
+                &[&account_id, &connection_id],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_provider_sync_state
+                  WHERE account_id = $1 AND connection_id = $2",
+                &[&account_id, &connection_id],
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'disconnected', connection_json = $3, updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2",
+                &[&account_id, &connection_id, &payload, &now],
+            )?;
+            tx.commit()?;
+            Ok(changed == 1)
+        }
     })
 }
 
@@ -2136,43 +5717,147 @@ pub fn mark_mailbox_reauthorization_required(
     account_id: &str,
     connection_id: &str,
 ) -> Result<bool> {
-    let Some(mut mailbox) = mailbox_connection(pool, account_id, connection_id)? else {
-        return Ok(false);
-    };
-    if mailbox.status == "reauthorization_required" {
-        return Ok(true);
-    }
-    mailbox.status = "reauthorization_required".to_string();
-    mailbox.updated_at_ms = now_ms();
-    let payload = to_json(&mailbox, "mailbox connection")?;
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "UPDATE jobs_mailbox_connections
-                SET status = 'reauthorization_required',
-                    connection_json = ?3,
-                    updated_at_ms = ?4
-              WHERE account_id = ?1 AND id = ?2",
-            params![
-                account_id,
-                connection_id,
-                payload,
-                mailbox.updated_at_ms
-            ],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "UPDATE jobs_mailbox_connections
-                SET status = 'reauthorization_required',
-                    connection_json = $3,
-                    updated_at_ms = $4
-              WHERE account_id = $1 AND id = $2",
-            &[
-                &account_id,
-                &connection_id,
-                &payload,
-                &mailbox.updated_at_ms,
-            ],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let current: Option<(String, String, i64)> = tx
+                .query_row(
+                    "SELECT status, connection_json, updated_at_ms
+                       FROM jobs_mailbox_connections
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, connection_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((status, payload, updated_at_ms)) = current else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            let unresolved_actions: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, connection_id],
+                |row| row.get(0),
+            )?;
+            if unresolved_actions > 0 {
+                anyhow::bail!(
+                    "mailbox authorization cannot change while communication is unresolved"
+                )
+            }
+            if status == "reauthorization_required" {
+                tx.commit()?;
+                return Ok(true);
+            }
+            if status != "connected" {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let mut mailbox: MailboxConnection = parse_json(payload, "mailbox connection")?;
+            if mailbox.id != connection_id || mailbox.status != status {
+                anyhow::bail!("mailbox connection authority is inconsistent")
+            }
+            mailbox.status = "reauthorization_required".to_string();
+            mailbox.updated_at_ms = now_ms().max(updated_at_ms.saturating_add(1));
+            let payload = to_json(&mailbox, "mailbox connection")?;
+            let changed = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'reauthorization_required',
+                        connection_json = ?3,
+                        updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2 AND status = 'connected'",
+                params![account_id, connection_id, payload, mailbox.updated_at_ms],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("mailbox authorization authority changed")
+            }
+            tx.commit()?;
+            Ok(true)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let current = tx.query_opt(
+                "SELECT status, connection_json, updated_at_ms
+                   FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &connection_id],
+            )?;
+            let Some(current) = current else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            let status: String = current.get(0);
+            let payload: String = current.get(1);
+            let updated_at_ms: i64 = current.get(2);
+            let unresolved_actions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &connection_id],
+                )?
+                .get(0);
+            if unresolved_actions > 0 {
+                anyhow::bail!(
+                    "mailbox authorization cannot change while communication is unresolved"
+                )
+            }
+            if status == "reauthorization_required" {
+                tx.commit()?;
+                return Ok(true);
+            }
+            if status != "connected" {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let mut mailbox: MailboxConnection = parse_json(payload, "mailbox connection")?;
+            if mailbox.id != connection_id || mailbox.status != status {
+                anyhow::bail!("mailbox connection authority is inconsistent")
+            }
+            mailbox.status = "reauthorization_required".to_string();
+            mailbox.updated_at_ms = now_ms().max(updated_at_ms.saturating_add(1));
+            let payload = to_json(&mailbox, "mailbox connection")?;
+            let changed = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'reauthorization_required',
+                        connection_json = $3,
+                        updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2 AND status = 'connected'",
+                &[
+                    &account_id,
+                    &connection_id,
+                    &payload,
+                    &mailbox.updated_at_ms,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("mailbox authorization authority changed")
+            }
+            tx.commit()?;
+            Ok(true)
+        }
     })
+}
+
+fn canonical_jobs_oauth_state_token(state_token: &str) -> Result<&str> {
+    if state_token.len() < 32
+        || state_token.len() > 512
+        || state_token.trim() != state_token
+        || !state_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        anyhow::bail!("OAuth state token is invalid")
+    }
+    Ok(state_token)
 }
 
 pub fn save_jobs_oauth_state(
@@ -2181,22 +5866,25 @@ pub fn save_jobs_oauth_state(
     state_token: &str,
     state: &JobsOAuthState,
 ) -> Result<()> {
-    if state_token.trim().len() < 32 {
-        anyhow::bail!("OAuth state token is too short")
-    }
+    let state_token = canonical_jobs_oauth_state_token(state_token)?;
     if !matches!(state.provider.as_str(), "gmail" | "outlook") {
         anyhow::bail!("unsupported Jobs OAuth provider")
     }
-    let state_hash = private_lookup_hash("jobs-oauth-state", state_token.trim())?;
+    let state_hash = private_lookup_hash("jobs-oauth-state", state_token)?;
     let payload = to_json(state, "Jobs OAuth state")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
-                "DELETE FROM jobs_oauth_states WHERE expires_at_ms <= ?1",
-                params![now_ms()],
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
             )?;
-            conn.execute(
+            tx.execute(
+                "DELETE FROM jobs_oauth_states
+                  WHERE account_id = ?1 AND expires_at_ms <= ?2",
+                params![account_id, now_ms()],
+            )?;
+            let inserted = tx.execute(
                 "INSERT INTO jobs_oauth_states (
                     state_hash, account_id, provider, state_json, expires_at_ms, created_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -2210,16 +5898,24 @@ pub fn save_jobs_oauth_state(
                     state.created_at_ms,
                 ],
             )?;
+            if inserted != 1 {
+                anyhow::bail!("OAuth state token already exists")
+            }
+            tx.commit()?;
             Ok(())
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            tx.execute(
-                "DELETE FROM jobs_oauth_states WHERE expires_at_ms <= $1",
-                &[&now_ms()],
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
             )?;
             tx.execute(
+                "DELETE FROM jobs_oauth_states
+                  WHERE account_id = $1 AND expires_at_ms <= $2",
+                &[&account_id, &now_ms()],
+            )?;
+            let inserted = tx.execute(
                 "INSERT INTO jobs_oauth_states (
                     state_hash, account_id, provider, state_json, expires_at_ms, created_at_ms
                  ) VALUES ($1, $2, $3, $4, $5, $6)
@@ -2233,6 +5929,9 @@ pub fn save_jobs_oauth_state(
                     &state.created_at_ms,
                 ],
             )?;
+            if inserted != 1 {
+                anyhow::bail!("OAuth state token already exists")
+            }
             tx.commit()?;
             Ok(())
         }
@@ -2243,7 +5942,8 @@ pub fn consume_jobs_oauth_state(
     pool: &DbPool,
     state_token: &str,
 ) -> Result<Option<(String, JobsOAuthState)>> {
-    let state_hash = private_lookup_hash("jobs-oauth-state", state_token.trim())?;
+    let state_token = canonical_jobs_oauth_state_token(state_token)?;
+    let state_hash = private_lookup_hash("jobs-oauth-state", state_token)?;
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -2269,10 +5969,7 @@ pub fn consume_jobs_oauth_state(
             if expires_at_ms <= now {
                 return Ok(None);
             }
-            Ok(Some((
-                account_id,
-                parse_json(payload, "Jobs OAuth state")?,
-            )))
+            Ok(Some((account_id, parse_json(payload, "Jobs OAuth state")?)))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
@@ -2304,6 +6001,37 @@ pub fn save_jobs_provider_credential(
     account_id: &str,
     credential: &JobsProviderCredential,
 ) -> Result<JobsProviderCredential> {
+    let mut credential = credential.clone();
+    credential.scopes = credential
+        .scopes
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    credential.scopes.sort();
+    credential.scopes.dedup();
+    credential.capabilities = credential
+        .capabilities
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    credential.capabilities.sort();
+    credential.capabilities.dedup();
+    if credential.grant_revision < 0 {
+        anyhow::bail!("provider grant revision is invalid")
+    }
+    if credential.grant_revision > 0 {
+        let computed = communication_grant_sha256(&credential)?;
+        if !credential.grant_sha256.is_empty() && credential.grant_sha256 != computed {
+            anyhow::bail!("provider grant digest is invalid")
+        }
+        credential.grant_sha256 = computed;
+    } else if !credential.grant_sha256.is_empty() {
+        anyhow::bail!("legacy provider credential cannot carry a grant digest")
+    }
     if !matches!(credential.provider.as_str(), "gmail" | "outlook") {
         anyhow::bail!("unsupported Jobs credential provider")
     }
@@ -2317,10 +6045,32 @@ pub fn save_jobs_provider_credential(
         &format!("mailbox:{}", credential.provider),
         credential.provider_subject.trim(),
     )?;
-    let payload = to_json(credential, "Jobs provider credential")?;
+    let payload = to_json(&credential, "Jobs provider credential")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.query_row(
+                "SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = ?1 AND id = ?2 AND provider = ?3
+                    AND status = 'connected'",
+                params![account_id, credential.connection_id, credential.provider],
+                |_| Ok(()),
+            )?;
+            let unresolved_actions: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, credential.connection_id],
+                |row| row.get(0),
+            )?;
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
+            tx.execute(
                 "INSERT INTO jobs_provider_credentials (
                     connection_id, account_id, provider, provider_subject_hash,
                     credential_json, created_at_ms, updated_at_ms
@@ -2341,10 +6091,33 @@ pub fn save_jobs_provider_credential(
                     credential.updated_at_ms,
                 ],
             )?;
-            Ok(credential.clone())
+            tx.commit()?;
+            Ok(credential)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.query_one(
+                "SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND id = $2 AND provider = $3
+                    AND status = 'connected' FOR UPDATE",
+                &[&account_id, &credential.connection_id, &credential.provider],
+            )?;
+            let unresolved_actions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &credential.connection_id],
+                )?
+                .get(0);
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
+            tx.execute(
                 "INSERT INTO jobs_provider_credentials (
                     connection_id, account_id, provider, provider_subject_hash,
                     credential_json, created_at_ms, updated_at_ms
@@ -2365,7 +6138,8 @@ pub fn save_jobs_provider_credential(
                     &credential.updated_at_ms,
                 ],
             )?;
-            Ok(credential.clone())
+            tx.commit()?;
+            Ok(credential)
         }
     })
 }
@@ -2399,6 +6173,219 @@ pub fn jobs_provider_credential(
             .map(|row| parse_json(row.get(0), "Jobs provider credential"))
             .transpose(),
     })
+}
+
+/// Atomically rotates provider tokens without changing the authority grant.
+/// The caller supplies the exact credential snapshot it refreshed from; a
+/// disconnect, consent upgrade, or concurrent refresh makes the CAS fail.
+pub fn refresh_jobs_provider_credential_cas(
+    pool: &DbPool,
+    account_id: &str,
+    expected: &JobsProviderCredential,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at_ms: i64,
+) -> Result<JobsProviderCredential> {
+    if !crate::jobs_provider_auth::valid_provider_token(access_token)
+        || refresh_token
+            .is_some_and(|value| !crate::jobs_provider_auth::valid_provider_token(value))
+        || !crate::jobs_provider_auth::valid_provider_token(&expected.access_token)
+        || (!expected.refresh_token.is_empty()
+            && !crate::jobs_provider_auth::valid_provider_token(&expected.refresh_token))
+    {
+        anyhow::bail!("provider credential refresh token is invalid")
+    }
+    if expected.connection_id.trim().is_empty()
+        || !matches!(expected.provider.as_str(), "gmail" | "outlook")
+        || expected.provider_subject.trim().is_empty()
+        || expected.access_token.is_empty()
+        || expires_at_ms <= now_ms()
+        || expected.grant_revision < 0
+    {
+        anyhow::bail!("provider credential refresh CAS request is invalid")
+    }
+    if expected.grant_revision > 0
+        && (expected.grant_sha256.len() != 64
+            || communication_grant_sha256(expected)? != expected.grant_sha256)
+    {
+        anyhow::bail!("provider credential refresh grant digest is invalid")
+    }
+    let subject_hash = private_lookup_hash(
+        &format!("mailbox:{}", expected.provider),
+        expected.provider_subject.trim(),
+    )?;
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let raw: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT mailbox.connection_json, credential.credential_json
+                       FROM jobs_provider_credentials credential
+                       JOIN jobs_mailbox_connections mailbox
+                         ON mailbox.account_id = credential.account_id
+                        AND mailbox.id = credential.connection_id
+                      WHERE credential.account_id = ?1 AND credential.connection_id = ?2
+                        AND credential.provider = ?3
+                        AND credential.provider_subject_hash = ?4
+                        AND credential.updated_at_ms = ?5
+                        AND mailbox.status = 'connected'",
+                    params![
+                        account_id,
+                        expected.connection_id,
+                        expected.provider,
+                        subject_hash,
+                        expected.updated_at_ms,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (mailbox_json, raw) =
+                raw.ok_or_else(|| anyhow::anyhow!("provider credential refresh lost CAS"))?;
+            let mailbox: MailboxConnection = parse_json(mailbox_json, "mailbox connection")?;
+            let current: JobsProviderCredential = parse_json(raw, "Jobs provider credential")?;
+            validate_provider_refresh_mailbox(expected, &mailbox)?;
+            validate_provider_refresh_snapshot(expected, &current)?;
+            let mut updated = current;
+            updated.access_token = access_token.to_string();
+            if let Some(refresh_token) = refresh_token {
+                updated.refresh_token = refresh_token.to_string();
+            }
+            updated.expires_at_ms = expires_at_ms;
+            updated.updated_at_ms = now_ms().max(expected.updated_at_ms.saturating_add(1));
+            let payload = to_json(&updated, "Jobs provider credential")?;
+            let changed = tx.execute(
+                "UPDATE jobs_provider_credentials
+                    SET credential_json = ?6, updated_at_ms = ?7
+                  WHERE account_id = ?1 AND connection_id = ?2 AND provider = ?3
+                    AND provider_subject_hash = ?4 AND updated_at_ms = ?5",
+                params![
+                    account_id,
+                    expected.connection_id,
+                    expected.provider,
+                    subject_hash,
+                    expected.updated_at_ms,
+                    payload,
+                    updated.updated_at_ms,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("provider credential refresh lost CAS")
+            }
+            tx.commit()?;
+            Ok(updated)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let row = tx
+                .query_opt(
+                    "SELECT mailbox.connection_json, credential.credential_json
+                       FROM jobs_provider_credentials credential
+                       JOIN jobs_mailbox_connections mailbox
+                         ON mailbox.account_id = credential.account_id
+                        AND mailbox.id = credential.connection_id
+                      WHERE credential.account_id = $1 AND credential.connection_id = $2
+                        AND credential.provider = $3
+                        AND credential.provider_subject_hash = $4
+                        AND credential.updated_at_ms = $5
+                        AND mailbox.status = 'connected'
+                      FOR UPDATE OF mailbox, credential",
+                    &[
+                        &account_id,
+                        &expected.connection_id,
+                        &expected.provider,
+                        &subject_hash,
+                        &expected.updated_at_ms,
+                    ],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("provider credential refresh lost CAS"))?;
+            let current: JobsProviderCredential =
+                parse_json(row.get(1), "Jobs provider credential")?;
+            let mailbox: MailboxConnection = parse_json(row.get(0), "mailbox connection")?;
+            validate_provider_refresh_mailbox(expected, &mailbox)?;
+            validate_provider_refresh_snapshot(expected, &current)?;
+            let mut updated = current;
+            updated.access_token = access_token.to_string();
+            if let Some(refresh_token) = refresh_token {
+                updated.refresh_token = refresh_token.to_string();
+            }
+            updated.expires_at_ms = expires_at_ms;
+            updated.updated_at_ms = now_ms().max(expected.updated_at_ms.saturating_add(1));
+            let payload = to_json(&updated, "Jobs provider credential")?;
+            let changed = tx.execute(
+                "UPDATE jobs_provider_credentials
+                    SET credential_json = $6, updated_at_ms = $7
+                  WHERE account_id = $1 AND connection_id = $2 AND provider = $3
+                    AND provider_subject_hash = $4 AND updated_at_ms = $5",
+                &[
+                    &account_id,
+                    &expected.connection_id,
+                    &expected.provider,
+                    &subject_hash,
+                    &expected.updated_at_ms,
+                    &payload,
+                    &updated.updated_at_ms,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("provider credential refresh lost CAS")
+            }
+            tx.commit()?;
+            Ok(updated)
+        }
+    })
+}
+
+fn validate_provider_refresh_snapshot(
+    expected: &JobsProviderCredential,
+    current: &JobsProviderCredential,
+) -> Result<()> {
+    if current.connection_id != expected.connection_id
+        || current.provider != expected.provider
+        || current.provider_subject != expected.provider_subject
+        || current.updated_at_ms != expected.updated_at_ms
+        || current.access_token != expected.access_token
+        || current.refresh_token != expected.refresh_token
+        || current.grant_revision != expected.grant_revision
+        || current.grant_sha256 != expected.grant_sha256
+        || current.scopes != expected.scopes
+        || current.capabilities != expected.capabilities
+    {
+        anyhow::bail!("provider credential refresh lost CAS")
+    }
+    Ok(())
+}
+
+fn validate_provider_refresh_mailbox(
+    expected: &JobsProviderCredential,
+    mailbox: &MailboxConnection,
+) -> Result<()> {
+    let mut capabilities = mailbox.capabilities.clone();
+    capabilities.sort();
+    capabilities.dedup();
+    let mut expected_capabilities = expected.capabilities.clone();
+    expected_capabilities.sort();
+    expected_capabilities.dedup();
+    if mailbox.id != expected.connection_id
+        || mailbox.provider != expected.provider
+        || mailbox.status != "connected"
+        || (expected.grant_revision > 0 && capabilities != expected_capabilities)
+        || (expected.grant_revision == 0
+            && !expected_capabilities
+                .iter()
+                .all(|capability| capabilities.contains(capability)))
+    {
+        anyhow::bail!("provider credential refresh mailbox authority changed")
+    }
+    Ok(())
 }
 
 pub fn list_integrations(pool: &DbPool, account_id: &str) -> Result<Vec<JobsIntegration>> {
@@ -2625,19 +6612,31 @@ pub fn save_run_event(
     let payload = to_json(&value.event, "Jobs run event")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_run_events(id, account_id, run_id, event_type, event_json, created_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![value.id, account_id, value.run_id, value.event_type, payload, value.created_at_ms],
             )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_run_events(id, account_id, run_id, event_type, event_json, created_at_ms)
                  VALUES ($1, $2, $3, $4, $5, $6)",
                 &[&value.id, &account_id, &value.run_id, &value.event_type, &payload, &value.created_at_ms],
             )?;
+            tx.commit()?;
             Ok(value)
         }
     })

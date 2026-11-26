@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use unicode_general_category::{get_general_category, GeneralCategory};
+use unicode_normalization::UnicodeNormalization;
 
 use super::jobs_tailoring::tailor_resume;
 use super::DbPool;
@@ -48,7 +50,105 @@ const GLOBAL_DISCOVERY_MAX_BATCH_ROWS: usize = 1_000;
 const GLOBAL_DISCOVERY_MAX_MATERIALIZED_PER_ACCOUNT: usize = 500;
 const EXECUTION_LEASE_TTL_MS: i64 = 60 * 1_000;
 const LOCAL_RESUME_ACTION_TTL_MS: i64 = 15 * 60 * 1_000;
+pub const SUBMISSION_RECONCILIATION_GRACE_MS: i64 = 24 * 60 * 60 * 1_000;
+pub const SERVER_SUBMISSION_AUTHORITY_KEY: &str = "_bluey_server_submission_authority_v1";
+pub const FINAL_SUBMIT_PROOF_KEY: &str = "_bluey_final_submit_proof_v1";
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitProof {
+    pub schema_version: i64,
+    pub adapter: String,
+    pub adapter_version: String,
+    pub control: String,
+    pub job: FinalSubmitJobProof,
+    pub target: FinalSubmitTargetProof,
+    pub files: Vec<FinalSubmitFileProof>,
+    pub fields: Vec<FinalSubmitFieldProof>,
+    pub part_order: Vec<FinalSubmitPartOrderProof>,
+    pub documents: Vec<FinalSubmitDocumentProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certification: Option<AtsFinalSubmitCertificationProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_surface: Option<AtsFinalSubmitObservedSurfaceProof>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AtsFinalSubmitCertificationProof {
+    pub schema_version: i64,
+    pub provider: String,
+    pub adapter_version: String,
+    pub manifest_sha256: String,
+    pub activation_sha256: String,
+    pub activation_generation: i64,
+    pub target_key_sha256: String,
+    pub layout_set_sha256: String,
+    pub adapter_bundle_sha256: String,
+    pub runner_target_sha256s: Vec<String>,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AtsFinalSubmitObservedSurfaceProof {
+    pub schema_version: i64,
+    pub variant_key: String,
+    pub layout_contract_version: i64,
+    pub surface_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitJobProof {
+    pub approved_canonical_url: String,
+    pub page_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitTargetProof {
+    pub action_url: String,
+    pub method: String,
+    pub enctype: String,
+    pub form_target: String,
+    pub provider_job_key: String,
+    pub form_identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitFileProof {
+    pub field_name: String,
+    pub name: String,
+    pub byte_length: i64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitFieldProof {
+    pub field_name: String,
+    pub value_byte_length: i64,
+    pub value_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitPartOrderProof {
+    pub kind: String,
+    pub index: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitDocumentProof {
+    pub kind: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    pub sha256: String,
+}
 
 fn default_discovery_interval_ms() -> i64 {
     4 * 60 * 60 * 1_000
@@ -73,12 +173,22 @@ fn discovery_next_run_at(source: &DiscoverySource, completed_at_ms: i64, failure
 
 const DISCOVERY_ACCOUNT_LOCK_SQL: &str =
     "SELECT pg_advisory_xact_lock(hashtextextended('jobs-discovery-account:' || $1, 0))";
+const DISCOVERY_ACCOUNT_SHARED_LOCK_SQL: &str =
+    "SELECT pg_advisory_xact_lock_shared(hashtextextended('jobs-discovery-account:' || $1, 0))";
 
 fn lock_discovery_account_postgres(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
 ) -> Result<()> {
     tx.query_one(DISCOVERY_ACCOUNT_LOCK_SQL, &[&account_id])?;
+    Ok(())
+}
+
+pub(crate) fn lock_discovery_account_shared_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> Result<()> {
+    tx.query_one(DISCOVERY_ACCOUNT_SHARED_LOCK_SQL, &[&account_id])?;
     Ok(())
 }
 
@@ -293,7 +403,7 @@ pub struct JobPreferences {
     pub desired_locations: Vec<String>,
     #[serde(default = "default_location_policy")]
     pub location_policy: String,
-    #[serde(default)]
+    #[serde(default = "default_remote_preference")]
     pub remote_preference: String,
     #[serde(default)]
     pub employment_types: Vec<String>,
@@ -301,7 +411,7 @@ pub struct JobPreferences {
     pub engagement_types: Vec<String>,
     #[serde(default)]
     pub minimum_compensation: Option<i64>,
-    #[serde(default)]
+    #[serde(default = "default_sponsorship_policy")]
     pub sponsorship: String,
     #[serde(default)]
     pub excluded_companies: Vec<String>,
@@ -325,11 +435,11 @@ impl Default for JobPreferences {
             desired_roles: Vec::new(),
             desired_locations: Vec::new(),
             location_policy: default_location_policy(),
-            remote_preference: "hybrid_ok".to_string(),
+            remote_preference: default_remote_preference(),
             employment_types: vec!["full_time".to_string()],
             engagement_types: Vec::new(),
             minimum_compensation: None,
-            sponsorship: "ask".to_string(),
+            sponsorship: default_sponsorship_policy(),
             excluded_companies: Vec::new(),
             excluded_titles: Vec::new(),
             daily_limit: default_daily_limit(),
@@ -337,6 +447,105 @@ impl Default for JobPreferences {
             max_posting_age_days: default_max_posting_age_days(),
             time_zone_offset_minutes: 0,
             updated_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CareerTrackPolicyAuthority {
+    #[serde(default)]
+    pub taxonomy_version: String,
+    #[serde(default)]
+    pub taxonomy_sha256: String,
+    #[serde(default)]
+    pub taxonomy_activation_epoch: i64,
+    #[serde(default)]
+    pub canonicalizer_schema_version: i64,
+    #[serde(default)]
+    pub canonicalizer_sha256: String,
+    #[serde(default)]
+    pub account_input_generation: i64,
+    #[serde(default)]
+    pub account_input_transition_sha256: String,
+    #[serde(default)]
+    pub account_input_semantic_sha256: String,
+    #[serde(default)]
+    pub track_input_generation: i64,
+    #[serde(default)]
+    pub track_input_transition_sha256: String,
+    #[serde(default)]
+    pub track_semantic_sha256: String,
+    #[serde(default)]
+    pub canonical_role_id: String,
+    #[serde(default)]
+    pub canonical_role_family_id: String,
+    #[serde(default)]
+    pub canonical_location_ids: Vec<String>,
+    #[serde(default)]
+    pub source_resume_asset_id: String,
+    #[serde(default)]
+    pub source_resume_sha256: String,
+    #[serde(default)]
+    pub application_identity_id: String,
+    #[serde(default)]
+    pub application_identity_sha256: String,
+    #[serde(default)]
+    pub job_preferences_sha256: String,
+    #[serde(default)]
+    pub policy_revision_id: String,
+    #[serde(default)]
+    pub policy_revision_no: i64,
+    #[serde(default)]
+    pub canonical_policy_sha256: String,
+    #[serde(default)]
+    pub policy_head_generation: i64,
+    #[serde(default)]
+    pub policy_head_transition_sha256: String,
+    #[serde(default)]
+    pub policy_review_receipt_id: String,
+    #[serde(default)]
+    pub policy_review_receipt_sha256: String,
+    #[serde(default = "default_track_policy_review_state")]
+    pub review_state: String,
+    #[serde(default)]
+    pub review_reason_codes: Vec<String>,
+}
+
+fn default_track_policy_review_state() -> String {
+    "legacy_unreviewed".to_string()
+}
+
+impl Default for CareerTrackPolicyAuthority {
+    fn default() -> Self {
+        Self {
+            taxonomy_version: String::new(),
+            taxonomy_sha256: String::new(),
+            taxonomy_activation_epoch: 0,
+            canonicalizer_schema_version: 0,
+            canonicalizer_sha256: String::new(),
+            account_input_generation: 0,
+            account_input_transition_sha256: String::new(),
+            account_input_semantic_sha256: String::new(),
+            track_input_generation: 0,
+            track_input_transition_sha256: String::new(),
+            track_semantic_sha256: String::new(),
+            canonical_role_id: String::new(),
+            canonical_role_family_id: String::new(),
+            canonical_location_ids: Vec::new(),
+            source_resume_asset_id: String::new(),
+            source_resume_sha256: String::new(),
+            application_identity_id: String::new(),
+            application_identity_sha256: String::new(),
+            job_preferences_sha256: String::new(),
+            policy_revision_id: String::new(),
+            policy_revision_no: 0,
+            canonical_policy_sha256: String::new(),
+            policy_head_generation: 0,
+            policy_head_transition_sha256: String::new(),
+            policy_review_receipt_id: String::new(),
+            policy_review_receipt_sha256: String::new(),
+            review_state: default_track_policy_review_state(),
+            review_reason_codes: Vec::new(),
         }
     }
 }
@@ -353,6 +562,8 @@ pub struct CareerTrackPolicy {
     pub engagement_types: Vec<String>,
     #[serde(default)]
     pub work_authorizations: Vec<String>,
+    #[serde(default)]
+    pub authority: CareerTrackPolicyAuthority,
 }
 
 impl Default for CareerTrackPolicy {
@@ -363,6 +574,7 @@ impl Default for CareerTrackPolicy {
             employment_types: vec!["full_time".to_string()],
             engagement_types: Vec::new(),
             work_authorizations: Vec::new(),
+            authority: CareerTrackPolicyAuthority::default(),
         }
     }
 }
@@ -405,6 +617,130 @@ pub struct AutoSubmitAuthorization {
     pub status: String,
     #[serde(skip_serializing, default)]
     pub authority_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryScamSignal {
+    pub code: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobDiscoveryEvidence {
+    pub provenance: String,
+    pub canonical_status: String,
+    #[serde(default)]
+    pub canonical_job_id: Option<String>,
+    pub employer_verification_status: String,
+    #[serde(default)]
+    pub employer_id: Option<String>,
+    #[serde(default)]
+    pub canonical_employer_domain: Option<String>,
+    #[serde(default)]
+    pub application_domain: Option<String>,
+    pub scam_risk_status: String,
+    #[serde(default)]
+    pub scam_signals: Vec<DiscoveryScamSignal>,
+    pub original_source_status: String,
+    #[serde(default)]
+    pub original_source_checked_at_ms: Option<i64>,
+    #[serde(default)]
+    pub original_source_snapshot_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub original_source_evidence_hash: Option<String>,
+    #[serde(default)]
+    pub original_source_mismatched_fields: Vec<String>,
+    #[serde(default = "default_true")]
+    pub requires_original_revalidation: bool,
+}
+
+impl Default for JobDiscoveryEvidence {
+    fn default() -> Self {
+        Self {
+            provenance: "unknown".to_string(),
+            canonical_status: "unknown".to_string(),
+            canonical_job_id: None,
+            employer_verification_status: "unknown".to_string(),
+            employer_id: None,
+            canonical_employer_domain: None,
+            application_domain: None,
+            scam_risk_status: "unknown".to_string(),
+            scam_signals: Vec::new(),
+            original_source_status: "unknown".to_string(),
+            original_source_checked_at_ms: None,
+            original_source_snapshot_expires_at_ms: None,
+            original_source_evidence_hash: None,
+            original_source_mismatched_fields: Vec::new(),
+            requires_original_revalidation: true,
+        }
+    }
+}
+
+impl JobDiscoveryEvidence {
+    pub fn external_feed_lead(canonical_job_id: String) -> Self {
+        Self {
+            provenance: "external_feed".to_string(),
+            canonical_status: "canonical".to_string(),
+            canonical_job_id: Some(canonical_job_id),
+            ..Self::default()
+        }
+    }
+
+    /// Test-only legacy materialization. Production execution authority must
+    /// never be minted from mutable posting JSON.
+    #[cfg(test)]
+    pub(crate) fn verified_original_source(
+        canonical_job_id: String,
+        employer_id: String,
+        application_domain: Option<String>,
+        checked_at_ms: i64,
+        evidence_hash: String,
+    ) -> Self {
+        let mut evidence = Self::provider_verified_original_source(
+            canonical_job_id,
+            employer_id,
+            application_domain,
+            checked_at_ms,
+            evidence_hash,
+        );
+        evidence.provenance = "test_fixture_original_source".to_string();
+        evidence.employer_verification_status = "verified".to_string();
+        evidence.scam_risk_status = "clear".to_string();
+        evidence
+    }
+
+    /// Record a fresh snapshot from an allowlisted hosted ATS without
+    /// overstating independent employer or scam verification. This evidence
+    /// is sufficient for a review-first packet, but never for unattended
+    /// queueing. Execution-grade source authority is relational and
+    /// release-bound; it is not stored in caller-mutable posting JSON.
+    pub fn provider_verified_original_source(
+        canonical_job_id: String,
+        employer_id: String,
+        application_domain: Option<String>,
+        checked_at_ms: i64,
+        evidence_hash: String,
+    ) -> Self {
+        Self {
+            provenance: "original_source".to_string(),
+            canonical_status: "canonical".to_string(),
+            canonical_job_id: Some(canonical_job_id),
+            employer_verification_status: "ats_tenant_verified".to_string(),
+            employer_id: Some(employer_id),
+            canonical_employer_domain: None,
+            application_domain,
+            scam_risk_status: "source_screened".to_string(),
+            scam_signals: Vec::new(),
+            original_source_status: "verified_open".to_string(),
+            original_source_checked_at_ms: Some(checked_at_ms),
+            original_source_snapshot_expires_at_ms: Some(
+                checked_at_ms.saturating_add(24 * 60 * 60 * 1_000),
+            ),
+            original_source_evidence_hash: Some(evidence_hash),
+            original_source_mismatched_fields: Vec::new(),
+            requires_original_revalidation: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,6 +787,8 @@ pub struct JobPosting {
     pub created_at_ms: i64,
     #[serde(default)]
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub discovery_evidence: JobDiscoveryEvidence,
     #[serde(default)]
     pub eligibility: Option<JobEligibilityDecision>,
 }
@@ -566,6 +904,8 @@ pub struct DiscoveryRunResult {
     pub status: String,
     pub discovered_count: i64,
     pub upserted_count: i64,
+    #[serde(default)]
+    pub held_count: i64,
     pub closed_count: i64,
     pub replayed: bool,
 }
@@ -687,6 +1027,8 @@ pub struct JobDiscoveryAuthority {
     pub membership_status: String,
     pub last_seen_at_ms: i64,
     pub last_seen_run_id: String,
+    #[serde(default)]
+    pub workday_reconciliation_held: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,6 +1066,41 @@ pub struct RoleExperienceEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AtsCertificationSummary {
+    pub provider_label: String,
+    #[serde(default)]
+    pub adapter_version: Option<String>,
+    #[serde(default)]
+    pub certified_runner_kinds: Vec<String>,
+    pub status: String,
+    #[serde(default)]
+    pub last_verified_at_ms: Option<i64>,
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
+    pub reason: String,
+    pub next_action: String,
+    pub canary_available: bool,
+}
+
+impl Default for AtsCertificationSummary {
+    fn default() -> Self {
+        Self {
+            provider_label: "Application site".to_string(),
+            adapter_version: None,
+            certified_runner_kinds: Vec::new(),
+            status: "review_only".to_string(),
+            last_verified_at_ms: None,
+            expires_at_ms: None,
+            reason: "No active ATS certification is available for this exact application target."
+                .to_string(),
+            next_action: "Review the packet and complete the provider-specific approval."
+                .to_string(),
+            canary_available: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobEligibilityDecision {
     pub capability: String,
     pub can_prepare: bool,
@@ -750,6 +1127,8 @@ pub struct JobEligibilityDecision {
     pub application_identity_id: Option<String>,
     #[serde(default)]
     pub evidence_revision_id: Option<String>,
+    #[serde(default)]
+    pub ats_certification: AtsCertificationSummary,
     pub evaluated_at_ms: i64,
 }
 
@@ -771,6 +1150,7 @@ impl Default for JobEligibilityDecision {
             career_track_id: String::new(),
             application_identity_id: None,
             evidence_revision_id: None,
+            ats_certification: AtsCertificationSummary::default(),
             evaluated_at_ms: 0,
         }
     }
@@ -1066,6 +1446,16 @@ pub struct JobsOAuthState {
     pub provider: String,
     pub code_verifier: String,
     #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub authorization_purpose: String,
+    #[serde(default)]
+    pub requested_scopes: Vec<String>,
+    #[serde(default)]
+    pub requested_capabilities: Vec<String>,
+    #[serde(default)]
+    pub expected_grant_revision: i64,
+    #[serde(default)]
     pub return_path: String,
     pub expires_at_ms: i64,
     pub created_at_ms: i64,
@@ -1081,6 +1471,12 @@ pub struct JobsProviderCredential {
     pub refresh_token: String,
     #[serde(default)]
     pub scopes: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub grant_revision: i64,
+    #[serde(default)]
+    pub grant_sha256: String,
     pub expires_at_ms: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -1140,6 +1536,202 @@ pub struct JobsProviderMessage {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationAction {
+    #[serde(default)]
+    pub id: String,
+    pub application_id: String,
+    pub connection_id: String,
+    #[serde(default)]
+    pub source_message_id: Option<String>,
+    pub kind: String,
+    pub provider: String,
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub payload_sha256: String,
+    #[serde(default)]
+    pub authority_sha256: String,
+    #[serde(default = "default_pending_status")]
+    pub status: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+    #[serde(default)]
+    pub lease_kind: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub active_attempt_id: Option<String>,
+    #[serde(default)]
+    pub next_attempt_at_ms: i64,
+    #[serde(default)]
+    pub attempt_count: i64,
+    #[serde(default)]
+    pub reconciliation_count: i64,
+    #[serde(default = "default_action_revision")]
+    pub action_revision: i64,
+    #[serde(default)]
+    pub approval_revision: i64,
+    #[serde(default)]
+    pub approved_authority_sha256: String,
+    #[serde(default)]
+    pub approved_grant_revision: i64,
+    #[serde(default)]
+    pub approved_grant_sha256: String,
+    #[serde(default)]
+    pub approved_at_ms: Option<i64>,
+    #[serde(default)]
+    pub dispatched_at_ms: Option<i64>,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+fn default_action_revision() -> i64 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationActionLease {
+    pub account_id: String,
+    pub action: JobsCommunicationAction,
+    pub attempt_id: String,
+    pub lease_kind: String,
+    pub provider_operation_key: String,
+    pub authority_sha256: String,
+    pub approval_revision: i64,
+    pub grant_revision: i64,
+    pub grant_sha256: String,
+    pub lease_token: String,
+    pub fence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsCommunicationLeaseAccess {
+    pub account_id: String,
+    pub action_id: String,
+    pub attempt_id: String,
+    pub owner_id: String,
+    pub lease_token: String,
+    pub fence: i64,
+    pub authority_sha256: String,
+    pub approval_revision: i64,
+    pub grant_revision: i64,
+    pub grant_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationActionFinish {
+    #[serde(flatten)]
+    pub lease: JobsCommunicationLeaseAccess,
+    pub outcome: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub evidence: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationActionReconciliation {
+    #[serde(flatten)]
+    pub lease: JobsCommunicationLeaseAccess,
+    pub resolution: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub evidence: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationAttemptEvidence {
+    pub id: String,
+    pub action_id: String,
+    pub provider: String,
+    pub provider_operation_key: String,
+    pub dispatch_no: i64,
+    pub approval_revision: i64,
+    pub authority_sha256: String,
+    pub grant_revision: i64,
+    pub grant_sha256: String,
+    pub state: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub evidence: Value,
+    pub evidence_sha256: String,
+    pub request_started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationReconciliationEvidence {
+    pub id: String,
+    pub action_id: String,
+    pub attempt_id: String,
+    pub fence: i64,
+    pub resolution: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub evidence: Value,
+    pub evidence_sha256: String,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobsCommunicationActionExport {
+    pub id: String,
+    pub application_id: String,
+    pub connection_id: String,
+    pub source_message_id: Option<String>,
+    pub kind: String,
+    pub provider: String,
+    pub payload: Value,
+    pub status: String,
+    pub action_revision: i64,
+    pub approval_revision: i64,
+    pub approved_at_ms: Option<i64>,
+    pub dispatched_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobsProviderMessageExport {
+    pub id: String,
+    pub connection_id: String,
+    pub provider: String,
+    pub sender: String,
+    pub recipients: Vec<String>,
+    pub subject: String,
+    pub body_text: String,
+    pub received_at_ms: i64,
+    pub application_id: Option<String>,
+    pub processing_status: String,
+    pub classification: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobsCommunicationEvidenceExport {
+    pub action_id: String,
+    pub event_kind: String,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobsCommunicationReconciliationExport {
+    pub action_id: String,
+    pub resolution: String,
+    pub recorded_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsEntitlement {
     pub plan: String,
@@ -1158,6 +1750,52 @@ pub struct JobsEntitlement {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalBrowserReleaseArtifact {
+    pub platform: String,
+    pub architecture: String,
+    pub package_kind: String,
+    pub role: String,
+    pub file_name: String,
+    pub url: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub descriptor_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LocalBrowserReleaseAvailability {
+    Available {
+        reason: String,
+        channel: String,
+        release_id: String,
+        artifact_origin: String,
+        manifest_sha256: String,
+        release_sequence: i64,
+        build_id: String,
+        app_version: String,
+        protocol_version: i64,
+        released_at_ms: i64,
+        artifacts: Vec<LocalBrowserReleaseArtifact>,
+    },
+    Disabled {
+        reason: String,
+    },
+    Unassigned {
+        reason: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl LocalBrowserReleaseAvailability {
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerChannelAvailability {
     pub status: String,
     pub available: bool,
@@ -1165,17 +1803,20 @@ pub struct RunnerChannelAvailability {
     pub distribution_enabled: bool,
     pub reason: String,
     pub next_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release: Option<LocalBrowserReleaseAvailability>,
 }
 
 impl Default for RunnerChannelAvailability {
     fn default() -> Self {
         Self {
-            status: "invited_beta".to_string(),
+            status: "limited_beta".to_string(),
             available: false,
             plan_included: false,
             distribution_enabled: false,
             reason: "This runner is not available for this account.".to_string(),
             next_action: "Use Review first.".to_string(),
+            release: None,
         }
     }
 }
@@ -1254,11 +1895,38 @@ pub struct ExecutionLeaseGrant {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RunnerVolumeExecutionLeaseGrant {
+    #[serde(flatten)]
+    pub lease: ExecutionLeaseGrant,
+    pub purge_subject: String,
+    pub volume_id: String,
+    pub enrollment_epoch: i64,
+    pub process_instance_id: String,
+    pub volume_key_fingerprint: String,
+    pub runtime_grant_id: String,
+    pub runtime_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExecutionLeaseRecord {
     pub run_id: String,
     pub fence: i64,
     pub lease_expires_at_ms: i64,
     pub phase: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BrowserProfileSnapshotRecord {
+    pub browser_profile_id: String,
+    pub generation: i64,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub envelope_version: i64,
+    pub writer_run_id: String,
+    pub writer_fence: i64,
+    pub updated_at_ms: i64,
+    #[serde(skip_serializing)]
+    pub object_key: String,
 }
 
 #[derive(Debug, Error)]
@@ -1292,13 +1960,74 @@ impl From<postgres::Error> for ExecutionLeaseError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsMatchesPageInfo {
+    pub schema_version: i64,
+    pub page_size: i64,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+impl Default for JobsMatchesPageInfo {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            page_size: 50,
+            has_more: false,
+            next_cursor: None,
+        }
+    }
+}
+
+impl JobsMatchesPageInfo {
+    fn omitted_from_exhaustive_export() -> Self {
+        Self {
+            schema_version: 1,
+            page_size: 0,
+            has_more: false,
+            next_cursor: None,
+        }
+    }
+
+    fn is_omitted_from_exhaustive_export(&self) -> bool {
+        self.schema_version == 1
+            && self.page_size == 0
+            && !self.has_more
+            && self.next_cursor.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobsMatchesPage {
+    pub matches: Vec<JobPosting>,
+    pub page: JobsMatchesPageInfo,
+}
+
+/// Frozen, display-only context for an existing application. It must never be
+/// used as current source, ATS, integrity, handoff, or effect authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplicationJobContext {
+    pub id: String,
+    pub company: String,
+    pub title: String,
+    pub location: String,
+    pub track_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsWorkspace {
     pub profile: CareerProfile,
     pub preferences: JobPreferences,
     pub facts: Vec<CareerFact>,
     pub tracks: Vec<CareerTrack>,
     pub matches: Vec<JobPosting>,
+    #[serde(
+        default,
+        skip_serializing_if = "JobsMatchesPageInfo::is_omitted_from_exhaustive_export"
+    )]
+    pub matches_page: JobsMatchesPageInfo,
     pub applications: Vec<JobApplication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub application_jobs: Vec<ApplicationJobContext>,
     pub application_evidence: Vec<ApplicationEvidence>,
     pub browser_sessions: Vec<BrowserSession>,
     pub interventions: Vec<Intervention>,
@@ -1320,10 +2049,20 @@ pub struct JobsWorkspace {
 /// already represented by the workspace and resume versions.
 #[derive(Debug, Clone, Serialize)]
 pub struct JobsAccountExport {
-    pub workspace: JobsWorkspace,
+    pub workspace: Option<JobsWorkspace>,
+    pub application_answer_revisions: Vec<ApplicationAnswerRevision>,
+    pub canonical_track_policy_ledger: CanonicalTrackPolicyLedgerExport,
     pub resume_versions: Vec<ResumeVersion>,
     pub attempt_reservations: Vec<AttemptReservation>,
     pub run_events: Vec<RunEvent>,
+    pub provider_messages: Vec<JobsProviderMessageExport>,
+    pub communication_actions: Vec<JobsCommunicationActionExport>,
+    pub communication_evidence: Vec<JobsCommunicationEvidenceExport>,
+    pub communication_reconciliations: Vec<JobsCommunicationReconciliationExport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub public_beta_enrollments: Vec<super::jobs_beta_access::PublicBetaEnrollmentExport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub public_beta_overrides: Vec<super::jobs_beta_access::PublicBetaOverrideExport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1345,6 +2084,12 @@ pub struct AttemptReservation {
     pub status: String,
     pub reserved_at_ms: i64,
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub canonical_employer_id: Option<String>,
+    #[serde(default)]
+    pub canonical_employer_domain: Option<String>,
+    #[serde(default)]
+    pub employer_attestation_sha256: Option<String>,
 }
 
 fn default_resume_mode() -> String {
@@ -1368,6 +2113,14 @@ fn default_max_posting_age_days() -> i64 {
 }
 
 fn default_location_policy() -> String {
+    "ask".to_string()
+}
+
+fn default_remote_preference() -> String {
+    "hybrid_ok".to_string()
+}
+
+fn default_sponsorship_policy() -> String {
     "ask".to_string()
 }
 
@@ -1608,9 +2361,23 @@ fn parse_json_lossy<T: DeserializeOwned>(raw: &str) -> Option<T> {
 }
 
 include!("jobs/candidate_policy.rs");
+include!("jobs/taxonomy_policy.rs");
 include!("jobs/resume_truth.rs");
 include!("jobs/evidence.rs");
 include!("jobs/profile_postings.rs");
+#[cfg(feature = "jobs-submission-observation")]
+#[path = "jobs/submission_observation.rs"]
+pub(crate) mod submission_observation;
+#[path = "jobs/workday_hold_storage.rs"]
+mod workday_hold_storage;
+use workday_hold_storage::{
+    count_workday_reconciliation_holds_postgres, count_workday_reconciliation_holds_sqlite,
+    record_workday_reconciliation_hold_observation_postgres,
+    record_workday_reconciliation_hold_observation_sqlite,
+    write_workday_reconciliation_hold_postgres, write_workday_reconciliation_hold_sqlite,
+    WorkdayReconciliationHoldInput, WorkdayReconciliationHoldObservationInput,
+    WorkdayReconciliationHoldRunInput,
+};
 include!("jobs/discovery.rs");
 include!("jobs/global_discovery.rs");
 include!("jobs/global_discovery_completion.rs");
@@ -1618,17 +2385,137 @@ include!("jobs/global_materialization.rs");
 include!("jobs/global_archive.rs");
 include!("jobs/resume_assets.rs");
 include!("jobs/auto_submit.rs");
+include!("jobs/operational_holds.rs");
+include!("jobs/attempt_employer_identity.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
+include!("jobs/application_answer_revisions.rs");
 include!("jobs/customer_data.rs");
+include!("jobs/submission_reconciliation.rs");
 include!("jobs/mailbox_sync.rs");
+include!("jobs/communication_actions.rs");
+include!("jobs/workflow_commands.rs");
+include!("jobs/workflow_cleanup.rs");
 include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
+include!("jobs/local_run_publication_transport.rs");
+include!("jobs/local_run_publication.rs");
+#[cfg(test)]
+#[path = "jobs/local_run_publication_tests.rs"]
+mod local_run_publication_tests;
+include!("jobs/execution_session_authority.rs");
 include!("jobs/execution_leases.rs");
+include!("jobs/runner_volume_purge.rs");
+include!("jobs/browser_release_authority.rs");
+include!("jobs/browser_release_trust.rs");
+include!("jobs/browser_release_registry.rs");
+include!("jobs/ats_certification_authority.rs");
+include!("jobs/ats_certification_page.rs");
+include!("jobs/managed_cloud_release_authority.rs");
+#[path = "jobs/managed_cloud_provisioning_installation.rs"]
+pub(crate) mod managed_cloud_provisioning_installation;
+#[path = "jobs/managed_cloud_provisioning_persistence.rs"]
+mod managed_cloud_provisioning_persistence;
+#[path = "jobs/managed_cloud_provisioning_protocol.rs"]
+pub(crate) mod managed_cloud_provisioning_protocol;
+#[path = "jobs/managed_cloud_provisioning_runtime.rs"]
+pub(crate) mod managed_cloud_provisioning_runtime;
+#[path = "jobs/managed_cloud_provisioning_snapshot.rs"]
+pub(crate) mod managed_cloud_provisioning_snapshot;
+include!("jobs/original_source_verification.rs");
+#[cfg(test)]
+#[path = "jobs/original_source_parser_refresh.rs"]
+mod original_source_parser_refresh;
+#[cfg(test)]
+#[path = "jobs/original_source_parser_refresh_tests.rs"]
+mod original_source_parser_refresh_tests;
+#[cfg(test)]
+#[path = "jobs/original_source_signed_worker_handoff_tests.rs"]
+mod original_source_signed_worker_handoff_tests;
+#[path = "jobs/smartrecruiters_requirements.rs"]
+pub(crate) mod smartrecruiters_requirements;
+include!("jobs/source_verifier_boot.rs");
+include!("jobs/job_integrity_authority.rs");
+include!("jobs/job_integrity_composition.rs");
+include!("jobs/browser_profile_snapshots.rs");
 include!("jobs/workspace.rs");
+
+#[cfg(any(test, feature = "integration-test-support"))]
+#[cfg_attr(feature = "integration-test-support", allow(dead_code))]
+#[path = "jobs/production_positive_authority_fixture.rs"]
+pub(crate) mod production_positive_authority_fixture;
+
+#[cfg(all(debug_assertions, feature = "integration-test-support"))]
+#[doc(hidden)]
+#[path = "jobs/runner_control_plane_fixture.rs"]
+pub mod integration_test_runner_control_plane;
+
+#[cfg(feature = "integration-test-support")]
+#[doc(hidden)]
+pub struct IntegrationTestProductionPositiveJobAuthoritiesRequest<'a> {
+    pub pool: &'a DbPool,
+    pub account_id: &'a str,
+    pub posting: &'a JobPosting,
+    pub profile: &'a CareerProfile,
+    pub preferences: &'a JobPreferences,
+    pub canonical_employer_domain: &'a str,
+    pub suffix: &'a str,
+    pub runner_kind: &'a str,
+}
+
+#[cfg(feature = "integration-test-support")]
+#[doc(hidden)]
+pub fn install_integration_test_production_positive_job_authorities(
+    request: IntegrationTestProductionPositiveJobAuthoritiesRequest<'_>,
+) -> JobPosting {
+    let (saved, managed) =
+        production_positive_authority_fixture::save_production_positive_verified_import(
+            request.pool,
+            request.account_id,
+            request.posting,
+            request.profile,
+            request.preferences,
+        );
+    let installed =
+        production_positive_authority_fixture::install_production_positive_job_authorities_for_runner(
+            request.pool,
+            request.account_id,
+            &saved,
+            &managed,
+            request.canonical_employer_domain,
+            request.suffix,
+            request.runner_kind,
+        );
+    assert!(installed.source.feature_active);
+    assert!(installed.source.integrity_binding.is_some());
+    assert_eq!(installed.ats.status.status, "active");
+    assert!(installed.ats.active_binding.is_some());
+    assert_eq!(
+        installed.composed.job_integrity.status,
+        JobIntegrityResolutionStatus::Verified
+    );
+    installed.posting
+}
 
 #[cfg(test)]
 #[path = "jobs/postgres_local_authority_tests.rs"]
 mod postgres_local_authority_tests;
 
+#[cfg(test)]
+#[path = "jobs/execution_session_authority_tests.rs"]
+mod execution_session_authority_db_tests;
+
+#[cfg(test)]
+#[path = "jobs/answer_memory_binding_tests.rs"]
+mod answer_memory_binding_tests;
+
+#[cfg(test)]
+#[path = "jobs/answer_memory_writer_tests.rs"]
+mod answer_memory_writer_tests;
+
 include!("jobs/tests.rs");
+
+#[cfg(test)]
+pub(crate) use tests::{
+    authenticated_worker_submit_snapshot, seed_c2c_candidate_submission_for_router,
+};

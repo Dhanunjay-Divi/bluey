@@ -17,11 +17,20 @@ type HmacSha256 = Hmac<Sha256>;
 type AuthError = (StatusCode, String);
 
 const SIGNATURE_VERSION: &str = "bluey-jobs-worker-v1";
+const MANAGED_CLOUD_SIGNATURE_VERSION: &str = "bluey-jobs-worker-v2";
 const SIGNATURE_AUDIENCE: &str = "bluey-jobs-api";
 const SIGNATURE_WINDOW_SECS: u64 = 90;
 const DEFAULT_SIGNED_BODY_BYTES: usize = 4 * 1024 * 1024;
 const DISCOVERY_SIGNED_BODY_BYTES: usize = 32 * 1024 * 1024;
+const BROWSER_PROFILE_SIGNED_BODY_BYTES: usize = 64 * 1024 * 1024;
 const RECEIPT_SIGNED_BODY_BYTES: usize = 64 * 1024 * 1024;
+const ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES: usize = 256 * 1024;
+const WORKFLOW_COMMAND_SIGNED_BODY_BYTES: usize = 16 * 1024;
+const WORKFLOW_INTERVENTION_PREPARE_SIGNED_BODY_BYTES: usize = 256 * 1024;
+const MANAGED_CLOUD_RUNTIME_SIGNED_BODY_BYTES: usize = 64 * 1024;
+const ORIGINAL_SOURCE_VERIFICATION_SIGNED_BODY_BYTES: usize = 256 * 1024;
+const ATS_LAYOUT_OBSERVATION_PATH: &str =
+    "/api/jobs/internal/ats-certifications/layout-observations";
 
 #[derive(Debug, Clone)]
 pub struct JobsWorkerIdentity {
@@ -40,6 +49,7 @@ struct WorkerSignatureInput<'a> {
     nonce: &'a str,
     audience: &'a str,
     scope: &'a str,
+    origin: Option<&'a str>,
     method: &'a str,
     path: &'a str,
     content_sha256: &'a str,
@@ -107,6 +117,16 @@ fn verify_request(
     request: &Request<Body>,
     now_secs: u64,
 ) -> Result<VerifiedWorkerRequest, AuthError> {
+    // V2 signs exact query-free control paths. Do not discard an unsigned query
+    // while deriving a scope or the HMAC input. Legacy wire behavior is unchanged.
+    if request
+        .uri()
+        .path()
+        .starts_with("/api/jobs/internal/managed-cloud/v2/")
+        && request.uri().query().is_some()
+    {
+        return Err(unauthorized());
+    }
     let worker_id = required_header(request, "x-bluey-jobs-worker-id")?;
     let timestamp_raw = required_header(request, "x-bluey-jobs-worker-timestamp")?;
     let nonce = required_header(request, "x-bluey-jobs-worker-nonce")?;
@@ -136,6 +156,22 @@ fn verify_request(
     if supplied_scope != expected_scope {
         return Err(unauthorized());
     }
+    let supplied_origin = optional_header(request, "x-bluey-jobs-worker-origin")?;
+    let origin = if expected_scope == "managed-cloud-runtime" {
+        let expected_origin =
+            crate::jobs_managed_cloud_runtime::managed_cloud_api_origin_for_worker_auth()
+                .ok_or_else(unauthorized)?;
+        let supplied_origin = supplied_origin.ok_or_else(unauthorized)?;
+        if supplied_origin != expected_origin {
+            return Err(unauthorized());
+        }
+        Some(expected_origin)
+    } else {
+        if supplied_origin.is_some() {
+            return Err(unauthorized());
+        }
+        None
+    };
 
     let canonical = canonical_request(WorkerSignatureInput {
         worker_id,
@@ -143,6 +179,7 @@ fn verify_request(
         nonce,
         audience: SIGNATURE_AUDIENCE,
         scope: expected_scope,
+        origin: origin.as_deref(),
         method: request.method().as_str(),
         path: request.uri().path(),
         content_sha256,
@@ -167,17 +204,31 @@ fn verify_request(
 }
 
 fn canonical_request(input: WorkerSignatureInput<'_>) -> String {
-    format!(
-        "{SIGNATURE_VERSION}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        input.timestamp,
-        input.nonce,
-        input.worker_id,
-        input.audience,
-        input.scope,
-        input.method.to_ascii_uppercase(),
-        input.path,
-        input.content_sha256,
-    )
+    match input.origin {
+        Some(origin) => format!(
+            "{MANAGED_CLOUD_SIGNATURE_VERSION}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            input.timestamp,
+            input.nonce,
+            input.worker_id,
+            input.audience,
+            input.scope,
+            origin,
+            input.method.to_ascii_uppercase(),
+            input.path,
+            input.content_sha256,
+        ),
+        None => format!(
+            "{SIGNATURE_VERSION}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            input.timestamp,
+            input.nonce,
+            input.worker_id,
+            input.audience,
+            input.scope,
+            input.method.to_ascii_uppercase(),
+            input.path,
+            input.content_sha256,
+        ),
+    }
 }
 
 fn signature_matches(key: &str, canonical: &[u8], supplied_hex: &str) -> bool {
@@ -196,7 +247,19 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
     if !method.eq_ignore_ascii_case("POST") || !path.starts_with("/api/jobs/internal/") {
         return None;
     }
-    if path.contains("/execution-leases/") {
+    if workflow_command_materialize_path(path) {
+        Some("workflow-command-materialize")
+    } else if workflow_command_execution_path(path) {
+        Some("workflow-command-execution")
+    } else if managed_cloud_runtime_path(path) {
+        Some("managed-cloud-runtime")
+    } else if original_source_verification_path(path) {
+        Some("original-source-verification")
+    } else if path == ATS_LAYOUT_OBSERVATION_PATH {
+        Some("ats-layout-observation")
+    } else if path.contains("/runner-volumes/") {
+        Some("runner-volume")
+    } else if path.contains("/execution-leases/") {
         Some("execution")
     } else if path.contains("/discovery/") || path.contains("/global-discovery/") {
         Some("discovery")
@@ -214,8 +277,20 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
 }
 
 fn signed_body_limit(path: &str) -> usize {
-    if path.ends_with("/receipt") {
+    if workflow_command_intervention_prepare_path(path) {
+        WORKFLOW_INTERVENTION_PREPARE_SIGNED_BODY_BYTES
+    } else if managed_cloud_runtime_path(path) {
+        MANAGED_CLOUD_RUNTIME_SIGNED_BODY_BYTES
+    } else if original_source_verification_path(path) {
+        ORIGINAL_SOURCE_VERIFICATION_SIGNED_BODY_BYTES
+    } else if workflow_command_materialize_path(path) || workflow_command_execution_path(path) {
+        WORKFLOW_COMMAND_SIGNED_BODY_BYTES
+    } else if path == ATS_LAYOUT_OBSERVATION_PATH {
+        ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES
+    } else if path.ends_with("/receipt") {
         RECEIPT_SIGNED_BODY_BYTES
+    } else if path.contains("/execution-leases/") && path.ends_with("/profile/store") {
+        BROWSER_PROFILE_SIGNED_BODY_BYTES
     } else if (path.contains("/discovery/") || path.contains("/global-discovery/"))
         && (path.ends_with("/complete") || path.ends_with("/batches"))
     {
@@ -225,6 +300,122 @@ fn signed_body_limit(path: &str) -> usize {
     }
 }
 
+fn workflow_command_materialize_path(path: &str) -> bool {
+    let Some(request_id) = path
+        .strip_prefix("/api/jobs/internal/workflow-commands/")
+        .and_then(|rest| rest.strip_suffix("/materialize"))
+    else {
+        return false;
+    };
+    valid_workflow_identifier(request_id, 20, 128)
+}
+
+fn managed_cloud_runtime_path(path: &str) -> bool {
+    let provisioning_claim = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/v2/runtime-grants/")
+        .and_then(|rest| rest.strip_suffix("/claim"))
+        .is_some_and(|grant_id| valid_workflow_identifier(grant_id, 20, 128));
+    let provisioning_instance = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/v2/runtime-instances/")
+        .is_some_and(|rest| {
+            [
+                "/heartbeats",
+                "/source-verifier-boot-registration",
+                "/source-verifier-boot-startup",
+            ]
+            .into_iter()
+            .any(|suffix| {
+                rest.strip_suffix(suffix)
+                    .is_some_and(|id| valid_workflow_identifier(id, 20, 128))
+            })
+        });
+    let grant_claim = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/runtime-grants/")
+        .and_then(|rest| rest.strip_suffix("/claim"))
+        .is_some_and(|grant_id| valid_workflow_identifier(grant_id, 20, 128));
+    let heartbeat = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/runtime-instances/")
+        .and_then(|rest| rest.strip_suffix("/heartbeats"))
+        .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
+    let original_source_verifier_startup = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/runtime-instances/")
+        .and_then(|rest| rest.strip_suffix("/original-source-verifier-startup"))
+        .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
+    let source_verifier_boot_registration = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/runtime-instances/")
+        .and_then(|rest| rest.strip_suffix("/source-verifier-boot-registration"))
+        .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
+    let source_verifier_boot_startup = path
+        .strip_prefix("/api/jobs/internal/managed-cloud/runtime-instances/")
+        .and_then(|rest| rest.strip_suffix("/source-verifier-boot-startup"))
+        .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
+    grant_claim
+        || provisioning_claim
+        || provisioning_instance
+        || heartbeat
+        || original_source_verifier_startup
+        || source_verifier_boot_registration
+        || source_verifier_boot_startup
+}
+
+fn original_source_verification_path(path: &str) -> bool {
+    const PREFIX: &str = "/api/jobs/internal/original-source-verifications/";
+    if path == concat!("/api/jobs/internal/original-source-verifications/", "lease") {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix(PREFIX) else {
+        return false;
+    };
+    ["/heartbeat", "/complete", "/fail"]
+        .into_iter()
+        .any(|suffix| {
+            rest.strip_suffix(suffix)
+                .is_some_and(|assignment_id| valid_workflow_identifier(assignment_id, 20, 128))
+        })
+}
+
+fn workflow_command_execution_path(path: &str) -> bool {
+    workflow_command_intervention_prepare_path(path)
+        || workflow_command_finalize_path(path)
+        || workflow_command_intervention_publish_path(path)
+}
+
+fn workflow_command_intervention_prepare_path(path: &str) -> bool {
+    workflow_command_request_id(path, "/intervention/prepare").is_some()
+}
+
+fn workflow_command_finalize_path(path: &str) -> bool {
+    workflow_command_request_id(path, "/finalize").is_some()
+}
+
+fn workflow_command_intervention_publish_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/jobs/internal/workflow-commands/") else {
+        return false;
+    };
+    let Some((request_id, rest)) = rest.split_once("/intervention/") else {
+        return false;
+    };
+    let Some(intervention_id) = rest.strip_suffix("/publish") else {
+        return false;
+    };
+    valid_workflow_identifier(request_id, 20, 128)
+        && valid_workflow_identifier(intervention_id, 20, 128)
+}
+
+fn workflow_command_request_id<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let request_id = path
+        .strip_prefix("/api/jobs/internal/workflow-commands/")?
+        .strip_suffix(suffix)?;
+    valid_workflow_identifier(request_id, 20, 128).then_some(request_id)
+}
+
+fn valid_workflow_identifier(value: &str, min: usize, max: usize) -> bool {
+    (min..=max).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn required_header<'a>(request: &'a Request<Body>, name: &str) -> Result<&'a str, AuthError> {
     request
         .headers()
@@ -232,6 +423,18 @@ fn required_header<'a>(request: &'a Request<Body>, name: &str) -> Result<&'a str
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
         .ok_or_else(unauthorized)
+}
+
+fn optional_header<'a>(
+    request: &'a Request<Body>,
+    name: &str,
+) -> Result<Option<&'a str>, AuthError> {
+    request
+        .headers()
+        .get(name)
+        .map(|value| value.to_str().map_err(|_| unauthorized()))
+        .transpose()
+        .map(|value| value.filter(|value| !value.is_empty()))
 }
 
 fn valid_identifier(value: &str, min: usize, max: usize) -> bool {
@@ -254,6 +457,13 @@ fn unauthorized() -> AuthError {
 
 #[cfg(debug_assertions)]
 fn legacy_debug_token_valid(request: &Request<Body>) -> bool {
+    if request.uri().path() == ATS_LAYOUT_OBSERVATION_PATH
+        || managed_cloud_runtime_path(request.uri().path())
+        || original_source_verification_path(request.uri().path())
+        || managed_execution_effect_authorization_path(request.uri().path())
+    {
+        return false;
+    }
     let expected = std::env::var("BLUEY_JOBS_WORKER_TOKEN").unwrap_or_default();
     let supplied = request
         .headers()
@@ -264,6 +474,13 @@ fn legacy_debug_token_valid(request: &Request<Body>) -> bool {
     !expected.is_empty()
         && supplied.len() == expected.len()
         && supplied.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1
+}
+
+#[cfg(any(debug_assertions, test))]
+fn managed_execution_effect_authorization_path(path: &str) -> bool {
+    path.strip_prefix("/api/jobs/internal/execution-leases/")
+        .and_then(|rest| rest.strip_suffix("/authorize-managed-effect"))
+        .is_some_and(|run_id| !run_id.is_empty() && !run_id.contains('/'))
 }
 
 #[cfg(test)]
@@ -281,6 +498,7 @@ mod tests {
             nonce,
             audience: SIGNATURE_AUDIENCE,
             scope,
+            origin: None,
             method: "POST",
             path,
             content_sha256: &content_sha256,
@@ -311,8 +529,140 @@ mod tests {
             Some("discovery")
         );
         assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/original-source-verifications/lease"
+            ),
+            Some("original-source-verification")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                concat!(
+                    "/api/jobs/internal/original-source-verifications/",
+                    "source-verification-assignment-123/heartbeat"
+                )
+            ),
+            Some("original-source-verification")
+        );
+        assert_eq!(
             worker_scope("POST", "/api/jobs/internal/execution-leases/run/heartbeat"),
             Some("execution")
+        );
+        assert_eq!(
+            worker_scope("POST", "/api/jobs/internal/runner-volumes/volume/poll"),
+            Some("runner-volume")
+        );
+        assert_eq!(
+            worker_scope("POST", ATS_LAYOUT_OBSERVATION_PATH),
+            Some("ats-layout-observation")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/materialize"
+            ),
+            Some("workflow-command-materialize")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/intervention/prepare"
+            ),
+            Some("workflow-command-execution")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/managed-cloud/runtime-grants/cloud-grant-1234567890/claim"
+            ),
+            Some("managed-cloud-runtime")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                concat!(
+                    "/api/jobs/internal/managed-cloud/runtime-instances/",
+                    "cloud-instance-1234567890/original-source-verifier-startup"
+                )
+            ),
+            Some("managed-cloud-runtime")
+        );
+        assert_eq!(
+            signed_body_limit(concat!(
+                "/api/jobs/internal/managed-cloud/runtime-instances/",
+                "cloud-instance-1234567890/original-source-verifier-startup"
+            )),
+            MANAGED_CLOUD_RUNTIME_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                concat!(
+                    "/api/jobs/internal/managed-cloud/runtime-instances/",
+                    "cloud-instance-1234567890/heartbeats"
+                )
+            ),
+            Some("managed-cloud-runtime")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/intervention/wfint-v2-123456789012/publish"
+            ),
+            Some("workflow-command-execution")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/finalize"
+            ),
+            Some("workflow-command-execution")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/short/materialize"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-1234567890/intervention/short/publish"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq:v2:1234567890/materialize"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/ats-certifications/layout-observations/extra"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/original-source-verifications/short/complete"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                concat!(
+                    "/api/jobs/internal/original-source-verifications/",
+                    "source-verification-assignment-123/unknown"
+                )
+            ),
+            None
         );
         assert_eq!(
             worker_scope("GET", "/api/jobs/internal/discovery/lease"),
@@ -321,6 +671,10 @@ mod tests {
         assert_eq!(
             signed_body_limit("/api/jobs/internal/applications/app/receipt"),
             RECEIPT_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit("/api/jobs/internal/execution-leases/run/profile/store"),
+            BROWSER_PROFILE_SIGNED_BODY_BYTES
         );
         assert_eq!(
             signed_body_limit("/api/jobs/internal/discovery/source/complete"),
@@ -334,6 +688,97 @@ mod tests {
             signed_body_limit("/api/jobs/internal/discovery/lease"),
             DEFAULT_SIGNED_BODY_BYTES
         );
+        assert_eq!(
+            signed_body_limit("/api/jobs/internal/original-source-verifications/lease"),
+            ORIGINAL_SOURCE_VERIFICATION_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit(ATS_LAYOUT_OBSERVATION_PATH),
+            ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit(
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/materialize"
+            ),
+            WORKFLOW_COMMAND_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit(
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/intervention/prepare"
+            ),
+            WORKFLOW_INTERVENTION_PREPARE_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit(
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/intervention/wfint-v2-123456789012/publish"
+            ),
+            WORKFLOW_COMMAND_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit(concat!(
+                "/api/jobs/internal/managed-cloud/runtime-instances/",
+                "cloud-instance-1234567890/heartbeats"
+            )),
+            MANAGED_CLOUD_RUNTIME_SIGNED_BODY_BYTES
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial]
+    fn managed_cloud_runtime_never_accepts_the_legacy_debug_bearer() {
+        let prior = std::env::var_os("BLUEY_JOBS_WORKER_TOKEN");
+        std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", "legacy-debug-token");
+        let request = Request::post(
+            "/api/jobs/internal/managed-cloud/runtime-grants/cloud-grant-1234567890/claim",
+        )
+        .header("authorization", "Bearer legacy-debug-token")
+        .body(Body::empty())
+        .unwrap();
+        assert!(!legacy_debug_token_valid(&request));
+        match prior {
+            Some(value) => std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", value),
+            None => std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN"),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial]
+    fn managed_execution_effect_never_accepts_the_legacy_debug_bearer() {
+        let prior = std::env::var_os("BLUEY_JOBS_WORKER_TOKEN");
+        std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", "legacy-debug-token");
+        let request =
+            Request::post("/api/jobs/internal/execution-leases/run-123/authorize-managed-effect")
+                .header("authorization", "Bearer legacy-debug-token")
+                .body(Body::empty())
+                .unwrap();
+        assert!(managed_execution_effect_authorization_path(
+            request.uri().path()
+        ));
+        assert!(!legacy_debug_token_valid(&request));
+        match prior {
+            Some(value) => std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", value),
+            None => std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN"),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial]
+    fn original_source_verification_never_accepts_the_legacy_debug_bearer() {
+        let prior = std::env::var_os("BLUEY_JOBS_WORKER_TOKEN");
+        std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", "legacy-debug-token");
+        let request = Request::post("/api/jobs/internal/original-source-verifications/lease")
+            .header("authorization", "Bearer legacy-debug-token")
+            .body(Body::empty())
+            .unwrap();
+        assert!(original_source_verification_path(request.uri().path()));
+        assert!(!legacy_debug_token_valid(&request));
+        match prior {
+            Some(value) => std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", value),
+            None => std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN"),
+        }
     }
 
     #[test]
@@ -344,6 +789,7 @@ mod tests {
             nonce: "abcdef0123456789abcdef0123456789",
             audience: SIGNATURE_AUDIENCE,
             scope: "application-state",
+            origin: None,
             method: "POST",
             path: "/api/jobs/internal/applications/app-123/state",
             content_sha256: "d2bf9fe5a8a5253a3c0f969fdac700d8936d5b728770133ee502efea230979d6",
@@ -356,6 +802,64 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn managed_cloud_signature_binds_the_configured_origin() {
+        let prior_key = std::env::var_os("BLUEY_JOBS_WORKER_SIGNING_KEY");
+        let prior_origin = std::env::var_os("BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN");
+        std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", KEY);
+        std::env::set_var(
+            "BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN",
+            "https://jobs-api.internal",
+        );
+        let path = "/api/jobs/internal/managed-cloud/runtime-grants/cloud-grant-1234567890/claim";
+        let content_sha256 = hex::encode(Sha256::digest(b"{}"));
+        let canonical = canonical_request(WorkerSignatureInput {
+            worker_id: "workflow-gateway-runtime",
+            timestamp: 1_750_000_000,
+            nonce: "abcdef0123456789abcdef0123456789",
+            audience: SIGNATURE_AUDIENCE,
+            scope: "managed-cloud-runtime",
+            origin: Some("https://jobs-api.internal"),
+            method: "POST",
+            path,
+            content_sha256: &content_sha256,
+        });
+        let mut mac = HmacSha256::new_from_slice(KEY.as_bytes()).unwrap();
+        mac.update(canonical.as_bytes());
+        let signature = hex::encode(mac.finalize().into_bytes());
+        let request = Request::post(path)
+            .header("x-bluey-jobs-worker-id", "workflow-gateway-runtime")
+            .header("x-bluey-jobs-worker-timestamp", "1750000000")
+            .header(
+                "x-bluey-jobs-worker-nonce",
+                "abcdef0123456789abcdef0123456789",
+            )
+            .header("x-bluey-jobs-worker-audience", SIGNATURE_AUDIENCE)
+            .header("x-bluey-jobs-worker-scope", "managed-cloud-runtime")
+            .header("x-bluey-jobs-worker-origin", "https://jobs-api.internal")
+            .header("x-bluey-jobs-worker-content-sha256", content_sha256)
+            .header("x-bluey-jobs-worker-signature", signature)
+            .body(Body::empty())
+            .unwrap();
+        assert!(verify_request(&request, 1_750_000_000).is_ok());
+
+        std::env::set_var(
+            "BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN",
+            "https://different.internal",
+        );
+        assert!(verify_request(&request, 1_750_000_000).is_err());
+        match prior_key {
+            Some(value) => std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", value),
+            None => std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY"),
+        }
+        match prior_origin {
+            Some(value) => std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN", value),
+            None => std::env::remove_var("BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn signed_request_is_bound_to_scope_and_time() {
         std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", KEY);
         let now = 1_750_000_000;
@@ -384,6 +888,172 @@ mod tests {
             "execution",
         );
         assert!(verify_request(&wrong_scope, now).is_err());
+
+        let ats_observation = signed_request(
+            ATS_LAYOUT_OBSERVATION_PATH,
+            now,
+            "abcdef0123456789abcdef0123456792",
+            "ats-layout-observation",
+        );
+        assert_eq!(
+            verify_request(&ats_observation, now)
+                .unwrap()
+                .identity
+                .scope,
+            "ats-layout-observation"
+        );
+
+        let mut wrong_path = signed_request(
+            "/api/jobs/internal/ats-certifications/layout-observations/extra",
+            now,
+            "abcdef0123456789abcdef0123456793",
+            "ats-layout-observation",
+        );
+        *wrong_path.uri_mut() = ATS_LAYOUT_OBSERVATION_PATH.parse().unwrap();
+        assert!(verify_request(&wrong_path, now).is_err());
         std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial]
+    fn ats_observation_rejects_the_legacy_debug_bearer() {
+        std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", "legacy-debug-token");
+        let ats_request = Request::post(ATS_LAYOUT_OBSERVATION_PATH)
+            .header("authorization", "Bearer legacy-debug-token")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!legacy_debug_token_valid(&ats_request));
+
+        let legacy_discovery = Request::post("/api/jobs/internal/discovery/lease")
+            .header("authorization", "Bearer legacy-debug-token")
+            .body(Body::empty())
+            .unwrap();
+        assert!(legacy_debug_token_valid(&legacy_discovery));
+        std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+    }
+    #[test]
+    fn source_verifier_boot_paths_are_admitted() {
+        let base = "/api/jobs/internal/managed-cloud/runtime-instances/";
+        let instance = "cloud-instance-1234567890";
+        assert!(managed_cloud_runtime_path(&format!(
+            "{base}{instance}/source-verifier-boot-registration"
+        )));
+        assert!(managed_cloud_runtime_path(&format!(
+            "{base}{instance}/source-verifier-boot-startup"
+        )));
+        assert!(!managed_cloud_runtime_path(&format!(
+            "{base}{instance}/source-verifier-boot-unknown"
+        )));
+        assert!(!managed_cloud_runtime_path(
+            "/api/jobs/internal/managed-cloud/runtime-instances/short/source-verifier-boot-startup"
+        ));
+    }
+
+    #[test]
+    fn c3_provisioning_paths_are_exact_post_scopes_with_bounded_bodies() {
+        let id = "cloud-instance-1234567890";
+        for path in [
+            format!("/api/jobs/internal/managed-cloud/v2/runtime-grants/{id}/claim"),
+            format!("/api/jobs/internal/managed-cloud/v2/runtime-instances/{id}/heartbeats"),
+            format!("/api/jobs/internal/managed-cloud/v2/runtime-instances/{id}/source-verifier-boot-registration"),
+            format!("/api/jobs/internal/managed-cloud/v2/runtime-instances/{id}/source-verifier-boot-startup"),
+        ] {
+            assert_eq!(worker_scope("POST", &path), Some("managed-cloud-runtime"));
+            assert_eq!(signed_body_limit(&path), MANAGED_CLOUD_RUNTIME_SIGNED_BODY_BYTES);
+            assert_eq!(worker_scope("GET", &path), None);
+            assert!(!managed_cloud_runtime_path(&format!("{path}/")));
+            assert!(!managed_cloud_runtime_path(&format!("{path}?extra=1")));
+            assert!(!managed_cloud_runtime_path(&path.replace("/v2/", "/v02/")));
+            assert!(!managed_cloud_runtime_path(&path.replace("/v2/", "/v3/")));
+            assert!(!managed_cloud_runtime_path(&path.replace(id, "short")));
+        }
+        assert!(!managed_cloud_runtime_path(&format!(
+            "/api/jobs/internal/managed-cloud/v2/runtime-instances/{id}/original-source-verifier-startup"
+        )));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial]
+    fn c3_provisioning_paths_never_accept_legacy_debug_bearer() {
+        let prior = std::env::var_os("BLUEY_JOBS_WORKER_TOKEN");
+        std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", "legacy-debug-token");
+        for suffix in [
+            "heartbeats",
+            "source-verifier-boot-registration",
+            "source-verifier-boot-startup",
+        ] {
+            let request = Request::post(format!(
+                "/api/jobs/internal/managed-cloud/v2/runtime-instances/cloud-instance-1234567890/{suffix}"
+            ))
+            .header("authorization", "Bearer legacy-debug-token")
+            .body(Body::empty())
+            .unwrap();
+            assert!(!legacy_debug_token_valid(&request));
+        }
+        match prior {
+            Some(value) => std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", value),
+            None => std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn c3_provisioning_signatures_do_not_authorize_unsigned_query_suffixes() {
+        let prior_key = std::env::var_os("BLUEY_JOBS_WORKER_SIGNING_KEY");
+        let prior_origin = std::env::var_os("BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN");
+        std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", KEY);
+        std::env::set_var(
+            "BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN",
+            "https://jobs-api.internal",
+        );
+        let id = "cloud-instance-1234567890";
+        for path in [
+            format!("/api/jobs/internal/managed-cloud/v2/runtime-grants/{id}/claim"),
+            format!("/api/jobs/internal/managed-cloud/v2/runtime-instances/{id}/heartbeats"),
+            format!("/api/jobs/internal/managed-cloud/v2/runtime-instances/{id}/source-verifier-boot-registration"),
+            format!("/api/jobs/internal/managed-cloud/v2/runtime-instances/{id}/source-verifier-boot-startup"),
+        ] {
+            let content_sha256 = hex::encode(Sha256::digest(b"{}"));
+            let canonical = canonical_request(WorkerSignatureInput {
+                worker_id: "workflow-gateway-runtime",
+                timestamp: 1_750_000_000,
+                nonce: "abcdef0123456789abcdef0123459abc",
+                audience: SIGNATURE_AUDIENCE,
+                scope: "managed-cloud-runtime",
+                origin: Some("https://jobs-api.internal"),
+                method: "POST",
+                path: &path,
+                content_sha256: &content_sha256,
+            });
+            let mut mac = HmacSha256::new_from_slice(KEY.as_bytes()).unwrap();
+            mac.update(canonical.as_bytes());
+            let signature = hex::encode(mac.finalize().into_bytes());
+            let mut request = Request::post(&path)
+                .header("x-bluey-jobs-worker-id", "workflow-gateway-runtime")
+                .header("x-bluey-jobs-worker-timestamp", "1750000000")
+                .header("x-bluey-jobs-worker-nonce", "abcdef0123456789abcdef0123459abc")
+                .header("x-bluey-jobs-worker-audience", SIGNATURE_AUDIENCE)
+                .header("x-bluey-jobs-worker-scope", "managed-cloud-runtime")
+                .header("x-bluey-jobs-worker-origin", "https://jobs-api.internal")
+                .header("x-bluey-jobs-worker-content-sha256", content_sha256)
+                .header("x-bluey-jobs-worker-signature", signature)
+                .body(Body::from("{}"))
+                .unwrap();
+            assert!(verify_request(&request, 1_750_000_000).is_ok());
+            for suffix in ["?extra=1", "?"] {
+                *request.uri_mut() = format!("{path}{suffix}").parse().unwrap();
+                assert!(verify_request(&request, 1_750_000_000).is_err());
+            }
+        }
+        match prior_key {
+            Some(value) => std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", value),
+            None => std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY"),
+        }
+        match prior_origin {
+            Some(value) => std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN", value),
+            None => std::env::remove_var("BLUEY_JOBS_MANAGED_CLOUD_API_ORIGIN"),
+        }
     }
 }

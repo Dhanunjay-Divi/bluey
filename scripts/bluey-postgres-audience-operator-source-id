@@ -1,0 +1,84 @@
+#!/bin/bash
+# Scoped source drift detector. Local/read-only candidate, not provenance proof.
+set -euo pipefail
+
+PATH=/usr/bin:/bin
+LC_ALL=C
+export PATH LC_ALL
+readonly HEADER='bluey-postgres-audience-operator-source-v3'
+
+if [[ $# -ne 0 ]]; then
+  printf '%s\n' 'usage: bluey-postgres-audience-operator-source-id' >&2
+  exit 64
+fi
+
+is_canonical_decimal() {
+  local value=$1
+  [[ "$value" == 0 || "$value" =~ ^[1-9][0-9]*$ ]]
+}
+
+file_byte_count() {
+  local file=$1 raw='' count=''
+  raw=$(/usr/bin/wc -c < "$file") || return $?
+  count="${raw//[[:space:]]/}"
+  is_canonical_decimal "$count" || return 65
+  printf '%s' "$count" || return $?
+}
+
+script_dir=$(CDPATH= cd -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")" && /bin/pwd -P) || exit $?
+repo_root=$(CDPATH= cd -- "$script_dir/.." && /bin/pwd -P) || exit $?
+
+emit_file() {
+  local relative_path=$1 file='' content_bytes=''
+  file="$repo_root/$relative_path"
+  [[ -f "$file" && ! -L "$file" ]] || {
+    printf 'required regular source file is unavailable: %s\n' "$relative_path" >&2
+    return 66
+  }
+  # All fixed closure paths are ASCII. LC_ALL=C makes this a byte length.
+  is_canonical_decimal "${#relative_path}" || return 65
+  content_bytes=$(file_byte_count "$file") || return $?
+  /usr/bin/printf '%s:' "${#relative_path}" || return $?
+  /usr/bin/printf '%s' "$relative_path" || return $?
+  /usr/bin/printf '%s:' "$content_bytes" || return $?
+  /bin/cat -- "$file" || return $?
+}
+
+emit_stream() {
+  /usr/bin/printf '%s\0' "$HEADER" || return $?
+  /usr/bin/printf '%s:' '22' || return $?
+  emit_file 'server/src/db/operator-source-identity.rs' || return $?
+  emit_file 'server/src/db/operator.rs' || return $?
+  emit_file 'server/src/db/mod.rs' || return $?
+  emit_file 'server/Cargo.toml' || return $?
+  emit_file 'server/src/bin/bluey-postgres-audience-operator.rs' || return $?
+  emit_file 'server/src/db/migration-ledger-name.rs' || return $?
+  emit_file 'server/src/db/migration-ledger-catalog.rs' || return $?
+  emit_file 'server/src/db/postgres-audience-selected-ledger-driver.rs' || return $?
+  emit_file 'server/src/db/postgres-audience-operator-entry.rs' || return $?
+  emit_file 'server/src/db/postgres-audience-shared-driver.rs' || return $?
+  emit_file 'server/src/db/postgres-audience-replay-adapter.rs' || return $?
+  emit_file 'server/src/db/postgres-audience-replay-driver.rs' || return $?
+  emit_file 'server/src/db/postgres-audience-shared-setup.sql' || return $?
+  emit_file 'server/src/db/postgres-audience-shared-validate.sql' || return $?
+  emit_file 'server/src/db/postgres-audience-shared-forward.sql' || return $?
+  emit_file 'server/src/db/postgres-audience-replay-setup-legacy.sql' || return $?
+  emit_file 'server/src/db/postgres-audience-replay-validate-legacy.sql' || return $?
+  emit_file 'infra/postgres/server-runtime/036_jobs_signed_job_integrity_authority.sql' || return $?
+  emit_file 'infra/postgres/server-runtime/040_jobs_original_source_verifier_startup_authority.sql' || return $?
+  emit_file 'infra/postgres/server-runtime/045_jobs_provisioned_runtime_startup.sql' || return $?
+  emit_file 'infra/postgres/server-runtime/049_jobs_process_attachment_signature_audience.sql' || return $?
+  emit_file 'infra/postgres/server-runtime/052_jobs_managed_cloud_release_v4_audiences.sql' || return $?
+}
+
+if digest=$(emit_stream | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'); then
+  :
+else
+  status=$?
+  exit "$status"
+fi
+[[ "$digest" =~ ^[0-9a-f]{64}$ ]] || {
+  printf '%s\n' 'source identity digest was malformed' >&2
+  exit 65
+}
+/usr/bin/printf '%s\n' "$digest"

@@ -3,6 +3,7 @@ import type { FetchResponse, JobsFetch } from "@bluey/jobs-automation";
 import { describe, expect, it, vi } from "vitest";
 import {
   DiscoveryApiClient,
+  DiscoveryApiError,
   type DiscoveryApiFetch,
   type DiscoveryCompleteInput,
   type DiscoveryFailInput,
@@ -112,7 +113,7 @@ function greenhousePayload(): unknown {
       absolute_url: "https://boards.greenhouse.io/acme/jobs/job-1?gh_src=private",
       location: { name: "Remote" },
       content: "<p>Build reliable systems.</p>",
-      updated_at: SCHEDULED_FOR,
+      first_published: SCHEDULED_FOR,
     }],
   };
 }
@@ -233,7 +234,7 @@ describe("discovery worker runtime", () => {
           canonical_url: "https://boards.greenhouse.io/acme/jobs/job-1",
           title: "Platform Engineer",
           location: "Remote",
-          workplace: "remote",
+          workplace: "unknown",
           description: "Build reliable systems.",
           compensation: "",
           employment_type: "",
@@ -243,6 +244,139 @@ describe("discovery worker runtime", () => {
       },
     });
     expect(logger.events.some((event) => event.event === "discovery_telemetry")).toBe(true);
+  });
+
+  it("reports an updated-but-undated Greenhouse posting as review-only", async () => {
+    const api = new FakeApi([lease()]);
+    const atsFetch: JobsFetch = vi.fn(async () =>
+      response({
+        jobs: [
+          {
+            id: "job-1",
+            title: "Platform Engineer",
+            absolute_url: "https://boards.greenhouse.io/acme/jobs/job-1",
+            location: { name: "Remote" },
+            updated_at: SCHEDULED_FOR,
+          },
+        ],
+      }),
+    );
+    const worker = new DiscoveryWorkerRuntime({
+      api,
+      atsFetch,
+      loopClock: new ImmediateClock(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("completed");
+    expect(atsFetch).toHaveBeenCalledTimes(1);
+    expect(api.failed).toEqual([]);
+    expect(api.completed).toHaveLength(1);
+    expect(api.completed[0]?.input.jobs).toEqual([
+      expect.objectContaining({ external_id: "job-1", posted_at_ms: null }),
+    ]);
+  });
+
+  it("rejects a supplied malformed Greenhouse publication date", async () => {
+    const api = new FakeApi([lease()]);
+    const worker = new DiscoveryWorkerRuntime({
+      api,
+      atsFetch: async () =>
+        response({
+          jobs: [{
+            id: "job-1",
+            title: "Platform Engineer",
+            absolute_url: "https://boards.greenhouse.io/acme/jobs/job-1",
+            first_published: "updated recently",
+            updated_at: SCHEDULED_FOR,
+          }],
+        }),
+      loopClock: new ImmediateClock(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("failed");
+    expect(api.completed).toEqual([]);
+    expect(api.failed).toEqual([
+      expect.objectContaining({
+        sourceId: "source-greenhouse-acme",
+        input: expect.objectContaining({ error_code: "invalid_response" }),
+      }),
+    ]);
+  });
+
+  it("replays an unacknowledged failure on a new token for the same source and slot", async () => {
+    const initial = lease();
+    for (const [next, same] of [
+      [initial, true],
+      [lease({ lease_expires_at_ms: SCHEDULED_FOR_MS + 60_000 }, {
+        lease_token: "replacement-lease",
+      }), true],
+      [lease({ config: { board_token: "acme", company: "Changed" } }), false],
+      [lease({ track_id: "replacement-track" }), false],
+    ] as const) {
+      const api = new FakeApi([initial, next]);
+      const recordFailure = api.fail.bind(api);
+      api.fail = async (...args) => {
+        await recordFailure(...args);
+        if (api.failed.length === 1) {
+          throw new DiscoveryApiError("api_timeout", "synthetic lost acknowledgement");
+        }
+      };
+      const atsFetch: JobsFetch = vi.fn(async () =>
+        response({
+          jobs: [{
+            id: "job-1",
+            title: "Platform Engineer",
+            absolute_url: "https://boards.greenhouse.io/acme/jobs/job-1",
+            first_published: "not-a-date",
+          }],
+        }),
+      );
+      const worker = new DiscoveryWorkerRuntime({ api, atsFetch, loopClock: new ImmediateClock() });
+      await expect(worker.pollOnce()).rejects.toMatchObject({ code: "api_timeout" });
+      await expect(worker.pollOnce()).resolves.toBe(same ? "replayed" : "failed");
+      expect(atsFetch).toHaveBeenCalledTimes(same ? 1 : 2);
+      expect(api.completed).toEqual([]);
+      expect(api.failed).toHaveLength(2);
+      expect(api.failed[1]?.input.lease_token).toBe(next.lease_token);
+      expect(api.failed[1]?.input.error_code).toBe("invalid_response");
+    }
+  });
+
+  it("does not resurrect a pending failure after changed source authority is rejected", async () => {
+    const original = lease();
+    const replacement = lease({ track_id: "replacement-track" }, {
+      lease_token: "replacement-lease",
+    });
+    const api = new FakeApi([original, replacement, original]);
+    const recordFailure = api.fail.bind(api);
+    api.fail = async (...args) => {
+      await recordFailure(...args);
+      if (api.failed.length === 1) {
+        throw new DiscoveryApiError("api_timeout", "synthetic lost acknowledgement");
+      }
+      if (api.failed.length === 2) {
+        throw new DiscoveryApiError("api_rejected", "synthetic rejection", 409);
+      }
+    };
+    const atsFetch: JobsFetch = vi.fn(async () =>
+      response({
+        jobs: [{
+          id: "job-1",
+          title: "Platform Engineer",
+          absolute_url: "https://boards.greenhouse.io/acme/jobs/job-1",
+          first_published: "not-a-date",
+        }],
+      }),
+    );
+    const worker = new DiscoveryWorkerRuntime({ api, atsFetch, loopClock: new ImmediateClock() });
+    await expect(worker.pollOnce()).rejects.toMatchObject({ code: "api_timeout" });
+    await expect(worker.pollOnce()).rejects.toMatchObject({ code: "api_rejected" });
+    await expect(worker.pollOnce()).resolves.toBe("failed");
+    expect(atsFetch).toHaveBeenCalledTimes(3);
+    expect(api.completed).toEqual([]);
+    expect(api.failed.map(({ input }) => input.lease_token)).toEqual([
+      original.lease_token, replacement.lease_token, original.lease_token,
+    ]);
   });
 
   it("pins Lever discovery to the official API host", async () => {
@@ -279,6 +413,41 @@ describe("discovery worker runtime", () => {
       postedAt: SCHEDULED_FOR,
       payload: { company: "Atlas", source: "lever" },
     });
+  });
+
+  it("keeps denied C2C out of a submitted discovery snapshot while forwarding allowed labels", async () => {
+    const api = new FakeApi([lease({
+      id: "source-lever-engagement-fixture",
+      provider: "lever",
+      config: { kind: "lever", site: "acme", company: "Acme" },
+    })]);
+    const atsFetch: JobsFetch = vi.fn(async () => response([
+      { id: "denied", engagement: "C2C / 1099 not accepted" },
+      { id: "w2", engagement: "C2C, 1099 not accepted; W2 only" },
+      { id: "c2c", engagement: "C2C only" },
+    ].map(({ id, engagement }) => ({
+      id,
+      text: "Platform Engineer",
+      categories: { location: "New York, NY", commitment: "Contract", engagement },
+      createdAt: SCHEDULED_FOR_MS,
+    }))));
+    const worker = new DiscoveryWorkerRuntime({
+      api, atsFetch, loopClock: new ImmediateClock(), logger: new RecordingLogger(),
+    });
+
+    await expect(worker.pollOnce()).resolves.toBe("completed");
+
+    expect(api.failed).toEqual([]);
+    expect(api.completed).toHaveLength(1);
+    const result = api.completed[0];
+    expect(result.sourceId).toBe("source-lever-engagement-fixture");
+    expect(result.input.complete_snapshot).toBe(true);
+    expect(result.input.jobs).toHaveLength(3);
+    expect(result.input.jobs.map((job) => job.employment_type)).toEqual(["contract", "contract", "contract"]);
+    const byId = Object.fromEntries(result.input.jobs.map((job) => [job.external_id, job.engagement_type]));
+    expect(byId.denied, "denied C2C at completion boundary").toBe("");
+    expect(byId.w2).toBe("w2");
+    expect(byId.c2c).toBe("c2c");
   });
 
   it("maps every scheduled ATS source to its official provider endpoint", async () => {
@@ -439,6 +608,105 @@ describe("discovery worker runtime", () => {
     expect(requestCount).toBe(3);
     expect(api.completed).toEqual([]);
     expect(api.failed[0]?.input.error_code).toBe("unavailable");
+  });
+
+  it("reports invalid_response rather than completing a snapshot after an unsupported table", async () => {
+    const api = new FakeApi([lease(curatedSource())]);
+    let requests = 0;
+    const curatedFetch: typeof fetch = vi.fn(async () => new Response(++requests === 3
+      ? "<table><tr><th>Info</th></tr><tr><td>Changed format</td></tr></table>"
+      : curatedFeedMarkdown()));
+    const worker = new DiscoveryWorkerRuntime({ api, curatedFetch, logger: new RecordingLogger() });
+
+    await expect(worker.pollOnce()).resolves.toBe("failed");
+    expect(requests).toBe(3);
+    expect(api.completed).toEqual([]);
+    expect(api.failed.map(({ input }) => input.error_code)).toEqual(["invalid_response"]);
+  });
+
+  it("does not mark a curated snapshot failed when its completion acknowledgement is lost", async () => {
+    const initial = lease(curatedSource());
+    const renewed = { ...initial, lease_token: "renewed-curated-lease" };
+    const api = new FakeApi([initial, renewed]);
+    const recordComplete = api.complete.bind(api);
+    api.complete = async (...args) => {
+      await recordComplete(...args);
+      if (api.completed.length === 1) {
+        throw new DiscoveryApiError("api_timeout", "synthetic completion response lost");
+      }
+    };
+    let now = SCHEDULED_FOR_MS;
+    const curatedFetch: typeof fetch = vi.fn(async () => new Response(curatedFeedMarkdown()));
+    const worker = new DiscoveryWorkerRuntime({ api, curatedFetch, curatedNow: () => now,
+      curatedSnapshotTtlMs: 1_000, logger: new RecordingLogger() });
+    await expect(worker.pollOnce()).rejects.toMatchObject({ code: "api_timeout" });
+    now += 2_000; // A new fetch would now outlive the retained feed snapshot.
+    await expect(worker.pollOnce()).resolves.toBe("replayed");
+    expect(curatedFetch).toHaveBeenCalledTimes(CURATED_FEED_IDS.length);
+    expect(api.failed).toEqual([]);
+    const first = api.completed[0];
+    expect(first).toBeDefined();
+    expect(api.completed).toEqual([first, {
+      sourceId: first.sourceId, input: { ...first.input, lease_token: renewed.lease_token },
+    }]);
+    expect(first.input.jobs[0]?.requires_original_revalidation).toBe(true);
+  });
+
+  it("retains the exact direct ATS completion through lease rotation", async () => {
+    const initial = lease();
+    const renewed = { ...initial, lease_token: "renewed-ats-lease" };
+    const api = new FakeApi([initial, renewed]);
+    const atsFetch: JobsFetch = vi.fn(async () => response(greenhousePayload()));
+    const recordComplete = api.complete.bind(api);
+    api.complete = async (...args) => {
+      await recordComplete(...args);
+      if (api.completed.length === 1) {
+        throw new DiscoveryApiError("api_unavailable", "synthetic report retries exhausted", 503);
+      }
+    };
+    const worker = new DiscoveryWorkerRuntime({ api, atsFetch, loopClock: new ImmediateClock() });
+    await expect(worker.pollOnce()).rejects.toMatchObject({ code: "api_unavailable" });
+    await expect(worker.pollOnce()).resolves.toBe("replayed");
+    expect(atsFetch).toHaveBeenCalledTimes(1);
+    expect(api.failed).toEqual([]);
+    expect(api.completed).toHaveLength(2);
+    expect(api.completed[1]?.input).toEqual({ ...api.completed[0]?.input, lease_token: renewed.lease_token });
+  });
+
+  it("drops a pending completion on source, slot or definite rejection instead of replaying it", async () => {
+    const initial = lease(curatedSource());
+    for (const boundary of ["source_change", "slot_change", "definite_rejection"] as const) {
+      const next: DiscoverySourceLease = { ...initial, lease_token: "new-lease" };
+      if (boundary === "source_change") next.source = { ...initial.source, account_id: "new-account" };
+      if (boundary === "slot_change") next.replay_key = "new-slot";
+      const api = new FakeApi([initial, next, next]);
+      let now = SCHEDULED_FOR_MS;
+      let role = "Software Engineer";
+      const curatedFetch: typeof fetch = vi.fn(async () => new Response(curatedFeedMarkdown(role)));
+      const recordComplete = api.complete.bind(api);
+      api.complete = async (...args) => {
+        await recordComplete(...args);
+        if (api.completed.length === 1) {
+          throw new DiscoveryApiError("api_timeout", "synthetic report response lost");
+        }
+        if (boundary === "definite_rejection" && api.completed.length === 2) {
+          throw new DiscoveryApiError("api_rejected", "synthetic stale lease refusal", 409);
+        }
+      };
+      const worker = new DiscoveryWorkerRuntime({ api, curatedFetch, curatedNow: () => now,
+        curatedSnapshotTtlMs: 1_000, logger: new RecordingLogger() });
+      await expect(worker.pollOnce()).rejects.toMatchObject({ code: "api_timeout" });
+      now += 2_000;
+      role = "Data Engineer";
+      if (boundary === "definite_rejection") {
+        await expect(worker.pollOnce()).rejects.toMatchObject({ code: "api_rejected" });
+        expect(api.completed[1]?.input.jobs[0]?.title).toBe("Software Engineer");
+      }
+      await expect(worker.pollOnce()).resolves.toBe("completed");
+      expect(api.completed.at(-1)?.input.jobs[0]?.title).toBe("Data Engineer");
+      expect(api.failed).toEqual([]);
+      expect(curatedFetch).toHaveBeenCalledTimes(2 * CURATED_FEED_IDS.length);
+    }
   });
 
   it("shares one bounded curated snapshot across account leases", async () => {
@@ -718,6 +986,63 @@ describe("discovery worker runtime", () => {
     expect(logs).not.toContain("answers");
     expect(logs).not.toContain("secret-value");
     expect(logs).toContain("provider_error");
+  });
+
+  it("signs a pending failure with the current lease after transport retries are exhausted", async () => {
+    const initial = lease();
+    const replacement = lease({ lease_expires_at_ms: SCHEDULED_FOR_MS + 60_000 }, {
+      lease_token: "rotated-test-lease",
+    });
+    const requests: Array<{ input: string; init?: RequestInit }> = [];
+    const reports: Array<{ input: string; init?: RequestInit }> = [];
+    const availableLeases = [initial, replacement];
+    const api = new DiscoveryApiClient({
+      origin: "https://jobs.internal",
+      signingKey: WORKER_SIGNING_KEY,
+      workerId: "discovery-worker-test",
+      reportAttempts: 2,
+      reportRetryMs: 0,
+      sleep: async () => undefined,
+      fetch: async (input, init) => {
+        const request = { input: String(input), init };
+        requests.push(request);
+        const path = new URL(request.input).pathname;
+        if (path === "/api/jobs/internal/discovery/lease") {
+          return Response.json(availableLeases.shift());
+        }
+        expect(path).toBe("/api/jobs/internal/discovery/source-greenhouse-acme/fail");
+        reports.push(request);
+        return new Response(null, { status: reports.length <= 2 ? 503 : 204 });
+      },
+    });
+    const atsFetch: JobsFetch = vi.fn(async () => response({
+      jobs: [{
+        id: "job-1",
+        title: "Platform Engineer",
+        absolute_url: "https://boards.greenhouse.io/acme/jobs/job-1",
+        first_published: "not-a-date",
+      }],
+    }));
+    const worker = new DiscoveryWorkerRuntime({ api, atsFetch, loopClock: new ImmediateClock() });
+
+    await expect(worker.pollOnce()).rejects.toMatchObject({ code: "api_unavailable", status: 503 });
+    await expect(worker.pollOnce()).resolves.toBe("replayed");
+    expect(atsFetch).toHaveBeenCalledTimes(1);
+    expect(requests).toHaveLength(5);
+    expect(reports).toHaveLength(3);
+    expect(reports[1]?.init?.body).toBe(reports[0]?.init?.body);
+    expect(reports.map(({ init }) => JSON.parse(String(init?.body)))).toEqual(
+      [initial, initial, replacement].map((item) => ({
+        lease_token: item.lease_token,
+        replay_key: item.replay_key,
+        scheduled_for_ms: item.scheduled_for_ms,
+        error_code: "invalid_response",
+      })),
+    );
+    for (const request of requests) expectSignedDiscoveryRequest(request, "discovery-worker-test");
+    expect(new Set(requests.map(({ init }) =>
+      new Headers(init?.headers).get("x-bluey-jobs-worker-nonce"),
+    )).size).toBe(5);
   });
 
   it("retries an idempotent completion with the exact same lease body", async () => {

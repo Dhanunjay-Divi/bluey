@@ -30,12 +30,7 @@ export async function guardBrowserRequest(route: GuardedRequestRoute): Promise<v
 }
 
 export async function guardBrowserWebSocket(route: GuardedWebSocketRoute): Promise<void> {
-  try {
-    await assertSafeBrowserWebSocketUrl(route.url());
-    route.connectToServer();
-  } catch {
-    await route.close({ code: 1008, reason: "Network target blocked" }).catch(() => undefined);
-  }
+  await route.close({ code: 1008, reason: "Network target blocked" }).catch(() => undefined);
 }
 
 export async function assertSafeBrowserRequestUrl(rawUrl: string): Promise<void> {
@@ -45,9 +40,6 @@ export async function assertSafeBrowserRequestUrl(rawUrl: string): Promise<void>
   await assertPublicApplicationUrl(url.toString());
 }
 
-export async function assertSafeBrowserWebSocketUrl(rawUrl: string): Promise<void> {
-  const url = new URL(rawUrl);
-  if (url.protocol !== "wss:") throw new Error("network_target_blocked");
-  url.protocol = "https:";
-  await assertPublicApplicationUrl(url.toString());
+export async function assertSafeBrowserWebSocketUrl(_rawUrl: string): Promise<never> {
+  throw new Error("network_target_blocked");
 }

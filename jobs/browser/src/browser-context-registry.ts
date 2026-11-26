@@ -2,38 +2,82 @@ import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, type BrowserContext } from "playwright";
 import {
+  browserLaunchEnvironment,
+  CERTIFIED_BROWSER_TRANSPORT_HARDENING_ARGS,
+} from "@bluey/jobs-automation";
+import {
   installBrowserNetworkGuard,
   LOCAL_BROWSER_SERVICE_WORKERS,
 } from "./browser-network.js";
 import { closeBrowserContexts } from "./context-shutdown.js";
 import { LocalBrowserError } from "./local-failure.js";
-import { identityContextKey, identityProfileDirectory } from "./profile.js";
+import {
+  BrowserProfilePathPolicy,
+  IdentityScopedBrowserContextRegistry,
+  browserIdentityScope,
+} from "./browser-profile-policy.js";
 
 export class BrowserContextRegistry {
-  private readonly contexts = new Map<string, BrowserContext>();
+  private readonly contexts: IdentityScopedBrowserContextRegistry<Promise<BrowserContext>>;
 
   constructor(
-    private readonly userDataDirectory: string,
+    userDataDirectory: string,
     private readonly packaged: boolean,
     private readonly resourcesPath: string,
-  ) {}
-
-  async contextFor(accountId: string, applicationIdentityId: string): Promise<BrowserContext> {
-    const contextKey = identityContextKey(accountId, applicationIdentityId);
-    const existing = this.contexts.get(contextKey);
-    if (existing) return existing;
-    const profile = join(
-      identityProfileDirectory(this.userDataDirectory, accountId, applicationIdentityId),
-      "chromium-profile",
+  ) {
+    this.contexts = new IdentityScopedBrowserContextRegistry(
+      new BrowserProfilePathPolicy(userDataDirectory),
     );
+  }
+
+  contextFor(accountId: string, applicationIdentityId: string): Promise<BrowserContext> {
+    const identity = browserIdentityScope(accountId, applicationIdentityId);
+    const existing = this.contexts.get(identity);
+    if (existing) return existing;
+
+    const profile = this.contexts.profileFor(identity).chromiumUserDataDirectory;
+    const pending = this.launchContext(profile);
+    this.contexts.bind(identity, pending);
+    void pending.then(
+      (context) => {
+        context.on("close", () => this.contexts.release(identity, pending));
+      },
+      () => {
+        this.contexts.release(identity, pending);
+      },
+    );
+    return pending;
+  }
+
+  async closeAll(): Promise<void> {
+    const pending = this.contexts.registrations().map(({ context }) => context);
+    this.contexts.clear();
+    const contexts: BrowserContext[] = [];
+    for (const result of await Promise.allSettled(pending)) {
+      if (result.status === "fulfilled") contexts.push(result.value);
+    }
+    await closeBrowserContexts(contexts);
+  }
+
+  private async launchContext(profile: string): Promise<BrowserContext> {
     await mkdir(profile, { recursive: true });
-    const executablePath = this.packaged ? await packagedChromiumExecutable(this.resourcesPath) : undefined;
+    const executablePath = this.packaged
+      ? await packagedChromiumExecutable(this.resourcesPath)
+      : undefined;
     const context = await chromium.launchPersistentContext(profile, {
+      chromiumSandbox: true,
+      env: browserLaunchEnvironment(process.env, process.platform),
       headless: false,
+      // A restored profile can contain tabs that begin loading before
+      // Playwright returns the context. Keep the browser offline until the
+      // caller has selected one run-bound page and installed its exact-submit
+      // guard.
+      offline: true,
       ...(executablePath ? { executablePath } : { channel: "chromium" }),
       viewport: null,
       acceptDownloads: true,
       serviceWorkers: LOCAL_BROWSER_SERVICE_WORKERS,
+      args: [...CERTIFIED_BROWSER_TRANSPORT_HARDENING_ARGS],
     });
     try {
       await installBrowserNetworkGuard(context);
@@ -41,14 +85,7 @@ export class BrowserContextRegistry {
       await context.close().catch(() => undefined);
       throw new LocalBrowserError("configuration_invalid");
     }
-    this.contexts.set(contextKey, context);
-    context.on("close", () => this.contexts.delete(contextKey));
     return context;
-  }
-
-  async closeAll(): Promise<void> {
-    await closeBrowserContexts(this.contexts.values());
-    this.contexts.clear();
   }
 }
 

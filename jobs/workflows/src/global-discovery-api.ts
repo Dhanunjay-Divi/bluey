@@ -289,7 +289,13 @@ async function readJson(response: Response): Promise<unknown> {
   if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
     throw invalidResponse("Global discovery API response is too large");
   }
-  const text = await response.text();
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    // A successful status can precede a dropped body after the write commits.
+    throw invalidResponse("Global discovery API response could not be read");
+  }
   if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) {
     throw invalidResponse("Global discovery API response is too large");
   }

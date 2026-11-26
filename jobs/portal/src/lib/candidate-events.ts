@@ -28,12 +28,19 @@ export const applicationOutcomes = [
   ["withdrawn", "Withdrawn"],
 ] as const;
 
-export function latestMatchFeedback(events: CandidateEvent[], jobId: string): CandidateEvent | undefined {
-  return latestEvent(events, (event) => event.event_type === "match_feedback" && event.job_id === jobId);
-}
-
-export function isJobPassed(events: CandidateEvent[], jobId: string): boolean {
-  return latestMatchFeedback(events, jobId)?.action === "pass";
+export function passedMatchJobIds(events: CandidateEvent[]): Set<string> {
+  const latest = new Map<string, CandidateEvent>();
+  for (const event of events) {
+    const jobId = event.job_id;
+    if (event.event_type !== "match_feedback" || typeof jobId !== "string") continue;
+    const current = latest.get(jobId);
+    if (!current || compareNewestFirst(event, current) < 0) latest.set(jobId, event);
+  }
+  const passed = new Set<string>();
+  for (const [jobId, event] of latest) {
+    if (event.action === "pass") passed.add(jobId);
+  }
+  return passed;
 }
 
 export function latestApplicationOutcome(events: CandidateEvent[], applicationId: string): CandidateEvent | undefined {

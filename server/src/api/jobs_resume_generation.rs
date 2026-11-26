@@ -28,13 +28,17 @@ use crate::{
     pricing, routing,
 };
 
-const GENERATION_SCHEMA_VERSION: i64 = 5;
+const GENERATION_SCHEMA_VERSION: i64 = 6;
 const MAX_RESUME_SKILLS: usize = 16;
 const MAX_HEADLINE_CHARS: usize = 180;
 const MAX_SUMMARY_CHARS: usize = 700;
 const MAX_REWRITE_CHARS: usize = 420;
 const MAX_REWRITE_SOURCES: usize = 4;
-const MAX_MODEL_OUTPUT_TOKENS: u32 = 1_200;
+const MAX_COVER_LETTER_PARAGRAPHS: usize = 4;
+const MAX_COVER_LETTER_PARAGRAPH_CHARS: usize = 700;
+const MAX_COVER_LETTER_CHARS: usize = 2_400;
+const MAX_COVER_LETTER_SOURCES: usize = 6;
+const MAX_MODEL_OUTPUT_TOKENS: u32 = 1_600;
 const MAX_CANDIDATE_PROMPT_BYTES: usize = 48 * 1024;
 const MAX_JOB_PROMPT_BYTES: usize = 32 * 1024;
 const MAX_USER_PROMPT_BYTES: usize = 96 * 1024;
@@ -54,6 +58,7 @@ pub struct GeneratedResume {
     pub content: Value,
     pub diff: Value,
     pub public_provenance: Value,
+    pub cover_letter: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -73,6 +78,22 @@ struct ResumePlan {
     employment_highlight_rewrites: Vec<HighlightRewrite>,
     #[serde(default)]
     project_order: Vec<usize>,
+    #[serde(default)]
+    cover_letter: Option<CoverLetterPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CoverLetterPlan {
+    #[serde(default)]
+    paragraphs: Vec<CoverLetterParagraph>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CoverLetterParagraph {
+    source_evidence_ids: Vec<String>,
+    text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,6 +130,23 @@ impl EvidenceCatalog {
                 &mut values,
                 &format!("certification:{index}"),
                 certification,
+            );
+        }
+        for (index, education) in profile.education.iter().enumerate() {
+            insert_evidence(
+                &mut values,
+                &format!("education:{index}:school"),
+                &education.school,
+            );
+            insert_evidence(
+                &mut values,
+                &format!("education:{index}:degree"),
+                &education.degree,
+            );
+            insert_evidence(
+                &mut values,
+                &format!("education:{index}:field"),
+                &education.field,
             );
         }
         for (entry_index, entry) in profile.employment.iter().enumerate() {
@@ -236,7 +274,7 @@ pub async fn generate(
                     .ok_or_else(|| anyhow!("completed generation has no output"))?,
             )
             .context("decode cached resume plan")?;
-            materialize(profile, baseline, &plan, "model")
+            materialize(profile, posting, baseline, &plan, "model")
         }
         ResumeGenerationReservation::Pending => {
             Err(anyhow!("resume generation is already in progress"))
@@ -348,7 +386,7 @@ async fn generate_reserved(
                     accounted.bluey_cost,
                 )?;
                 reservation.disarm();
-                return materialize(profile, baseline, &accounted.plan, "model");
+                return materialize(profile, posting, baseline, &accounted.plan, "model");
             }
             Ok(Ok(None)) => {}
             Ok(Err(error)) => {
@@ -1130,6 +1168,8 @@ Optimize the packet for the actual job, in this order:
 
 A bullet rewrite should be concise, ATS-readable, and use only facts present in its cited source bullets. Prefer a concrete action followed by supported scope and a supported result. Preserve every number, percentage, duration, team size, scale, client, tool, and outcome exactly as stated in the cited evidence; never estimate, round, combine, or improve a metric. Use active voice, remove filler and repetition, avoid first-person language, and avoid vague claims such as "results-driven", "proven", "expert", or "best-in-class" unless those exact words are candidate evidence. Do not force a metric into a bullet that has none. Use terminology from the job description only when the same skill, tool, responsibility, or outcome is already stated in the cited candidate evidence. Never keyword-stuff, copy requirements into the resume, or imply that packet coverage changes the candidate's underlying profile fit. Omit a rewrite when the existing bullet is already strong, when the change would be cosmetic only, or when the cited evidence cannot safely support a stronger job-aligned sentence.
 
+You may also create a short, job-specific cover letter. Each paragraph must cite the exact candidate evidence IDs that support every factual statement in that paragraph. The cover letter may explain motivation for this role using neutral language, but it must not invent company knowledge, personal enthusiasm, employment history, skills, metrics, authorization, salary, demographic details, availability, or legal answers. Do not copy the job description. Do not mention the target company or title inside a model-authored paragraph; Bluey adds those server-side. Return null when the evidence is not strong enough for a useful letter.
+
 The output schema is:
 {
   "headline_evidence_ids": ["evidence:id"],
@@ -1138,10 +1178,18 @@ The output schema is:
   "employment_order": [0],
   "employment_highlight_order": [{"entry_index":0,"highlight_indices":[0]}],
   "employment_highlight_rewrites": [{"entry_index":0,"highlight_index":0,"source_evidence_ids":["employment:0:highlight:0"],"text":"Evidence-grounded rewritten bullet."}],
-  "project_order": [0]
+  "project_order": [0],
+  "cover_letter": {
+    "paragraphs": [
+      {
+        "source_evidence_ids": ["employment:0:highlight:0"],
+        "text": "Evidence-grounded paragraph using only the cited candidate facts."
+      }
+    ]
+  }
 }
 
-Select zero or one headline evidence ID and any non-duplicated summary evidence IDs whose exact text fits the resume. Bluey composes those exact records deterministically; do not return headline or summary text. An empty headline or summary selection preserves Bluey's deterministic baseline instead of deleting it. Include every employment and project index exactly once. Include every highlight index exactly once for every employment entry. Choose at most 16 exact skills. Each rewrite target may appear at most once. Its own original highlight ID must be the first source_evidence_ids item; additional items may cite only other highlights from the same employment entry. Prefer the evidence that best answers the job description.
+Select zero or one headline evidence ID and any non-duplicated summary evidence IDs whose exact text fits the resume. Bluey composes those exact records deterministically; do not return headline or summary text. An empty headline or summary selection preserves Bluey's deterministic baseline instead of deleting it. Include every employment and project index exactly once. Include every highlight index exactly once for every employment entry. Choose at most 16 exact skills. Each rewrite target may appear at most once. Its own original highlight ID must be the first source_evidence_ids item; additional items may cite only other highlights from the same employment entry. Prefer the evidence that best answers the job description. A cover letter may contain at most four concise paragraphs. Each paragraph must cite one to six non-duplicated evidence IDs and be no longer than 700 characters. The complete model-authored letter must be no longer than 2,400 characters.
 
 The user input includes layout_policy. When it is preserve_source_docx, the original Word document is the layout authority: preserve its headline, summary, complete skill list, section order, employer order, title order, dates, education, project order, and bullet order. In that mode, propose only evidence-grounded same-role employment_highlight_rewrites; Bluey will ignore every requested reorder or selection change server-side."#
 }
@@ -1161,6 +1209,7 @@ fn user_prompt(
     let candidate = json!({
         "skills": profile.skills,
         "employment": profile.employment,
+        "education": profile.education,
         "projects": profile.projects,
         "certifications": profile.certifications,
     });
@@ -1271,7 +1320,62 @@ fn validate_plan(
         }
         validate_highlight_rewrite(profile, catalog, rewrite)?;
     }
+    if let Some(cover_letter) = &plan.cover_letter {
+        validate_cover_letter(profile, catalog, cover_letter)?;
+    }
     Ok(plan)
+}
+
+fn validate_cover_letter(
+    profile: &CareerProfile,
+    catalog: &EvidenceCatalog,
+    plan: &CoverLetterPlan,
+) -> Result<()> {
+    if plan.paragraphs.is_empty() || plan.paragraphs.len() > MAX_COVER_LETTER_PARAGRAPHS {
+        return Err(anyhow!(
+            "cover letter must contain between 1 and {MAX_COVER_LETTER_PARAGRAPHS} paragraphs"
+        ));
+    }
+
+    let mut total_chars = 0usize;
+    for paragraph in &plan.paragraphs {
+        let text = paragraph.text.trim();
+        if text.is_empty() {
+            return Err(anyhow!("cover letter paragraph is empty"));
+        }
+        let paragraph_chars = text.chars().count();
+        if paragraph_chars > MAX_COVER_LETTER_PARAGRAPH_CHARS {
+            return Err(anyhow!("cover letter paragraph is too long"));
+        }
+        total_chars = total_chars.saturating_add(paragraph_chars);
+        if paragraph.source_evidence_ids.is_empty()
+            || paragraph.source_evidence_ids.len() > MAX_COVER_LETTER_SOURCES
+        {
+            return Err(anyhow!(
+                "cover letter paragraph must cite between 1 and {MAX_COVER_LETTER_SOURCES} evidence records"
+            ));
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut sources = Vec::with_capacity(paragraph.source_evidence_ids.len());
+        for source_id in &paragraph.source_evidence_ids {
+            if !seen.insert(source_id) {
+                return Err(anyhow!("duplicate cover letter evidence id: {source_id}"));
+            }
+            sources.push(
+                catalog
+                    .values
+                    .get(source_id)
+                    .ok_or_else(|| anyhow!("unknown cover letter evidence id: {source_id}"))?
+                    .as_str(),
+            );
+        }
+        jobs::validate_grounded_application_text(profile, &sources, text)?;
+    }
+    if total_chars > MAX_COVER_LETTER_CHARS {
+        return Err(anyhow!("cover letter is too long"));
+    }
+    Ok(())
 }
 
 fn validate_highlight_rewrite(
@@ -1482,6 +1586,7 @@ fn deterministic_fallback(baseline: &ResumeVersion) -> Result<GeneratedResume> {
         "claims_added": 0,
         "claims_rewritten": 0,
         "rewrite_sources": {},
+        "cover_letter_included": false,
     });
     content["provenance"]["resume_generation"] = public_provenance.clone();
 
@@ -1499,11 +1604,13 @@ fn deterministic_fallback(baseline: &ResumeVersion) -> Result<GeneratedResume> {
         content,
         diff,
         public_provenance,
+        cover_letter: String::new(),
     })
 }
 
 fn materialize(
     profile: &CareerProfile,
+    posting: &JobPosting,
     baseline: &ResumeVersion,
     plan: &ResumePlan,
     kind: &str,
@@ -1585,6 +1692,8 @@ fn materialize(
         .collect::<Vec<_>>();
     content["projects"] = serde_json::to_value(&projects)?;
 
+    let (cover_letter, cover_letter_sources) = materialize_cover_letter(profile, posting, plan)?;
+
     let public_provenance = json!({
         "kind": kind,
         "schema_version": GENERATION_SCHEMA_VERSION,
@@ -1593,6 +1702,8 @@ fn materialize(
         "claims_added": 0,
         "claims_rewritten": rewrite_sources.len(),
         "rewrite_sources": rewrite_sources,
+        "cover_letter_included": !cover_letter.is_empty(),
+        "cover_letter_sources": cover_letter_sources,
     });
     content["provenance"]["resume_generation"] = public_provenance.clone();
     let diff = build_diff(
@@ -1608,7 +1719,50 @@ fn materialize(
         content,
         diff,
         public_provenance,
+        cover_letter,
     })
+}
+
+fn materialize_cover_letter(
+    profile: &CareerProfile,
+    posting: &JobPosting,
+    plan: &ResumePlan,
+) -> Result<(String, Value)> {
+    let Some(cover_letter) = &plan.cover_letter else {
+        return Ok((String::new(), json!({})));
+    };
+
+    let paragraphs = cover_letter
+        .paragraphs
+        .iter()
+        .map(|paragraph| paragraph.text.trim())
+        .collect::<Vec<_>>();
+    let mut sections = vec![
+        "Dear Hiring Team,".to_string(),
+        format!(
+            "I am applying for the {} role at {}.",
+            posting.title.trim(),
+            posting.company.trim()
+        ),
+    ];
+    sections.extend(paragraphs.iter().map(|paragraph| (*paragraph).to_string()));
+    sections.push(if profile.full_name.trim().is_empty() {
+        "Sincerely,".to_string()
+    } else {
+        format!("Sincerely,\n{}", profile.full_name.trim())
+    });
+    let rendered = sections.join("\n\n");
+    if rendered.chars().count() > MAX_COVER_LETTER_CHARS + 500 {
+        return Err(anyhow!("rendered cover letter is too long"));
+    }
+
+    let sources = cover_letter
+        .paragraphs
+        .iter()
+        .enumerate()
+        .map(|(index, paragraph)| (index.to_string(), json!(paragraph.source_evidence_ids)))
+        .collect::<serde_json::Map<_, _>>();
+    Ok((rendered, Value::Object(sources)))
 }
 
 fn build_diff(

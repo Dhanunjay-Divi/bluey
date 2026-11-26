@@ -98,6 +98,84 @@ export function validateWorkspaceLock(rootManifest, workspaceManifests, lockfile
   return issues.sort();
 }
 
+export function validateNativePackagingLock(manifest, lockfile) {
+  const issues = [...inventoryPackageLock(lockfile).issues];
+  const locked = lockfile.packages?.[""];
+  if (manifest.name !== "@bluey/jobs-browser-packaging" || manifest.private !== true ||
+      Object.hasOwn(manifest, "workspaces") || Object.hasOwn(manifest, "overrides")) {
+    issues.push("native SDK must be the independent private packaging package without workspace overrides");
+  }
+  if (!locked || lockfile.name !== manifest.name || lockfile.version !== manifest.version ||
+      locked.name !== manifest.name || locked.version !== manifest.version || locked.link ||
+      Object.hasOwn(locked, "workspaces") || Object.hasOwn(locked, "overrides")) {
+    issues.push("native SDK manifest identity does not match its independent lock");
+  }
+  for (const field of ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]) {
+    if (!sameDependencyMap(manifest[field], locked?.[field])) {
+      issues.push(`native SDK ${field} does not match its independent lock`);
+    }
+    if (field !== "devDependencies" &&
+        (Object.hasOwn(manifest, field) || (locked && Object.hasOwn(locked, field)))) {
+      issues.push(`native SDK must not declare ${field}`);
+    }
+  }
+  if (!sameDependencyMap(manifest.devDependencies, {
+    "electron-builder": manifest.devDependencies?.["electron-builder"],
+  }) || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(
+    manifest.devDependencies?.["electron-builder"] ?? "")) {
+    issues.push("native SDK electron-builder must be exactly version pinned");
+  }
+  for (const [lockPath, entry] of Object.entries(lockfile.packages ?? {})) {
+    if (!lockPath) continue;
+    if (entry.link || !lockPath.startsWith("node_modules/") ||
+        /(?:^|\/)\.\.?\//.test(lockPath) || /[\\\u0000-\u001f]/.test(lockPath)) {
+      issues.push("native SDK lock must not link to parent workspaces or local packages");
+    }
+    let registryUrl = false;
+    try {
+      const url = new URL(entry.resolved);
+      registryUrl = url.protocol === "https:" && url.hostname === "registry.npmjs.org" &&
+        url.port === "" && url.username === "" && url.password === "" &&
+        url.search === "" && url.hash === "";
+    } catch { /* Missing or non-URL origins refuse below. */ }
+    const sri = /^sha512-([A-Za-z0-9+/]{86}==)$/.exec(entry.integrity ?? "");
+    const canonicalIntegrity = sri && Buffer.from(sri[1], "base64").toString("base64") === sri[1];
+    if (!registryUrl || !canonicalIntegrity) {
+      issues.push("native SDK entries require registry-only origins and canonical sha512 integrity");
+    }
+  }
+  return [...new Set(issues)].sort();
+}
+
+export function validateWebPackagingGraph(rootManifest, lockfile) {
+  const issues = [];
+  if (rootManifest.devDependencies?.["@electron/asar"] !== "4.3.1" ||
+      lockfile.packages?.[""]?.devDependencies?.["@electron/asar"] !== "4.3.1") {
+    issues.push("Root release-contract tools must declare their own exact asar dependency");
+  }
+  const policy = rootManifest.overrides?.["@electron/asar@4.3.1"];
+  if (policy?.glob !== "14.0.3" || policy?.minimatch !== "11.0.3") {
+    issues.push("Web/cloud asar compatibility policy must pin the reviewed modern dependency graph");
+  }
+  if (lockfile.packages?.browser?.devDependencies?.["@electron/asar"] !== "4.3.1" ||
+      lockfile.packages?.browser?.devDependencies?.["electron-builder"] !== undefined) {
+    issues.push("Web/cloud browser metadata must exclude the native release SDK");
+  }
+  const forbidden = new Set(["electron-builder", "app-builder-lib", "electron-winstaller",
+    "electron-builder-squirrel-windows"]);
+  for (const [lockPath, metadata] of Object.entries(lockfile.packages ?? {})) {
+    const name = packageNameFromLockPath(lockPath);
+    if (lockPath === "browser/packaging" || forbidden.has(name)) {
+      issues.push("Native release SDK must remain outside the Web/cloud workspace lock");
+    }
+    const expected = { "@electron/asar": "4.3.1", glob: "14.0.3", minimatch: "11.0.3" }[name];
+    if (expected && metadata.version !== expected) {
+      issues.push(`Web/cloud ${name} does not match its reviewed compatibility pin`);
+    }
+  }
+  return [...new Set(issues)].sort();
+}
+
 export function parseProvenanceRows(markdown) {
   const rows = [];
   const expression =
@@ -162,10 +240,17 @@ function main() {
   );
   const inventory = inventoryPackageLock(lockfile);
   const workspaceIssues = validateWorkspaceLock(rootManifest, workspaceManifests, lockfile);
+  const webGraphIssues = validateWebPackagingGraph(rootManifest, lockfile);
+  const sdkRoot = path.join(jobsRoot, "browser", "packaging");
+  const sdkManifest = readJson(path.join(sdkRoot, "package.json"));
+  const sdkLock = readJson(path.join(sdkRoot, "package-lock.json"));
+  const sdkInventory = inventoryPackageLock(sdkLock);
+  const sdkIssues = validateNativePackagingLock(sdkManifest, sdkLock);
   const provenance = fs.readFileSync(path.join(jobsRoot, "THIRD_PARTY_PROVENANCE.md"), "utf8");
   const notices = fs.readFileSync(path.join(jobsRoot, "THIRD_PARTY_NOTICES.md"), "utf8");
   const provenanceResult = validateProvenance(provenance, notices, (relativePath) => fs.existsSync(path.join(jobsRoot, relativePath)));
-  const issues = [...inventory.issues, ...workspaceIssues, ...provenanceResult.issues].sort();
+  const issues = [...inventory.issues, ...workspaceIssues, ...webGraphIssues, ...provenanceResult.issues,
+    ...sdkIssues.map((issue) => `Native release SDK: ${issue}`)].sort();
 
   if (issues.length > 0) {
     console.error("Jobs provenance/license inventory failed:");
@@ -179,6 +264,8 @@ function main() {
     `Jobs dependency inventory passed (${inventory.lockEntries} lock entries, ${inventory.packages} unique package versions, ${inventory.overrideCount} audited override).`,
   );
   console.log(`License inventory: ${licenseSummary}`);
+  console.log(`Native release SDK license inventory passed (${sdkInventory.lockEntries} lock entries, ` +
+    `${sdkInventory.packages} unique package versions); this is not its security-audit pass.`);
   console.log(`Source provenance passed (${provenanceResult.rows.length} commit-pinned repositories).`);
 }
 

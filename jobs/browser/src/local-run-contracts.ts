@@ -4,7 +4,14 @@ import type {
   NormalizedJob,
 } from "@bluey/jobs-automation";
 import {
+  ApprovedExecutionIntegrityError,
+  CertifiedProviderJobKeyError,
+  assertCertifiedProviderNavigationJob,
+  assertApprovedExecutionChecksum,
+} from "@bluey/jobs-automation";
+import {
   scopedLocalRunAuthorization,
+  scopedLocalRunReconciliationAuthorization,
   type LocalRunCapabilities,
   type LocalRunCapabilityOperation,
 } from "./local-capabilities.js";
@@ -40,6 +47,17 @@ export function validateStartRunRequest(request: StartRunRequest): void {
     && request.packet.applicationIdentityId !== request.applicationIdentityId) {
     throw new LocalBrowserError("identity_mismatch");
   }
+  if (!request.job) throw new LocalBrowserError("run_request_invalid");
+  try {
+    assertApprovedExecutionChecksum(request.packet, request.job);
+    assertCertifiedProviderNavigationJob(request.url, request.job);
+  } catch (error) {
+    if (error instanceof ApprovedExecutionIntegrityError
+      || error instanceof CertifiedProviderJobKeyError) {
+      throw new LocalBrowserError("launch_mismatch");
+    }
+    throw error;
+  }
 }
 
 export function localRunDirectory(userData: string, request: StartRunRequest): string {
@@ -70,6 +88,17 @@ export function localRunAuthorization(
 ): { capability: string } {
   try {
     return scopedLocalRunAuthorization(delivery.capabilities, operation);
+  } catch {
+    throw new LocalBrowserError("launch_expired");
+  }
+}
+
+export function localRunReconciliationAuthorization(
+  delivery: LocalRunDelivery,
+  nowMs = Date.now(),
+): { capability: string } {
+  try {
+    return scopedLocalRunReconciliationAuthorization(delivery.capabilities, nowMs);
   } catch {
     throw new LocalBrowserError("launch_expired");
   }

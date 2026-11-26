@@ -1,3 +1,56 @@
+const OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT: usize = 8;
+
+#[cfg(test)]
+struct DiscoveryTestTimeline {
+    start: std::time::Instant,
+    marks: Vec<(&'static str, u128)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DISCOVERY_TEST_TIMELINE: std::cell::RefCell<Option<DiscoveryTestTimeline>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn mark_discovery_test_phase(phase: &'static str) {
+    DISCOVERY_TEST_TIMELINE.with_borrow_mut(|timeline| {
+        if let Some(timeline) = timeline {
+            timeline
+                .marks
+                .push((phase, timeline.start.elapsed().as_micros()));
+        }
+    });
+}
+
+type DiscoveryOperationalHoldScanCursor = (i64, String);
+
+static DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS: std::sync::LazyLock<
+    std::sync::Mutex<Option<DiscoveryOperationalHoldScanCursor>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn operational_hold_scan_cursor_snapshot<K: Clone>(
+    cursor: &std::sync::Mutex<Option<K>>,
+) -> Option<K> {
+    cursor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn compare_exchange_operational_hold_scan_cursor<K: Eq>(
+    cursor: &std::sync::Mutex<Option<K>>,
+    expected: Option<&K>,
+    next: Option<K>,
+) {
+    let mut cursor = cursor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cursor.as_ref() != expected {
+        return;
+    }
+    *cursor = next;
+}
 
 pub fn list_discovery_sources(pool: &DbPool, account_id: &str) -> Result<Vec<DiscoverySource>> {
     crate::db::run_blocking_db(|| match pool {
@@ -75,6 +128,530 @@ pub fn verified_import_discovery_membership_job_id(
             )
             .map(|row| row.map(|row| row.get(0)))
             .context("get verified-import discovery membership"),
+    })
+}
+
+const VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION: i64 = 1;
+const VERIFIED_IMPORT_BACKFILL_LEASE_MS: i64 = 5 * 60 * 1_000;
+
+#[cfg(test)]
+static VERIFIED_IMPORT_BACKFILL_SQLITE_CLAIM_WRITE_TX_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+const VERIFIED_IMPORT_BACKFILL_WRITE_TX_TEST_ACCOUNT: &str = "acct-claim-load";
+
+#[cfg(test)]
+pub(crate) fn reset_verified_import_backfill_sqlite_claim_write_tx_count() {
+    VERIFIED_IMPORT_BACKFILL_SQLITE_CLAIM_WRITE_TX_COUNT
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn verified_import_backfill_sqlite_claim_write_tx_count() -> usize {
+    VERIFIED_IMPORT_BACKFILL_SQLITE_CLAIM_WRITE_TX_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub struct VerifiedImportBackfillLease {
+    owner_id: String,
+    token: String,
+    expected_after_job_id: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Debug)]
+pub struct VerifiedImportBackfillBatch {
+    pub expected_after_job_id: String,
+    pub next_after_job_id: String,
+    pub scanned_count: usize,
+    pub postings: Vec<JobPosting>,
+}
+
+fn verified_import_backfill_lease_material() -> (String, String, String) {
+    let owner_id = format!("verified-import-backfill-{}", uuid::Uuid::new_v4());
+    let mut token_bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+    let token_sha256 = hex::encode(Sha256::digest(token.as_bytes()));
+    (owner_id, token, token_sha256)
+}
+
+fn verified_import_backfill_token_sha256(lease: &VerifiedImportBackfillLease) -> String {
+    hex::encode(Sha256::digest(lease.token.as_bytes()))
+}
+
+/// Claim the one durable repair worker for an account before scheduling any
+/// heavyweight work. Expired claims can be replaced, while a live owner keeps
+/// concurrent workspace requests from creating detached repair fan-out.
+pub fn claim_verified_import_backfill(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Option<VerifiedImportBackfillLease>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let observed_now_ms: i64 = conn.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            let unavailable = conn
+                .query_row(
+                    "SELECT completed=1
+                            OR (lease_owner IS NOT NULL AND lease_expires_at_ms>?3)
+                       FROM jobs_verified_import_backfill_checkpoints
+                      WHERE account_id=?1 AND migration_version=?2",
+                    params![
+                        account_id,
+                        VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                        observed_now_ms,
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if unavailable {
+                return Ok(None);
+            }
+            let (owner_id, token, token_sha256) = verified_import_backfill_lease_material();
+            #[cfg(test)]
+            if account_id == VERIFIED_IMPORT_BACKFILL_WRITE_TX_TEST_ACCOUNT {
+                VERIFIED_IMPORT_BACKFILL_SQLITE_CLAIM_WRITE_TX_COUNT
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now_ms: i64 = tx.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_verified_import_backfill_checkpoints (
+                    account_id, migration_version, after_job_id, completed, updated_at_ms
+                 ) VALUES (?1, ?2, '', 0, ?3)
+                 ON CONFLICT(account_id, migration_version) DO NOTHING",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    now_ms
+                ],
+            )?;
+            let expires_at_ms = now_ms.saturating_add(VERIFIED_IMPORT_BACKFILL_LEASE_MS);
+            let changed = tx.execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_owner=?3, lease_token_sha256=?4,
+                        lease_expires_at_ms=?5, updated_at_ms=?6
+                  WHERE account_id=?1 AND migration_version=?2 AND completed=0
+                    AND (lease_owner IS NULL OR lease_expires_at_ms<=?6)",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    owner_id,
+                    token_sha256,
+                    expires_at_ms,
+                    now_ms,
+                ],
+            )?;
+            if changed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let expected_after_job_id = tx.query_row(
+                "SELECT after_job_id FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id=?1 AND migration_version=?2
+                    AND lease_owner=?3 AND lease_token_sha256=?4
+                    AND lease_expires_at_ms=?5 AND lease_expires_at_ms>?6",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    owner_id,
+                    token_sha256,
+                    expires_at_ms,
+                    now_ms,
+                ],
+                |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok(Some(VerifiedImportBackfillLease {
+                owner_id,
+                token,
+                expected_after_job_id,
+                expires_at_ms,
+            }))
+        }
+        DbPool::Postgres(_) => {
+            let (owner_id, token, token_sha256) = verified_import_backfill_lease_material();
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let now_ms: i64 = tx
+                .query_one(
+                    "SELECT floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )?
+                .get(0);
+            tx.execute(
+                "INSERT INTO jobs_verified_import_backfill_checkpoints (
+                    account_id, migration_version, after_job_id, completed, updated_at_ms
+                 ) VALUES ($1, $2, '', 0, $3)
+                 ON CONFLICT(account_id, migration_version) DO NOTHING",
+                &[
+                    &account_id,
+                    &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    &now_ms,
+                ],
+            )?;
+            let expires_at_ms = now_ms.saturating_add(VERIFIED_IMPORT_BACKFILL_LEASE_MS);
+            let changed = tx.execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_owner=$3, lease_token_sha256=$4,
+                        lease_expires_at_ms=$5, updated_at_ms=$6
+                  WHERE account_id=$1 AND migration_version=$2 AND completed=0
+                    AND (lease_owner IS NULL OR lease_expires_at_ms<=$6)",
+                &[
+                    &account_id,
+                    &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    &owner_id,
+                    &token_sha256,
+                    &expires_at_ms,
+                    &now_ms,
+                ],
+            )?;
+            if changed != 1 {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let expected_after_job_id = tx
+                .query_one(
+                    "SELECT after_job_id FROM jobs_verified_import_backfill_checkpoints
+                      WHERE account_id=$1 AND migration_version=$2
+                        AND lease_owner=$3 AND lease_token_sha256=$4
+                        AND lease_expires_at_ms=$5",
+                    &[
+                        &account_id,
+                        &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                        &owner_id,
+                        &token_sha256,
+                        &expires_at_ms,
+                    ],
+                )?
+                .get(0);
+            tx.commit()?;
+            Ok(Some(VerifiedImportBackfillLease {
+                owner_id,
+                token,
+                expected_after_job_id,
+                expires_at_ms,
+            }))
+        }
+    })
+}
+
+/// Read one durable, ID-ordered slice of legacy verified imports. The caller
+/// advances the checkpoint only after every retryable operation in the slice
+/// succeeds. A crash or storage failure therefore replays at most one small,
+/// idempotent batch rather than skipping repair work.
+pub fn verified_import_backfill_batch(
+    pool: &DbPool,
+    account_id: &str,
+    lease: &VerifiedImportBackfillLease,
+    limit: usize,
+) -> Result<VerifiedImportBackfillBatch> {
+    if limit == 0 || limit > 250 {
+        anyhow::bail!("verified-import backfill batch size is invalid")
+    }
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now_ms: i64 = tx.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            let token_sha256 = verified_import_backfill_token_sha256(lease);
+            let after_job_id: String = tx
+                .query_row(
+                    "SELECT after_job_id
+                   FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id=?1 AND migration_version=?2 AND completed=0
+                    AND after_job_id=?3 AND lease_owner=?4
+                    AND lease_token_sha256=?5 AND lease_expires_at_ms=?6
+                    AND lease_expires_at_ms>?7",
+                    params![
+                        account_id,
+                        VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                        lease.expected_after_job_id,
+                        lease.owner_id,
+                        token_sha256,
+                        lease.expires_at_ms,
+                        now_ms,
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("verified-import backfill lease is unavailable"))?;
+            let mut statement = tx.prepare(
+                "SELECT id, posting_json, canonical_key, source, canonical_url, company
+                   FROM jobs_postings
+                  WHERE account_id = ?1 AND id > ?2 COLLATE BINARY
+                    AND substr(source, -7) = '_import'
+                  ORDER BY id COLLATE BINARY ASC LIMIT ?3",
+            )?;
+            let raws = statement
+                .query_map(params![account_id, after_job_id, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        row.get::<_, String>(5)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(statement);
+            let scanned_count = raws.len();
+            let next_after_job_id = raws
+                .last()
+                .map(|row| row.0.clone())
+                .unwrap_or_else(|| after_job_id.clone());
+            let postings = verified_import_backfill_postings(raws)?;
+            tx.commit()?;
+            Ok(VerifiedImportBackfillBatch {
+                expected_after_job_id: after_job_id,
+                next_after_job_id,
+                scanned_count,
+                postings,
+            })
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let now_ms: i64 = tx
+                .query_one(
+                    "SELECT floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )?
+                .get(0);
+            let token_sha256 = verified_import_backfill_token_sha256(lease);
+            let row = tx
+                .query_opt(
+                    "SELECT after_job_id
+                   FROM jobs_verified_import_backfill_checkpoints
+                  WHERE account_id=$1 AND migration_version=$2 AND completed=0
+                    AND after_job_id=$3 AND lease_owner=$4
+                    AND lease_token_sha256=$5 AND lease_expires_at_ms=$6
+                    AND lease_expires_at_ms>$7 FOR UPDATE",
+                    &[
+                        &account_id,
+                        &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                        &lease.expected_after_job_id,
+                        &lease.owner_id,
+                        &token_sha256,
+                        &lease.expires_at_ms,
+                        &now_ms,
+                    ],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("verified-import backfill lease is unavailable"))?;
+            let after_job_id = row.get::<_, String>(0);
+            let raws = tx
+                .query(
+                    r#"SELECT id, posting_json, canonical_key, source, canonical_url, company
+                       FROM jobs_postings
+                      WHERE account_id = $1 AND id COLLATE "C" > $2 COLLATE "C"
+                        AND RIGHT(source, 7) = '_import'
+                      ORDER BY id COLLATE "C" ASC LIMIT $3"#,
+                    &[&account_id, &after_job_id, &(limit as i64)],
+                )?
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.get::<_, String>(0),
+                        row.get::<_, String>(1),
+                        row.get::<_, String>(2),
+                        row.get::<_, String>(3),
+                        row.get::<_, Option<String>>(4).unwrap_or_default(),
+                        row.get::<_, String>(5),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let scanned_count = raws.len();
+            let next_after_job_id = raws
+                .last()
+                .map(|row| row.0.clone())
+                .unwrap_or_else(|| after_job_id.clone());
+            let postings = verified_import_backfill_postings(raws)?;
+            tx.commit()?;
+            Ok(VerifiedImportBackfillBatch {
+                expected_after_job_id: after_job_id,
+                next_after_job_id,
+                scanned_count,
+                postings,
+            })
+        }
+    })
+}
+
+fn verified_import_backfill_postings(
+    raws: Vec<(String, String, String, String, String, String)>,
+) -> Result<Vec<JobPosting>> {
+    raws.into_iter()
+        .map(
+            |(relational_id, raw, canonical_key, source, canonical_url, company)| {
+                let mut posting =
+                    parse_json::<JobPosting>(raw, "verified-import backfill posting")?;
+                // Legacy payloads can carry stale embedded identity. The
+                // tenant-bound relational row is the same authority used by
+                // current workspace/detail projections, so repair must not be
+                // permanently pinned by an unrecoverable JSON mismatch.
+                posting.id = relational_id;
+                posting.canonical_key = canonical_key;
+                posting.source = source;
+                posting.canonical_url = canonical_url;
+                posting.company = company;
+                Ok(posting)
+            },
+        )
+        .collect()
+}
+
+/// Compare-and-swap the durable checkpoint. Only a crashed owner whose lease
+/// expires may cause the same idempotent slice to replay; a live or stale owner
+/// can never move the monotonic cursor backwards.
+pub fn advance_verified_import_backfill_checkpoint(
+    pool: &DbPool,
+    account_id: &str,
+    lease: &VerifiedImportBackfillLease,
+    next_after_job_id: &str,
+    completed: bool,
+) -> Result<bool> {
+    let ordering = next_after_job_id
+        .as_bytes()
+        .cmp(lease.expected_after_job_id.as_bytes());
+    if (completed && !ordering.is_eq()) || (!completed && !ordering.is_gt()) {
+        anyhow::bail!("verified-import backfill checkpoint transition is invalid")
+    }
+    let completed = i64::from(completed);
+    let token_sha256 = verified_import_backfill_token_sha256(lease);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let now_ms: i64 = conn.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET after_job_id=?6, completed=?7, lease_owner=NULL,
+                        lease_token_sha256=NULL, lease_expires_at_ms=NULL,
+                        updated_at_ms=?9
+                  WHERE account_id = ?1 AND migration_version = ?2
+                    AND after_job_id=?3 AND completed=0 AND lease_owner=?4
+                    AND lease_token_sha256=?5 AND lease_expires_at_ms=?8
+                    AND lease_expires_at_ms>?9",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    lease.expected_after_job_id,
+                    lease.owner_id,
+                    token_sha256,
+                    next_after_job_id,
+                    completed,
+                    lease.expires_at_ms,
+                    now_ms,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .context("advance verified-import backfill checkpoint")
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET after_job_id=$6, completed=$7, lease_owner=NULL,
+                        lease_token_sha256=NULL, lease_expires_at_ms=NULL,
+                        updated_at_ms=
+                            floor(extract(epoch from clock_timestamp()) * 1000)::bigint
+                  WHERE account_id = $1 AND migration_version = $2
+                    AND after_job_id=$3 AND completed=0 AND lease_owner=$4
+                    AND lease_token_sha256=$5 AND lease_expires_at_ms=$8
+                    AND lease_expires_at_ms>
+                        floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                &[
+                    &account_id,
+                    &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    &lease.expected_after_job_id,
+                    &lease.owner_id,
+                    &token_sha256,
+                    &next_after_job_id,
+                    &(completed as i16),
+                    &lease.expires_at_ms,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .context("advance verified-import backfill checkpoint"),
+    })
+}
+
+/// Release a failed repair attempt without advancing its durable cursor. A
+/// stale owner cannot clear a replacement claim because both owner and secret
+/// token digest participate in the compare-and-swap.
+pub fn release_verified_import_backfill_lease(
+    pool: &DbPool,
+    account_id: &str,
+    lease: &VerifiedImportBackfillLease,
+) -> Result<bool> {
+    let token_sha256 = verified_import_backfill_token_sha256(lease);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let now_ms: i64 = conn.query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_owner=NULL, lease_token_sha256=NULL,
+                        lease_expires_at_ms=NULL, updated_at_ms=?6
+                  WHERE account_id=?1 AND migration_version=?2
+                    AND lease_owner=?3 AND lease_token_sha256=?4
+                    AND lease_expires_at_ms=?5 AND lease_expires_at_ms>?6",
+                params![
+                    account_id,
+                    VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    lease.owner_id,
+                    token_sha256,
+                    lease.expires_at_ms,
+                    now_ms,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .context("release verified-import backfill lease")
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .execute(
+                "UPDATE jobs_verified_import_backfill_checkpoints
+                    SET lease_owner=NULL, lease_token_sha256=NULL,
+                        lease_expires_at_ms=NULL,
+                        updated_at_ms=floor(extract(epoch from clock_timestamp()) * 1000)::bigint
+                  WHERE account_id=$1 AND migration_version=$2
+                    AND lease_owner=$3 AND lease_token_sha256=$4
+                    AND lease_expires_at_ms=$5
+                    AND lease_expires_at_ms>
+                        floor(extract(epoch from clock_timestamp()) * 1000)::bigint",
+                &[
+                    &account_id,
+                    &VERIFIED_IMPORT_BACKFILL_MIGRATION_VERSION,
+                    &lease.owner_id,
+                    &token_sha256,
+                    &lease.expires_at_ms,
+                ],
+            )
+            .map(|updated| updated == 1)
+            .context("release verified-import backfill lease"),
     })
 }
 
@@ -631,6 +1208,12 @@ fn verified_import_membership_run_id(
     format!("verified-import-{}", &digest[..32])
 }
 
+fn verified_import_identity_posting(relational_id: String, raw: String) -> Result<JobPosting> {
+    let mut posting = parse_json::<JobPosting>(raw, "job posting")?;
+    posting.id = relational_id;
+    Ok(posting)
+}
+
 fn resolve_verified_import_identity_sqlite(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
@@ -650,13 +1233,13 @@ fn resolve_verified_import_identity_sqlite(
     let membership_posting = match membership_job_id {
         Some(job_id) => tx
             .query_row(
-                "SELECT posting_json FROM jobs_postings
+                "SELECT id, posting_json FROM jobs_postings
                   WHERE account_id = ?1 AND id = ?2",
                 params![account_id, job_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
-            .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+            .map(|(id, raw)| verified_import_identity_posting(id, raw))
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("discovery membership refers to a missing job"))
             .map(Some)?,
@@ -664,23 +1247,23 @@ fn resolve_verified_import_identity_sqlite(
     };
     let canonical_posting = tx
         .query_row(
-            "SELECT posting_json FROM jobs_postings
+            "SELECT id, posting_json FROM jobs_postings
               WHERE account_id = ?1 AND canonical_key = ?2",
             params![account_id, canonical_key],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
-        .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
+        .map(|(id, raw)| verified_import_identity_posting(id, raw))
         .transpose()?;
     let mut statement = tx.prepare(
-        "SELECT posting_json FROM jobs_postings
+        "SELECT id, posting_json FROM jobs_postings
           WHERE account_id = ?1 AND canonical_url = ?2
           ORDER BY id LIMIT 2",
     )?;
     let mut rows = statement.query(params![account_id, canonical_url])?;
     let mut url_posting: Option<JobPosting> = None;
     while let Some(row) = rows.next()? {
-        let parsed = parse_json::<JobPosting>(row.get::<_, String>(0)?, "job posting")?;
+        let parsed = verified_import_identity_posting(row.get(0)?, row.get(1)?)?;
         if url_posting
             .as_ref()
             .is_some_and(|existing| existing.id != parsed.id)
@@ -714,11 +1297,11 @@ fn resolve_verified_import_identity_postgres(
     let membership_posting = match membership_job_id {
         Some(job_id) => tx
             .query_opt(
-                "SELECT posting_json FROM jobs_postings
+                "SELECT id, posting_json FROM jobs_postings
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
                 &[&account_id, &job_id],
             )?
-            .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+            .map(|row| verified_import_identity_posting(row.get(0), row.get(1)))
             .transpose()?
             .ok_or_else(|| anyhow::anyhow!("discovery membership refers to a missing job"))
             .map(Some)?,
@@ -726,21 +1309,21 @@ fn resolve_verified_import_identity_postgres(
     };
     let canonical_posting = tx
         .query_opt(
-            "SELECT posting_json FROM jobs_postings
+            "SELECT id, posting_json FROM jobs_postings
               WHERE account_id = $1 AND canonical_key = $2 FOR UPDATE",
             &[&account_id, &canonical_key],
         )?
-        .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
+        .map(|row| verified_import_identity_posting(row.get(0), row.get(1)))
         .transpose()?;
     let url_rows = tx.query(
-        "SELECT posting_json FROM jobs_postings
+        "SELECT id, posting_json FROM jobs_postings
           WHERE account_id = $1 AND canonical_url = $2
           ORDER BY id LIMIT 2 FOR UPDATE",
         &[&account_id, &canonical_url],
     )?;
     let mut url_posting: Option<JobPosting> = None;
     for row in url_rows {
-        let parsed = parse_json::<JobPosting>(row.get(0), "job posting")?;
+        let parsed = verified_import_identity_posting(row.get(0), row.get(1))?;
         if url_posting
             .as_ref()
             .is_some_and(|existing| existing.id != parsed.id)
@@ -772,6 +1355,149 @@ fn resolve_consistent_verified_import_identity<const N: usize>(
     Ok(resolved)
 }
 
+const SELECT_CURATED_LEAD_FOR_IMPORT: &str = "SELECT p.posting_json, p.source,
+    p.canonical_key, p.canonical_url
+    FROM jobs_postings p WHERE p.account_id = $1 AND p.id = $2
+    AND p.canonical_url <> ''
+    AND EXISTS (SELECT 1 FROM jobs_discovery_memberships m
+        JOIN jobs_discovery_sources s ON s.id = m.source_id AND s.account_id = m.account_id
+        WHERE m.account_id = p.account_id AND m.job_id = p.id
+          AND m.canonical_key = p.canonical_key AND m.availability_status = 'unknown'
+          AND s.provider = 'curated_feed')";
+
+type SelectedCuratedLeadRow = (String, String, String, String);
+
+/// Server-owned snapshot of one curated lead. Not serialized or supplied by a client.
+pub struct SelectedCuratedLead {
+    account_id: String,
+    posting: JobPosting,
+    row_sha256: [u8; 32],
+}
+
+impl SelectedCuratedLead {
+    pub fn canonical_url(&self) -> &str {
+        &self.posting.canonical_url
+    }
+
+    pub fn track_id(&self) -> &str {
+        &self.posting.track_id
+    }
+}
+
+pub fn capture_selected_curated_lead(
+    pool: &DbPool,
+    account_id: &str,
+    job_id: &str,
+) -> Result<Option<SelectedCuratedLead>> {
+    let row = crate::db::run_blocking_db(|| -> Result<Option<SelectedCuratedLeadRow>> {
+        match pool {
+            DbPool::Sqlite(_) => Ok(pool
+                .get()?
+                .query_row(
+                    SELECT_CURATED_LEAD_FOR_IMPORT,
+                    params![account_id, job_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?),
+            DbPool::Postgres(_) => Ok(pool
+                .get_pg()?
+                .query_opt(SELECT_CURATED_LEAD_FOR_IMPORT, &[&account_id, &job_id])?
+                .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))),
+        }
+    })?;
+    let Some((raw, source, canonical_key, canonical_url)) = row else {
+        return Ok(None);
+    };
+    let row_sha256 = Sha256::digest(raw.as_bytes()).into();
+    let posting = parse_json::<JobPosting>(raw, "job posting")?;
+    if posting.id != job_id
+        || posting.source != source
+        || posting.canonical_key != canonical_key
+        || posting.canonical_url != canonical_url
+        || !posting
+            .source
+            .strip_prefix("curated_feed:")
+            .is_some_and(|catalog| CURATED_DISCOVERY_CATALOG_IDS.contains(&catalog))
+        || posting.track_id.is_empty()
+        || posting.availability_status != "unknown"
+        || posting.discovery_evidence.provenance != "external_feed"
+        || !posting.discovery_evidence.requires_original_revalidation
+    {
+        return Ok(None);
+    }
+    Ok(Some(SelectedCuratedLead {
+        account_id: account_id.to_string(),
+        posting,
+        row_sha256,
+    }))
+}
+
+fn require_selected_curated_lead_unchanged(
+    selection: &SelectedCuratedLead,
+    row: Option<SelectedCuratedLeadRow>,
+) -> Result<()> {
+    let Some((raw, source, key, url)) = row else {
+        anyhow::bail!("selected curated lead changed before verified import")
+    };
+    let row_sha256: [u8; 32] = Sha256::digest(raw.as_bytes()).into();
+    if row_sha256 != selection.row_sha256
+        || source != selection.posting.source
+        || key != selection.posting.canonical_key
+        || url != selection.posting.canonical_url
+    {
+        anyhow::bail!("selected curated lead changed before verified import")
+    }
+    Ok(())
+}
+
+pub fn save_selected_curated_lead_verified_import(
+    pool: &DbPool,
+    account_id: &str,
+    selection: &SelectedCuratedLead,
+    posting: &JobPosting,
+    source: &DiscoverySourceInput,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+) -> Result<JobPosting> {
+    let evidence = &posting.discovery_evidence;
+    let now = now_ms();
+    let current_evidence = posting.last_verified_at_ms.is_some_and(|checked| {
+        (1..=now).contains(&checked)
+            && evidence.original_source_checked_at_ms == Some(checked)
+            && evidence
+                .original_source_snapshot_expires_at_ms
+                .is_some_and(|expiry| expiry >= now)
+    }) && evidence
+        .original_source_evidence_hash
+        .as_deref()
+        .is_some_and(original_source_valid_sha256);
+    if selection.account_id != account_id
+        || selection.canonical_url() != posting.canonical_url
+        || selection.track_id() != posting.track_id
+        || posting.source != format!("{}_import", source.provider)
+        || posting.availability_status != "active"
+        || evidence.provenance != "original_source"
+        || evidence.original_source_status != "verified_open"
+        || evidence.requires_original_revalidation
+        || !current_evidence
+    {
+        anyhow::bail!("verified import does not match the selected curated lead")
+    }
+    // Selection-specific imports must be addressable by the existing verifier
+    // even when scheduling authority is disabled for this account.
+    original_source_canonical_subject(posting)
+        .context("selected curated lead has no unambiguous original-source subject")?;
+    save_verified_import_posting(
+        pool,
+        account_id,
+        posting,
+        source,
+        profile,
+        preferences,
+        Some(selection),
+    )
+}
+
 /// Atomically accept a verified public import and its required board binding.
 /// Manual and unsupported links intentionally continue through `upsert_posting`
 /// alone. For a verified import, neither a source nor a match becomes visible
@@ -783,6 +1509,26 @@ pub fn save_verified_import_posting_with_source(
     source: &DiscoverySourceInput,
     profile: &CareerProfile,
     preferences: &JobPreferences,
+) -> Result<JobPosting> {
+    save_verified_import_posting(
+        pool,
+        account_id,
+        posting,
+        source,
+        profile,
+        preferences,
+        None,
+    )
+}
+
+fn save_verified_import_posting(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    source: &DiscoverySourceInput,
+    profile: &CareerProfile,
+    preferences: &JobPreferences,
+    selection: Option<&SelectedCuratedLead>,
 ) -> Result<JobPosting> {
     validate_discovery_source_input(pool, account_id, source)?;
     let (provider, source_key, track_id, interval, source_payload, source_id) =
@@ -846,6 +1592,24 @@ pub fn save_verified_import_posting_with_source(
                 &canonical_job_key(posting),
                 &posting.canonical_url,
             )?;
+            if let Some(selection) = selection {
+                if existing
+                    .as_ref()
+                    .is_none_or(|row| row.id != selection.posting.id)
+                {
+                    anyhow::bail!(
+                        "verified import resolved a different job than the selected curated lead"
+                    )
+                }
+                let row = tx
+                    .query_row(
+                        SELECT_CURATED_LEAD_FOR_IMPORT,
+                        params![account_id, selection.posting.id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?;
+                require_selected_curated_lead_unchanged(selection, row)?;
+            }
             let saved = prepare_snapshot_posting(
                 posting,
                 existing.clone(),
@@ -929,12 +1693,28 @@ pub fn save_verified_import_posting_with_source(
                     import_run_id,
                 ],
             )?;
+            if let Some(authority) =
+                sqlite_original_source_verification_scheduling_authority_for_account_tx(
+                    &tx, account_id,
+                )?
+            {
+                ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                    &tx, account_id, &saved, &authority,
+                )?;
+            }
             tx.commit()?;
             Ok(saved)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // Managed-release authority uses a process-wide advisory fence. Resolve it before
+            // taking the account/source locks so verifier publication and discovery ingestion
+            // share one lock order instead of forming managed->source/source->managed cycles.
+            let source_verification_authority =
+                postgres_original_source_verification_scheduling_authority_for_account_tx(
+                    &mut tx, account_id,
+                )?;
             lock_discovery_account_postgres(&mut tx, account_id)?;
             enforce_discovery_source_authority_postgres(
                 &mut tx,
@@ -976,6 +1756,23 @@ pub fn save_verified_import_posting_with_source(
                 &canonical_job_key(posting),
                 &posting.canonical_url,
             )?;
+            if let Some(selection) = selection {
+                if existing
+                    .as_ref()
+                    .is_none_or(|row| row.id != selection.posting.id)
+                {
+                    anyhow::bail!(
+                        "verified import resolved a different job than the selected curated lead"
+                    )
+                }
+                let row = tx
+                    .query_opt(
+                        format!("{SELECT_CURATED_LEAD_FOR_IMPORT} FOR UPDATE OF p").as_str(),
+                        &[&account_id, &selection.posting.id],
+                    )?
+                    .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)));
+                require_selected_curated_lead_unchanged(selection, row)?;
+            }
             let saved = prepare_snapshot_posting(
                 posting,
                 existing.clone(),
@@ -1059,6 +1856,11 @@ pub fn save_verified_import_posting_with_source(
                     &import_run_id,
                 ],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                    &mut tx, account_id, &saved, &authority,
+                )?;
+            }
             tx.commit()?;
             Ok(saved)
         }
@@ -1179,9 +1981,180 @@ fn discovery_source_from_pg_row(row: postgres::Row) -> Result<DiscoverySource> {
     })
 }
 
+fn canonical_discovery_track_active(value: i64) -> Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => anyhow::bail!("discovery source Career Track active projection is noncanonical"),
+    }
+}
+
+fn add_discovery_track_operational_context(
+    context: &mut OperationalHoldContext,
+    track_id: &str,
+    track_json: String,
+    relational_active: bool,
+    include_scopes: bool,
+) -> Result<()> {
+    let track: CareerTrack = parse_json(track_json, "Career Track")?;
+    if track.id != track_id || track.active != relational_active {
+        anyhow::bail!("discovery source Career Track projection changed")
+    }
+    if !include_scopes {
+        return Ok(());
+    }
+    context.insert_scope(OperationalHoldScopeKind::CareerTrack, track_id)?;
+    for region in track.locations {
+        if let Some(region) = operational_region(&region) {
+            context.insert_scope(OperationalHoldScopeKind::Region, region)?;
+        }
+    }
+    Ok(())
+}
+
+fn discovery_operational_context_base(source: &DiscoverySource) -> Result<OperationalHoldContext> {
+    let mut context = OperationalHoldContext::new()
+        .with_scope(OperationalHoldScopeKind::DiscoverySource, &source.id)?
+        .with_scope(OperationalHoldScopeKind::Account, &source.account_id)?
+        .with_scope(OperationalHoldScopeKind::AtsProvider, &source.provider)?;
+    if !source.track_id.trim().is_empty() {
+        context.insert_scope(OperationalHoldScopeKind::CareerTrack, &source.track_id)?;
+    }
+    Ok(context)
+}
+
+fn discovery_operational_context_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    source: &DiscoverySource,
+) -> Result<OperationalHoldContext> {
+    let mut context = discovery_operational_context_base(source)?;
+    if source.track_id.trim().is_empty() {
+        let mut statement = tx.prepare(
+            "SELECT id, track_json, active FROM jobs_tracks
+              WHERE account_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![source.account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (track_id, track_json, raw_active) = row?;
+            let active = canonical_discovery_track_active(raw_active)?;
+            add_discovery_track_operational_context(
+                &mut context,
+                &track_id,
+                track_json,
+                active,
+                active,
+            )?;
+        }
+    } else {
+        let (track_id, track_json, raw_active) = tx
+            .query_row(
+                "SELECT id, track_json, active FROM jobs_tracks
+              WHERE account_id = ?1 AND id = ?2",
+                params![source.account_id, source.track_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("discovery source Career Track was not found"))?;
+        let active = canonical_discovery_track_active(raw_active)?;
+        add_discovery_track_operational_context(&mut context, &track_id, track_json, active, true)?;
+    }
+    Ok(context)
+}
+
+fn discovery_operational_context_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    source: &DiscoverySource,
+) -> Result<OperationalHoldContext> {
+    let mut context = discovery_operational_context_base(source)?;
+    let rows = if source.track_id.trim().is_empty() {
+        tx.query(
+            "SELECT id, track_json, active FROM jobs_tracks
+              WHERE account_id = $1 ORDER BY id FOR SHARE",
+            &[&source.account_id],
+        )?
+    } else {
+        vec![tx
+            .query_opt(
+                "SELECT id, track_json, active FROM jobs_tracks
+                  WHERE account_id = $1 AND id = $2 FOR SHARE",
+                &[&source.account_id, &source.track_id],
+            )?
+            .ok_or_else(|| anyhow::anyhow!("discovery source Career Track was not found"))?]
+    };
+    for row in rows {
+        let raw_active = i64::from(row.get::<_, i32>(2));
+        let relational_active = canonical_discovery_track_active(raw_active)?;
+        let include_scopes = !source.track_id.trim().is_empty() || relational_active;
+        add_discovery_track_operational_context(
+            &mut context,
+            &row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            relational_active,
+            include_scopes,
+        )?;
+    }
+    Ok(context)
+}
+
+fn discovery_operationally_allowed_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    source: &DiscoverySource,
+) -> Result<bool> {
+    let context = discovery_operational_context_sqlite(tx, source)?;
+    operational_hold_allows(require_operational_capability_sqlite_tx(
+        tx,
+        OperationalCapability::Discovery,
+        &context,
+    ))
+}
+
+fn discovery_operationally_allowed_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    source: &DiscoverySource,
+) -> Result<bool> {
+    let context = discovery_operational_context_postgres(tx, source)?;
+    operational_hold_allows(require_operational_capability_postgres_tx(
+        tx,
+        OperationalCapability::Discovery,
+        &context,
+    ))
+}
+
 pub fn lease_due_discovery_source(
     pool: &DbPool,
     worker_id: &str,
+) -> Result<Option<DiscoverySourceLease>> {
+    lease_due_discovery_source_inner(pool, worker_id, None)
+}
+
+#[cfg(any(test, feature = "integration-test-support"))]
+pub(crate) fn lease_due_discovery_source_for_test(
+    pool: &DbPool,
+    worker_id: &str,
+    source_id: &str,
+) -> Result<Option<DiscoverySourceLease>> {
+    if source_id.trim().is_empty() {
+        anyhow::bail!("test discovery source ID is required")
+    }
+    lease_due_discovery_source_inner(pool, worker_id, Some(source_id))
+}
+
+fn lease_due_discovery_source_inner(
+    pool: &DbPool,
+    worker_id: &str,
+    target_source_id: Option<&str>,
 ) -> Result<Option<DiscoverySourceLease>> {
     let worker_id = worker_id.trim();
     if worker_id.len() < 3
@@ -1205,9 +2178,27 @@ pub fn lease_due_discovery_source(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let source = tx
-                .query_row(
-                    "SELECT id, account_id, track_id, provider, source_key, source_json,
+            let initial_scan_cursor = if target_source_id.is_some() {
+                None
+            } else {
+                operational_hold_scan_cursor_snapshot(&DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS)
+            };
+            let mut scan_cursor = initial_scan_cursor.clone();
+            let mut wrapped = false;
+            let mut scanned = 0;
+            let mut exhausted = false;
+            let source = loop {
+                if scanned >= OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+                    break None;
+                }
+                let cursor_next_run_at_ms = scan_cursor.as_ref().map(|cursor| cursor.0);
+                let cursor_source_id = scan_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.1.as_str())
+                    .unwrap_or_default();
+                let candidate = tx
+                    .query_row(
+                        "SELECT id, account_id, track_id, provider, source_key, source_json,
                             status, health, consecutive_failures, run_interval_ms,
                             next_run_at_ms, last_success_at_ms, last_failure_at_ms,
                             last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms
@@ -1220,13 +2211,57 @@ pub fn lease_due_discovery_source(
                              WHERE r.source_id = jobs_discovery_sources.id
                                AND r.status = 'committing'
                         )
+                        AND (?4 IS NULL OR id = ?4)
+                        AND (?2 IS NULL OR next_run_at_ms > ?2
+                             OR (next_run_at_ms = ?2 AND id > ?3))
                       ORDER BY next_run_at_ms ASC, id ASC LIMIT 1",
-                    params![now],
-                    discovery_source_from_sqlite_row,
-                )
-                .optional()?;
+                        params![
+                            now,
+                            cursor_next_run_at_ms,
+                            cursor_source_id,
+                            target_source_id
+                        ],
+                        discovery_source_from_sqlite_row,
+                    )
+                    .optional()?;
+                let Some(candidate) = candidate else {
+                    if !wrapped && initial_scan_cursor.is_some() {
+                        scan_cursor = None;
+                        wrapped = true;
+                        continue;
+                    }
+                    exhausted = true;
+                    break None;
+                };
+                let candidate_cursor = (candidate.next_run_at_ms, candidate.id.clone());
+                if wrapped
+                    && initial_scan_cursor
+                        .as_ref()
+                        .is_some_and(|initial| &candidate_cursor >= initial)
+                {
+                    exhausted = true;
+                    break None;
+                }
+                scan_cursor = Some(candidate_cursor);
+                scanned += 1;
+                if discovery_operationally_allowed_sqlite(&tx, &candidate)? {
+                    break Some(candidate);
+                }
+            };
+            let next_scan_cursor = (source.is_none()
+                && !exhausted
+                && scanned == OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT)
+                .then(|| scan_cursor.clone())
+                .flatten();
             let Some(source) = source else {
                 tx.commit()?;
+                if target_source_id.is_none() {
+                    compare_exchange_operational_hold_scan_cursor(
+                        &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                        initial_scan_cursor.as_ref(),
+                        next_scan_cursor,
+                    );
+                }
                 return Ok(None);
             };
             let scheduled_for_ms = source.next_run_at_ms;
@@ -1247,6 +2282,13 @@ pub fn lease_due_discovery_source(
                 params![run_id, source.account_id, source.id, replay_key, now],
             )?;
             tx.commit()?;
+            if target_source_id.is_none() {
+                compare_exchange_operational_hold_scan_cursor(
+                    &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
+            }
             Ok(Some(DiscoverySourceLease {
                 source: DiscoverySource {
                     lease_expires_at_ms: Some(lease_expires),
@@ -1261,29 +2303,92 @@ pub fn lease_due_discovery_source(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let row = tx.query_opt(
-                "SELECT id, account_id, track_id, provider, source_key, source_json,
-                        status, health, consecutive_failures, run_interval_ms,
-                        next_run_at_ms, last_success_at_ms, last_failure_at_ms,
-                        last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms
-                   FROM jobs_discovery_sources
-                  WHERE status = 'active' AND health <> 'paused'
-                    AND next_run_at_ms <= $1
-                    AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)
-                    AND NOT EXISTS (
-                        SELECT 1 FROM jobs_discovery_runs r
-                         WHERE r.source_id = jobs_discovery_sources.id
-                           AND r.status = 'committing'
-                    )
-                  ORDER BY next_run_at_ms ASC, id ASC
-                  FOR UPDATE SKIP LOCKED LIMIT 1",
-                &[&now],
-            )?;
-            let Some(row) = row else {
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            let initial_scan_cursor = if target_source_id.is_some() {
+                None
+            } else {
+                operational_hold_scan_cursor_snapshot(&DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS)
+            };
+            let mut scan_cursor = initial_scan_cursor.clone();
+            let mut wrapped = false;
+            let mut scanned = 0;
+            let mut exhausted = false;
+            let source = loop {
+                if scanned >= OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+                    break None;
+                }
+                let cursor_next_run_at_ms = scan_cursor.as_ref().map(|cursor| cursor.0);
+                let cursor_source_id = scan_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.1.as_str())
+                    .unwrap_or_default();
+                let row = tx.query_opt(
+                    "SELECT id, account_id, track_id, provider, source_key, source_json,
+                            status, health, consecutive_failures, run_interval_ms,
+                            next_run_at_ms, last_success_at_ms, last_failure_at_ms,
+                            last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms
+                       FROM jobs_discovery_sources
+                      WHERE status = 'active' AND health <> 'paused'
+                        AND next_run_at_ms <= $1
+                        AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM jobs_discovery_runs r
+                             WHERE r.source_id = jobs_discovery_sources.id
+                               AND r.status = 'committing'
+                        )
+                        AND ($4::TEXT IS NULL OR id = $4)
+                        AND ($2::BIGINT IS NULL OR next_run_at_ms > $2
+                             OR (next_run_at_ms = $2 AND id > $3))
+                      ORDER BY next_run_at_ms ASC, id ASC
+                      FOR UPDATE SKIP LOCKED LIMIT 1",
+                    &[
+                        &now,
+                        &cursor_next_run_at_ms,
+                        &cursor_source_id,
+                        &target_source_id,
+                    ],
+                )?;
+                let Some(row) = row else {
+                    if !wrapped && initial_scan_cursor.is_some() {
+                        scan_cursor = None;
+                        wrapped = true;
+                        continue;
+                    }
+                    exhausted = true;
+                    break None;
+                };
+                let candidate = discovery_source_from_pg_row(row)?;
+                let candidate_cursor = (candidate.next_run_at_ms, candidate.id.clone());
+                if wrapped
+                    && initial_scan_cursor
+                        .as_ref()
+                        .is_some_and(|initial| &candidate_cursor >= initial)
+                {
+                    exhausted = true;
+                    break None;
+                }
+                scan_cursor = Some(candidate_cursor);
+                scanned += 1;
+                if discovery_operationally_allowed_postgres(&mut tx, &candidate)? {
+                    break Some(candidate);
+                }
+            };
+            let next_scan_cursor = (source.is_none()
+                && !exhausted
+                && scanned == OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT)
+                .then(|| scan_cursor.clone())
+                .flatten();
+            let Some(source) = source else {
                 tx.commit()?;
+                if target_source_id.is_none() {
+                    compare_exchange_operational_hold_scan_cursor(
+                        &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                        initial_scan_cursor.as_ref(),
+                        next_scan_cursor,
+                    );
+                }
                 return Ok(None);
             };
-            let source = discovery_source_from_pg_row(row)?;
             let scheduled_for_ms = source.next_run_at_ms;
             let replay_key = discovery_replay_key(&source.id, scheduled_for_ms);
             let run_id = discovery_run_id(&source.id, &replay_key);
@@ -1308,6 +2413,13 @@ pub fn lease_due_discovery_source(
                 &[&run_id, &source.account_id, &source.id, &replay_key, &now],
             )?;
             tx.commit()?;
+            if target_source_id.is_none() {
+                compare_exchange_operational_hold_scan_cursor(
+                    &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
+            }
             Ok(Some(DiscoverySourceLease {
                 source: DiscoverySource {
                     lease_expires_at_ms: Some(lease_expires),
@@ -1411,7 +2523,8 @@ fn recover_legacy_stale_discovery_commits(pool: &DbPool, now: i64) -> Result<()>
 #[allow(clippy::too_many_arguments)]
 fn prepare_discovery_snapshot_candidate(
     posting: &JobPosting,
-    existing: Option<JobPosting>,
+    mut existing: Option<JobPosting>,
+    existing_source_membership: bool,
     profile: &CareerProfile,
     preferences: &JobPreferences,
     applications: &[JobApplication],
@@ -1431,12 +2544,22 @@ fn prepare_discovery_snapshot_candidate(
     }
 
     let mut candidate = posting.clone();
-    if let Some(value) = existing.as_ref() {
+    if let Some(value) = existing.as_mut() {
         candidate.track_id.clone_from(&value.track_id);
+        // An undated Greenhouse refresh must not inherit a legacy edit time
+        // as a publication date. Only an existing membership of this exact
+        // provider job can clear it; a canonical-only match is not enough.
+        if existing_source_membership
+            && candidate.source == "greenhouse"
+            && value.source == "greenhouse"
+            && candidate.external_id == value.external_id
+            && candidate.canonical_key == value.canonical_key
+            && candidate.posted_at_ms.is_none()
+        {
+            value.posted_at_ms = None;
+        }
     }
-    let track = tracks
-        .iter()
-        .find(|track| track.id == candidate.track_id);
+    let track = tracks.iter().find(|track| track.id == candidate.track_id);
     if is_curated_job_source(&candidate.source) && track.is_none() {
         anyhow::bail!("curated discovery job Career Track was not found")
     }
@@ -1460,6 +2583,409 @@ fn prepare_discovery_snapshot_candidate(
 fn is_curated_job_source(source: &str) -> bool {
     source == CURATED_DISCOVERY_PROVIDER
         || source.starts_with(&format!("{CURATED_DISCOVERY_PROVIDER}:"))
+}
+
+// Rows produced before FIX-1167 can use the listing path, rather than the
+// requisition ID, as a same-source membership key. Match only exact legacy
+// spellings for the same canonical URL. Never infer identity from a title.
+fn workday_snapshot_legacy_ids(
+    source: &DiscoverySource,
+    posting: &JobPosting,
+) -> Option<[String; 4]> {
+    if source.provider != "workday" || posting.source != "workday" {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(&posting.canonical_url).ok()?;
+    // Unknown query selectors can be distinct posting variants.
+    if url.query().is_some() {
+        return None;
+    }
+    let (_, job_path) = url.path().split_once("/job/")?;
+    let full_path = url.path().to_string();
+    let short_path = format!("/job/{job_path}");
+    url.set_path(&short_path);
+    let legacy = [
+        posting.canonical_url.clone(),
+        full_path,
+        short_path,
+        url.to_string(),
+    ];
+    if legacy.iter().any(|value| value == &posting.external_id) {
+        return None;
+    }
+    Some(legacy)
+}
+
+fn workday_snapshot_requisition(leaf: &str, external_id: &str) -> bool {
+    let digits = |value: &str| {
+        (1..=32).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    if digits(external_id) {
+        return leaf == external_id;
+    }
+    let has_requisition_prefix = ["JR", "REQ", "R"].into_iter().any(|prefix| {
+        if !external_id
+            .get(..prefix.len())
+            .is_some_and(|supplied| supplied.eq_ignore_ascii_case(prefix))
+        {
+            return false;
+        }
+        let body = &external_id[prefix.len()..];
+        digits(body.strip_prefix(['-', '_']).unwrap_or(body))
+    });
+    has_requisition_prefix
+        && (leaf == external_id
+            || leaf
+                .strip_suffix(external_id)
+                .is_some_and(|prefix| prefix.ends_with('_')))
+}
+
+const SELECT_WORKDAY_SNAPSHOT_LEGACY: &str =
+    "SELECT p.id, p.posting_json, m.external_id, m.canonical_key, p.canonical_key
+    FROM jobs_discovery_memberships m
+    JOIN jobs_postings p ON p.account_id = m.account_id AND p.id = m.job_id
+    WHERE m.account_id = $1 AND m.source_id = $2 AND p.canonical_url = $3
+      AND p.source = 'workday' AND m.external_id IN ($4, $5, $6, $7)
+    ORDER BY p.id, m.external_id LIMIT 2";
+
+const WORKDAY_SNAPSHOT_REBIND_BLOCKERS: &str = "SELECT EXISTS(
+    SELECT 1 FROM jobs_postings WHERE account_id = $1 AND id <> $2 AND canonical_url = $3
+), EXISTS(
+    SELECT 1 FROM jobs_applications WHERE account_id = $1 AND job_id = $2
+    UNION ALL
+    SELECT 1 FROM jobs_resume_versions WHERE account_id = $1 AND job_id = $2
+    UNION ALL
+    SELECT 1 FROM jobs_original_source_verification_assignments WHERE account_id = $1 AND job_id = $2
+)";
+
+/// Distinguish an exact alias with frozen history from contradictory identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+enum WorkdaySnapshotRebindBlocker {
+    #[error("legacy Workday discovery identity has conflicting or protected history")]
+    ConflictingIdentity,
+    #[error("legacy Workday discovery identity has conflicting or protected history")]
+    ProtectedHistory,
+}
+
+fn workday_snapshot_rebind_blocker(
+    conflicting_identity: bool,
+    protected_history: bool,
+) -> Option<WorkdaySnapshotRebindBlocker> {
+    if conflicting_identity {
+        return Some(WorkdaySnapshotRebindBlocker::ConflictingIdentity);
+    }
+    if protected_history {
+        return Some(WorkdaySnapshotRebindBlocker::ProtectedHistory);
+    }
+    None
+}
+
+const REKEY_WORKDAY_SNAPSHOT_MEMBERSHIP: &str = "UPDATE jobs_discovery_memberships
+    SET external_id = $5
+    WHERE account_id = $1 AND source_id = $2 AND job_id = $3 AND external_id = $4";
+
+type LegacyWorkdayMatch = (String, String, String, String, String);
+
+enum WorkdaySnapshotRebind {
+    Rebound(JobPosting),
+    Hold {
+        prior: JobPosting,
+        legacy_external_id: String,
+    },
+}
+
+fn workday_snapshot_requires_hold(
+    conflicting_identity: bool,
+    protected_history: bool,
+    already_held: bool,
+) -> Result<bool> {
+    match workday_snapshot_rebind_blocker(conflicting_identity, protected_history) {
+        Some(WorkdaySnapshotRebindBlocker::ConflictingIdentity) => {
+            Err(WorkdaySnapshotRebindBlocker::ConflictingIdentity.into())
+        }
+        Some(WorkdaySnapshotRebindBlocker::ProtectedHistory) => Ok(true),
+        None => Ok(already_held),
+    }
+}
+
+fn workday_snapshot_legacy_posting(
+    matches: Vec<LegacyWorkdayMatch>,
+    source: &DiscoverySource,
+    incoming: &JobPosting,
+) -> Result<Option<(JobPosting, String)>> {
+    let mut matches = matches.into_iter();
+    let Some((id, raw, old_id, membership_key, posting_key)) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        anyhow::bail!("ambiguous legacy Workday discovery identity")
+    }
+    let prior = verified_import_identity_posting(id, raw)?;
+    if prior.source != "workday"
+        || prior.external_id != old_id
+        || prior.canonical_key != posting_key
+        || membership_key != posting_key
+        || prior.canonical_url != incoming.canonical_url
+        || prior.track_id != source.track_id
+        || incoming.track_id != source.track_id
+    {
+        anyhow::bail!("legacy Workday discovery identity no longer matches its source")
+    }
+    let url = reqwest::Url::parse(&incoming.canonical_url)?;
+    if !url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .is_some_and(|leaf| workday_snapshot_requisition(leaf, &incoming.external_id))
+        || original_source_subject_sha256(incoming).is_err()
+    {
+        anyhow::bail!("legacy Workday discovery requires a recognized requisition identity")
+    }
+    Ok(Some((prior, old_id)))
+}
+
+fn rebind_workday_snapshot_membership_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    source: &DiscoverySource,
+    incoming: &JobPosting,
+    held_jobs: &BTreeSet<String>,
+) -> Result<Option<WorkdaySnapshotRebind>> {
+    let Some([url, full_path, job_path, short_url]) = workday_snapshot_legacy_ids(source, incoming)
+    else {
+        return Ok(None);
+    };
+    let mut statement = tx.prepare(SELECT_WORKDAY_SNAPSHOT_LEGACY)?;
+    let matches = statement
+        .query_map(
+            params![
+                source.account_id,
+                source.id,
+                incoming.canonical_url,
+                url,
+                full_path,
+                job_path,
+                short_url,
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let Some((prior, old_id)) = workday_snapshot_legacy_posting(matches, source, incoming)? else {
+        return Ok(None);
+    };
+    let (conflicting_identity, protected_history) = tx.query_row(
+        WORKDAY_SNAPSHOT_REBIND_BLOCKERS,
+        params![source.account_id, prior.id, incoming.canonical_url],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if workday_snapshot_requires_hold(
+        conflicting_identity,
+        protected_history,
+        held_jobs.contains(&prior.id),
+    )? {
+        return Ok(Some(WorkdaySnapshotRebind::Hold {
+            prior,
+            legacy_external_id: old_id,
+        }));
+    }
+    let changed = tx.execute(
+        REKEY_WORKDAY_SNAPSHOT_MEMBERSHIP,
+        rusqlite::named_params! {
+            "$1": &source.account_id,
+            "$2": &source.id,
+            "$3": &prior.id,
+            "$4": &old_id,
+            "$5": &incoming.external_id,
+        },
+    )?;
+    if changed != 1 {
+        anyhow::bail!("legacy Workday discovery membership changed")
+    }
+    Ok(Some(WorkdaySnapshotRebind::Rebound(prior)))
+}
+
+fn rebind_workday_snapshot_membership_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    source: &DiscoverySource,
+    incoming: &JobPosting,
+    held_jobs: &BTreeSet<String>,
+) -> Result<Option<WorkdaySnapshotRebind>> {
+    let Some([url, full_path, job_path, short_url]) = workday_snapshot_legacy_ids(source, incoming)
+    else {
+        return Ok(None);
+    };
+    let matches = tx
+        .query(
+            &format!("{SELECT_WORKDAY_SNAPSHOT_LEGACY} FOR UPDATE OF p, m"),
+            &[
+                &source.account_id,
+                &source.id,
+                &incoming.canonical_url,
+                &url,
+                &full_path,
+                &job_path,
+                &short_url,
+            ],
+        )?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+        .collect();
+    let Some((prior, old_id)) = workday_snapshot_legacy_posting(matches, source, incoming)? else {
+        return Ok(None);
+    };
+    // Check dependents after locking the posting; their foreign keys keep
+    // a concurrent insert from acquiring a new reference during rebind.
+    let blockers = tx.query_one(
+        WORKDAY_SNAPSHOT_REBIND_BLOCKERS,
+        &[&source.account_id, &prior.id, &incoming.canonical_url],
+    )?;
+    if workday_snapshot_requires_hold(
+        blockers.get(0),
+        blockers.get(1),
+        held_jobs.contains(&prior.id),
+    )? {
+        return Ok(Some(WorkdaySnapshotRebind::Hold {
+            prior,
+            legacy_external_id: old_id,
+        }));
+    }
+    let changed = tx.execute(
+        REKEY_WORKDAY_SNAPSHOT_MEMBERSHIP,
+        &[
+            &source.account_id,
+            &source.id,
+            &prior.id,
+            &old_id,
+            &incoming.external_id,
+        ],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("legacy Workday discovery membership changed")
+    }
+    Ok(Some(WorkdaySnapshotRebind::Rebound(prior)))
+}
+
+const DISCOVERY_ACCOUNT_HELD_JOBS_SQL: &str =
+    "SELECT DISTINCT job_id FROM jobs_workday_reconciliation_holds WHERE account_id = $1";
+
+// A terminal count is also an integrity check. Counting only observations
+// with the expected account/source would silently discard corrupted rows.
+macro_rules! discovery_run_with_hold_tally {
+    ($columns:literal, $from:literal) => {
+        concat!(
+            $columns,
+            "(SELECT CASE
+                WHEN COUNT(*) = 0 THEN 0
+                WHEN COUNT(*) = COUNT(h.job_id) AND COUNT(*) <= 10000
+                 AND r.status = 'completed' AND r.completed_at_ms IS NOT NULL
+                 AND EXISTS (
+                     SELECT 1 FROM jobs_discovery_sources s
+                      WHERE s.id = r.source_id AND s.account_id = r.account_id
+                        AND s.provider = 'workday'
+                 )
+                THEN COUNT(*) ELSE -1
+              END
+                FROM jobs_workday_reconciliation_hold_observations o
+                LEFT JOIN jobs_workday_reconciliation_holds h
+                  ON h.account_id = o.account_id AND h.source_id = o.source_id
+                 AND h.job_id = o.job_id AND o.account_id = r.account_id
+                 AND o.source_id = r.source_id
+               WHERE o.run_id = r.id)",
+            $from,
+        )
+    };
+}
+
+fn check_discovery_completion_tally(
+    status: &str,
+    discovered: i64,
+    upserted: i64,
+    held: i64,
+) -> Result<()> {
+    if (status == "completed"
+        && (held < 0 || upserted < 0 || discovered.checked_sub(upserted) != Some(held)))
+        || (status == "failed" && held != 0)
+    {
+        anyhow::bail!("discovery completion hold observations do not match its snapshot tally")
+    }
+    Ok(())
+}
+
+fn finalize_workday_hold_observations_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    source: &DiscoverySource,
+    run_id: &str,
+    held: &BTreeSet<String>,
+) -> Result<i64> {
+    if held.is_empty() {
+        return Ok(0);
+    }
+    for job_id in held {
+        record_workday_reconciliation_hold_observation_sqlite(
+            tx,
+            &WorkdayReconciliationHoldObservationInput {
+                run_id,
+                account_id: &source.account_id,
+                source_id: &source.id,
+                job_id,
+            },
+        )?;
+    }
+    let count = count_workday_reconciliation_holds_sqlite(
+        tx,
+        &WorkdayReconciliationHoldRunInput {
+            run_id,
+            account_id: &source.account_id,
+            source_id: &source.id,
+        },
+    )?;
+    anyhow::ensure!(
+        count == held.len() as i64,
+        "discovery hold observation set changed"
+    );
+    Ok(count)
+}
+
+fn finalize_workday_hold_observations_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    source: &DiscoverySource,
+    run_id: &str,
+    held: &BTreeSet<String>,
+) -> Result<i64> {
+    if held.is_empty() {
+        return Ok(0);
+    }
+    for job_id in held {
+        record_workday_reconciliation_hold_observation_postgres(
+            tx,
+            &WorkdayReconciliationHoldObservationInput {
+                run_id,
+                account_id: &source.account_id,
+                source_id: &source.id,
+                job_id,
+            },
+        )?;
+    }
+    let count = count_workday_reconciliation_holds_postgres(
+        tx,
+        &WorkdayReconciliationHoldRunInput {
+            run_id,
+            account_id: &source.account_id,
+            source_id: &source.id,
+        },
+    )?;
+    anyhow::ensure!(
+        count == held.len() as i64,
+        "discovery hold observation set changed"
+    );
+    Ok(count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1535,12 +3061,15 @@ fn publish_discovery_snapshot(
             }
             let run = tx
                 .query_row(
-                    "SELECT id, status, discovered_count, upserted_count, closed_count, snapshot_hash
-                       FROM jobs_discovery_runs WHERE source_id = ?1 AND replay_key = ?2",
+                    discovery_run_with_hold_tally!(
+                        "SELECT r.id, r.status, r.discovered_count, r.upserted_count, r.closed_count, r.snapshot_hash, ",
+                        " FROM jobs_discovery_runs r WHERE r.source_id = ?1 AND r.replay_key = ?2"
+                    ),
                     params![source.id, replay_key],
                     |row| Ok((
                         row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<String>>(5)?,
+                        row.get::<_, i64>(6)?,
                     )),
                 )
                 .optional()?
@@ -1549,12 +3078,14 @@ fn publish_discovery_snapshot(
                 if run.1 == "completed" && run.5.as_deref() != Some(snapshot_hash) {
                     anyhow::bail!("discovery replay payload does not match the completed snapshot")
                 }
+                check_discovery_completion_tally(&run.1, run.2, run.3, run.6)?;
                 return Ok(DiscoveryRunResult {
                     run_id: run.0,
                     replay_key: replay_key.to_string(),
                     status: run.1,
                     discovered_count: run.2,
                     upserted_count: run.3,
+                    held_count: run.6,
                     closed_count: run.4,
                     replayed: true,
                 });
@@ -1568,7 +3099,22 @@ fn publish_discovery_snapshot(
                 params![source.id, replay_key, snapshot_hash],
             )?;
 
+            let source_verification_authority = if source.provider != CURATED_DISCOVERY_PROVIDER {
+                sqlite_original_source_verification_scheduling_authority_for_account_tx(
+                    &tx,
+                    &source.account_id,
+                )?
+            } else {
+                None
+            };
             let mut seen = Vec::with_capacity(normalized.len());
+            let mut held_jobs = {
+                let mut stmt = tx.prepare(DISCOVERY_ACCOUNT_HELD_JOBS_SQL)?;
+                let rows =
+                    stmt.query_map(params![source.account_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<BTreeSet<_>>>()?
+            };
+            let mut held_in_run = BTreeSet::new();
             for (external_id, (posting, content_hash)) in normalized {
                 let membership_job_id: Option<String> = tx
                     .query_row(
@@ -1605,6 +3151,43 @@ fn publish_discovery_snapshot(
                     .optional()?
                     .map(|raw| parse_json::<JobPosting>(raw, "job posting"))
                     .transpose()?;
+                let rebind = match membership_posting {
+                    Some(existing) => Some(WorkdaySnapshotRebind::Rebound(existing)),
+                    None => {
+                        rebind_workday_snapshot_membership_sqlite(&tx, source, posting, &held_jobs)?
+                    }
+                };
+                let membership_posting = match rebind {
+                    Some(WorkdaySnapshotRebind::Rebound(existing)) => Some(existing),
+                    Some(WorkdaySnapshotRebind::Hold {
+                        prior,
+                        legacy_external_id,
+                    }) => {
+                        if canonical_posting
+                            .as_ref()
+                            .is_some_and(|value| value.id != prior.id)
+                            || !held_in_run.insert(prior.id.clone())
+                        {
+                            anyhow::bail!("discovery membership and canonical job disagree")
+                        }
+                        write_workday_reconciliation_hold_sqlite(
+                            &tx,
+                            &WorkdayReconciliationHoldInput {
+                                account_id: &source.account_id,
+                                source_id: &source.id,
+                                prior_job_id: &prior.id,
+                                legacy_external_id: &legacy_external_id,
+                                current_run_id: &run_id,
+                                current_snapshot_sha256: snapshot_hash,
+                                proposed_external_id: &posting.external_id,
+                                observed_at_ms,
+                            },
+                        )?;
+                        held_jobs.insert(prior.id);
+                        continue;
+                    }
+                    None => None,
+                };
                 if membership_posting
                     .as_ref()
                     .zip(canonical_posting.as_ref())
@@ -1612,10 +3195,20 @@ fn publish_discovery_snapshot(
                 {
                     anyhow::bail!("discovery membership and canonical job disagree")
                 }
+                let existing_source_membership = membership_posting.is_some();
                 let existing = membership_posting.or(canonical_posting);
+                if existing
+                    .as_ref()
+                    .is_some_and(|job| held_jobs.contains(&job.id))
+                {
+                    anyhow::bail!(
+                        "discovery input cannot replace an unresolved Workday reconciliation hold"
+                    )
+                }
                 let saved = prepare_discovery_snapshot_candidate(
                     posting,
                     existing.as_ref().cloned(),
+                    existing_source_membership,
                     profile,
                     preferences,
                     applications,
@@ -1676,6 +3269,14 @@ fn publish_discovery_snapshot(
                         content_hash, observed_at_ms, run_id, posting.availability_status,
                     ],
                 )?;
+                if let Some(authority) = source_verification_authority.as_ref() {
+                    ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                        &tx,
+                        &source.account_id,
+                        &saved,
+                        authority,
+                    )?;
+                }
                 seen.push(external_id.clone());
             }
             let closed_count = close_missing_snapshot_memberships_sqlite(
@@ -1684,6 +3285,7 @@ fn publish_discovery_snapshot(
                 &run_id,
                 observed_at_ms,
                 &seen,
+                source_verification_authority.as_ref(),
                 profile,
                 preferences,
                 applications,
@@ -1728,6 +3330,14 @@ fn publish_discovery_snapshot(
             if completed != 1 {
                 anyhow::bail!("discovery lease is stale")
             }
+            let held_count =
+                finalize_workday_hold_observations_sqlite(&tx, source, &run_id, &held_in_run)?;
+            check_discovery_completion_tally(
+                "completed",
+                normalized.len() as i64,
+                seen.len() as i64,
+                held_count,
+            )?;
             tx.commit()?;
             Ok(DiscoveryRunResult {
                 run_id,
@@ -1735,6 +3345,7 @@ fn publish_discovery_snapshot(
                 status: "completed".to_string(),
                 discovered_count: normalized.len() as i64,
                 upserted_count: seen.len() as i64,
+                held_count,
                 closed_count,
                 replayed: false,
             })
@@ -1742,6 +3353,16 @@ fn publish_discovery_snapshot(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // Keep managed-release advisory authority ahead of discovery/source row locks. The
+            // verifier terminal path uses that same order when it republishes source truth.
+            let source_verification_authority = if source.provider != CURATED_DISCOVERY_PROVIDER {
+                postgres_original_source_verification_scheduling_authority_for_account_tx(
+                    &mut tx,
+                    &source.account_id,
+                )?
+            } else {
+                None
+            };
             lock_discovery_account_postgres(&mut tx, &source.account_id)?;
             let tx_now = now_ms();
             let fresh = tx.query_opt(
@@ -1776,9 +3397,10 @@ fn publish_discovery_snapshot(
                 anyhow::bail!("discovery lease is stale")
             }
             let run = tx.query_opt(
-                "SELECT id, status, discovered_count, upserted_count, closed_count, snapshot_hash
-                   FROM jobs_discovery_runs
-                  WHERE source_id = $1 AND replay_key = $2 FOR UPDATE",
+                discovery_run_with_hold_tally!(
+                    "SELECT r.id, r.status, r.discovered_count, r.upserted_count, r.closed_count, r.snapshot_hash, ",
+                    " FROM jobs_discovery_runs r WHERE r.source_id = $1 AND r.replay_key = $2 FOR UPDATE OF r"
+                ),
                 &[&source.id, &replay_key],
             )?.ok_or_else(|| anyhow::anyhow!("discovery lease is stale"))?;
             let run_id: String = run.get(0);
@@ -1791,12 +3413,20 @@ fn publish_discovery_snapshot(
                 if run_status == "completed" && stored_hash.as_deref() != Some(snapshot_hash) {
                     anyhow::bail!("discovery replay payload does not match the completed snapshot")
                 }
+                let held_count = run.get(6);
+                check_discovery_completion_tally(
+                    &run_status,
+                    discovered_count,
+                    upserted_count,
+                    held_count,
+                )?;
                 return Ok(DiscoveryRunResult {
                     run_id,
                     replay_key: replay_key.to_string(),
                     status: run_status,
                     discovered_count,
                     upserted_count,
+                    held_count,
                     closed_count,
                     replayed: true,
                 });
@@ -1808,6 +3438,8 @@ fn publish_discovery_snapshot(
             {
                 anyhow::bail!("discovery lease is stale")
             }
+            #[cfg(test)]
+            mark_discovery_test_phase("publish");
             tx.execute(
                 "UPDATE jobs_discovery_runs SET snapshot_hash = $3
                   WHERE source_id = $1 AND replay_key = $2 AND status = 'running'",
@@ -1815,6 +3447,12 @@ fn publish_discovery_snapshot(
             )?;
 
             let mut seen = Vec::with_capacity(normalized.len());
+            let mut held_jobs = tx
+                .query(DISCOVERY_ACCOUNT_HELD_JOBS_SQL, &[&source.account_id])?
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<BTreeSet<_>>();
+            let mut held_in_run = BTreeSet::new();
             for (external_id, (posting, content_hash)) in normalized {
                 let membership_job_id = tx
                     .query_opt(
@@ -1846,6 +3484,43 @@ fn publish_discovery_snapshot(
                     )?
                     .map(|row| parse_json::<JobPosting>(row.get(0), "job posting"))
                     .transpose()?;
+                let rebind = match membership_posting {
+                    Some(existing) => Some(WorkdaySnapshotRebind::Rebound(existing)),
+                    None => rebind_workday_snapshot_membership_postgres(
+                        &mut tx, source, posting, &held_jobs,
+                    )?,
+                };
+                let membership_posting = match rebind {
+                    Some(WorkdaySnapshotRebind::Rebound(existing)) => Some(existing),
+                    Some(WorkdaySnapshotRebind::Hold {
+                        prior,
+                        legacy_external_id,
+                    }) => {
+                        if canonical_posting
+                            .as_ref()
+                            .is_some_and(|value| value.id != prior.id)
+                            || !held_in_run.insert(prior.id.clone())
+                        {
+                            anyhow::bail!("discovery membership and canonical job disagree")
+                        }
+                        write_workday_reconciliation_hold_postgres(
+                            &mut tx,
+                            &WorkdayReconciliationHoldInput {
+                                account_id: &source.account_id,
+                                source_id: &source.id,
+                                prior_job_id: &prior.id,
+                                legacy_external_id: &legacy_external_id,
+                                current_run_id: &run_id,
+                                current_snapshot_sha256: snapshot_hash,
+                                proposed_external_id: &posting.external_id,
+                                observed_at_ms,
+                            },
+                        )?;
+                        held_jobs.insert(prior.id);
+                        continue;
+                    }
+                    None => None,
+                };
                 if membership_posting
                     .as_ref()
                     .zip(canonical_posting.as_ref())
@@ -1853,10 +3528,20 @@ fn publish_discovery_snapshot(
                 {
                     anyhow::bail!("discovery membership and canonical job disagree")
                 }
+                let existing_source_membership = membership_posting.is_some();
                 let existing = membership_posting.or(canonical_posting);
+                if existing
+                    .as_ref()
+                    .is_some_and(|job| held_jobs.contains(&job.id))
+                {
+                    anyhow::bail!(
+                        "discovery input cannot replace an unresolved Workday reconciliation hold"
+                    )
+                }
                 let saved = prepare_discovery_snapshot_candidate(
                     posting,
                     existing.as_ref().cloned(),
+                    existing_source_membership,
                     profile,
                     preferences,
                     applications,
@@ -1927,6 +3612,14 @@ fn publish_discovery_snapshot(
                         &posting.availability_status,
                     ],
                 )?;
+                if let Some(authority) = source_verification_authority.as_ref() {
+                    ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                        &mut tx,
+                        &source.account_id,
+                        &saved,
+                        authority,
+                    )?;
+                }
                 seen.push(external_id.clone());
             }
             let closed_count = close_missing_snapshot_memberships_postgres(
@@ -1935,12 +3628,15 @@ fn publish_discovery_snapshot(
                 &run_id,
                 observed_at_ms,
                 &seen,
+                source_verification_authority.as_ref(),
                 profile,
                 preferences,
                 applications,
                 reservations,
                 tracks,
             )?;
+            #[cfg(test)]
+            mark_discovery_test_phase("finalize");
             let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
                     SET health = 'healthy', consecutive_failures = 0,
@@ -1979,13 +3675,28 @@ fn publish_discovery_snapshot(
             if completed != 1 {
                 anyhow::bail!("discovery lease is stale")
             }
+            let held_count = finalize_workday_hold_observations_postgres(
+                &mut tx,
+                source,
+                &run_id,
+                &held_in_run,
+            )?;
+            check_discovery_completion_tally(
+                "completed",
+                normalized.len() as i64,
+                seen.len() as i64,
+                held_count,
+            )?;
             tx.commit()?;
+            #[cfg(test)]
+            mark_discovery_test_phase("committed");
             Ok(DiscoveryRunResult {
                 run_id,
                 replay_key: replay_key.to_string(),
                 status: "completed".to_string(),
                 discovered_count: normalized.len() as i64,
                 upserted_count: seen.len() as i64,
+                held_count,
                 closed_count,
                 replayed: false,
             })
@@ -2000,6 +3711,7 @@ fn close_missing_snapshot_memberships_sqlite(
     _run_id: &str,
     observed_at_ms: i64,
     seen: &[String],
+    source_verification_authority: Option<&ManagedCloudOriginalSourceVerificationAuthority>,
     profile: &CareerProfile,
     preferences: &JobPreferences,
     applications: &[JobApplication],
@@ -2008,9 +3720,11 @@ fn close_missing_snapshot_memberships_sqlite(
 ) -> Result<i64> {
     const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
     let mut stmt = tx.prepare(
-        "SELECT external_id, job_id, missing_count, missing_since_at_ms, availability_status
-           FROM jobs_discovery_memberships
-          WHERE source_id = ?1 AND availability_status IN ('active', 'unknown')",
+        "SELECT m.external_id, m.job_id, m.missing_count, m.missing_since_at_ms, m.availability_status
+           FROM jobs_discovery_memberships m
+          WHERE m.source_id = ?1 AND m.availability_status IN ('active', 'unknown')
+            AND NOT EXISTS (SELECT 1 FROM jobs_workday_reconciliation_holds h
+                             WHERE h.account_id = m.account_id AND h.job_id = m.job_id)",
     )?;
     let active = stmt
         .query_map(params![source.id], |row| {
@@ -2106,6 +3820,14 @@ fn close_missing_snapshot_memberships_sqlite(
                   WHERE account_id = ?1 AND id = ?2",
                 params![source.account_id, job_id, payload, observed_at_ms],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                    tx,
+                    &source.account_id,
+                    &posting,
+                    authority,
+                )?;
+            }
         }
         if !still_unknown {
             closed += 1;
@@ -2121,6 +3843,7 @@ fn close_missing_snapshot_memberships_postgres(
     _run_id: &str,
     observed_at_ms: i64,
     seen: &[String],
+    source_verification_authority: Option<&ManagedCloudOriginalSourceVerificationAuthority>,
     profile: &CareerProfile,
     preferences: &JobPreferences,
     applications: &[JobApplication],
@@ -2130,9 +3853,12 @@ fn close_missing_snapshot_memberships_postgres(
     const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
     let active = tx
         .query(
-            "SELECT external_id, job_id, missing_count, missing_since_at_ms, availability_status
-               FROM jobs_discovery_memberships
-              WHERE source_id = $1 AND availability_status IN ('active', 'unknown') FOR UPDATE",
+            "SELECT m.external_id, m.job_id, m.missing_count, m.missing_since_at_ms, m.availability_status
+               FROM jobs_discovery_memberships m
+              WHERE m.source_id = $1 AND m.availability_status IN ('active', 'unknown')
+                AND NOT EXISTS (SELECT 1 FROM jobs_workday_reconciliation_holds h
+                                 WHERE h.account_id = m.account_id AND h.job_id = m.job_id)
+              FOR UPDATE OF m",
             &[&source.id],
         )?
         .into_iter()
@@ -2177,15 +3903,14 @@ fn close_missing_snapshot_memberships_postgres(
         if changed == 0 || !should_close {
             continue;
         }
-        let row = tx
-            .query_one(
-                "SELECT
+        let row = tx.query_one(
+            "SELECT
                     EXISTS(SELECT 1 FROM jobs_discovery_memberships
                       WHERE account_id = $1 AND job_id = $2 AND availability_status = 'active'),
                     EXISTS(SELECT 1 FROM jobs_discovery_memberships
                       WHERE account_id = $1 AND job_id = $2 AND availability_status = 'unknown')",
-                &[&source.account_id, &job_id],
-            )?;
+            &[&source.account_id, &job_id],
+        )?;
         let still_active: bool = row.get(0);
         let still_unknown: bool = row.get(1);
         if still_active {
@@ -2227,6 +3952,14 @@ fn close_missing_snapshot_memberships_postgres(
                   WHERE account_id = $1 AND id = $2",
                 &[&source.account_id, &job_id, &payload, &observed_at_ms],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                    tx,
+                    &source.account_id,
+                    &posting,
+                    authority,
+                )?;
+            }
         }
         if !still_unknown {
             closed += 1;
@@ -2250,6 +3983,8 @@ pub fn complete_discovery_run(
     if jobs.len() > 10_000 {
         anyhow::bail!("discovery snapshot exceeded the job limit")
     }
+    #[cfg(test)]
+    mark_discovery_test_phase("preload");
     let source = get_discovery_source(pool, source_id)?
         .ok_or_else(|| anyhow::anyhow!("discovery source not found"))?;
 
@@ -2269,6 +4004,8 @@ pub fn complete_discovery_run(
     if source.provider == CURATED_DISCOVERY_PROVIDER && tracks.is_empty() {
         anyhow::bail!("curated discovery requires at least one Career Track")
     }
+    #[cfg(test)]
+    mark_discovery_test_phase("normalize");
     let fetched_at_ms = now_ms();
     let mut normalized = BTreeMap::<String, (JobPosting, String)>::new();
     for input in jobs {
@@ -2280,6 +4017,8 @@ pub fn complete_discovery_run(
             source_company
         };
         let content_hash = discovered_job_content_hash(&source, input, company, &canonical_url);
+        let material_provider_snapshot = source.provider != CURATED_DISCOVERY_PROVIDER
+            && !original_source_requirements_not_loaded(&source.provider, &input.description);
         let mut posting = JobPosting {
             id: String::new(),
             canonical_key: String::new(),
@@ -2299,14 +4038,11 @@ pub fn complete_discovery_run(
             canonical_url,
             description: input.description.trim().to_string(),
             compensation: input.compensation.trim().to_string(),
-            employment_type: [
-                input.employment_type.trim(),
-                input.engagement_type.trim(),
-            ]
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
+            employment_type: [input.employment_type.trim(), input.engagement_type.trim()]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
             track_id: source.track_id.clone(),
             match_score: 0,
             matched_reasons: Vec::new(),
@@ -2314,8 +4050,7 @@ pub fn complete_discovery_run(
             posted_at_ms: input
                 .posted_at_ms
                 .filter(|value| *value <= fetched_at_ms + DAY_MS),
-            last_verified_at_ms: (source.provider != CURATED_DISCOVERY_PROVIDER)
-                .then_some(fetched_at_ms),
+            last_verified_at_ms: material_provider_snapshot.then_some(fetched_at_ms),
             availability_status: if source.provider == CURATED_DISCOVERY_PROVIDER {
                 "unknown".to_string()
             } else {
@@ -2324,15 +4059,13 @@ pub fn complete_discovery_run(
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
         };
         if source.provider == CURATED_DISCOVERY_PROVIDER {
-            let Some(track) = best_curated_discovery_track(
-                &posting,
-                &profile,
-                &preferences,
-                &tracks,
-            ) else {
+            let Some(track) =
+                best_curated_discovery_track(&posting, &profile, &preferences, &tracks)
+            else {
                 continue;
             };
             posting.track_id = track.id.clone();
@@ -2340,6 +4073,26 @@ pub fn complete_discovery_run(
             anyhow::bail!("discovery source Career Track was not found")
         }
         posting.canonical_key = canonical_job_key(&posting);
+        posting.discovery_evidence = if source.provider == CURATED_DISCOVERY_PROVIDER {
+            JobDiscoveryEvidence::external_feed_lead(posting.canonical_key.clone())
+        } else if material_provider_snapshot {
+            let application_domain = reqwest::Url::parse(&posting.canonical_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string));
+            JobDiscoveryEvidence::provider_verified_original_source(
+                posting.canonical_key.clone(),
+                source.source_key.clone(),
+                application_domain,
+                fetched_at_ms,
+                content_hash.clone(),
+            )
+        } else {
+            // SmartRecruiters list snapshots legitimately omit the role
+            // requirements. Keep the active membership, but leave posting JSON
+            // nonpositive until the separate original-source verifier observes
+            // the exact detail record.
+            JobDiscoveryEvidence::default()
+        };
         let external_id = posting.external_id.clone();
         match normalized.get(&external_id) {
             Some((existing, existing_hash))
@@ -2355,6 +4108,8 @@ pub fn complete_discovery_run(
     }
 
     let snapshot_hash = discovery_snapshot_hash(&source, replay_key, &normalized);
+    #[cfg(test)]
+    mark_discovery_test_phase("replay_lookup");
     if let Some(existing) =
         completed_discovery_run(pool, source_id, replay_key, Some(&snapshot_hash))?
     {
@@ -2363,7 +4118,9 @@ pub fn complete_discovery_run(
             ..existing
         });
     }
-    publish_discovery_snapshot(
+    #[cfg(test)]
+    mark_discovery_test_phase("authority_and_locks");
+    let result = publish_discovery_snapshot(
         pool,
         &source,
         lease_token,
@@ -2377,7 +4134,18 @@ pub fn complete_discovery_run(
         &reservations,
         &tracks,
         fetched_at_ms,
-    )
+    )?;
+    if result.held_count > 0 && !result.replayed {
+        tracing::info!(
+            event = "jobs_workday_discovery_reconciliation_held",
+            discovered_count = result.discovered_count,
+            upserted_count = result.upserted_count,
+            held_count = result.held_count,
+            closed_count = result.closed_count,
+            "Workday discovery completed with held posting identities"
+        );
+    }
+    Ok(result)
 }
 
 pub fn fail_discovery_run(
@@ -2426,8 +4194,10 @@ pub fn fail_discovery_run(
                 .ok_or_else(|| anyhow::anyhow!("discovery source not found"))?;
             let run = tx
                 .query_row(
-                    "SELECT id, status, discovered_count, upserted_count, closed_count
-                       FROM jobs_discovery_runs WHERE source_id = ?1 AND replay_key = ?2",
+                    discovery_run_with_hold_tally!(
+                        "SELECT r.id, r.status, r.discovered_count, r.upserted_count, r.closed_count, ",
+                        " FROM jobs_discovery_runs r WHERE r.source_id = ?1 AND r.replay_key = ?2"
+                    ),
                     params![source.id, replay_key],
                     |row| {
                         Ok((
@@ -2436,12 +4206,14 @@ pub fn fail_discovery_run(
                             row.get::<_, i64>(2)?,
                             row.get::<_, i64>(3)?,
                             row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
                         ))
                     },
                 )
                 .optional()?
                 .ok_or_else(|| anyhow::anyhow!("discovery lease is stale"))?;
             if matches!(run.1.as_str(), "completed" | "failed") {
+                check_discovery_completion_tally(&run.1, run.2, run.3, run.5)?;
                 tx.commit()?;
                 return Ok(DiscoveryRunResult {
                     run_id: run.0,
@@ -2449,6 +4221,7 @@ pub fn fail_discovery_run(
                     status: run.1,
                     discovered_count: run.2,
                     upserted_count: run.3,
+                    held_count: run.5,
                     closed_count: run.4,
                     replayed: true,
                 });
@@ -2505,6 +4278,7 @@ pub fn fail_discovery_run(
                 status: "failed".to_string(),
                 discovered_count: 0,
                 upserted_count: 0,
+                held_count: 0,
                 closed_count: 0,
                 replayed: false,
             })
@@ -2535,9 +4309,10 @@ pub fn fail_discovery_run(
             let source = discovery_source_from_pg_row(row)?;
             let run = tx
                 .query_opt(
-                    "SELECT id, status, discovered_count, upserted_count, closed_count
-                       FROM jobs_discovery_runs
-                      WHERE source_id = $1 AND replay_key = $2 FOR UPDATE",
+                    discovery_run_with_hold_tally!(
+                        "SELECT r.id, r.status, r.discovered_count, r.upserted_count, r.closed_count, ",
+                        " FROM jobs_discovery_runs r WHERE r.source_id = $1 AND r.replay_key = $2 FOR UPDATE OF r"
+                    ),
                     &[&source.id, &replay_key],
                 )?
                 .map(|row| {
@@ -2547,10 +4322,12 @@ pub fn fail_discovery_run(
                         row.get::<_, i64>(2),
                         row.get::<_, i64>(3),
                         row.get::<_, i64>(4),
+                        row.get::<_, i64>(5),
                     )
                 })
                 .ok_or_else(|| anyhow::anyhow!("discovery lease is stale"))?;
             if matches!(run.1.as_str(), "completed" | "failed") {
+                check_discovery_completion_tally(&run.1, run.2, run.3, run.5)?;
                 tx.commit()?;
                 return Ok(DiscoveryRunResult {
                     run_id: run.0,
@@ -2558,6 +4335,7 @@ pub fn fail_discovery_run(
                     status: run.1,
                     discovered_count: run.2,
                     upserted_count: run.3,
+                    held_count: run.5,
                     closed_count: run.4,
                     replayed: true,
                 });
@@ -2614,6 +4392,7 @@ pub fn fail_discovery_run(
                 status: "failed".to_string(),
                 discovered_count: 0,
                 upserted_count: 0,
+                held_count: 0,
                 closed_count: 0,
                 replayed: false,
             })
@@ -2658,8 +4437,7 @@ fn validate_discovered_job(source: &DiscoverySource, input: &DiscoveredJobInput)
 fn is_canonical_discovered_employment_type(value: &str) -> bool {
     matches!(
         value.trim(),
-        ""
-            | "full_time"
+        "" | "full_time"
             | "part_time"
             | "contract"
             | "temporary"
@@ -2694,16 +4472,28 @@ fn canonicalize_curated_lead_url(raw: &str) -> Result<String> {
     {
         anyhow::bail!("curated job URL must be public default-port HTTPS without credentials")
     }
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    // Classify the parsed DNS name rather than reparsing a serialized IP literal.
+    // Leave the URL itself unchanged so this does not change its canonical key.
+    let domain = url.domain().unwrap_or_default();
+    let host = domain.strip_suffix('.').unwrap_or(domain);
+    let intermediaries = [
+        "github.com",
+        "raw.githubusercontent.com",
+        "gist.githubusercontent.com",
+        "simplify.jobs",
+        "prepai.dev",
+        "zapply.jobs",
+    ];
     if host.is_empty()
         || host == "localhost"
         || host.ends_with(".localhost")
         || host.ends_with(".local")
-        || host.parse::<std::net::IpAddr>().is_ok()
-        || matches!(
-            host.as_str(),
-            "github.com" | "raw.githubusercontent.com" | "gist.githubusercontent.com"
-        )
+        || intermediaries.iter().any(|&blocked| {
+            host == blocked
+                || host
+                    .strip_suffix(blocked)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
     {
         anyhow::bail!("curated job URL must point to a public employer application page")
     }
@@ -2724,6 +4514,50 @@ fn canonicalize_curated_lead_url(raw: &str) -> Result<String> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
+#[cfg(test)]
+mod curated_lead_url_tests {
+    use super::canonicalize_curated_lead_url;
+
+    #[test]
+    fn rejects_unsupported_host_and_transport_forms() {
+        let accepted = [
+            "https://[2001:db8::1]/job",
+            "https://192.0.2.1/job",
+            "https://localhost./job",
+            "https://sub.localhost/job",
+            "https://careers.local./job",
+            "https://gist.githubusercontent.com/example/job",
+            "https://redirect.simplify.jobs/job",
+            "https://jobs.simplify.jobs./job",
+            "https://careers.example:8443/job",
+            "https://fixture:fixture@careers.example/job",
+            "http://careers.example/job",
+        ]
+        .into_iter()
+        .filter(|url| canonicalize_curated_lead_url(url).is_ok())
+        .collect::<Vec<_>>();
+        assert!(
+            accepted.is_empty(),
+            "accepted unsupported fixture: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn preserves_valid_employer_domains_and_query_canonicalization() {
+        let url = "https://jobs.simplify.jobs.example:443/opening?z=9&utm_source=feed&a=2#details";
+        assert_eq!(
+            canonicalize_curated_lead_url(url).unwrap(),
+            "https://jobs.simplify.jobs.example/opening?a=2&z=9"
+        );
+        let ats_url = "https://jobs.lever.co/fixture/synthetic-opening";
+        assert_eq!(canonicalize_curated_lead_url(ats_url).unwrap(), ats_url);
+        assert_eq!(
+            canonicalize_curated_lead_url("https://careers.example./opening?ref=fixture").unwrap(),
+            "https://careers.example./opening"
+        );
+    }
+}
+
 fn best_curated_discovery_track<'a>(
     posting: &JobPosting,
     profile: &CareerProfile,
@@ -2732,6 +4566,7 @@ fn best_curated_discovery_track<'a>(
 ) -> Option<&'a CareerTrack> {
     tracks
         .iter()
+        .filter(|track| track.active)
         .filter_map(|track| {
             let target_family = canonical_role_family(Some(track), posting);
             let posting_family = posting_role_family(posting);
@@ -2759,8 +4594,20 @@ fn best_curated_discovery_track<'a>(
 
 fn meaningful_role_overlap(left: &str, right: &str) -> bool {
     const GENERIC: [&str; 14] = [
-        "associate", "developer", "engineer", "engineering", "intern", "junior", "lead",
-        "manager", "principal", "senior", "specialist", "staff", "the", "and",
+        "associate",
+        "developer",
+        "engineer",
+        "engineering",
+        "intern",
+        "junior",
+        "lead",
+        "manager",
+        "principal",
+        "senior",
+        "specialist",
+        "staff",
+        "the",
+        "and",
     ];
     let tokens = |value: &str| {
         value
@@ -2998,11 +4845,12 @@ fn completed_discovery_run(
         DbPool::Sqlite(_) => pool
             .get()?
             .query_row(
-                "SELECT id, replay_key, status, discovered_count, upserted_count,
-                        closed_count, snapshot_hash
-                   FROM jobs_discovery_runs
-                  WHERE source_id = ?1 AND replay_key = ?2
-                    AND status IN ('completed', 'failed')",
+                discovery_run_with_hold_tally!(
+                    "SELECT r.id, r.replay_key, r.status, r.discovered_count, \
+                     r.upserted_count, r.closed_count, r.snapshot_hash, ",
+                    " FROM jobs_discovery_runs r WHERE r.source_id = ?1 AND r.replay_key = ?2
+                       AND r.status IN ('completed', 'failed')"
+                ),
                 params![source_id, replay_key],
                 |row| {
                     Ok((
@@ -3012,6 +4860,7 @@ fn completed_discovery_run(
                             status: row.get(2)?,
                             discovered_count: row.get(3)?,
                             upserted_count: row.get(4)?,
+                            held_count: row.get(7)?,
                             closed_count: row.get(5)?,
                             replayed: false,
                         },
@@ -3024,11 +4873,12 @@ fn completed_discovery_run(
         DbPool::Postgres(_) => pool
             .get_pg()?
             .query_opt(
-                "SELECT id, replay_key, status, discovered_count, upserted_count,
-                        closed_count, snapshot_hash
-                   FROM jobs_discovery_runs
-                  WHERE source_id = $1 AND replay_key = $2
-                    AND status IN ('completed', 'failed')",
+                discovery_run_with_hold_tally!(
+                    "SELECT r.id, r.replay_key, r.status, r.discovered_count, \
+                     r.upserted_count, r.closed_count, r.snapshot_hash, ",
+                    " FROM jobs_discovery_runs r WHERE r.source_id = $1 AND r.replay_key = $2
+                       AND r.status IN ('completed', 'failed')"
+                ),
                 &[&source_id, &replay_key],
             )?
             .map(|row| {
@@ -3039,6 +4889,7 @@ fn completed_discovery_run(
                         status: row.get(2),
                         discovered_count: row.get(3),
                         upserted_count: row.get(4),
+                        held_count: row.get(7),
                         closed_count: row.get(5),
                         replayed: false,
                     },
@@ -3048,10 +4899,429 @@ fn completed_discovery_run(
             .map(Ok)
             .transpose(),
     })?;
+    if let Some((result, _)) = &completed {
+        check_discovery_completion_tally(
+            &result.status,
+            result.discovered_count,
+            result.upserted_count,
+            result.held_count,
+        )?;
+    }
     if let (Some(expected), Some((result, stored))) = (expected_snapshot_hash, completed.as_ref()) {
         if result.status == "completed" && stored.as_deref() != Some(expected) {
             anyhow::bail!("discovery replay payload does not match the completed snapshot")
         }
     }
     Ok(completed.map(|(result, _)| result))
+}
+
+#[cfg(test)]
+fn discovery_operational_hold_test_pool() -> DbPool {
+    let path = std::env::temp_dir().join(format!(
+        "bluey-discovery-hold-{}-{}.sqlite3",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let pool = crate::db::open_pool(&path).unwrap();
+    crate::db::run_migrations(&pool).unwrap();
+    pool.get()
+        .unwrap()
+        .execute(
+            "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+             VALUES ('acct-discovery-hold', 'discovery-hold@example.com', 'hash', 0)",
+            [],
+        )
+        .unwrap();
+    pool
+}
+
+#[cfg(test)]
+fn append_discovery_operational_hold_test_event(
+    pool: &DbPool,
+    event_id: &str,
+    capability: OperationalCapability,
+    scope_kind: OperationalHoldScopeKind,
+    scope_id: &str,
+    transition: OperationalHoldTransition,
+    expected_event_id: Option<&str>,
+) {
+    append_operational_hold_event(
+        pool,
+        &AppendOperationalHoldEventRequest {
+            event_id: event_id.to_string(),
+            capability,
+            scope_kind,
+            scope_id: scope_id.to_string(),
+            transition,
+            reason_code: if transition == OperationalHoldTransition::Held {
+                OperationalHoldReasonCode::Incident
+            } else {
+                OperationalHoldReasonCode::ManualRelease
+            },
+            reason_ref: None,
+            expected_head_revision: i64::from(expected_event_id.is_some()),
+            expected_current_event_id: expected_event_id.map(str::to_string),
+        },
+        "discovery-test-operator",
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_track_operational_context_omits_unknown_region_sentinels() {
+    let track = CareerTrack {
+        id: "track-region-context".to_string(),
+        name: "Region context".to_string(),
+        role: "Software Engineer".to_string(),
+        locations: vec![
+            "Unknown".to_string(),
+            "N/A".to_string(),
+            "NA".to_string(),
+            "Not Specified".to_string(),
+            "Unspecified".to_string(),
+            "  ".to_string(),
+            "München".to_string(),
+        ],
+        remote_preference: "hybrid_ok".to_string(),
+        application_identity_id: None,
+        policy: CareerTrackPolicy::default(),
+        active: true,
+        match_count: 0,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    let mut context = OperationalHoldContext::new();
+    add_discovery_track_operational_context(
+        &mut context,
+        &track.id,
+        to_json(&track, "Career Track").unwrap(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    for sentinel in ["unknown", "n/a", "na", "not specified", "unspecified"] {
+        assert!(!context.matches(OperationalHoldScopeKind::Region, sentinel));
+    }
+    assert!(context.matches(OperationalHoldScopeKind::Region, "münchen"));
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_lease_fails_closed_for_missing_or_mismatched_bound_track() {
+    let pool = discovery_operational_hold_test_pool();
+    let track = CareerTrack {
+        id: "track-discovery-context".to_string(),
+        name: "Discovery context".to_string(),
+        role: "Software Engineer".to_string(),
+        locations: vec!["New York, NY".to_string()],
+        remote_preference: "hybrid_ok".to_string(),
+        application_identity_id: None,
+        policy: CareerTrackPolicy::default(),
+        active: true,
+        match_count: 0,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    upsert_track(&pool, "acct-discovery-hold", &track).unwrap();
+    let source = upsert_discovery_source(
+        &pool,
+        "acct-discovery-hold",
+        &DiscoverySourceInput {
+            track_id: track.id.clone(),
+            provider: "greenhouse".to_string(),
+            source_key: "context-board".to_string(),
+            company: "Context Incorporated".to_string(),
+            run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+        },
+    )
+    .unwrap();
+    pool.get()
+        .unwrap()
+        .execute(
+            "DELETE FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
+            params!["acct-discovery-hold", track.id],
+        )
+        .unwrap();
+
+    let missing = lease_due_discovery_source(&pool, "missing-track-worker").unwrap_err();
+    assert!(missing
+        .to_string()
+        .contains("discovery source Career Track was not found"));
+
+    upsert_track(&pool, "acct-discovery-hold", &track).unwrap();
+    let mismatched = CareerTrack {
+        id: "track-other".to_string(),
+        ..track.clone()
+    };
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_tracks SET track_json = ?3
+              WHERE account_id = ?1 AND id = ?2",
+            params![
+                "acct-discovery-hold",
+                track.id,
+                to_json(&mismatched, "mismatched Career Track").unwrap()
+            ],
+        )
+        .unwrap();
+
+    let mismatched = lease_due_discovery_source(&pool, "mismatched-track-worker").unwrap_err();
+    assert!(mismatched
+        .to_string()
+        .contains("discovery source Career Track projection changed"));
+
+    let canonical_track = to_json(&track, "canonical Career Track").unwrap();
+    for (index, raw_active) in [2_i64, -1].into_iter().enumerate() {
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_tracks SET track_json = ?3, active = ?4
+                  WHERE account_id = ?1 AND id = ?2",
+                params!["acct-discovery-hold", track.id, canonical_track, raw_active],
+            )
+            .unwrap();
+        let malformed =
+            lease_due_discovery_source(&pool, &format!("noncanonical-active-worker-{index}"))
+                .unwrap_err();
+        assert_eq!(
+            malformed.to_string(),
+            "discovery source Career Track active projection is noncanonical"
+        );
+    }
+    let lease_state: (Option<String>, Option<String>, Option<i64>, i64) = pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT lease_owner, lease_token, lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM jobs_discovery_runs WHERE source_id = ?1)
+               FROM jobs_discovery_sources WHERE id = ?1",
+            params![&source.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(lease_state, (None, None, None, 0));
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_lease_skips_native_pauses_and_operational_holds_without_starvation() {
+    let pool = discovery_operational_hold_test_pool();
+    let track = upsert_track(
+        &pool,
+        "acct-discovery-hold",
+        &CareerTrack {
+            id: "track-discovery-hold".to_string(),
+            name: "Held discovery".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: None,
+            policy: CareerTrackPolicy::default(),
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+    let make_source = |provider: &str, source_key: &str| {
+        upsert_discovery_source(
+            &pool,
+            "acct-discovery-hold",
+            &DiscoverySourceInput {
+                track_id: track.id.clone(),
+                provider: provider.to_string(),
+                source_key: source_key.to_string(),
+                company: format!("{source_key} Incorporated"),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap()
+    };
+    let paused = ensure_managed_curated_discovery_source(&pool, "acct-discovery-hold")
+        .unwrap()
+        .unwrap();
+    assert!(paused.track_id.is_empty());
+    let held = make_source("greenhouse", "held-board");
+    let allowed = make_source("lever", "allowed-board");
+    set_discovery_source_status(&pool, "acct-discovery-hold", &paused.id, "paused").unwrap();
+    let schedule = now_ms().saturating_sub(10_000);
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_discovery_sources
+                SET next_run_at_ms = CASE id
+                    WHEN ?1 THEN ?4 WHEN ?2 THEN ?5 ELSE ?6 END
+              WHERE id IN (?1, ?2, ?3)",
+            params![
+                paused.id,
+                held.id,
+                allowed.id,
+                schedule,
+                schedule + 1,
+                schedule + 2,
+            ],
+        )
+        .unwrap();
+
+    let mut conn = pool.get().unwrap();
+    let tx = conn.transaction().unwrap();
+    let paused_context = discovery_operational_context_sqlite(&tx, &paused).unwrap();
+    assert!(paused_context.matches(OperationalHoldScopeKind::CareerTrack, &track.id));
+    assert!(paused_context.matches(OperationalHoldScopeKind::Region, "new york, ny"));
+    let held_context = discovery_operational_context_sqlite(&tx, &held).unwrap();
+    assert!(held_context.matches(OperationalHoldScopeKind::Global, "*"));
+    assert!(held_context.matches(OperationalHoldScopeKind::DiscoverySource, &held.id));
+    assert!(held_context.matches(OperationalHoldScopeKind::Account, "acct-discovery-hold"));
+    assert!(held_context.matches(OperationalHoldScopeKind::CareerTrack, &track.id));
+    assert!(held_context.matches(OperationalHoldScopeKind::AtsProvider, "greenhouse"));
+    assert!(held_context.matches(OperationalHoldScopeKind::Region, "new york, ny"));
+    tx.commit().unwrap();
+
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "discovery-global-all-hold",
+        OperationalCapability::All,
+        OperationalHoldScopeKind::Global,
+        "*",
+        OperationalHoldTransition::Held,
+        None,
+    );
+    assert!(lease_due_discovery_source(&pool, "held-worker")
+        .unwrap()
+        .is_none());
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "discovery-global-all-release",
+        OperationalCapability::All,
+        OperationalHoldScopeKind::Global,
+        "*",
+        OperationalHoldTransition::Released,
+        Some("discovery-global-all-hold"),
+    );
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "discovery-source-hold",
+        OperationalCapability::Discovery,
+        OperationalHoldScopeKind::DiscoverySource,
+        &held.id,
+        OperationalHoldTransition::Held,
+        None,
+    );
+
+    let lease = lease_due_discovery_source(&pool, "allowed-worker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.source.id, allowed.id);
+    let conn = pool.get().unwrap();
+    let held_lease: Option<String> = conn
+        .query_row(
+            "SELECT lease_owner FROM jobs_discovery_sources WHERE id = ?1",
+            params![held.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(held_lease.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_held_candidate_scan_is_bounded_and_advances_on_the_next_call() {
+    let pool = discovery_operational_hold_test_pool();
+    let track = |id: &str, name: &str| CareerTrack {
+        id: id.to_string(),
+        name: name.to_string(),
+        role: "Software Engineer".to_string(),
+        locations: vec!["New York, NY".to_string()],
+        remote_preference: "hybrid_ok".to_string(),
+        application_identity_id: None,
+        policy: CareerTrackPolicy::default(),
+        active: true,
+        match_count: 0,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    let held_track = track("track-bounded-held", "Bounded held discovery");
+    let allowed_track = track("track-bounded-allowed", "Bounded allowed discovery");
+    upsert_track(&pool, "acct-discovery-hold", &held_track).unwrap();
+    upsert_track(&pool, "acct-discovery-hold", &allowed_track).unwrap();
+
+    let mut held_sources = Vec::new();
+    for index in 0..OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+        held_sources.push(
+            upsert_discovery_source(
+                &pool,
+                "acct-discovery-hold",
+                &DiscoverySourceInput {
+                    track_id: held_track.id.clone(),
+                    provider: "greenhouse".to_string(),
+                    source_key: format!("bounded-held-board-{index:02}"),
+                    company: format!("Bounded Held {index:02} Incorporated"),
+                    run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+                },
+            )
+            .unwrap(),
+        );
+    }
+    let allowed = upsert_discovery_source(
+        &pool,
+        "acct-discovery-hold",
+        &DiscoverySourceInput {
+            track_id: allowed_track.id.clone(),
+            provider: "lever".to_string(),
+            source_key: "bounded-allowed-board".to_string(),
+            company: "Bounded Allowed Incorporated".to_string(),
+            run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+        },
+    )
+    .unwrap();
+    let schedule = now_ms().saturating_sub(100_000);
+    let conn = pool.get().unwrap();
+    for (index, source) in held_sources.iter().enumerate() {
+        conn.execute(
+            "UPDATE jobs_discovery_sources SET next_run_at_ms = ?2 WHERE id = ?1",
+            params![source.id, schedule + index as i64],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE jobs_discovery_sources SET next_run_at_ms = ?2 WHERE id = ?1",
+        params![
+            allowed.id,
+            schedule + OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT as i64
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "bounded-direct-greenhouse-hold",
+        OperationalCapability::Discovery,
+        OperationalHoldScopeKind::AtsProvider,
+        "greenhouse",
+        OperationalHoldTransition::Held,
+        None,
+    );
+
+    let worker_id = "bounded-direct-held-scan-worker";
+    assert!(lease_due_discovery_source(&pool, worker_id)
+        .unwrap()
+        .is_none());
+    let lease = lease_due_discovery_source(&pool, worker_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.source.id, allowed.id);
+    assert!(held_sources.iter().all(|source| {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT lease_owner IS NULL FROM jobs_discovery_sources WHERE id = ?1",
+                params![source.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    }));
 }

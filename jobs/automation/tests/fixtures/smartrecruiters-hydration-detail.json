@@ -1,0 +1,23 @@
+{
+  "id": "smart-1",
+  "active": true,
+  "name": "Platform Engineer",
+  "company": { "identifier": "acme", "name": "Acme" },
+  "postingUrl": "https://jobs.smartrecruiters.com/acme/smart-1-platform-engineer",
+  "applyUrl": "https://jobs.smartrecruiters.com/acme/smart-1-platform-engineer?oga=true",
+  "ref": "https://api.smartrecruiters.com/v1/companies/acme/postings/smart-1",
+  "location": { "city": "Austin", "region": "TX" },
+  "workplaceType": "hybrid",
+  "jobAd": {
+    "sections": {
+      "qualifications": { "text": "<p>SQL &amp; Rust.</p>" },
+      "jobDescription": {
+        "text": "<p>Build reliable systems.</p>",
+        "description": "Build reliable systems."
+      }
+    }
+  },
+  "compensation": "USD 120000-160000 year",
+  "typeOfEmployment": { "label": "Full-time" },
+  "releasedDate": "2026-08-25T12:00:00Z"
+}

@@ -1,12 +1,19 @@
 import type { JobEligibilityDecision, JobsWorkspace } from "../types";
 
 const now = Date.now();
+const previewEvidenceScope = "bluey-cloud/accounts/preview-account";
+const previewResumeKey = `${previewEvidenceScope}/context/jobs/app-3/receipt/resume.pdf`;
+const previewReceiptKey = `${previewEvidenceScope}/jobs/applications/app-3/receipt.json`;
+const previewConfirmationKey = `${previewEvidenceScope}/context/jobs/app-3/receipt/confirmation.png`;
+const previewResumeSha256 = "a".repeat(64);
+const previewReceiptSha256 = "b".repeat(64);
+const previewConfirmationSha256 = "c".repeat(64);
 
 const betaEligibility = (extraReview: JobEligibilityDecision["review_reasons"] = []): JobEligibilityDecision => ({
   capability: "beta_review",
   can_prepare: true,
   can_auto_submit: false,
-  can_queue_local: true,
+  can_queue_local: false,
   can_queue_cloud: true,
   hard_failures: [],
   review_reasons: [
@@ -18,6 +25,7 @@ const betaEligibility = (extraReview: JobEligibilityDecision["review_reasons"] =
 });
 
 export const previewWorkspace: JobsWorkspace = {
+  interview_prep_receipts: { "app-3": "d".repeat(64) },
   profile: {
     full_name: "Taylor Rivera",
     email: "taylor@example.com",
@@ -182,6 +190,12 @@ export const previewWorkspace: JobsWorkspace = {
       status: "active",
     },
   ],
+  matches_page: {
+    schema_version: 1,
+    page_size: 50,
+    has_more: false,
+    next_cursor: null,
+  },
   matches: [
     {
       id: "job-1",
@@ -280,6 +294,7 @@ export const previewWorkspace: JobsWorkspace = {
       eligibility: betaEligibility([{ code: "salary_needs_review", message: "Review the listed compensation against your preference." }]),
     },
   ],
+  application_jobs: [],
   applications: [
     {
       id: "app-1",
@@ -322,6 +337,7 @@ export const previewWorkspace: JobsWorkspace = {
         receiptId: "receipt-app-3",
         accountId: "preview-account",
         applicationId: "app-3",
+        _bluey_server_submission_fingerprint_v1: "d".repeat(64),
         runId: "run-app-3",
         generatedAt: new Date(now - 82_000_000).toISOString(),
         runner: "cloud",
@@ -350,8 +366,9 @@ export const previewWorkspace: JobsWorkspace = {
         documents: [{
           kind: "resume",
           versionId: "resume-3",
-          storageKey: "jobs/app-3/Taylor-Rivera-Northwind-Senior-Product-Engineer.pdf",
-          sha256: "a".repeat(64),
+          storageKey: previewResumeKey,
+          sha256: previewResumeSha256,
+          mediaType: "application/pdf",
         }],
         events: [{ id: "event-app-3-submit", occurredAt: new Date(now - 82_000_000).toISOString(), type: "submitted" }],
         result: {
@@ -362,7 +379,30 @@ export const previewWorkspace: JobsWorkspace = {
           issues: [],
         },
         finalUrl: "https://boards.greenhouse.io/northwind/jobs/92831/confirmation",
-        screenshotKeys: ["jobs/app-3/confirmation.png"],
+        screenshotKeys: [previewConfirmationKey],
+        evidenceObjects: [
+          {
+            kind: "resume",
+            storageKey: previewResumeKey,
+            sha256: previewResumeSha256,
+            mediaType: "application/pdf",
+            sizeBytes: 16_384,
+          },
+          {
+            kind: "screenshot",
+            storageKey: previewConfirmationKey,
+            sha256: previewConfirmationSha256,
+            mediaType: "image/png",
+            sizeBytes: 32_768,
+          },
+        ],
+        receiptObject: {
+          storageKey: previewReceiptKey,
+          sha256: previewReceiptSha256,
+          mediaType: "application/json",
+          sizeBytes: 2_048,
+          schemaVersion: 1,
+        },
         application_identity: { email: "taylor@example.com", verified: true },
       },
       created_at_ms: now - 86_400_000,
@@ -393,11 +433,37 @@ export const previewWorkspace: JobsWorkspace = {
       provider: "greenhouse",
       file_name: "Taylor-Rivera-Northwind-Senior-Product-Engineer.pdf",
       media_type: "application/pdf",
-      storage_key: "jobs/app-3/Taylor-Rivera-Northwind-Senior-Product-Engineer.pdf",
-      sha256: "a".repeat(64),
+      storage_key: previewResumeKey,
+      sha256: previewResumeSha256,
       resume_version_id: "resume-3",
       occurred_at_ms: now - 82_000_000,
-      metadata: { attached_to_submission: true },
+      metadata: {
+        attached_to_submission: true,
+        receipt_id: "receipt-app-3",
+        size_bytes: 16_384,
+      },
+      created_at_ms: now - 82_000_000,
+    },
+    {
+      id: "evidence-receipt-app-3",
+      application_id: "app-3",
+      kind: "application_receipt",
+      label: "Application receipt bundle",
+      provider: "greenhouse",
+      file_name: "receipt-app-3.json",
+      media_type: "application/json",
+      storage_key: previewReceiptKey,
+      sha256: previewReceiptSha256,
+      resume_version_id: "resume-3",
+      occurred_at_ms: now - 82_000_000,
+      metadata: {
+        immutable: true,
+        receipt_id: "receipt-app-3",
+        schema_version: 1,
+        size_bytes: 2_048,
+        runner: "cloud",
+        run_id: "run-app-3",
+      },
       created_at_ms: now - 82_000_000,
     },
     {
@@ -406,12 +472,19 @@ export const previewWorkspace: JobsWorkspace = {
       kind: "submission_confirmation",
       label: "Application received",
       provider: "greenhouse",
-      file_name: "",
-      media_type: "",
-      storage_key: "",
-      sha256: "",
+      file_name: "submission-confirmation.png",
+      media_type: "image/png",
+      storage_key: previewConfirmationKey,
+      sha256: previewConfirmationSha256,
+      resume_version_id: "resume-3",
       occurred_at_ms: now - 82_000_000,
-      metadata: { external_id: "northwind-confirmation-92831", confirmation: "Application received" },
+      metadata: {
+        confirmation: "Application received",
+        evidence_strength: "browser_confirmed",
+        receipt_id: "receipt-app-3",
+        screenshot_keys: [previewConfirmationKey],
+        size_bytes: 32_768,
+      },
       created_at_ms: now - 82_000_000,
     },
     {
@@ -534,7 +607,7 @@ export const previewWorkspace: JobsWorkspace = {
       id: "outcome-1",
       event_type: "application_outcome",
       job_id: "job-1",
-      application_id: "app-1",
+      application_id: "app-3",
       action: "interview",
       reasons: [],
       note: "Recruiter screen scheduled for Friday.",
@@ -626,7 +699,7 @@ export const previewWorkspace: JobsWorkspace = {
     used_packets: 24,
     period_start_ms: now - 9 * 86_400_000,
     period_end_ms: now + 21 * 86_400_000,
-    local_browser: true,
+    local_browser: false,
     cloud_browser: true,
     overage_cents: 50,
     monthly_price_cents: 4900,
@@ -636,12 +709,12 @@ export const previewWorkspace: JobsWorkspace = {
   },
   runner_availability: {
     local: {
-      status: "available",
-      available: true,
-      plan_included: true,
-      distribution_enabled: true,
-      reason: "Bluey Browser is available on this account.",
-      next_action: "Approve a packet, then run it on this computer.",
+      status: "limited_beta",
+      available: false,
+      plan_included: false,
+      distribution_enabled: false,
+      reason: "Local execution is not part of the web launch.",
+      next_action: "Use cloud automation or Review first.",
     },
     cloud: {
       status: "available",
@@ -652,8 +725,7 @@ export const previewWorkspace: JobsWorkspace = {
       next_action: "Approve a packet, then queue it in the cloud.",
     },
     auto_submit_available: true,
-    auto_submit_reason:
-      "Auto-submit can use either Bluey Browser or the background runner.",
+    auto_submit_reason: "Auto-submit can use the enabled cloud automation runner.",
   },
 };
 
@@ -679,42 +751,49 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
       },
       tracks: [],
       matches: [],
+      application_jobs: [],
       applications: [],
       browser_sessions: [],
       interventions: [],
     };
   }
   if (scenario === "many-matches") {
-    const matches = Array.from({ length: 125 }, (_, index) => {
-      const template = workspace.matches[index % workspace.matches.length];
-      const candidateLead = index % 4 === 0;
-      const eligibility = template.eligibility ?? betaEligibility();
-      return {
-        ...template,
-        id: `volume-job-${index + 1}`,
-        canonical_key: `volume-job-${index + 1}`,
-        external_id: `volume-${index + 1}`,
-        company: `${template.company} ${index + 1}`,
-        title: index % 3 === 0 ? `Senior Product Engineer ${index + 1}` : template.title,
-        source: candidateLead ? "curated_feed:preview-volume" : template.source,
-        canonical_url: `https://example.com/jobs/volume-${index + 1}`,
-        track_id: workspace.tracks[index % workspace.tracks.length].id,
-        match_score: 70 + (index % 26),
-        posted_at_ms: now - (index % 10) * 86_400_000,
-        last_verified_at_ms: candidateLead ? undefined : now - (index % 60) * 60_000,
-        availability_status: candidateLead ? "unknown" as const : "active" as const,
-        eligibility: candidateLead ? {
-          ...eligibility,
-          can_prepare: false,
-          can_auto_submit: false,
-          can_queue_local: false,
-          can_queue_cloud: false,
-        } : eligibility,
-      };
-    });
+    const matches = Array.from(
+      { length: Math.max(0, 125 - workspace.matches.length) },
+      (_, offset) => {
+        const index = workspace.matches.length + offset;
+        const template = workspace.matches[index % workspace.matches.length];
+        const candidateLead = index % 4 === 0;
+        const eligibility = template.eligibility ?? betaEligibility();
+        return {
+          ...template,
+          id: `volume-job-${index + 1}`,
+          canonical_key: `volume-job-${index + 1}`,
+          external_id: `volume-${index + 1}`,
+          company: `${template.company} ${index + 1}`,
+          title: index % 3 === 0 ? `Senior Product Engineer ${index + 1}` : template.title,
+          source: candidateLead ? "curated_feed:preview-volume" : template.source,
+          canonical_url: `https://example.com/jobs/volume-${index + 1}`,
+          track_id: workspace.tracks[index % workspace.tracks.length].id,
+          match_score: 70 + (index % 26),
+          posted_at_ms: now - (index % 10) * 86_400_000,
+          last_verified_at_ms: candidateLead ? undefined : now - (index % 60) * 60_000,
+          availability_status: candidateLead ? "unknown" as const : "active" as const,
+          eligibility: candidateLead
+            ? {
+                ...eligibility,
+                can_prepare: false,
+                can_auto_submit: false,
+                can_queue_local: false,
+                can_queue_cloud: false,
+              }
+            : eligibility,
+        };
+      },
+    );
     return {
       ...workspace,
-      matches,
+      matches: [...workspace.matches, ...matches],
       discovery_sources: [
         ...workspace.discovery_sources,
         {
@@ -741,7 +820,7 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
             ...(certified.eligibility ?? betaEligibility()),
             capability: "certified",
             can_auto_submit: true,
-            can_queue_local: true,
+            can_queue_local: false,
             can_queue_cloud: true,
             review_reasons: [],
           },
@@ -788,14 +867,12 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
       ],
       runner_availability: {
         local: {
-          status: "invited_beta",
+          status: "limited_beta",
           available: false,
-          plan_included: true,
+          plan_included: false,
           distribution_enabled: false,
-          reason:
-            "Bluey Browser is included in your plan but has not been enabled for this release.",
-          next_action:
-            "Use Review first; Bluey will prepare the exact resume and answers for handoff.",
+          reason: "Local execution is not part of the web launch.",
+          next_action: "Use Review first; Bluey prepares the exact resume and answers for handoff.",
         },
         cloud: {
           status: "upgrade_required",
@@ -809,7 +886,7 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
         },
         auto_submit_available: false,
         auto_submit_reason:
-          "Auto-submit is not available in this release because your included runner is still in invited beta. Review first and job-site handoff remain available.",
+          "Cloud automation is not available for this account. Review first and job-site handoff remain available.",
       },
     };
   }

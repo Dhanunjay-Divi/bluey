@@ -10,6 +10,7 @@ export type LocalFailureCode =
   | "identity_mismatch"
   | "launch_expired"
   | "launch_mismatch"
+  | "manual_submission_observed"
   | "result_delivery_failed"
   | "run_not_active"
   | "run_request_invalid"
@@ -23,6 +24,11 @@ export interface LocalFailureClassification {
   preservePage: boolean;
 }
 
+export type LocalSideEffectReason = Extract<
+  LocalFailureCode,
+  "manual_submission_observed" | "submit_marker_state_unavailable" | "submit_outcome_unknown"
+>;
+
 const SAFE_MESSAGES: Record<LocalFailureCode, string> = {
   browser_execution_failed: "Bluey Browser could not finish this application safely.",
   configuration_invalid: "Bluey Browser is not configured for this application launch.",
@@ -30,6 +36,10 @@ const SAFE_MESSAGES: Record<LocalFailureCode, string> = {
   identity_mismatch: "This application does not match the isolated browser identity.",
   launch_expired: "This application launch expired. Start it again from Bluey Jobs.",
   launch_mismatch: "This application launch did not match the requested run.",
+  manual_submission_observed: [
+    "Bluey observed employer submission confirmation outside its authorized submit path.",
+    "Review the preserved browser; Bluey will not retry automatically.",
+  ].join(" "),
   result_delivery_failed: "Bluey Browser could not safely save the local result.",
   run_not_active: "This local application is no longer active.",
   run_request_invalid: "Bluey Browser received an invalid application launch.",
@@ -57,15 +67,21 @@ export function safeLocalFailure(error: unknown): Pick<LocalFailureClassificatio
   };
 }
 
+export function isLocalSideEffectReason(value: LocalFailureCode): value is LocalSideEffectReason {
+  return value === "manual_submission_observed"
+    || value === "submit_marker_state_unavailable"
+    || value === "submit_outcome_unknown";
+}
+
 export async function classifyLocalFailure(
   runDirectory: string | undefined,
   error: unknown,
 ): Promise<LocalFailureClassification> {
-  if (error instanceof LocalBrowserError && error.code === "submit_outcome_unknown") {
+  if (error instanceof LocalBrowserError && isLocalSideEffectReason(error.code)) {
     return {
       status: "side_effect_unknown",
-      code: "submit_outcome_unknown",
-      message: SAFE_MESSAGES.submit_outcome_unknown,
+      code: error.code,
+      message: SAFE_MESSAGES[error.code],
       preservePage: true,
     };
   }

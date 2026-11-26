@@ -11,10 +11,13 @@ use postgres_native_tls::MakeTlsConnector;
 use r2d2::{ManageConnection, Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::OptionalExtension;
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::Semaphore;
 
 pub mod account_data;
 pub mod accounts;
@@ -25,8 +28,11 @@ pub mod devices;
 pub mod diagnostic_logs;
 pub mod idempotency;
 pub mod jobs;
+pub mod jobs_beta_access;
 pub mod jobs_generation;
 pub mod jobs_generation_allowance;
+#[cfg(feature = "jobs-mcp-read")]
+pub mod jobs_mcp_read;
 pub mod jobs_provider_cost_holds;
 mod jobs_tailoring;
 pub mod legal_acceptances;
@@ -34,8 +40,12 @@ pub mod link_codes;
 pub mod metrics;
 pub mod object_uploads;
 pub mod ops_audit;
+#[cfg(test)]
+pub(crate) mod owned_postgres_test;
 pub mod refresh_tokens;
 pub mod signup_otps;
+mod sqlite_pool;
+pub use sqlite_pool::{SafeSqliteClient, SafeSqliteConnectionManager};
 pub mod stripe_auto_reload;
 pub mod stt_accounting;
 pub mod sync;
@@ -44,10 +54,42 @@ pub mod usage;
 pub mod usage_reservations;
 pub mod webhook_events;
 
-pub type SqliteDbPool = Pool<SqliteConnectionManager>;
+pub type SqliteDbPool = Pool<SafeSqliteConnectionManager>;
 pub type PostgresDbPool = Pool<SafePostgresConnectionManager>;
-pub type SqliteDbConn = PooledConnection<SqliteConnectionManager>;
+pub type SqliteDbConn = PooledConnection<SafeSqliteConnectionManager>;
 pub type PostgresDbConn = PooledConnection<SafePostgresConnectionManager>;
+
+const POSTGRES_PRIMARY_POOL_SIZE: u32 = 16;
+const POSTGRES_LIFECYCLE_POOL_SIZE: u32 = 8;
+
+/// PostgreSQL lifecycle locks deliberately use a pool separate from ordinary
+/// database work. Account object guards span network I/O; retaining those
+/// sessions in the primary pool could otherwise starve the finalization calls
+/// needed to release the guards.
+#[derive(Clone)]
+pub struct PostgresPools {
+    primary: PostgresDbPool,
+    lifecycle: PostgresDbPool,
+    lifecycle_slots: Arc<Semaphore>,
+}
+
+impl Deref for PostgresPools {
+    type Target = PostgresDbPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.primary
+    }
+}
+
+impl PostgresPools {
+    pub(crate) fn lifecycle_pool(&self) -> PostgresDbPool {
+        self.lifecycle.clone()
+    }
+
+    pub(crate) fn lifecycle_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.lifecycle_slots)
+    }
+}
 
 pub struct SafePostgresConnectionManager {
     inner: PostgresConnectionManager<MakeTlsConnector>,
@@ -55,6 +97,7 @@ pub struct SafePostgresConnectionManager {
 
 pub struct SafePostgresClient {
     inner: Option<postgres::Client>,
+    broken: bool,
 }
 
 impl SafePostgresConnectionManager {
@@ -78,6 +121,12 @@ impl DerefMut for SafePostgresClient {
         self.inner
             .as_mut()
             .expect("safe postgres client missing inner client")
+    }
+}
+
+impl SafePostgresClient {
+    pub(crate) fn mark_broken(&mut self) {
+        self.broken = true;
     }
 }
 
@@ -109,6 +158,7 @@ impl ManageConnection for SafePostgresConnectionManager {
     fn connect(&self) -> Result<Self::Connection, Self::Error> {
         self.inner.connect().map(|client| SafePostgresClient {
             inner: Some(client),
+            broken: false,
         })
     }
 
@@ -117,14 +167,14 @@ impl ManageConnection for SafePostgresConnectionManager {
     }
 
     fn has_broken(&self, client: &mut Self::Connection) -> bool {
-        self.inner.has_broken(client)
+        client.broken || self.inner.has_broken(client)
     }
 }
 
 #[derive(Clone)]
 pub enum DbPool {
     Sqlite(SqliteDbPool),
-    Postgres(PostgresDbPool),
+    Postgres(PostgresPools),
 }
 
 impl DbPool {
@@ -149,13 +199,13 @@ impl DbPool {
 
     pub fn get_pg(&self) -> Result<PostgresDbConn> {
         match self {
-            Self::Postgres(pool) => {
+            Self::Postgres(pools) => {
                 if in_tokio_multithread_runtime() && !in_db_blocking_context() {
                     anyhow::bail!(
                         "Postgres DB access must run inside db::run_blocking_db while on the Tokio runtime"
                     );
                 }
-                pool.get().context("get postgres conn")
+                pools.primary.get().context("get postgres conn")
             }
             Self::Sqlite(_) => anyhow::bail!("postgres connection requested from sqlite backend"),
         }
@@ -208,7 +258,7 @@ pub fn run_blocking_db<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-/// Open or create the SQLite DB. Enables WAL + foreign keys.
+/// Open or create the SQLite DB. Enables WAL, foreign keys and recursive triggers.
 pub fn open_pool(path: &Path) -> Result<DbPool> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -217,18 +267,19 @@ pub fn open_pool(path: &Path) -> Result<DbPool> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
+             PRAGMA recursive_triggers = ON;
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;",
         )
     });
     let pool = Pool::builder()
         .max_size(8)
-        .build(manager)
+        .build(SafeSqliteConnectionManager::new(manager))
         .context("build pool")?;
     Ok(DbPool::Sqlite(pool))
 }
 
-pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
+fn postgres_connection_settings(database_url: &str) -> Result<(postgres::Config, TlsConnector)> {
     let pg_config = database_url
         .parse::<postgres::Config>()
         .context("parse BLUEY_DATABASE_URL")?;
@@ -253,18 +304,47 @@ pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
     {
         tls_builder.danger_accept_invalid_hostnames(true);
     }
-    let tls = tls_builder
-        .build()
-        .context("build postgres TLS connector")?;
-    let manager = SafePostgresConnectionManager::new(PostgresConnectionManager::new(
+    Ok((
+        pg_config,
+        tls_builder
+            .build()
+            .context("build postgres TLS connector")?,
+    ))
+}
+pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
+    let (pg_config, tls) = postgres_connection_settings(database_url)?;
+    let primary_manager = SafePostgresConnectionManager::new(PostgresConnectionManager::new(
+        pg_config.clone(),
+        MakeTlsConnector::new(tls.clone()),
+    ));
+    let lifecycle_manager = SafePostgresConnectionManager::new(PostgresConnectionManager::new(
         pg_config,
         MakeTlsConnector::new(tls),
     ));
-    let pool = Pool::builder()
-        .max_size(16)
-        .build(manager)
+    let primary = Pool::builder()
+        .max_size(POSTGRES_PRIMARY_POOL_SIZE)
+        .build(primary_manager)
         .context("build postgres pool")?;
-    Ok(DbPool::Postgres(pool))
+    let lifecycle = Pool::builder()
+        .max_size(POSTGRES_LIFECYCLE_POOL_SIZE)
+        .min_idle(Some(0))
+        .build(lifecycle_manager)
+        .context("build postgres lifecycle pool")?;
+    Ok(DbPool::Postgres(PostgresPools {
+        primary,
+        lifecycle,
+        lifecycle_slots: Arc::new(Semaphore::new(POSTGRES_LIFECYCLE_POOL_SIZE as usize)),
+    }))
+}
+fn open_one_shot_postgres_client(database_url: &str) -> Result<SafePostgresClient> {
+    let (config, tls) = postgres_connection_settings(database_url)?;
+    let client = config
+        .connect(MakeTlsConnector::new(tls))
+        .context("connect one-shot PostgreSQL operator client")?;
+    Ok(SafePostgresClient {
+        inner: Some(client),
+        broken: false,
+    })
 }
 
 /// Migrations, run in order. Each one is idempotent (CREATE TABLE IF NOT
@@ -277,6 +357,83 @@ const SQLITE_JOBS_GLOBAL_INGESTION_QUARANTINE: &str =
     include_str!("../../../infra/sqlite/server-runtime/039_jobs_global_ingestion_quarantine.sql");
 const SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
     include_str!("../../../infra/sqlite/server-runtime/040_jobs_auto_submit_authorizations.sql");
+const SQLITE_JOBS_COMMUNICATION_ACTIONS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/041_jobs_communication_actions.sql");
+const SQLITE_JOBS_BROWSER_PROFILE_SNAPSHOTS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/042_jobs_browser_profile_snapshots.sql");
+const SQLITE_ACCOUNT_DELETION_INTENTS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/043_account_deletion_intents.sql");
+const SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/044_jobs_submission_evidence_reservations.sql"
+);
+const SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/045_jobs_account_object_upload_backfill.sql"
+);
+const SQLITE_JOBS_RUNNER_VOLUME_PURGE: &str =
+    include_str!("../../../infra/sqlite/server-runtime/046_jobs_runner_volume_purge.sql");
+const SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/047_jobs_browser_release_authority.sql");
+const SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/048_jobs_ats_certification_authority.sql");
+const SQLITE_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/049_jobs_browser_release_runtime_components.sql"
+);
+const SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/050_jobs_runner_process_runtime_authority.sql"
+);
+const SQLITE_JOBS_COMMUNICATION_EXECUTION: &str =
+    include_str!("../../../infra/sqlite/server-runtime/051_jobs_communication_execution.sql");
+const SQLITE_JOBS_OPERATIONAL_HOLDS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/052_jobs_operational_holds.sql");
+const SQLITE_JOBS_WORKFLOW_COMMANDS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/053_jobs_workflow_commands.sql");
+const SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/054_jobs_workflow_cleanup_authority.sql");
+const SQLITE_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/055_jobs_managed_cloud_release_authority.sql"
+);
+const SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/056_jobs_canonical_taxonomy_authority.sql");
+const SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql"
+);
+const SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/058_jobs_signed_job_integrity_authority.sql"
+);
+const SQLITE_JOBS_PUBLIC_BETA_ACCESS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/060_jobs_public_beta_access.sql");
+const SQLITE_JOBS_WORKSPACE_PAGINATION: &str =
+    include_str!("../../../infra/sqlite/server-runtime/061_jobs_workspace_pagination.sql");
+const SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/062_jobs_original_source_verifier_startup_authority.sql"
+);
+const SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/063_jobs_source_verifier_boot_generation_authority.sql"
+);
+const SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/064_jobs_source_verifier_heartbeat_boot_generation_fence.sql"
+);
+const SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/065_jobs_source_verifier_heartbeat_boot_bindings.sql"
+);
+const SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/066_jobs_attempt_employer_identity.sql");
+const SQLITE_JOBS_PROVISIONED_RUNTIME_STARTUP: &str =
+    include_str!("../../../infra/sqlite/server-runtime/067_jobs_provisioned_runtime_startup.sql");
+const SQLITE_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/068_jobs_provisioned_runtime_observations.sql"
+);
+const SQLITE_JOBS_ATS_STORAGE_FENCES: &str =
+    include_str!("../../../infra/sqlite/server-runtime/069_jobs_ats_storage_fences.sql");
+const SQLITE_JOBS_APPLICATION_ANSWER_REVISIONS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/070_jobs_application_answer_revisions.sql");
+const SQLITE_JOBS_WORKDAY_RECONCILIATION_HOLDS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/071_jobs_workday_reconciliation_holds.sql");
+const SQLITE_JOBS_MCP_READ_GRANTS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/072_jobs_mcp_read_grants.sql");
+const SQLITE_JOBS_MANAGED_CLOUD_RELEASE_V4_AUDIENCES: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/073_jobs_managed_cloud_release_v4_audiences.sql"
+);
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1589,6 +1746,72 @@ const MIGRATIONS: &[&str] = &[
     // 0040 - Track-scoped, revisioned user authority for unattended
     // application submission.
     SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
+    // 0041 - approval-gated, replay-safe email and calendar actions.
+    SQLITE_JOBS_COMMUNICATION_ACTIONS,
+    // 0042 - durable encrypted Browser profile snapshot generations.
+    SQLITE_JOBS_BROWSER_PROFILE_SNAPSHOTS,
+    // 0043 - durable account-deletion write fence and upload drain status.
+    SQLITE_ACCOUNT_DELETION_INTENTS,
+    // 0044 - protected evidence capacity reserved before employer Submit.
+    SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+    // 0045 - adopt existing source resumes and Browser profiles into the
+    // account-scoped object lifecycle.
+    SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+    // 0046 - signed managed-runner volume identity, purge fan-out, and
+    // pseudonymous restore tombstones.
+    SQLITE_JOBS_RUNNER_VOLUME_PURGE,
+    // 0047 - signed local Browser release and claim authority.
+    SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+    // 0048 - signed, tenant/surface/runtime-scoped ATS certification authority.
+    SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
+    // 0049 - exact signed Browser automation and Chromium runtime components.
+    SQLITE_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS,
+    // 0050 - one-time cloud process runtime grants and immutable lease bindings.
+    SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY,
+    // 0051 - exact reviewed communication dispatch and reconciliation evidence.
+    SQLITE_JOBS_COMMUNICATION_EXECUTION,
+    // 0052 - durable, revisioned operational holds and exact CAS heads.
+    SQLITE_JOBS_OPERATIONAL_HOLDS,
+    // 0053 - durable workflow start/resume commands and delivery evidence.
+    SQLITE_JOBS_WORKFLOW_COMMANDS,
+    // 0054 - global legacy inventory and account-bound workflow cleanup authority.
+    SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+    // 0055 - signed managed-cloud release, activation, runtime, and admission authority.
+    SQLITE_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
+    // 0056 - immutable canonical Career Track policy revisions, review receipts,
+    // and exact compare-and-swap heads.
+    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
+    // 0057 - replay-safe original-source assignment, receipt, transition,
+    // lease, circuit, quarantine, and exact current-head authority.
+    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+    // 0058 - dual-role signed employer-identity and job-risk authority.
+    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+    // 0060 - durable, dark-by-default public first-come cohort authority.
+    // 0059 remains reserved for the separate business-messaging authority.
+    SQLITE_JOBS_PUBLIC_BETA_ACCESS,
+    // 0061 - stable bounded interactive workspace keyset order.
+    SQLITE_JOBS_WORKSPACE_PAGINATION,
+    // 0062 - one-shot original-source verifier startup readiness authority.
+    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+    // 0063 - server-assigned monotonic source-verifier boot generation authority.
+    SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+    // 0064 - project the boot generation fence onto runtime heartbeats.
+    SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+    // 0065 - bind prospective boot-protocol heartbeats to registered generations.
+    SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS,
+    // 0066 - immutable canonical employer bindings for application attempts.
+    SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY,
+    // 0067 - disjoint non-serving provisioning storage; no runtime/proof writer.
+    SQLITE_JOBS_PROVISIONED_RUNTIME_STARTUP,
+    // 0068 - immutable observations and versioned control/boot storage.
+    SQLITE_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS,
+    // 0069 - replacement-safe components and immutable ATS head scopes.
+    SQLITE_JOBS_ATS_STORAGE_FENCES,
+    SQLITE_JOBS_APPLICATION_ANSWER_REVISIONS,
+    // 0071 - immutable Workday protected-history reconciliation holds.
+    SQLITE_JOBS_WORKDAY_RECONCILIATION_HOLDS,
+    // 0072 - scoped read capability storage only; no grants are issued at startup.
+    SQLITE_JOBS_MCP_READ_GRANTS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1599,59 +1822,649 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
 }
 
 fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
-    let conn = pool.get().context("get conn")?;
-    for (i, sql) in MIGRATIONS.iter().enumerate() {
+    run_sqlite_migration_list(pool, MIGRATIONS)?;
+    let mut conn = pool
+        .get()
+        .context("get signature audience migration connection")?;
+    let outcome = apply_sqlite_signature_audience_migration(&mut conn)
+        .and_then(|()| apply_sqlite_release_v4_signature_audience_migration(&mut conn));
+    if let Err(error) = outcome {
+        // Never return an uncertain transaction/foreign-key session to the pool.
+        conn.mark_broken();
+        return Err(error.context("SQLite managed signature audience migration failed"));
+    }
+    Ok(())
+}
+
+include!("sqlite-signature-audience-wrapper.rs");
+#[cfg(test)]
+include!("sqlite-signature-audience-tests.rs");
+
+fn run_sqlite_migration_list(pool: &DbPool, migrations: &[&str]) -> Result<()> {
+    let mut conn = pool.get().context("get conn")?;
+    let result = run_sqlite_migration_list_with_connection(&mut conn, migrations);
+    if result.is_err() {
+        // Earlier migrations also attempt transaction/PRAGMA cleanup. If that cleanup
+        // fails, the owning checkout must not be recycled as a healthy session.
+        conn.mark_broken();
+    }
+    result?;
+    tracing::info!(
+        backend = pool.backend_name(),
+        count = migrations.len(),
+        "migrations applied"
+    );
+    Ok(())
+}
+
+fn run_sqlite_migration_list_with_connection(
+    conn: &mut rusqlite::Connection,
+    migrations: &[&str],
+) -> Result<()> {
+    check_sqlite_ats_storage_lineage(conn)?;
+    let signed_job_integrity_index = migrations
+        .iter()
+        .position(|migration| *migration == SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY)
+        .context("SQLite signed job-integrity migration is missing")?;
+    let (preceding_migrations, signed_and_following_migrations) =
+        migrations.split_at(signed_job_integrity_index);
+    let (signed_job_integrity_migration, following_migrations) = signed_and_following_migrations
+        .split_first()
+        .context("SQLite signed job-integrity migration is missing")?;
+    for (i, sql) in preceding_migrations.iter().enumerate() {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
+    ensure_sqlite_attempt_employer_identity_columns(conn)?;
+    // SQLite replays the bundled schema on every startup. Phase611 cleanup
+    // columns therefore use the idempotent column helper rather than an
+    // unconditional ALTER TABLE in the replayed SQL file.
+    ensure_column(
+        conn,
+        "jobs_workflow_commands",
+        "managed_cloud_authority_required",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(managed_cloud_authority_required IN (0, 1))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_workflow_cleanup_targets",
+        "managed_cloud_binding_sha256",
+        "TEXT CHECK(managed_cloud_binding_sha256 IS NULL OR (
+            length(managed_cloud_binding_sha256) = 64
+            AND managed_cloud_binding_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_workflow_cleanup_targets",
+        "managed_cloud_release_memo_base64url",
+        "TEXT CHECK(managed_cloud_release_memo_base64url IS NULL OR (
+            length(managed_cloud_release_memo_base64url) BETWEEN 1 AND 174763
+            AND managed_cloud_release_memo_base64url NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_workflow_cleanup_targets",
+        "managed_cloud_release_memo_sha256",
+        "TEXT CHECK(managed_cloud_release_memo_sha256 IS NULL OR (
+            length(managed_cloud_release_memo_sha256) = 64
+            AND managed_cloud_release_memo_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_workflow_request_id",
+        "TEXT CHECK(managed_cloud_workflow_request_id IS NULL OR (
+            length(managed_cloud_workflow_request_id) = 45
+            AND substr(managed_cloud_workflow_request_id, 1, 9) = 'wfreq-v2-'
+            AND substr(managed_cloud_workflow_request_id, 10)
+                NOT GLOB '*[^0-9a-f-]*'
+            AND length(replace(substr(managed_cloud_workflow_request_id, 10), '-', '')) = 32
+            AND substr(managed_cloud_workflow_request_id, 18, 1) = '-'
+            AND substr(managed_cloud_workflow_request_id, 23, 1) = '-'
+            AND substr(managed_cloud_workflow_request_id, 24, 1) = '5'
+            AND substr(managed_cloud_workflow_request_id, 28, 1) = '-'
+            AND substr(managed_cloud_workflow_request_id, 29, 1) GLOB '[89ab]'
+            AND substr(managed_cloud_workflow_request_id, 33, 1) = '-'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_request_command_id",
+        "TEXT CHECK(managed_cloud_request_command_id IS NULL OR (
+            length(managed_cloud_request_command_id) BETWEEN 20 AND 128
+            AND managed_cloud_request_command_id NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_execution_command_id",
+        "TEXT CHECK(managed_cloud_execution_command_id IS NULL OR (
+            length(managed_cloud_execution_command_id) BETWEEN 20 AND 128
+            AND managed_cloud_execution_command_id NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_binding_sha256",
+        "TEXT CHECK(managed_cloud_binding_sha256 IS NULL OR (
+            length(managed_cloud_binding_sha256) = 64
+            AND managed_cloud_binding_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_release_memo_base64url",
+        "TEXT CHECK(managed_cloud_release_memo_base64url IS NULL OR (
+            length(managed_cloud_release_memo_base64url) BETWEEN 1 AND 174763
+            AND managed_cloud_release_memo_base64url NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_release_sha256",
+        "TEXT CHECK(managed_cloud_release_sha256 IS NULL OR (
+            length(managed_cloud_release_sha256) = 64
+            AND managed_cloud_release_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_runtime_instance_id",
+        "TEXT CHECK(managed_cloud_runtime_instance_id IS NULL OR (
+            length(managed_cloud_runtime_instance_id) BETWEEN 20 AND 128
+            AND managed_cloud_runtime_instance_id NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_runtime_instance_epoch",
+        "INTEGER CHECK(managed_cloud_runtime_instance_epoch IS NULL OR
+            managed_cloud_runtime_instance_epoch BETWEEN 1 AND 9007199254740991)",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_worker_id",
+        "TEXT CHECK(managed_cloud_worker_id IS NULL OR (
+            length(managed_cloud_worker_id) BETWEEN 20 AND 128
+            AND managed_cloud_worker_id NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_gateway_authority_base64url",
+        "TEXT CHECK(managed_cloud_gateway_authority_base64url IS NULL OR (
+            length(managed_cloud_gateway_authority_base64url) BETWEEN 1 AND 174763
+            AND managed_cloud_gateway_authority_base64url NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_gateway_authority_sha256",
+        "TEXT CHECK(managed_cloud_gateway_authority_sha256 IS NULL OR (
+            length(managed_cloud_gateway_authority_sha256) = 64
+            AND managed_cloud_gateway_authority_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_execution_leases",
+        "managed_cloud_lease_authority_sha256",
+        "TEXT CHECK(managed_cloud_lease_authority_sha256 IS NULL OR (
+            length(managed_cloud_lease_authority_sha256) = 64
+            AND managed_cloud_lease_authority_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS jobs_managed_cloud_irreversible_effect_receipts (
+           run_id TEXT NOT NULL CHECK(length(run_id) BETWEEN 20 AND 128
+             AND run_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           fence INTEGER NOT NULL CHECK(fence BETWEEN 1 AND 9007199254740991),
+           account_id TEXT NOT NULL CHECK(length(account_id) BETWEEN 1 AND 240),
+           application_id TEXT NOT NULL CHECK(length(application_id) BETWEEN 1 AND 240),
+           workflow_request_id TEXT NOT NULL CHECK(
+             length(workflow_request_id) = 45
+             AND substr(workflow_request_id, 1, 9) = 'wfreq-v2-'
+             AND substr(workflow_request_id, 10) NOT GLOB '*[^0-9a-f-]*'
+             AND length(replace(substr(workflow_request_id, 10), '-', '')) = 32
+             AND substr(workflow_request_id, 18, 1) = '-'
+             AND substr(workflow_request_id, 23, 1) = '-'
+             AND substr(workflow_request_id, 24, 1) = '5'
+             AND substr(workflow_request_id, 28, 1) = '-'
+             AND substr(workflow_request_id, 29, 1) GLOB '[89ab]'
+             AND substr(workflow_request_id, 33, 1) = '-'),
+           request_command_id TEXT NOT NULL CHECK(
+             length(request_command_id) BETWEEN 20 AND 128
+             AND request_command_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           execution_command_id TEXT NOT NULL CHECK(
+             length(execution_command_id) BETWEEN 20 AND 128
+             AND execution_command_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           binding_sha256 TEXT NOT NULL CHECK(length(binding_sha256) = 64
+             AND binding_sha256 NOT GLOB '*[^0-9a-f]*'),
+           release_memo_base64url TEXT NOT NULL CHECK(
+             length(release_memo_base64url) BETWEEN 1 AND 174763
+             AND release_memo_base64url NOT GLOB '*[^A-Za-z0-9_-]*'),
+           release_sha256 TEXT NOT NULL CHECK(length(release_sha256) = 64
+             AND release_sha256 NOT GLOB '*[^0-9a-f]*'),
+           runtime_instance_id TEXT NOT NULL CHECK(
+             length(runtime_instance_id) BETWEEN 20 AND 128
+             AND runtime_instance_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           runtime_instance_epoch INTEGER NOT NULL
+             CHECK(runtime_instance_epoch BETWEEN 1 AND 9007199254740991),
+           worker_id TEXT NOT NULL CHECK(length(worker_id) BETWEEN 20 AND 128
+             AND worker_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           gateway_authority_base64url TEXT NOT NULL CHECK(
+             length(gateway_authority_base64url) BETWEEN 1 AND 174763
+             AND gateway_authority_base64url NOT GLOB '*[^A-Za-z0-9_-]*'),
+           gateway_authority_sha256 TEXT NOT NULL CHECK(
+             length(gateway_authority_sha256) = 64
+             AND gateway_authority_sha256 NOT GLOB '*[^0-9a-f]*'),
+           receipt_sha256 TEXT NOT NULL UNIQUE CHECK(length(receipt_sha256) = 64
+             AND receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+           committed_at_ms INTEGER NOT NULL
+             CHECK(committed_at_ms BETWEEN 0 AND 9007199254740991),
+           PRIMARY KEY(run_id, fence),
+           FOREIGN KEY(run_id) REFERENCES jobs_execution_leases(run_id) ON DELETE CASCADE,
+           FOREIGN KEY(request_command_id)
+             REFERENCES jobs_workflow_commands(id) ON DELETE CASCADE,
+           FOREIGN KEY(execution_command_id, binding_sha256,
+             release_memo_base64url, release_sha256)
+             REFERENCES jobs_managed_cloud_workflow_bindings(
+               command_id, binding_sha256, release_memo_base64url,
+               release_memo_sha256) ON DELETE CASCADE,
+           FOREIGN KEY(runtime_instance_id, runtime_instance_epoch, worker_id)
+             REFERENCES jobs_managed_cloud_runtime_instances(
+               runtime_instance_id, instance_epoch, worker_id) ON DELETE RESTRICT
+         );
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_irreversible_receipt_insert;
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_irreversible_receipt_no_update;
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_irreversible_receipt_no_delete;
+         CREATE TRIGGER trg_jobs_managed_cloud_irreversible_receipt_insert
+         BEFORE INSERT ON jobs_managed_cloud_irreversible_effect_receipts
+         WHEN NOT EXISTS(
+           SELECT 1 FROM jobs_execution_leases lease
+            WHERE lease.run_id=NEW.run_id AND lease.fence=NEW.fence
+              AND lease.account_id=NEW.account_id
+              AND lease.application_id=NEW.application_id
+              AND lease.phase='click_started'
+              AND lease.managed_cloud_lease_authority_sha256 IS NOT NULL
+              AND lease.managed_cloud_runtime_instance_id=NEW.runtime_instance_id
+              AND lease.managed_cloud_runtime_instance_epoch=NEW.runtime_instance_epoch
+              AND lease.managed_cloud_worker_id=NEW.worker_id
+         ) OR NOT EXISTS(
+           SELECT 1 FROM jobs_workflow_commands command
+            WHERE command.id=NEW.request_command_id
+              AND command.request_id=NEW.workflow_request_id
+              AND command.account_id=NEW.account_id
+              AND command.application_id=NEW.application_id
+              AND command.run_id=NEW.run_id
+              AND command.command_kind IN ('start','resume')
+              AND command.managed_cloud_authority_required=1
+              AND command.first_request_started_at_ms IS NOT NULL
+              AND EXISTS(
+                SELECT 1 FROM jobs_workflow_command_attempt_events event
+                 WHERE event.command_id=command.id
+                   AND event.event_kind='request_started')
+         ) BEGIN
+           SELECT RAISE(ABORT, 'managed cloud irreversible receipt is invalid');
+         END;
+         CREATE TRIGGER trg_jobs_managed_cloud_irreversible_receipt_no_update
+         BEFORE UPDATE ON jobs_managed_cloud_irreversible_effect_receipts BEGIN
+           SELECT RAISE(ABORT, 'managed cloud irreversible receipt is immutable');
+         END;
+         CREATE TRIGGER trg_jobs_managed_cloud_irreversible_receipt_no_delete
+         BEFORE DELETE ON jobs_managed_cloud_irreversible_effect_receipts
+         WHEN NOT EXISTS(
+           SELECT 1 FROM jobs_workflow_cleanup_hard_delete_cascade_tokens token
+            WHERE token.account_id=OLD.account_id
+              AND NOT EXISTS(
+                SELECT 1 FROM accounts account WHERE account.id=OLD.account_id)
+         ) BEGIN
+           SELECT RAISE(ABORT, 'managed cloud irreversible receipt is immutable');
+         END;
+         CREATE UNIQUE INDEX IF NOT EXISTS
+           idx_jobs_workflow_commands_managed_cloud_request_identity
+           ON jobs_workflow_commands(id, request_id);
+         CREATE UNIQUE INDEX IF NOT EXISTS
+           idx_jobs_managed_cloud_runtime_instance_epoch
+           ON jobs_managed_cloud_runtime_instances(runtime_instance_id, instance_epoch);
+         CREATE UNIQUE INDEX IF NOT EXISTS
+           idx_jobs_managed_cloud_runtime_instance_epoch_worker
+           ON jobs_managed_cloud_runtime_instances(
+             runtime_instance_id, instance_epoch, worker_id);
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_execution_lease_insert;
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_execution_lease_update;
+         CREATE TRIGGER trg_jobs_managed_cloud_execution_lease_insert
+         BEFORE INSERT ON jobs_execution_leases
+         WHEN
+           ((NEW.managed_cloud_workflow_request_id IS NULL)
+             + (NEW.managed_cloud_request_command_id IS NULL)
+             + (NEW.managed_cloud_execution_command_id IS NULL)
+             + (NEW.managed_cloud_binding_sha256 IS NULL)
+             + (NEW.managed_cloud_release_memo_base64url IS NULL)
+             + (NEW.managed_cloud_release_sha256 IS NULL)
+             + (NEW.managed_cloud_runtime_instance_id IS NULL)
+             + (NEW.managed_cloud_runtime_instance_epoch IS NULL)
+             + (NEW.managed_cloud_worker_id IS NULL)
+             + (NEW.managed_cloud_gateway_authority_base64url IS NULL)
+             + (NEW.managed_cloud_gateway_authority_sha256 IS NULL)
+             + (NEW.managed_cloud_lease_authority_sha256 IS NULL)) NOT IN (0, 12)
+           OR (NEW.managed_cloud_lease_authority_sha256 IS NOT NULL AND (
+             NOT EXISTS(
+               SELECT 1 FROM jobs_workflow_commands command
+                WHERE command.id = NEW.managed_cloud_request_command_id
+                  AND command.request_id = NEW.managed_cloud_workflow_request_id
+                  AND command.account_id = NEW.account_id
+                  AND command.application_id = NEW.application_id
+                  AND command.run_id = NEW.run_id
+                  AND command.managed_cloud_authority_required = 1
+                  AND command.command_kind IN ('start', 'resume')
+             )
+             OR NOT EXISTS(
+               SELECT 1 FROM jobs_managed_cloud_workflow_bindings binding
+                WHERE binding.command_id = NEW.managed_cloud_execution_command_id
+                  AND binding.binding_sha256 = NEW.managed_cloud_binding_sha256
+                  AND binding.release_memo_base64url =
+                      NEW.managed_cloud_release_memo_base64url
+                  AND binding.release_memo_sha256 = NEW.managed_cloud_release_sha256
+             )
+             OR NOT EXISTS(
+               SELECT 1 FROM jobs_managed_cloud_runtime_instances instance
+                WHERE instance.runtime_instance_id =
+                      NEW.managed_cloud_runtime_instance_id
+                  AND instance.instance_epoch =
+                      NEW.managed_cloud_runtime_instance_epoch
+                  AND instance.worker_id = NEW.managed_cloud_worker_id
+             )
+           ))
+         BEGIN
+           SELECT RAISE(ABORT, 'managed-cloud execution lease authority is invalid');
+         END;
+         CREATE TRIGGER trg_jobs_managed_cloud_execution_lease_update
+         BEFORE UPDATE OF fence, phase, managed_cloud_workflow_request_id,
+           managed_cloud_request_command_id, managed_cloud_execution_command_id,
+           managed_cloud_binding_sha256, managed_cloud_release_memo_base64url,
+           managed_cloud_release_sha256, managed_cloud_runtime_instance_id,
+           managed_cloud_runtime_instance_epoch, managed_cloud_worker_id,
+           managed_cloud_gateway_authority_base64url,
+           managed_cloud_gateway_authority_sha256,
+           managed_cloud_lease_authority_sha256
+         ON jobs_execution_leases
+         WHEN
+           ((NEW.managed_cloud_workflow_request_id IS NULL)
+             + (NEW.managed_cloud_request_command_id IS NULL)
+             + (NEW.managed_cloud_execution_command_id IS NULL)
+             + (NEW.managed_cloud_binding_sha256 IS NULL)
+             + (NEW.managed_cloud_release_memo_base64url IS NULL)
+             + (NEW.managed_cloud_release_sha256 IS NULL)
+             + (NEW.managed_cloud_runtime_instance_id IS NULL)
+             + (NEW.managed_cloud_runtime_instance_epoch IS NULL)
+             + (NEW.managed_cloud_worker_id IS NULL)
+             + (NEW.managed_cloud_gateway_authority_base64url IS NULL)
+             + (NEW.managed_cloud_gateway_authority_sha256 IS NULL)
+             + (NEW.managed_cloud_lease_authority_sha256 IS NULL)) NOT IN (0, 12)
+           OR (OLD.managed_cloud_lease_authority_sha256 IS NOT NULL
+             AND NEW.managed_cloud_lease_authority_sha256 IS NULL)
+           OR (OLD.managed_cloud_lease_authority_sha256 IS NOT NULL
+             AND NEW.fence <> OLD.fence
+             AND NEW.managed_cloud_lease_authority_sha256 =
+                 OLD.managed_cloud_lease_authority_sha256)
+           OR ((NEW.managed_cloud_workflow_request_id
+                  IS NOT OLD.managed_cloud_workflow_request_id
+             OR NEW.managed_cloud_request_command_id
+                  IS NOT OLD.managed_cloud_request_command_id
+             OR NEW.managed_cloud_execution_command_id
+                  IS NOT OLD.managed_cloud_execution_command_id
+             OR NEW.managed_cloud_binding_sha256
+                  IS NOT OLD.managed_cloud_binding_sha256
+             OR NEW.managed_cloud_release_memo_base64url
+                  IS NOT OLD.managed_cloud_release_memo_base64url
+             OR NEW.managed_cloud_release_sha256
+                  IS NOT OLD.managed_cloud_release_sha256
+             OR NEW.managed_cloud_runtime_instance_id
+                  IS NOT OLD.managed_cloud_runtime_instance_id
+             OR NEW.managed_cloud_runtime_instance_epoch
+                  IS NOT OLD.managed_cloud_runtime_instance_epoch
+             OR NEW.managed_cloud_worker_id IS NOT OLD.managed_cloud_worker_id
+             OR NEW.managed_cloud_gateway_authority_base64url
+                  IS NOT OLD.managed_cloud_gateway_authority_base64url
+             OR NEW.managed_cloud_gateway_authority_sha256
+                  IS NOT OLD.managed_cloud_gateway_authority_sha256
+             OR NEW.managed_cloud_lease_authority_sha256
+                  IS NOT OLD.managed_cloud_lease_authority_sha256)
+             AND NOT (OLD.phase = 'prepared' AND NEW.phase = 'prepared'
+               AND NEW.fence > OLD.fence))
+           OR (NEW.managed_cloud_lease_authority_sha256 IS NOT NULL AND (
+             NOT EXISTS(
+               SELECT 1 FROM jobs_workflow_commands command
+                WHERE command.id = NEW.managed_cloud_request_command_id
+                  AND command.request_id = NEW.managed_cloud_workflow_request_id
+                  AND command.account_id = NEW.account_id
+                  AND command.application_id = NEW.application_id
+                  AND command.run_id = NEW.run_id
+                  AND command.managed_cloud_authority_required = 1
+                  AND command.command_kind IN ('start', 'resume')
+             )
+             OR NOT EXISTS(
+               SELECT 1 FROM jobs_managed_cloud_workflow_bindings binding
+                WHERE binding.command_id = NEW.managed_cloud_execution_command_id
+                  AND binding.binding_sha256 = NEW.managed_cloud_binding_sha256
+                  AND binding.release_memo_base64url =
+                      NEW.managed_cloud_release_memo_base64url
+                  AND binding.release_memo_sha256 = NEW.managed_cloud_release_sha256
+             )
+             OR NOT EXISTS(
+               SELECT 1 FROM jobs_managed_cloud_runtime_instances instance
+                WHERE instance.runtime_instance_id =
+                      NEW.managed_cloud_runtime_instance_id
+                  AND instance.instance_epoch =
+                      NEW.managed_cloud_runtime_instance_epoch
+                  AND instance.worker_id = NEW.managed_cloud_worker_id
+             )
+           ))
+         BEGIN
+           SELECT RAISE(ABORT, 'managed-cloud execution lease authority is frozen');
+         END;
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_command_hard_delete;
+         CREATE TRIGGER trg_jobs_managed_cloud_command_hard_delete
+         BEFORE DELETE ON jobs_workflow_commands
+         WHEN EXISTS(
+           SELECT 1 FROM jobs_workflow_cleanup_hard_delete_cascade_tokens token
+            WHERE token.account_id = OLD.account_id
+              AND NOT EXISTS(
+                SELECT 1 FROM accounts account WHERE account.id = OLD.account_id)
+         )
+         BEGIN
+           DELETE FROM jobs_execution_leases
+            WHERE account_id = OLD.account_id
+              AND (managed_cloud_request_command_id = OLD.id
+                OR managed_cloud_execution_command_id = OLD.id);
+           DELETE FROM jobs_workflow_cleanup_targets
+            WHERE account_id = OLD.account_id AND start_command_id = OLD.id;
+           DELETE FROM jobs_managed_cloud_request_start_authorities
+            WHERE account_id = OLD.account_id AND command_id = OLD.id;
+           DELETE FROM jobs_managed_cloud_workflow_bindings
+            WHERE command_id = OLD.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS trg_jobs_managed_cloud_cleanup_target_binding_insert
+         BEFORE INSERT ON jobs_workflow_cleanup_targets
+         WHEN
+           ((NEW.managed_cloud_binding_sha256 IS NULL)
+             + (NEW.managed_cloud_release_memo_base64url IS NULL)
+             + (NEW.managed_cloud_release_memo_sha256 IS NULL)) NOT IN (0, 3)
+           OR (NEW.managed_cloud_binding_sha256 IS NULL AND EXISTS(
+             SELECT 1 FROM jobs_managed_cloud_workflow_bindings binding
+              WHERE binding.command_id = NEW.start_command_id
+           ))
+           OR (NEW.managed_cloud_binding_sha256 IS NOT NULL AND NOT EXISTS(
+             SELECT 1 FROM jobs_managed_cloud_workflow_bindings binding
+              WHERE binding.command_id = NEW.start_command_id
+                AND binding.binding_sha256 = NEW.managed_cloud_binding_sha256
+                AND binding.release_memo_base64url = NEW.managed_cloud_release_memo_base64url
+                AND binding.release_memo_sha256 = NEW.managed_cloud_release_memo_sha256
+           ))
+         BEGIN
+           SELECT RAISE(ABORT,
+             'workflow cleanup managed-cloud memo authority is invalid');
+         END;
+         CREATE TRIGGER IF NOT EXISTS
+           trg_jobs_managed_cloud_cleanup_target_binding_immutable
+         BEFORE UPDATE OF managed_cloud_binding_sha256,
+           managed_cloud_release_memo_base64url,
+           managed_cloud_release_memo_sha256
+         ON jobs_workflow_cleanup_targets
+         BEGIN
+           SELECT RAISE(ABORT,
+             'workflow cleanup managed-cloud memo authority is immutable');
+         END;
+         CREATE TRIGGER IF NOT EXISTS
+           trg_jobs_managed_cloud_binding_no_historical_retrofit
+         BEFORE INSERT ON jobs_managed_cloud_workflow_bindings
+         WHEN NOT EXISTS(
+           SELECT 1 FROM jobs_workflow_commands command
+            WHERE command.id = NEW.command_id
+              AND command.managed_cloud_authority_required = 1
+         ) OR EXISTS(
+             SELECT 1 FROM jobs_workflow_cleanup_targets target
+              WHERE target.start_command_id = NEW.command_id
+                AND (
+                  target.managed_cloud_binding_sha256 IS NULL
+                  OR target.managed_cloud_binding_sha256 <> NEW.binding_sha256
+                  OR target.managed_cloud_release_memo_base64url
+                     <> NEW.release_memo_base64url
+                  OR target.managed_cloud_release_memo_sha256
+                     <> NEW.release_memo_sha256
+                )
+           )
+         BEGIN
+           SELECT RAISE(ABORT,
+             'managed-cloud binding cannot retrofit cleanup memo authority');
+         END;
+         CREATE TRIGGER IF NOT EXISTS
+           trg_jobs_managed_cloud_command_authority_marker_immutable
+         BEFORE UPDATE OF managed_cloud_authority_required
+         ON jobs_workflow_commands
+         BEGIN
+           SELECT RAISE(ABORT,
+             'managed-cloud command authority marker is immutable');
+         END;",
+    )?;
+    jobs::activate_canonical_taxonomy_authority_sqlite(conn)
+        .context("activate SQLite Career Track taxonomy authority")?;
+    ensure_column(
+        conn,
+        "jobs_communication_actions",
+        "authority_sha256",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(conn, "jobs_communication_actions", "lease_kind", "TEXT")?;
+    ensure_column(
+        conn,
+        "jobs_communication_actions",
+        "active_attempt_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_communication_actions",
+        "reconciliation_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_communication_actions",
+        "action_revision",
+        "INTEGER NOT NULL DEFAULT 1 CHECK (
+            action_revision > 0 AND action_revision <= 9007199254740991
+        )",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_communication_actions",
+        "approval_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_communication_actions",
+        "approved_authority_sha256",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_communication_actions",
+        "approved_grant_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "jobs_communication_actions",
+        "approved_grant_sha256",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS trg_jobs_communication_action_revision_insert
+         BEFORE INSERT ON jobs_communication_actions
+         WHEN NEW.action_revision <= 0 OR NEW.action_revision > 9007199254740991
+         BEGIN
+           SELECT RAISE(ABORT,
+             'communication action revision is outside the portable range');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS trg_jobs_communication_action_revision_update
+         BEFORE UPDATE OF action_revision ON jobs_communication_actions
+         WHEN NEW.action_revision <= 0 OR NEW.action_revision > 9007199254740991
+         BEGIN
+           SELECT RAISE(ABORT,
+             'communication action revision is outside the portable range');
+         END;",
+    )?;
     // Keep historical SQLite migrations immutable. Additive columns used by
     // the global-candidate cold-storage lifecycle are applied after replay.
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_candidates",
         "content_hash",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_candidates",
         "archive_state",
         "TEXT NOT NULL DEFAULT 'hot'",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_candidates",
         "archive_storage_key",
         "TEXT",
     )?;
-    ensure_column(&conn, "jobs_global_candidates", "archive_sha256", "TEXT")?;
+    ensure_column(conn, "jobs_global_candidates", "archive_sha256", "TEXT")?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_candidates",
         "archive_size_bytes",
         "INTEGER",
     )?;
-    ensure_column(&conn, "jobs_global_candidates", "archived_at_ms", "INTEGER")?;
+    ensure_column(conn, "jobs_global_candidates", "archived_at_ms", "INTEGER")?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_candidates",
         "archive_attempt_count",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_candidates",
         "archive_next_attempt_at_ms",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_candidates",
         "archive_lease_owner",
         "TEXT",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_candidates",
         "archive_lease_expires_at_ms",
         "INTEGER",
@@ -1664,37 +2477,37 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
              );",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_ingestion_runs",
         "rejected_rows",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_global_ingestion_runs",
         "rejection_summary_json",
         "TEXT NOT NULL DEFAULT '{}'",
     )?;
-    ensure_column(&conn, "stt_sessions", "started_at_ms", "INTEGER")?;
-    ensure_column(&conn, "stt_sessions", "ended_at_ms", "INTEGER")?;
-    ensure_column(&conn, "stt_sessions", "relay_close_reason", "TEXT")?;
-    ensure_column(&conn, "device_codes", "device_id", "TEXT")?;
-    ensure_column(&conn, "device_codes", "device_name", "TEXT")?;
-    ensure_column(&conn, "device_codes", "platform", "TEXT")?;
-    ensure_column(&conn, "device_codes", "arch", "TEXT")?;
-    ensure_column(&conn, "device_codes", "app_version", "TEXT")?;
+    ensure_column(conn, "stt_sessions", "started_at_ms", "INTEGER")?;
+    ensure_column(conn, "stt_sessions", "ended_at_ms", "INTEGER")?;
+    ensure_column(conn, "stt_sessions", "relay_close_reason", "TEXT")?;
+    ensure_column(conn, "device_codes", "device_id", "TEXT")?;
+    ensure_column(conn, "device_codes", "device_name", "TEXT")?;
+    ensure_column(conn, "device_codes", "platform", "TEXT")?;
+    ensure_column(conn, "device_codes", "arch", "TEXT")?;
+    ensure_column(conn, "device_codes", "app_version", "TEXT")?;
     // 0033 - explicit trust provenance for provider-attempt settlement.
     // SQLite has no broadly supported `ADD COLUMN IF NOT EXISTS`, so use the
     // same schema-inspection helper as earlier additive migrations. This keeps
     // startup/replay idempotent for both pre-0033 and already-upgraded files.
     ensure_column(
-        &conn,
+        conn,
         "jobs_provider_cost_holds",
         "usage_provenance",
         "TEXT NOT NULL DEFAULT 'missing' CHECK (usage_provenance IN ('exact', 'estimated', 'missing'))",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "usage_events",
         "origin",
         "TEXT NOT NULL DEFAULT 'legacy_unverified'",
@@ -1845,40 +2658,40 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
              ON usage_reservations(settled_at_ms)
              WHERE status = 'settled';",
     )?;
-    ensure_column(&conn, "refresh_tokens", "device_id", "TEXT")?;
+    ensure_column(conn, "refresh_tokens", "device_id", "TEXT")?;
     ensure_column(
-        &conn,
+        conn,
         "accounts",
         "reserved_cents",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    ensure_column(&conn, "accounts", "square_customer_id", "TEXT")?;
-    ensure_column(&conn, "accounts", "square_card_id", "TEXT")?;
-    ensure_column(&conn, "accounts", "square_card_brand", "TEXT")?;
-    ensure_column(&conn, "accounts", "square_card_last4", "TEXT")?;
+    ensure_column(conn, "accounts", "square_customer_id", "TEXT")?;
+    ensure_column(conn, "accounts", "square_card_id", "TEXT")?;
+    ensure_column(conn, "accounts", "square_card_brand", "TEXT")?;
+    ensure_column(conn, "accounts", "square_card_last4", "TEXT")?;
     ensure_column(
-        &conn,
+        conn,
         "accounts",
         "billing_restricted",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    ensure_column(&conn, "accounts", "billing_restriction_reason", "TEXT")?;
-    ensure_column(&conn, "accounts", "billing_restricted_at", "DATETIME")?;
+    ensure_column(conn, "accounts", "billing_restriction_reason", "TEXT")?;
+    ensure_column(conn, "accounts", "billing_restricted_at", "DATETIME")?;
     ensure_column(
-        &conn,
+        conn,
         "accounts",
         "is_temporary",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    ensure_column(&conn, "accounts", "temporary_expires_at", "DATETIME")?;
+    ensure_column(conn, "accounts", "temporary_expires_at", "DATETIME")?;
     ensure_column(
-        &conn,
+        conn,
         "signup_otps",
         "account_id",
         "TEXT REFERENCES accounts(id) ON DELETE CASCADE",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "jobs_resume_generations",
         "reservation_token",
         "TEXT NOT NULL DEFAULT ''",
@@ -1889,65 +2702,65 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         [],
     )?;
     ensure_column(
-        &conn,
+        conn,
         "stt_sessions",
         "reserved_cents",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "stt_sessions",
         "settled_cents",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "stt_sessions",
         "refunded_cents",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "stt_sessions",
         "reserved_trial_seconds",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "stt_sessions",
         "settled_trial_seconds",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "stt_sessions",
         "refunded_trial_seconds",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    ensure_column(&conn, "trial_grants", "email_domain_hash", "TEXT")?;
-    ensure_column(&conn, "trial_abuse_events", "email_domain_hash", "TEXT")?;
+    ensure_column(conn, "trial_grants", "email_domain_hash", "TEXT")?;
+    ensure_column(conn, "trial_abuse_events", "email_domain_hash", "TEXT")?;
     ensure_column(
-        &conn,
+        conn,
         "legal_acceptances",
         "terms_text_hash",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "legal_acceptances",
         "privacy_text_hash",
         "TEXT NOT NULL DEFAULT ''",
     )?;
-    ensure_column(&conn, "legal_acceptances", "email_hash", "TEXT")?;
-    ensure_column(&conn, "legal_acceptances", "ip_user_agent_hash", "TEXT")?;
+    ensure_column(conn, "legal_acceptances", "email_hash", "TEXT")?;
+    ensure_column(conn, "legal_acceptances", "ip_user_agent_hash", "TEXT")?;
     ensure_column(
-        &conn,
+        conn,
         "legal_acceptances",
         "retention_expires_at",
         "DATETIME",
     )?;
     ensure_column(
-        &conn,
+        conn,
         "cloud_context_artifacts",
         "updated_at_ms",
         "INTEGER NOT NULL DEFAULT 0",
@@ -1959,7 +2772,7 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         [],
     )?;
     ensure_column(
-        &conn,
+        conn,
         "legal_acceptances",
         "accepted_at",
         // SQLite rejects non-constant defaults such as datetime('now') when
@@ -1980,10 +2793,464 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
             ON legal_acceptances(email_hash, created_at);
         "#,
     )?;
-    tracing::info!(
-        backend = pool.backend_name(),
-        count = MIGRATIONS.len(),
-        "migrations applied"
+    // Run this after every legacy ensure-column/trigger refresh above. A SQLite table rename
+    // reparses all triggers, so the one-time immutable-ledger swap must only happen once those
+    // replay-era compatibility columns exist.
+    ensure_sqlite_original_source_verification_hold_capability(conn)
+        .context("widen SQLite operational-hold capability authority")?;
+    // Migration 058 rebuilds one immutable table to widen a CHECK constraint. SQLite reparses
+    // every trigger during that table swap, including replay-era triggers that refer to columns
+    // installed by the compatibility helpers above. Execute it only after those columns and
+    // trigger refreshes are present, then continue with later additive migrations.
+    execute_sqlite_signed_job_integrity_migration(conn, signed_job_integrity_migration)
+        .with_context(|| format!("migration {} failed", signed_job_integrity_index + 1))?;
+    for (offset, sql) in following_migrations.iter().enumerate() {
+        let migration_number = signed_job_integrity_index + offset + 2;
+        let transactional_migration_number = match *sql {
+            SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY => Some("063"),
+            SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE => Some("064"),
+            SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS => Some("065"),
+            SQLITE_JOBS_ATS_STORAGE_FENCES => Some("069"),
+            SQLITE_JOBS_APPLICATION_ANSWER_REVISIONS => Some("070"),
+            SQLITE_JOBS_WORKDAY_RECONCILIATION_HOLDS => Some("071"),
+            _ => None,
+        };
+        if *sql == SQLITE_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS {
+            execute_sqlite_provisioned_runtime_observations_migration(conn, sql)
+                .with_context(|| format!("migration {migration_number} failed"))?;
+        } else if *sql == SQLITE_JOBS_PROVISIONED_RUNTIME_STARTUP {
+            execute_sqlite_provisioned_runtime_migration(conn, sql)
+                .with_context(|| format!("migration {migration_number} failed"))?;
+        } else if *sql == SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY {
+            execute_sqlite_original_source_verifier_startup_migration(conn, sql)
+                .with_context(|| format!("migration {migration_number} failed"))?;
+        } else if let Some(version) = transactional_migration_number {
+            execute_sqlite_transactional_migration(conn, sql, version)
+                .with_context(|| format!("migration {migration_number} failed"))?;
+        } else {
+            conn.execute_batch(sql)
+                .with_context(|| format!("migration {migration_number} failed"))?;
+        }
+    }
+    Ok(())
+}
+
+const SQLITE_ATS_STORAGE_LINEAGE_MARKER: &str = "jobs-ats-storage-fences-post-provisioning-v1";
+const SQLITE_ATS_STORAGE_TRIGGERS: &[(&str, &str)] = &[
+    (
+        "trg_jobs_browser_runtime_component_insert_fence",
+        "jobs_browser_release_artifact_runtime_components",
+    ),
+    (
+        "trg_jobs_ats_trust_head_insert_fence",
+        "jobs_ats_certification_trust_head",
+    ),
+    (
+        "trg_jobs_ats_head_insert_fence",
+        "jobs_ats_certification_heads",
+    ),
+    (
+        "trg_jobs_ats_quarantine_head_insert_fence",
+        "jobs_ats_certification_quarantine_heads",
+    ),
+    (
+        "trg_jobs_ats_circuit_head_insert_fence",
+        "jobs_ats_certification_circuit_heads",
+    ),
+    (
+        "trg_jobs_ats_head_scope_immutable",
+        "jobs_ats_certification_heads",
+    ),
+    (
+        "trg_jobs_ats_quarantine_scope_immutable",
+        "jobs_ats_certification_quarantine_heads",
+    ),
+    (
+        "trg_jobs_ats_circuit_scope_immutable",
+        "jobs_ats_certification_circuit_heads",
+    ),
+    (
+        "trg_jobs_ats_trust_projection_insert",
+        "jobs_ats_certification_trust_head",
+    ),
+    (
+        "trg_jobs_ats_trust_projection_update",
+        "jobs_ats_certification_trust_head",
+    ),
+    (
+        "trg_jobs_ats_head_projection_insert",
+        "jobs_ats_certification_heads",
+    ),
+    (
+        "trg_jobs_ats_head_projection_update",
+        "jobs_ats_certification_heads",
+    ),
+    (
+        "trg_jobs_ats_quarantine_projection_insert",
+        "jobs_ats_certification_quarantine_heads",
+    ),
+    (
+        "trg_jobs_ats_quarantine_projection_update",
+        "jobs_ats_certification_quarantine_heads",
+    ),
+    (
+        "trg_jobs_ats_circuit_event_scope_insert",
+        "jobs_ats_certification_circuit_heads",
+    ),
+    (
+        "trg_jobs_ats_circuit_event_scope_update",
+        "jobs_ats_certification_circuit_heads",
+    ),
+];
+
+// This is a migration-order guard, not authentication of same-user database state.
+// It runs before migration DDL or data writes; opening a pool may already set WAL.
+fn check_sqlite_ats_storage_lineage(conn: &rusqlite::Connection) -> Result<()> {
+    let mut present = 0;
+    for &(name, expected_table) in SQLITE_ATS_STORAGE_TRIGGERS {
+        let object: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT type, name, tbl_name FROM sqlite_master WHERE name=?1 COLLATE NOCASE",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((kind, actual_name, table)) = object {
+            anyhow::ensure!(
+                kind == "trigger" && actual_name == name && table == expected_table,
+                "SQLite ATS storage lineage requires manual review"
+            );
+            present += 1;
+        }
+    }
+    let marker_table: Option<String> = conn
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name='bluey_data_migrations'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let marker_count: i64 = match marker_table.as_deref() {
+        None => 0,
+        Some("table") => conn.query_row(
+            "SELECT COUNT(*) FROM bluey_data_migrations WHERE name=?1",
+            [SQLITE_ATS_STORAGE_LINEAGE_MARKER],
+            |row| row.get(0),
+        )?,
+        Some(_) => anyhow::bail!("SQLite ATS storage lineage requires manual review"),
+    };
+    anyhow::ensure!(
+        (present == 0 && marker_count == 0)
+            || (present == SQLITE_ATS_STORAGE_TRIGGERS.len() && marker_count == 1),
+        "SQLite ATS storage lineage requires manual review"
+    );
+    Ok(())
+}
+
+fn execute_sqlite_transactional_migration(
+    conn: &mut rusqlite::Connection,
+    migration: &str,
+    version: &str,
+) -> Result<()> {
+    // These migrations own their transactions. The source-verifier migrations
+    // also temporarily disable foreign keys; ATS storage fences keep them on.
+    // Do not return an open transaction or changed enforcement state to the pool:
+    // r2d2_sqlite does not discard broken connections.
+    anyhow::ensure!(
+        conn.is_autocommit(),
+        "SQLite migration {version} requires an autocommit connection"
+    );
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let execution = conn.execute_batch(migration).and_then(|()| {
+        if conn.is_autocommit() {
+            Ok(())
+        } else {
+            Err(rusqlite::Error::InvalidParameterName(format!(
+                "SQLite migration {version} left an uncommitted transaction"
+            )))
+        }
+    });
+    let rollback = (|| -> Result<()> {
+        if !conn.is_autocommit() {
+            conn.execute_batch("ROLLBACK")?;
+        }
+        anyhow::ensure!(
+            conn.is_autocommit(),
+            "SQLite migration {version} rollback failed"
+        );
+        Ok(())
+    })();
+    let restore = (|| -> Result<()> {
+        conn.pragma_update(None, "foreign_keys", foreign_keys_enabled)?;
+        let restored: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        anyhow::ensure!(
+            restored == foreign_keys_enabled,
+            "SQLite foreign-key enforcement was not restored after migration {version}"
+        );
+        Ok(())
+    })();
+    if let Err(error) = execution {
+        let rollback_status = rollback
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        let restore_status = restore
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        return Err(anyhow::Error::new(error).context(format!(
+            "SQLite migration {version} failed; rollback={rollback_status}; \
+             foreign_key_restore={restore_status}"
+        )));
+    }
+    rollback.with_context(|| format!("finish SQLite migration {version} transaction cleanup"))?;
+    restore.with_context(|| {
+        format!("restore SQLite foreign-key enforcement after migration {version}")
+    })?;
+    let foreign_key_violation = conn
+        .prepare("PRAGMA foreign_key_check")?
+        .query([])?
+        .next()?
+        .is_some();
+    anyhow::ensure!(
+        !foreign_key_violation,
+        "SQLite migration {version} produced a foreign-key violation"
+    );
+    Ok(())
+}
+
+fn execute_sqlite_provisioned_runtime_migration(
+    conn: &mut rusqlite::Connection,
+    migration: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        conn.is_autocommit(),
+        "SQLite migration 067 requires an autocommit connection"
+    );
+    let applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bluey_data_migrations
+          WHERE name='jobs-provisioned-runtime-startup-storage-v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    // Never copy a populated v4 table back through legacy defaults on replay.
+    // Both branches retain the existing executor's FK/transaction-state checks.
+    execute_sqlite_transactional_migration(
+        conn,
+        if applied { "SELECT 1;" } else { migration },
+        "067",
+    )
+}
+
+fn sqlite_provisioned_observation_replay_guards(migration: &str) -> Result<&str> {
+    const BEGIN: &str = "-- C3_REPLAY_SAFE_BOOT_GUARDS_BEGIN\n";
+    const END: &str = "-- C3_REPLAY_SAFE_BOOT_GUARDS_END\n";
+    anyhow::ensure!(
+        migration.matches(BEGIN).count() == 1 && migration.matches(END).count() == 1,
+        "SQLite 068 replay guard boundaries changed"
+    );
+    let (_, remaining) = migration
+        .split_once(BEGIN)
+        .context("SQLite 068 replay guard beginning missing")?;
+    let (guards, _) = remaining
+        .split_once(END)
+        .context("SQLite 068 replay guard end missing")?;
+    anyhow::ensure!(
+        !guards.trim().is_empty(),
+        "SQLite 068 replay guards are empty"
+    );
+    // This selects one compiled, reviewed migration block, not arbitrary SQL.
+    // Rebuilds and the one-shot ledger statement must never be inside it.
+    for forbidden in [
+        "ALTER TABLE",
+        "CREATE TABLE",
+        "DROP TABLE",
+        "PRAGMA",
+        "COMMIT;",
+        "ROLLBACK;",
+        "BEGIN IMMEDIATE",
+        "BEGIN TRANSACTION",
+        "bluey_data_migrations",
+    ] {
+        anyhow::ensure!(
+            !guards
+                .to_ascii_uppercase()
+                .contains(&forbidden.to_ascii_uppercase()),
+            "SQLite 068 replay guard block contains one-shot statements"
+        );
+    }
+    Ok(guards)
+}
+
+fn execute_sqlite_provisioned_runtime_observations_migration(
+    conn: &mut rusqlite::Connection,
+    migration: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        conn.is_autocommit(),
+        "SQLite 068 requires an autocommit connection"
+    );
+    let guards = sqlite_provisioned_observation_replay_guards(migration)?;
+    let applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bluey_data_migrations
+          WHERE name='jobs-provisioned-runtime-observations-storage-v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if applied {
+        // Older replay-era files refresh these guards. Restore only their
+        // reviewed version-aware definitions, without recopying live v2 rows.
+        let replay = format!("BEGIN IMMEDIATE;\n{guards}\nCOMMIT;\n");
+        execute_sqlite_transactional_migration(conn, &replay, "068")
+    } else {
+        // Full DDL, FK verification and one-shot marker are one transaction.
+        execute_sqlite_transactional_migration(conn, migration, "068")
+    }
+}
+
+fn execute_sqlite_signed_job_integrity_migration(
+    conn: &mut rusqlite::Connection,
+    migration: &str,
+) -> Result<()> {
+    let startup_v3_applied: bool = conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM bluey_data_migrations
+            WHERE name='jobs-original-source-verifier-startup-authority-v1'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    let migration = if startup_v3_applied {
+        let suffix = "CREATE TABLE IF NOT EXISTS jobs_job_integrity_trust_policies";
+        let offset = migration
+            .find(suffix)
+            .context("SQLite migration 058 job-integrity suffix is missing")?;
+        &migration[offset..]
+    } else {
+        migration
+    };
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let execution = conn.execute_batch(migration);
+    let rollback = (|| -> Result<()> {
+        if !conn.is_autocommit() {
+            conn.execute_batch("ROLLBACK")?;
+        }
+        Ok(())
+    })();
+    let restore = (|| -> Result<()> {
+        conn.pragma_update(None, "foreign_keys", foreign_keys_enabled)?;
+        let restored: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        anyhow::ensure!(
+            restored == foreign_keys_enabled,
+            "SQLite foreign-key enforcement was not restored after migration 058"
+        );
+        Ok(())
+    })();
+
+    if let Err(error) = execution {
+        let rollback_status = rollback
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        let restore_status = restore
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        return Err(anyhow::Error::new(error).context(format!(
+            "SQLite migration 058 failed; rollback={rollback_status}; \
+             foreign_key_restore={restore_status}"
+        )));
+    }
+    rollback.context("finish SQLite migration 058 transaction cleanup")?;
+    restore.context("restore SQLite foreign-key enforcement after migration 058")?;
+
+    let foreign_key_violation = conn
+        .prepare("PRAGMA foreign_key_check")?
+        .query([])?
+        .next()?
+        .is_some();
+    anyhow::ensure!(
+        !foreign_key_violation,
+        "SQLite migration 058 produced a foreign-key violation"
+    );
+    Ok(())
+}
+
+fn execute_sqlite_original_source_verifier_startup_migration(
+    conn: &mut rusqlite::Connection,
+    migration: &str,
+) -> Result<()> {
+    const MARKER: &str = "jobs-original-source-verifier-startup-authority-v1";
+    const ADDITIVE_SUFFIX: &str =
+        "CREATE TABLE IF NOT EXISTS jobs_managed_cloud_manifest_source_verifier_startup_protocols";
+    let already_applied: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bluey_data_migrations WHERE name=?1)",
+        [MARKER],
+        |row| row.get(0),
+    )?;
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let execution = if already_applied {
+        (|| -> rusqlite::Result<()> {
+            let suffix_offset = migration.find(ADDITIVE_SUFFIX).ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName(
+                    "SQLite migration 062 additive suffix is missing".to_string(),
+                )
+            })?;
+            let suffix = &migration[suffix_offset..];
+            let commit_offset = suffix.rfind("COMMIT;").ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName(
+                    "SQLite migration 062 commit boundary is missing".to_string(),
+                )
+            })?;
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            conn.execute_batch(&suffix[..commit_offset])?;
+            conn.execute_batch("COMMIT;")
+        })()
+    } else {
+        conn.execute_batch(migration)
+    };
+    let rollback = (|| -> Result<()> {
+        if !conn.is_autocommit() {
+            conn.execute_batch("ROLLBACK")?;
+        }
+        Ok(())
+    })();
+    let restore = (|| -> Result<()> {
+        conn.pragma_update(None, "foreign_keys", foreign_keys_enabled)?;
+        let restored: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        anyhow::ensure!(
+            restored == foreign_keys_enabled,
+            "SQLite foreign-key enforcement was not restored after migration 062"
+        );
+        Ok(())
+    })();
+    if let Err(error) = execution {
+        let rollback_status = rollback
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        let restore_status = restore
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        return Err(anyhow::Error::new(error).context(format!(
+            "SQLite migration 062 failed; rollback={rollback_status}; \
+             foreign_key_restore={restore_status}"
+        )));
+    }
+    rollback.context("finish SQLite migration 062 transaction cleanup")?;
+    restore.context("restore SQLite foreign-key enforcement after migration 062")?;
+    let foreign_key_violation = conn
+        .prepare("PRAGMA foreign_key_check")?
+        .query([])?
+        .next()?
+        .is_some();
+    anyhow::ensure!(
+        !foreign_key_violation,
+        "SQLite migration 062 produced a foreign-key violation"
     );
     Ok(())
 }
@@ -2024,6 +3291,162 @@ const POSTGRES_JOBS_GLOBAL_CANDIDATE_ARCHIVE: &str =
     include_str!("../../../infra/postgres/server-runtime/017_jobs_global_candidate_archive.sql");
 const POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/018_jobs_auto_submit_authorizations.sql");
+const POSTGRES_JOBS_COMMUNICATION_ACTIONS: &str =
+    include_str!("../../../infra/postgres/server-runtime/019_jobs_communication_actions.sql");
+const POSTGRES_JOBS_BROWSER_PROFILE_SNAPSHOTS: &str =
+    include_str!("../../../infra/postgres/server-runtime/020_jobs_browser_profile_snapshots.sql");
+pub const ACCOUNT_DELETION_INTENTS_MIGRATION_ID: &str = "021_account_deletion_intents.sql";
+const POSTGRES_ACCOUNT_DELETION_INTENTS: &str =
+    include_str!("../../../infra/postgres/server-runtime/021_account_deletion_intents.sql");
+pub const JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID: &str =
+    "022_jobs_submission_evidence_reservations.sql";
+const POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/022_jobs_submission_evidence_reservations.sql"
+);
+pub const JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID: &str =
+    "023_jobs_account_object_upload_backfill.sql";
+const POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL: &str = include_str!(
+    "../../../infra/postgres/server-runtime/023_jobs_account_object_upload_backfill.sql"
+);
+pub const JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID: &str = "024_jobs_runner_volume_purge.sql";
+const POSTGRES_JOBS_RUNNER_VOLUME_PURGE: &str =
+    include_str!("../../../infra/postgres/server-runtime/024_jobs_runner_volume_purge.sql");
+pub const JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID: &str =
+    "025_jobs_browser_release_authority.sql";
+const POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/025_jobs_browser_release_authority.sql");
+pub const JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID: &str =
+    "026_jobs_ats_certification_authority.sql";
+const POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/026_jobs_ats_certification_authority.sql");
+pub const JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS_MIGRATION_ID: &str =
+    "027_jobs_browser_release_runtime_components.sql";
+const POSTGRES_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/027_jobs_browser_release_runtime_components.sql"
+);
+pub const JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY_MIGRATION_ID: &str =
+    "028_jobs_runner_process_runtime_authority.sql";
+const POSTGRES_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/028_jobs_runner_process_runtime_authority.sql"
+);
+pub const JOBS_COMMUNICATION_EXECUTION_MIGRATION_ID: &str = "029_jobs_communication_execution.sql";
+const POSTGRES_JOBS_COMMUNICATION_EXECUTION: &str =
+    include_str!("../../../infra/postgres/server-runtime/029_jobs_communication_execution.sql");
+pub const JOBS_OPERATIONAL_HOLDS_MIGRATION_ID: &str = "030_jobs_operational_holds.sql";
+const POSTGRES_JOBS_OPERATIONAL_HOLDS: &str =
+    include_str!("../../../infra/postgres/server-runtime/030_jobs_operational_holds.sql");
+pub const JOBS_WORKFLOW_COMMANDS_MIGRATION_ID: &str = "031_jobs_workflow_commands.sql";
+const POSTGRES_JOBS_WORKFLOW_COMMANDS: &str =
+    include_str!("../../../infra/postgres/server-runtime/031_jobs_workflow_commands.sql");
+pub const JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID: &str =
+    "032_jobs_workflow_cleanup_authority.sql";
+const POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/032_jobs_workflow_cleanup_authority.sql");
+pub const JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID: &str =
+    "033_jobs_managed_cloud_release_authority.sql";
+const POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql"
+);
+pub const JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID: &str =
+    "034_jobs_canonical_taxonomy_authority.sql";
+const POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql"
+);
+pub const JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID: &str =
+    "035_jobs_original_source_verification_authority.sql";
+const POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql"
+);
+pub const JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID: &str =
+    "036_jobs_signed_job_integrity_authority.sql";
+const POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/036_jobs_signed_job_integrity_authority.sql"
+);
+pub const JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID: &str = "038_jobs_public_beta_access.sql";
+const POSTGRES_JOBS_PUBLIC_BETA_ACCESS: &str =
+    include_str!("../../../infra/postgres/server-runtime/038_jobs_public_beta_access.sql");
+pub const JOBS_WORKSPACE_PAGINATION_MIGRATION_ID: &str = "039_jobs_workspace_pagination.sql";
+const POSTGRES_JOBS_WORKSPACE_PAGINATION: &str =
+    include_str!("../../../infra/postgres/server-runtime/039_jobs_workspace_pagination.sql");
+pub const JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID: &str =
+    "040_jobs_original_source_verifier_startup_authority.sql";
+const POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/040_jobs_original_source_verifier_startup_authority.sql"
+);
+pub const JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID: &str =
+    "041_jobs_source_verifier_boot_generation_authority.sql";
+const POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/041_jobs_source_verifier_boot_generation_authority.sql"
+);
+pub const JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID: &str =
+    "042_jobs_source_verifier_heartbeat_boot_generation_fence.sql";
+const POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE: &str = include_str!(
+    "../../../infra/postgres/server-runtime/042_jobs_source_verifier_heartbeat_boot_generation_fence.sql"
+);
+pub const JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID: &str =
+    "043_jobs_source_verifier_heartbeat_boot_bindings.sql";
+const POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/043_jobs_source_verifier_heartbeat_boot_bindings.sql"
+);
+pub const JOBS_ATTEMPT_EMPLOYER_IDENTITY_MIGRATION_ID: &str =
+    "044_jobs_attempt_employer_identity.sql";
+const POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/044_jobs_attempt_employer_identity.sql");
+pub const JOBS_PROVISIONED_RUNTIME_STARTUP_MIGRATION_ID: &str =
+    "045_jobs_provisioned_runtime_startup.sql";
+const POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP: &str =
+    include_str!("../../../infra/postgres/server-runtime/045_jobs_provisioned_runtime_startup.sql");
+pub const JOBS_PROVISIONED_RUNTIME_OBSERVATIONS_MIGRATION_ID: &str =
+    "046_jobs_provisioned_runtime_observations.sql";
+const POSTGRES_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/046_jobs_provisioned_runtime_observations.sql"
+);
+pub const JOBS_ATS_STORAGE_FENCES_MIGRATION_ID: &str = "047_jobs_ats_storage_fences.sql";
+const POSTGRES_JOBS_ATS_STORAGE_FENCES: &str =
+    include_str!("../../../infra/postgres/server-runtime/047_jobs_ats_storage_fences.sql");
+pub const JOBS_APPLICATION_ANSWER_REVISIONS_MIGRATION_ID: &str =
+    "048_jobs_application_answer_revisions.sql";
+const POSTGRES_JOBS_APPLICATION_ANSWER_REVISIONS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/048_jobs_application_answer_revisions.sql"
+);
+pub const JOBS_PROCESS_ATTACHMENT_SIGNATURE_AUDIENCE_MIGRATION_ID: &str =
+    "049_jobs_process_attachment_signature_audience.sql";
+const POSTGRES_JOBS_PROCESS_ATTACHMENT_SIGNATURE_AUDIENCE: &str = include_str!(
+    "../../../infra/postgres/server-runtime/049_jobs_process_attachment_signature_audience.sql"
+);
+pub const JOBS_WORKDAY_RECONCILIATION_HOLDS_MIGRATION_ID: &str =
+    "050_jobs_workday_reconciliation_holds.sql";
+const POSTGRES_JOBS_WORKDAY_RECONCILIATION_HOLDS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/050_jobs_workday_reconciliation_holds.sql"
+);
+pub const JOBS_MCP_READ_GRANTS_MIGRATION_ID: &str = "051_jobs_mcp_read_grants.sql";
+const POSTGRES_JOBS_MCP_READ_GRANTS: &str =
+    include_str!("../../../infra/postgres/server-runtime/051_jobs_mcp_read_grants.sql");
+pub const JOBS_MANAGED_CLOUD_RELEASE_V4_AUDIENCES_MIGRATION_ID: &str =
+    "052_jobs_managed_cloud_release_v4_audiences.sql";
+const POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_V4_AUDIENCES: &str = include_str!(
+    "../../../infra/postgres/server-runtime/052_jobs_managed_cloud_release_v4_audiences.sql"
+);
+
+// The raw migration files refuse execution. Keep the forward body in their
+// signed source bytes, but compile it only through the guarded transaction.
+fn guarded_release_v4_audience_body(source: &str) -> Result<&str> {
+    const START: &str = "\n/* BEGIN GUARDED AUDIENCE V4 BODY\n";
+    const END: &str = "\nEND GUARDED AUDIENCE V4 BODY */\n";
+    anyhow::ensure!(
+        source.matches(START).count() == 1 && source.matches(END).count() == 1,
+        "release-v4 audience migration markers changed"
+    );
+    let body = source
+        .split_once(START)
+        .and_then(|(_, rest)| rest.strip_suffix(END))
+        .context("release-v4 audience migration must end at the guarded body boundary")?;
+    anyhow::ensure!(
+        !body.trim().is_empty() && !body.contains("/*") && !body.contains("*/"),
+        "release-v4 audience migration body is invalid"
+    );
+    Ok(body)
+}
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2085,14 +3508,285 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
         "018_jobs_auto_submit_authorizations.sql",
         POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
     ),
+    (
+        "019_jobs_communication_actions.sql",
+        POSTGRES_JOBS_COMMUNICATION_ACTIONS,
+    ),
+    (
+        "020_jobs_browser_profile_snapshots.sql",
+        POSTGRES_JOBS_BROWSER_PROFILE_SNAPSHOTS,
+    ),
+    (
+        ACCOUNT_DELETION_INTENTS_MIGRATION_ID,
+        POSTGRES_ACCOUNT_DELETION_INTENTS,
+    ),
+    (
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
+        POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+    ),
+    (
+        JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
+        POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+    ),
+    (
+        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
+        POSTGRES_JOBS_RUNNER_VOLUME_PURGE,
+    ),
+    (
+        JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY,
+    ),
+    (
+        JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
+    ),
+    (
+        JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS_MIGRATION_ID,
+        POSTGRES_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS,
+    ),
+    (
+        JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY,
+    ),
+    (
+        JOBS_COMMUNICATION_EXECUTION_MIGRATION_ID,
+        POSTGRES_JOBS_COMMUNICATION_EXECUTION,
+    ),
+    (
+        JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
+        POSTGRES_JOBS_OPERATIONAL_HOLDS,
+    ),
+    (
+        JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
+        POSTGRES_JOBS_WORKFLOW_COMMANDS,
+    ),
+    (
+        JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+    ),
+    (
+        JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
+    ),
+    (
+        JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
+    ),
+    (
+        JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+    ),
+    (
+        JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+    ),
+    (
+        JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID,
+        POSTGRES_JOBS_PUBLIC_BETA_ACCESS,
+    ),
+    (
+        JOBS_WORKSPACE_PAGINATION_MIGRATION_ID,
+        POSTGRES_JOBS_WORKSPACE_PAGINATION,
+    ),
+    (
+        JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+    ),
+    (
+        JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+    ),
+    (
+        JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID,
+        POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+    ),
+    (
+        JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS_MIGRATION_ID,
+        POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_BINDINGS,
+    ),
+    (
+        JOBS_ATTEMPT_EMPLOYER_IDENTITY_MIGRATION_ID,
+        POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY,
+    ),
+    (
+        JOBS_PROVISIONED_RUNTIME_STARTUP_MIGRATION_ID,
+        POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP,
+    ),
+    (
+        JOBS_PROVISIONED_RUNTIME_OBSERVATIONS_MIGRATION_ID,
+        POSTGRES_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS,
+    ),
+    (
+        JOBS_ATS_STORAGE_FENCES_MIGRATION_ID,
+        POSTGRES_JOBS_ATS_STORAGE_FENCES,
+    ),
+    (
+        JOBS_APPLICATION_ANSWER_REVISIONS_MIGRATION_ID,
+        POSTGRES_JOBS_APPLICATION_ANSWER_REVISIONS,
+    ),
+    (
+        JOBS_PROCESS_ATTACHMENT_SIGNATURE_AUDIENCE_MIGRATION_ID,
+        POSTGRES_JOBS_PROCESS_ATTACHMENT_SIGNATURE_AUDIENCE,
+    ),
+    (
+        JOBS_WORKDAY_RECONCILIATION_HOLDS_MIGRATION_ID,
+        POSTGRES_JOBS_WORKDAY_RECONCILIATION_HOLDS,
+    ),
+    (
+        JOBS_MCP_READ_GRANTS_MIGRATION_ID,
+        POSTGRES_JOBS_MCP_READ_GRANTS,
+    ),
+    (
+        JOBS_MANAGED_CLOUD_RELEASE_V4_AUDIENCES_MIGRATION_ID,
+        POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_V4_AUDIENCES,
+    ),
 ];
+
+include!("postgres-audience-shared-driver.rs");
+include!("postgres-audience-replay-adapter.rs");
+include!("postgres-audience-replay-driver.rs");
+include!("migration-ledger-name.rs");
+include!("migration-ledger-catalog.rs");
+include!("postgres-audience-selected-ledger-driver.rs");
+include!("postgres-audience-operator-entry.rs");
+#[cfg(test)]
+include!("postgres-audience-selected-ledger-tests.rs");
+#[cfg(feature = "jobs-mcp-operator")]
+pub mod jobs_mcp_operator;
+pub mod operator;
+#[cfg(test)]
+include!("postgres-audience-shared-driver-tests.rs");
+#[cfg(test)]
+include!("postgres-audience-replay-tests.rs");
+
+fn postgres_provisioned_runtime_body(sql: &str) -> Result<&str> {
+    postgres_provisioned_runtime_body_for_version(sql, "045")
+}
+
+fn postgres_provisioned_runtime_body_for_version<'a>(
+    sql: &'a str,
+    version: &str,
+) -> Result<&'a str> {
+    anyhow::ensure!(
+        matches!(version, "045" | "046"),
+        "unknown provisioning migration"
+    );
+    // Keep the operator file self-contained, but own the transaction through
+    // the driver here so an error cannot return an aborted session to the pool.
+    const BEGIN: &str = "\nBEGIN;\n";
+    anyhow::ensure!(
+        sql.matches(BEGIN).count() == 1,
+        "PostgreSQL {version} begin boundary changed"
+    );
+    anyhow::ensure!(
+        sql.lines().filter(|line| *line == "COMMIT;").count() == 1,
+        "PostgreSQL {version} commit boundary changed"
+    );
+    let (prefix, rest) = sql
+        .split_once(BEGIN)
+        .with_context(|| format!("PostgreSQL {version} begin boundary missing"))?;
+    anyhow::ensure!(
+        prefix
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim_start().starts_with("--")),
+        "PostgreSQL {version} preamble must contain only comments"
+    );
+    // This is a closed migration-file boundary, not a general SQL rewriter.
+    // Conservatively reject other transaction controls, including aliases/spacing.
+    let controls: String = sql
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .flat_map(char::to_uppercase)
+        .collect();
+    anyhow::ensure!(
+        controls.matches("BEGIN;").count() == 1
+            && controls.matches("COMMIT;").count() == 1
+            && !controls.contains("ROLLBACK;")
+            && !controls.contains("STARTTRANSACTION")
+            && !controls.contains("BEGINWORK")
+            && !controls.contains("BEGINTRANSACTION")
+            && !controls.contains("COMMITWORK")
+            && !controls.contains("COMMITTRANSACTION"),
+        "PostgreSQL {version} transaction controls changed"
+    );
+    let body = rest
+        .trim_end()
+        .strip_suffix("\nCOMMIT;")
+        .with_context(|| format!("PostgreSQL {version} commit boundary missing"))?;
+    Ok(body)
+}
+
+// The existing fault fixture deliberately mutates 045 SQL to verify rollback of
+// the original transaction primitive. Normal startup uses the closed guarded
+// replay path instead; this adapter is not a production migration entry point.
+#[cfg(test)]
+fn execute_postgres_provisioned_runtime_migration(
+    conn: &mut postgres::Client,
+    sql: &str,
+) -> Result<()> {
+    execute_postgres_provisioning_migration(conn, sql, "045")
+}
+
+fn execute_postgres_provisioning_migration(
+    conn: &mut postgres::Client,
+    sql: &str,
+    version: &str,
+) -> Result<()> {
+    let body = if version == "045" {
+        postgres_provisioned_runtime_body(sql)?
+    } else {
+        postgres_provisioned_runtime_body_for_version(sql, version)?
+    };
+    let mut tx = conn
+        .transaction()
+        .with_context(|| format!("begin PostgreSQL {version}"))?;
+    // Operator SQL can target a selected ledger, but the server's owned
+    // migration path always records canonical history. LOCAL also restores
+    // any previous session setting after commit or rollback on a pooled client.
+    let applied = tx
+        .batch_execute("SET LOCAL bluey.migration_table = 'bluey_schema_migrations';")
+        .and_then(|()| tx.batch_execute(body));
+    if let Err(error) = applied {
+        let rollback = tx.rollback();
+        return match rollback {
+            Ok(()) => Err(anyhow::Error::new(error)
+                .context(format!("PostgreSQL {version} failed; rollback=ok"))),
+            Err(rollback) => Err(anyhow::Error::new(error)
+                .context(format!("PostgreSQL {version} failed; rollback={rollback}"))),
+        };
+    }
+    tx.commit()
+        .with_context(|| format!("commit PostgreSQL {version} schema and ledger"))
+}
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
     run_blocking_db(|| run_postgres_migrations_inner(pool))
 }
 
 fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
+    run_postgres_migration_list(pool, POSTGRES_POST_JOBS_MIGRATIONS)
+}
+
+fn run_postgres_migration_list(pool: &DbPool, post_jobs_migrations: &[(&str, &str)]) -> Result<()> {
     let mut conn = pool.get_pg()?;
+    let ledger_exists: bool = conn
+        .query_one(
+            "SELECT to_regclass('bluey_schema_migrations') IS NOT NULL",
+            &[],
+        )?
+        .get(0);
+    if ledger_exists {
+        let old_lineage: bool = conn
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM bluey_schema_migrations WHERE version=$1)",
+                &[&"045_jobs_ats_storage_fences.sql"],
+            )?
+            .get(0);
+        anyhow::ensure!(
+            !old_lineage,
+            "PostgreSQL ATS storage lineage requires manual review"
+        );
+    }
     conn.batch_execute(
         "CREATE TABLE IF NOT EXISTS bluey_schema_migrations (
             version TEXT PRIMARY KEY,
@@ -2133,9 +3827,48 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
         &[&"002_jobs.sql"],
     )
     .context("record postgres Jobs migration")?;
-    for (version, sql) in POSTGRES_POST_JOBS_MIGRATIONS {
-        conn.batch_execute(sql)
-            .with_context(|| format!("apply post-Jobs postgres migration {version}"))?;
+    for (version, sql) in post_jobs_migrations {
+        if matches!(
+            *version,
+            JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID
+                | JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID
+                | JOBS_PROVISIONED_RUNTIME_STARTUP_MIGRATION_ID
+        ) {
+            if let Err(error) = execute_postgres_audience_replay(&mut conn, version) {
+                conn.mark_broken();
+                return Err(error);
+            }
+            continue;
+        }
+        if *version == JOBS_PROCESS_ATTACHMENT_SIGNATURE_AUDIENCE_MIGRATION_ID {
+            if let Err(error) = execute_postgres_signature_audience_049(&mut conn) {
+                conn.mark_broken();
+                return Err(error);
+            }
+            continue;
+        }
+        if *version == JOBS_MANAGED_CLOUD_RELEASE_V4_AUDIENCES_MIGRATION_ID {
+            let ledger = canonical_migration_ledger();
+            if let Err(error) = execute_selected_signature_audience_migration(
+                &mut conn,
+                SelectedSignatureAudienceMigration::Forward052,
+                &ledger,
+            ) {
+                conn.mark_broken();
+                return Err(error);
+            }
+            continue;
+        }
+        if *version == JOBS_ATS_STORAGE_FENCES_MIGRATION_ID {
+            execute_postgres_ats_storage_fences_migration(&mut conn)?;
+            continue;
+        }
+        if *version == JOBS_PROVISIONED_RUNTIME_OBSERVATIONS_MIGRATION_ID {
+            execute_postgres_provisioning_migration(&mut conn, sql, "046")?;
+        } else {
+            conn.batch_execute(sql)
+                .with_context(|| format!("apply post-Jobs postgres migration {version}"))?;
+        }
         conn.execute(
             "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
              ON CONFLICT (version) DO NOTHING",
@@ -2173,12 +3906,444 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
     if embedding_type != "vector" {
         anyhow::bail!("cloud_rag_chunks.embedding is {embedding_type}, expected vector");
     }
+    jobs::activate_canonical_taxonomy_authority_postgres(&mut conn)
+        .context("activate PostgreSQL Career Track taxonomy authority")?;
 
     tracing::info!(
         backend = pool.backend_name(),
-        migrations = POSTGRES_MIGRATIONS.len() + POSTGRES_POST_JOBS_MIGRATIONS.len(),
+        migrations = POSTGRES_MIGRATIONS.len() + post_jobs_migrations.len(),
         "migrations applied"
     );
+    Ok(())
+}
+
+fn execute_postgres_ats_storage_fences_migration(conn: &mut postgres::Client) -> Result<()> {
+    // Validation, table locks, trigger installation and the ledger row commit
+    // together. Transaction drop rolls back every change on any error.
+    let mut tx = conn
+        .transaction()
+        .context("begin ATS storage fence migration")?;
+    tx.batch_execute("SET LOCAL lock_timeout = '5s'; SET LOCAL statement_timeout = '30s';")
+        .context("bound ATS storage fence migration locks and statements")?;
+    tx.batch_execute(POSTGRES_JOBS_ATS_STORAGE_FENCES)
+        .context("apply ATS storage fence migration")?;
+    tx.execute(
+        "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
+         ON CONFLICT (version) DO NOTHING",
+        &[&JOBS_ATS_STORAGE_FENCES_MIGRATION_ID],
+    )
+    .context("record ATS storage fence migration")?;
+    tx.commit().context("commit ATS storage fence migration")
+}
+
+#[cfg(test)]
+mod ats_storage_migration_tests {
+    use super::*;
+
+    fn sqlite_migrations_before(anchor: &str) -> &[&'static str] {
+        let position = MIGRATIONS
+            .iter()
+            .position(|migration| *migration == anchor)
+            .expect("named SQLite migration anchor remains registered");
+        &MIGRATIONS[..position]
+    }
+
+    #[test]
+    fn sqlite_original_phase654_fences_refuse_populated_upgrade_without_mutation() {
+        // Exact unreleased Phase 654 067 blob, before the Phase 655 marker existed.
+        const OLD_067: &str =
+            include_str!("../../tests/fixtures/phase654_067_jobs_ats_storage_fences.sql");
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory().with_init(|conn| {
+            conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;")
+        });
+        let pool = DbPool::Sqlite(
+            r2d2::Pool::builder()
+                .max_size(1)
+                .build(SafeSqliteConnectionManager::new(manager))
+                .unwrap(),
+        );
+        run_sqlite_migration_list(
+            &pool,
+            sqlite_migrations_before(SQLITE_JOBS_PROVISIONED_RUNTIME_STARTUP),
+        )
+        .unwrap();
+        {
+            let mut conn = pool.get().unwrap();
+            conn.execute_batch(
+                "INSERT INTO jobs_ats_certification_circuit_events VALUES
+                ('first',printf('%064x',1),'x','provider','a','opened',
+                 'evidence_failure',0,0,0,0,0,'test',0,'test',0);
+                INSERT INTO jobs_ats_certification_circuit_heads VALUES
+                ('provider','a',1,'first','opened',0);",
+            )
+            .unwrap();
+            execute_sqlite_transactional_migration(&mut conn, OLD_067, "067").unwrap();
+        }
+        let snapshot = |conn: &rusqlite::Connection| {
+            let mut schema_query = conn
+                .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+                .unwrap();
+            let schema = schema_query
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let mut ledger_query = conn
+                .prepare("SELECT name,applied_at FROM bluey_data_migrations ORDER BY name")
+                .unwrap();
+            let ledger = ledger_query
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let head = conn.query_row("SELECT current_event_id,head_revision,state FROM
+                jobs_ats_certification_circuit_heads WHERE scope_kind='provider' AND subject_key='a'",
+                [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))).unwrap();
+            let event = conn
+                .query_row(
+                    "SELECT event_id,scope_kind,subject_key,transition FROM
+                jobs_ats_certification_circuit_events WHERE event_id='first'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let foreign_keys: bool = conn
+                .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+                .unwrap();
+            let recursive: bool = conn
+                .pragma_query_value(None, "recursive_triggers", |r| r.get(0))
+                .unwrap();
+            (schema, ledger, head, event, foreign_keys, recursive)
+        };
+        {
+            let mut conn = pool.get().unwrap();
+            let before = snapshot(&conn);
+            let changes_before: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+            let error = run_sqlite_migration_list_with_connection(&mut conn, MIGRATIONS)
+                .expect_err("old Phase 654 lineage must refuse before the migration pipeline");
+            assert!(
+                format!("{error:#}").contains("SQLite ATS storage lineage requires manual review")
+            );
+            let changes_after: i64 = conn
+                .query_row("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(changes_before, changes_after);
+            assert_eq!(before, snapshot(&conn));
+        }
+        let before = snapshot(&pool.get().unwrap());
+        assert!(before.4 && before.5);
+        let error = run_migrations(&pool).expect_err("old Phase 654 lineage must refuse");
+        assert!(format!("{error:#}").contains("SQLite ATS storage lineage requires manual review"));
+        let after = snapshot(&pool.get().unwrap());
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn sqlite_lineage_refuses_old_partial_and_misattached_states_before_migration() {
+        for scenario in ["old", "partial", "marker_partial", "wrong_table"] {
+            let manager = r2d2_sqlite::SqliteConnectionManager::memory().with_init(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;")
+            });
+            let pool = DbPool::Sqlite(
+                r2d2::Pool::builder()
+                    .max_size(1)
+                    .build(SafeSqliteConnectionManager::new(manager))
+                    .unwrap(),
+            );
+            run_migrations(&pool).unwrap();
+            {
+                let conn = pool.get().unwrap();
+                conn.execute_batch("CREATE TABLE lineage_witness(id INTEGER); INSERT INTO lineage_witness VALUES(7);")
+                    .unwrap();
+                if scenario == "old" || scenario == "partial" {
+                    conn.execute(
+                        "DELETE FROM bluey_data_migrations WHERE name=?1",
+                        [SQLITE_ATS_STORAGE_LINEAGE_MARKER],
+                    )
+                    .unwrap();
+                }
+                if scenario != "old" {
+                    conn.execute_batch("DROP TRIGGER trg_jobs_ats_circuit_event_scope_update;")
+                        .unwrap();
+                }
+                if scenario == "wrong_table" {
+                    conn.execute_batch(
+                        "CREATE TRIGGER trg_jobs_ats_circuit_event_scope_update
+                        BEFORE UPDATE ON lineage_witness BEGIN SELECT 1; END;",
+                    )
+                    .unwrap();
+                }
+            }
+            let before: i64 = pool
+                .get()
+                .unwrap()
+                .pragma_query_value(None, "schema_version", |row| row.get(0))
+                .unwrap();
+            let error = run_migrations(&pool).expect_err("ambiguous ATS lineage must refuse");
+            assert!(
+                format!("{error:#}").contains("SQLite ATS storage lineage requires manual review")
+            );
+            let conn = pool.get().unwrap();
+            let after: i64 = conn
+                .pragma_query_value(None, "schema_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(before, after);
+            assert_eq!(
+                conn.query_row("SELECT id FROM lineage_witness", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                7
+            );
+            for pragma in ["foreign_keys", "recursive_triggers"] {
+                assert!(conn
+                    .pragma_query_value(None, pragma, |row| row.get::<_, bool>(0))
+                    .unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_lineage_marker_and_schema_rollback_together_on_migration_failure() {
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory().with_init(|conn| {
+            conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;")
+        });
+        let pool = DbPool::Sqlite(
+            r2d2::Pool::builder()
+                .max_size(1)
+                .build(SafeSqliteConnectionManager::new(manager))
+                .unwrap(),
+        );
+        run_sqlite_migration_list(
+            &pool,
+            sqlite_migrations_before(SQLITE_JOBS_ATS_STORAGE_FENCES),
+        )
+        .unwrap();
+        let mut conn = pool.get().unwrap();
+        let migration = SQLITE_JOBS_ATS_STORAGE_FENCES.replacen(
+            "COMMIT;",
+            "SELECT missing_lineage_failure(); COMMIT;",
+            1,
+        );
+        assert!(execute_sqlite_transactional_migration(&mut conn, &migration, "069").is_err());
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM bluey_data_migrations WHERE name=?1",
+                [SQLITE_ATS_STORAGE_LINEAGE_MARKER],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        for &(name, _) in SQLITE_ATS_STORAGE_TRIGGERS {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name=?1",
+                    [name],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+        for pragma in ["foreign_keys", "recursive_triggers"] {
+            assert!(conn
+                .pragma_query_value(None, pragma, |row| row.get::<_, bool>(0))
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn managed_sqlite_connections_enable_immutable_delete_guards_on_replace() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("BLUEY_TEST_RUN_ROOT").expect("canonical test launcher required"),
+        );
+        let path = root.join(format!("pool-{}.db", uuid::Uuid::new_v4()));
+        assert!(!path.exists());
+        let pool = open_pool(&path).unwrap();
+        // Hold every slot concurrently so this checks initialization of distinct
+        // physical connections, not eight checkouts of a single connection.
+        let connections = (0..8).map(|_| pool.get().unwrap()).collect::<Vec<_>>();
+        for conn in &connections {
+            assert!(conn
+                .pragma_query_value(None, "recursive_triggers", |r| r.get::<_, bool>(0))
+                .unwrap());
+            assert!(conn
+                .pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+                .unwrap());
+        }
+        drop(connections);
+        let conn = pool.get().unwrap();
+        assert!(conn
+            .pragma_query_value(None, "recursive_triggers", |r| r.get::<_, bool>(0))
+            .unwrap());
+    }
+
+    #[test]
+    fn storage_fences_are_registered_in_both_runtime_migration_lists() {
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_ATS_STORAGE_FENCES));
+        let entries = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .filter(|(version, _)| *version == JOBS_ATS_STORAGE_FENCES_MIGRATION_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, POSTGRES_JOBS_ATS_STORAGE_FENCES);
+    }
+
+    #[test]
+    fn workday_reconciliation_holds_are_registered_and_transaction_safe() {
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_WORKDAY_RECONCILIATION_HOLDS));
+        let entries = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .filter(|(version, _)| *version == JOBS_WORKDAY_RECONCILIATION_HOLDS_MIGRATION_ID)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, POSTGRES_JOBS_WORKDAY_RECONCILIATION_HOLDS);
+        assert!(SQLITE_JOBS_WORKDAY_RECONCILIATION_HOLDS.starts_with("-- Target: SQLite"));
+        assert!(SQLITE_JOBS_WORKDAY_RECONCILIATION_HOLDS.contains("BEGIN IMMEDIATE;"));
+        assert!(SQLITE_JOBS_WORKDAY_RECONCILIATION_HOLDS
+            .trim_end()
+            .ends_with("COMMIT;"));
+        assert!(POSTGRES_JOBS_WORKDAY_RECONCILIATION_HOLDS.starts_with("-- Target: PostgreSQL"));
+    }
+
+    #[test]
+    fn populated_pre_observation_and_pre_fence_sqlite_upgrades_preserve_circuit() {
+        for anchor in [
+            SQLITE_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS,
+            SQLITE_JOBS_ATS_STORAGE_FENCES,
+        ] {
+            let manager = r2d2_sqlite::SqliteConnectionManager::memory().with_init(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;")
+            });
+            let pool = DbPool::Sqlite(
+                r2d2::Pool::builder()
+                    .max_size(1)
+                    .build(SafeSqliteConnectionManager::new(manager))
+                    .unwrap(),
+            );
+            run_sqlite_migration_list(&pool, sqlite_migrations_before(anchor)).unwrap();
+            {
+                let conn = pool.get().unwrap();
+                for pragma in ["foreign_keys", "recursive_triggers"] {
+                    assert!(conn
+                        .pragma_query_value(None, pragma, |row| row.get::<_, bool>(0))
+                        .unwrap());
+                }
+                conn.execute_batch(
+                    "INSERT INTO jobs_ats_certification_circuit_events VALUES
+                     ('first',printf('%064x',1),'x','provider','a','opened',
+                      'evidence_failure',0,0,0,0,0,'test',0,'test',0);
+                     INSERT INTO jobs_ats_certification_circuit_heads VALUES
+                     ('provider','a',1,'first','opened',0);",
+                )
+                .unwrap();
+            }
+            run_migrations(&pool).unwrap();
+            run_migrations(&pool).unwrap();
+            let conn = pool.get().unwrap();
+            let markers: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM bluey_data_migrations WHERE name=?1",
+                    [SQLITE_ATS_STORAGE_LINEAGE_MARKER],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(markers, 1);
+            for pragma in ["foreign_keys", "recursive_triggers"] {
+                assert!(conn
+                    .pragma_query_value(None, pragma, |row| row.get::<_, bool>(0))
+                    .unwrap());
+            }
+            let head: (String, i64) = conn
+                .query_row(
+                    "SELECT current_event_id,head_revision FROM jobs_ats_certification_circuit_heads
+                     WHERE scope_kind='provider' AND subject_key='a'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(head, ("first".to_owned(), 1));
+            assert!(conn.execute_batch(
+                "UPDATE jobs_ats_certification_circuit_heads SET subject_key='b',head_revision=2
+                 WHERE scope_kind='provider' AND subject_key='a'"
+            ).is_err());
+            let mut check = conn.prepare("PRAGMA foreign_key_check").unwrap();
+            assert!(check.query([]).unwrap().next().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn owned_migration_failure_rolls_back_and_leaves_the_connection_reusable() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE witness(id INTEGER);")
+            .unwrap();
+        let migration = "BEGIN IMMEDIATE;
+            INSERT INTO witness VALUES (1);
+            CREATE TEMP TABLE partial_guard(id INTEGER);
+            SELECT missing_fence_preflight_function();
+            COMMIT;";
+        assert!(execute_sqlite_transactional_migration(&mut conn, migration, "067").is_err());
+        assert!(conn.is_autocommit());
+        assert!(conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get::<_, bool>(0))
+            .unwrap());
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM witness", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_master WHERE name='partial_guard'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        execute_sqlite_transactional_migration(
+            &mut conn,
+            "BEGIN IMMEDIATE; INSERT INTO witness VALUES (2); COMMIT;",
+            "067",
+        )
+        .unwrap();
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row("SELECT id FROM witness", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+}
+
+fn ensure_sqlite_attempt_employer_identity_columns(conn: &rusqlite::Connection) -> Result<()> {
+    // SQLite replays every schema file. Install additive nullable columns before 066's
+    // indexes/guards; no legacy row is guessed, updated, or removed by this migration.
+    for column in [
+        "canonical_employer_id",
+        "canonical_employer_domain",
+        "employer_attestation_sha256",
+    ] {
+        ensure_column(conn, "jobs_attempt_reservations", column, "TEXT")?;
+    }
     Ok(())
 }
 
@@ -2199,6 +4364,156 @@ fn ensure_column(
         ))?;
     }
     Ok(())
+}
+
+const SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1: &str = concat!(
+    "'all', 'discovery', 'generation', 'application_queue', 'runner_claim',\n    ",
+    "'final_submit', 'mailbox_sync', 'communication_dispatch'",
+);
+const SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V2: &str = concat!(
+    "'all', 'discovery', 'original_source_verification', 'generation',\n    ",
+    "'application_queue', 'runner_claim', 'final_submit', 'mailbox_sync',\n    ",
+    "'communication_dispatch'",
+);
+
+/// Migration 052 predates the dedicated original-source verifier hold. SQLite replays every
+/// bundled SQL file at startup, so 057 cannot safely perform an unconditional table rebuild.
+/// Instead, the normal migration runner widens the two immutable-ledger CHECKs exactly once after
+/// detecting the legacy schema. The replacement is transactional, compares both complete row
+/// sets before swapping table names, validates foreign keys, and becomes a no-op on later starts.
+fn ensure_sqlite_original_source_verification_hold_capability(
+    conn: &mut rusqlite::Connection,
+) -> Result<()> {
+    let event_schema: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table'
+          AND name = 'jobs_operational_hold_events'",
+        [],
+        |row| row.get(0),
+    )?;
+    let head_schema: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table'
+          AND name = 'jobs_operational_hold_heads'",
+        [],
+        |row| row.get(0),
+    )?;
+    let event_is_v2 = event_schema.contains("'original_source_verification'");
+    let head_is_v2 = head_schema.contains("'original_source_verification'");
+    if event_is_v2 && head_is_v2 {
+        return Ok(());
+    }
+    if event_is_v2 != head_is_v2
+        || event_schema
+            .matches(SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1)
+            .count()
+            != 1
+        || head_schema
+            .matches(SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1)
+            .count()
+            != 1
+        || SQLITE_JOBS_OPERATIONAL_HOLDS
+            .matches(SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1)
+            .count()
+            != 2
+    {
+        anyhow::bail!("SQLite operational-hold capability schema is not an exact v1/v2 authority")
+    }
+
+    let widened_sql = SQLITE_JOBS_OPERATIONAL_HOLDS.replace(
+        SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1,
+        SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V2,
+    );
+    let staging_sql = widened_sql
+        .replace(
+            "jobs_operational_hold_events",
+            "jobs_operational_hold_events_phase614",
+        )
+        .replace(
+            "jobs_operational_hold_heads",
+            "jobs_operational_hold_heads_phase614",
+        );
+
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let migration = (|| -> Result<()> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS jobs_operational_hold_heads_phase614;
+             DROP TABLE IF EXISTS jobs_operational_hold_events_phase614;",
+        )?;
+        tx.execute_batch(&staging_sql)?;
+        tx.execute_batch(
+            "INSERT INTO jobs_operational_hold_events_phase614 (
+               event_id, event_ref, event_sha256, canonical_event_base64url, capability,
+               scope_kind, scope_id, revision_no, previous_revision_no, predecessor_event_id,
+               transition, reason_code, reason_ref, recorded_by, recorded_at_ms
+             ) SELECT
+               event_id, event_ref, event_sha256, canonical_event_base64url, capability,
+               scope_kind, scope_id, revision_no, previous_revision_no, predecessor_event_id,
+               transition, reason_code, reason_ref, recorded_by, recorded_at_ms
+             FROM jobs_operational_hold_events
+             ORDER BY capability, scope_kind, scope_id, revision_no;
+             INSERT INTO jobs_operational_hold_heads_phase614 (
+               capability, scope_kind, scope_id, scope_ref, head_revision, current_event_id,
+               current_event_ref, state, updated_by, updated_at_ms
+             ) SELECT
+               capability, scope_kind, scope_id, scope_ref, head_revision, current_event_id,
+               current_event_ref, state, updated_by, updated_at_ms
+             FROM jobs_operational_hold_heads
+             ORDER BY capability, scope_kind, scope_id;",
+        )?;
+        let changed: i64 = tx.query_row(
+            "SELECT
+               EXISTS(SELECT * FROM jobs_operational_hold_events
+                      EXCEPT SELECT * FROM jobs_operational_hold_events_phase614)
+             + EXISTS(SELECT * FROM jobs_operational_hold_events_phase614
+                      EXCEPT SELECT * FROM jobs_operational_hold_events)
+             + EXISTS(SELECT * FROM jobs_operational_hold_heads
+                      EXCEPT SELECT * FROM jobs_operational_hold_heads_phase614)
+             + EXISTS(SELECT * FROM jobs_operational_hold_heads_phase614
+                      EXCEPT SELECT * FROM jobs_operational_hold_heads)",
+            [],
+            |row| row.get(0),
+        )?;
+        if changed != 0 {
+            anyhow::bail!("SQLite operational-hold ledger changed during capability migration")
+        }
+
+        tx.execute_batch(
+            "DROP TABLE jobs_operational_hold_heads;
+             DROP TABLE jobs_operational_hold_events;
+             ALTER TABLE jobs_operational_hold_events_phase614
+               RENAME TO jobs_operational_hold_events;
+             ALTER TABLE jobs_operational_hold_heads_phase614
+               RENAME TO jobs_operational_hold_heads;
+             DROP INDEX IF EXISTS idx_jobs_operational_hold_events_phase614_history;
+             DROP INDEX IF EXISTS idx_jobs_operational_hold_heads_phase614_lookup;
+             DROP INDEX IF EXISTS idx_jobs_operational_hold_heads_phase614_refs;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_events_phase614_validate_insert;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_events_phase614_no_update;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_events_phase614_no_delete;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_heads_phase614_validate_insert;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_heads_phase614_monotonic;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_heads_phase614_no_delete;",
+        )?;
+        tx.execute_batch(&widened_sql)?;
+        let foreign_key_violation = tx
+            .prepare("PRAGMA foreign_key_check")?
+            .query([])?
+            .next()?
+            .is_some();
+        if foreign_key_violation {
+            anyhow::bail!("SQLite operational-hold capability migration broke a foreign key")
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = conn.pragma_update(None, "foreign_keys", foreign_keys_enabled);
+    match (migration, restored) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -2222,7 +4537,2038 @@ mod blocking_boundary_tests {
 
 #[cfg(test)]
 mod sqlite_migration_replay_tests {
-    use super::{ensure_column, open_pool, run_migrations};
+    use super::{
+        apply_sqlite_signature_audience_migration_with_hook, ensure_column,
+        ensure_sqlite_attempt_employer_identity_columns,
+        ensure_sqlite_original_source_verification_hold_capability,
+        execute_sqlite_original_source_verifier_startup_migration,
+        execute_sqlite_signed_job_integrity_migration, execute_sqlite_transactional_migration,
+        open_pool, run_migrations, signature_audience_schema,
+        SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+        SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY, SQLITE_JOBS_OPERATIONAL_HOLDS,
+        SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+    };
+
+    fn attempt_employer_legacy_schema() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        initialize_attempt_employer_legacy_schema(&conn);
+        conn
+    }
+
+    fn initialize_attempt_employer_legacy_schema(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "CREATE TABLE jobs_attempt_reservations (
+               id TEXT PRIMARY KEY, account_id TEXT NOT NULL, application_id TEXT NOT NULL,
+               company_key TEXT NOT NULL, status TEXT NOT NULL,
+               UNIQUE(account_id, application_id)
+             );
+             CREATE UNIQUE INDEX idx_jobs_attempt_reservations_active_company
+               ON jobs_attempt_reservations(account_id, company_key)
+               WHERE status IN ('reserved', 'running', 'side_effect_unknown', 'submitted');",
+        )
+        .unwrap();
+    }
+
+    fn migrate_attempt_employers(conn: &rusqlite::Connection) {
+        ensure_sqlite_attempt_employer_identity_columns(conn).unwrap();
+        conn.execute_batch(super::SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY)
+            .unwrap();
+    }
+
+    fn insert_bound_attempt(
+        conn: &rusqlite::Connection,
+        id: &str,
+        employer_id: &str,
+        domain: &str,
+        sha256: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO jobs_attempt_reservations (
+               id,account_id,application_id,company_key,status,
+               canonical_employer_id,canonical_employer_domain,employer_attestation_sha256
+             ) VALUES (?1,'account',?1,?1,'reserved',?2,?3,?4)",
+            rusqlite::params![id, employer_id, domain, sha256],
+        )
+    }
+
+    #[test]
+    fn attempt_employer_migration_preserves_legacy_rows_and_reconciliation_on_replay() {
+        let conn = attempt_employer_legacy_schema();
+        for status in [
+            "reserved",
+            "running",
+            "side_effect_unknown",
+            "submitted",
+            "released",
+        ] {
+            conn.execute(
+                "INSERT INTO jobs_attempt_reservations VALUES (?1,'account',?1,?1,?1)",
+                [status],
+            )
+            .unwrap();
+        }
+        migrate_attempt_employers(&conn);
+        migrate_attempt_employers(&conn);
+        type LegacyEmployerRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<LegacyEmployerRow> = conn
+            .prepare(
+                "SELECT id,status,canonical_employer_id,canonical_employer_domain,
+                        employer_attestation_sha256 FROM jobs_attempt_reservations ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        for (id, status, employer_id, domain, attestation) in rows {
+            assert_eq!(id, status);
+            assert_eq!((employer_id, domain, attestation), (None, None, None));
+        }
+        for terminal in ["side_effect_unknown", "submitted", "released"] {
+            conn.execute_batch("SAVEPOINT terminal_recording").unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE jobs_attempt_reservations SET status=?1 WHERE id='running'",
+                    [terminal],
+                )
+                .unwrap(),
+                1
+            );
+            conn.execute_batch("ROLLBACK TO terminal_recording; RELEASE terminal_recording")
+                .unwrap();
+        }
+        for status in ["reserved", "running"] {
+            assert!(conn
+                .execute(
+                    "UPDATE jobs_attempt_reservations SET status=?1 WHERE id='running'",
+                    [status],
+                )
+                .is_err());
+        }
+        for status in [
+            "released",
+            "reserved",
+            "running",
+            "side_effect_unknown",
+            "failed",
+        ] {
+            assert!(conn
+                .execute(
+                    "UPDATE jobs_attempt_reservations SET status=?1 WHERE id='submitted'",
+                    [status],
+                )
+                .is_err());
+        }
+        assert_eq!(conn.execute(
+            "UPDATE jobs_attempt_reservations SET company_key='submitted-metadata' WHERE id='submitted'",
+            [],
+        ).unwrap(), 1);
+        for status in ["reserved", "running", "side_effect_unknown", "submitted"] {
+            assert!(conn
+                .execute(
+                    "INSERT INTO jobs_attempt_reservations (
+                       id,account_id,application_id,company_key,status
+                     ) VALUES ('new','account','new','new',?1)",
+                    [status],
+                )
+                .is_err());
+        }
+        // Explicit complete binding is possible; this migration performs no such backfill.
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET canonical_employer_id='employer-legacy',
+               canonical_employer_domain='legacy.example',employer_attestation_sha256=?1
+               WHERE id='running'",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        migrate_attempt_employers(&conn);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM jobs_attempt_reservations",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+            5
+        );
+    }
+
+    #[test]
+    fn attempt_employer_sqlite_concurrent_alias_inserts_have_one_unique_constraint_loser() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-attempt-employer-race-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let setup = rusqlite::Connection::open(&path).unwrap();
+        initialize_attempt_employer_legacy_schema(&setup);
+        migrate_attempt_employers(&setup);
+        drop(setup);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [("alias-a", 'a'), ("alias-b", 'b')]
+            .into_iter()
+            .map(|(id, sha_byte)| {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let sha = sha_byte.to_string().repeat(64);
+                    let result =
+                        insert_bound_attempt(&conn, id, "employer-acme", "acme.example", &sha);
+                    (id, sha, result)
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM jobs_attempt_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: Vec<String> = conn
+            .query_row(
+                "SELECT id,account_id,application_id,company_key,status,canonical_employer_id,
+                    canonical_employer_domain,employer_attestation_sha256
+               FROM jobs_attempt_reservations",
+                [],
+                |row| (0..8).map(|index| row.get(index)).collect(),
+            )
+            .unwrap();
+        migrate_attempt_employers(&conn);
+        let replayed: Vec<String> = conn
+            .query_row(
+                "SELECT id,account_id,application_id,company_key,status,canonical_employer_id,
+                    canonical_employer_domain,employer_attestation_sha256
+               FROM jobs_attempt_reservations",
+                [],
+                |row| (0..8).map(|index| row.get(index)).collect(),
+            )
+            .unwrap();
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
+        let results: Vec<_> = results.into_iter().map(Result::unwrap).collect();
+        let winners: Vec<_> = results
+            .iter()
+            .filter(|(_, _, result)| result.is_ok())
+            .collect();
+        let losers: Vec<_> = results
+            .iter()
+            .filter(|(_, _, result)| result.is_err())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(losers.len(), 1);
+        assert_eq!(winners[0].2.as_ref().unwrap(), &1);
+        match losers[0].2.as_ref().unwrap_err() {
+            rusqlite::Error::SqliteFailure(error, message) => {
+                assert_eq!(error.code, rusqlite::ErrorCode::ConstraintViolation);
+                assert_eq!(error.extended_code, rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE);
+                assert!(message.as_ref().is_some_and(
+                    |message| message.contains("jobs_attempt_reservations.canonical_employer_")
+                ));
+            }
+            error => panic!("expected the canonical employer unique constraint, got {error:?}"),
+        }
+        assert_eq!(row_count, 1);
+        let (winner_id, winner_sha, _) = winners[0];
+        assert_eq!(
+            stored,
+            vec![
+                winner_id.to_string(),
+                "account".to_string(),
+                winner_id.to_string(),
+                winner_id.to_string(),
+                "reserved".to_string(),
+                "employer-acme".to_string(),
+                "acme.example".to_string(),
+                winner_sha.clone(),
+            ]
+        );
+        assert_eq!(replayed, stored);
+    }
+
+    #[test]
+    fn attempt_employer_irreversible_states_preserve_bound_and_legacy_slots() {
+        let conn = attempt_employer_legacy_schema();
+        for (id, status) in [
+            ("legacy-unknown", "side_effect_unknown"),
+            ("legacy-submitted", "submitted"),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs_attempt_reservations VALUES (?1,'account',?1,?1,?2)",
+                rusqlite::params![id, status],
+            )
+            .unwrap();
+        }
+        migrate_attempt_employers(&conn);
+        for (id, domain, state) in [
+            ("bound-unknown", "unknown.example", "side_effect_unknown"),
+            ("bound-submitted", "submitted.example", "submitted"),
+        ] {
+            insert_bound_attempt(&conn, id, id, domain, &"a".repeat(64)).unwrap();
+            conn.execute(
+                "UPDATE jobs_attempt_reservations SET status=?2 WHERE id=?1",
+                rusqlite::params![id, state],
+            )
+            .unwrap();
+        }
+        migrate_attempt_employers(&conn);
+        for id in ["legacy-unknown", "bound-unknown"] {
+            for denied in ["reserved", "running", "failed"] {
+                let error = conn
+                    .execute(
+                        "UPDATE jobs_attempt_reservations SET status=?2 WHERE id=?1",
+                        rusqlite::params![id, denied],
+                    )
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("unknown attempt requires reconciliation before reentry"));
+            }
+            for allowed in ["side_effect_unknown", "submitted", "released"] {
+                conn.execute_batch("SAVEPOINT unknown_reconciliation")
+                    .unwrap();
+                assert_eq!(
+                    conn.execute(
+                        "UPDATE jobs_attempt_reservations SET status=?2 WHERE id=?1",
+                        rusqlite::params![id, allowed],
+                    )
+                    .unwrap(),
+                    1
+                );
+                conn.execute_batch(
+                    "ROLLBACK TO unknown_reconciliation; RELEASE unknown_reconciliation",
+                )
+                .unwrap();
+            }
+            let state: String = conn
+                .query_row(
+                    "SELECT status FROM jobs_attempt_reservations WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "side_effect_unknown");
+        }
+        for id in ["legacy-submitted", "bound-submitted"] {
+            for denied in [
+                "released",
+                "reserved",
+                "running",
+                "failed",
+                "side_effect_unknown",
+            ] {
+                let error = conn
+                    .execute(
+                        "UPDATE jobs_attempt_reservations SET status=?2 WHERE id=?1",
+                        rusqlite::params![id, denied],
+                    )
+                    .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("submitted attempt status is irreversible"));
+            }
+            assert_eq!(
+                conn.execute(
+                    "UPDATE jobs_attempt_reservations SET company_key=company_key||'-metadata'
+                       WHERE id=?1",
+                    [id],
+                )
+                .unwrap(),
+                1
+            );
+        }
+        // The database permits the reconciled release transition, not its business authorization.
+        // Once the caller has authorized release, the existing same-employer renewal is preserved.
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET status='released' WHERE id='bound-unknown'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET status='reserved',employer_attestation_sha256=?1
+               WHERE id='bound-unknown'",
+            ["b".repeat(64)],
+        )
+        .unwrap();
+        let binding: (String, String, String) = conn
+            .query_row(
+                "SELECT canonical_employer_id,canonical_employer_domain,employer_attestation_sha256
+               FROM jobs_attempt_reservations WHERE id='bound-unknown'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            binding,
+            (
+                "bound-unknown".to_string(),
+                "unknown.example".to_string(),
+                "b".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn attempt_employer_binding_is_complete_immutable_and_active_unique() {
+        let conn = attempt_employer_legacy_schema();
+        migrate_attempt_employers(&conn);
+        insert_bound_attempt(
+            &conn,
+            "first",
+            "employer-acme",
+            "acme.example",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        assert!(insert_bound_attempt(
+            &conn,
+            "id-alias",
+            "employer-acme",
+            "different.example",
+            &"b".repeat(64)
+        )
+        .is_err());
+        assert!(insert_bound_attempt(
+            &conn,
+            "domain-alias",
+            "different-id",
+            "acme.example",
+            &"b".repeat(64)
+        )
+        .is_err());
+        insert_bound_attempt(&conn, "other", "other-id", "other.example", &"b".repeat(64)).unwrap();
+        conn.execute(
+            "INSERT INTO jobs_attempt_reservations (
+               id,account_id,application_id,company_key,status,
+               canonical_employer_id,canonical_employer_domain,employer_attestation_sha256
+             ) VALUES ('other-account','another-account','other-account','first','reserved',
+                       'employer-acme','acme.example',?1)",
+            ["a".repeat(64)],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs_attempt_reservations (
+               id,account_id,application_id,company_key,status,
+               canonical_employer_id,canonical_employer_domain,employer_attestation_sha256
+             ) VALUES ('display-alias','account','display-alias','first','reserved',
+                       'third-employer','third.example',?1)",
+                ["a".repeat(64)],
+            )
+            .is_err());
+        for assignment in [
+            "canonical_employer_id='replacement'",
+            "canonical_employer_domain='replacement.example'",
+            "canonical_employer_id=NULL,canonical_employer_domain=NULL,employer_attestation_sha256=NULL",
+            "employer_attestation_sha256='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
+        ] {
+            assert!(conn
+                .execute(&format!("UPDATE jobs_attempt_reservations SET {assignment} WHERE id='first'"), [])
+                .is_err());
+        }
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET status='released' WHERE id='first'",
+            [],
+        )
+        .unwrap();
+        assert!(conn.execute(
+            "UPDATE jobs_attempt_reservations SET employer_attestation_sha256=?1 WHERE id='first'",
+            ["b".repeat(64)],
+        ).is_err());
+        conn.execute(
+            "UPDATE jobs_attempt_reservations SET status='reserved',employer_attestation_sha256=?1
+               WHERE id='first'",
+            ["b".repeat(64)],
+        )
+        .unwrap();
+        migrate_attempt_employers(&conn);
+        let attestation: String = conn.query_row(
+            "SELECT employer_attestation_sha256 FROM jobs_attempt_reservations WHERE id='first'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(attestation, "b".repeat(64));
+    }
+
+    #[test]
+    fn attempt_employer_binding_rejects_invalid_tokens_domains_and_partial_shapes() {
+        let conn = attempt_employer_legacy_schema();
+        migrate_attempt_employers(&conn);
+        for domain in [
+            "",
+            "localhost",
+            "a.localhost",
+            "intranet",
+            "Acme.example",
+            "a..example",
+            "-a.example",
+            "a-.example",
+            "a.example.",
+            "127.0.0.1",
+            "127.1",
+            "a.123",
+            "a.0x7f",
+            "a.0x",
+            "é.example",
+            "a.example\0hidden",
+        ] {
+            assert!(
+                insert_bound_attempt(&conn, "invalid", "employer", domain, &"a".repeat(64))
+                    .is_err()
+            );
+        }
+        for id in ["", "bad employer", "employer\0hidden", "é", "bad@employer"] {
+            assert!(
+                insert_bound_attempt(&conn, "invalid", id, "valid.example", &"a".repeat(64))
+                    .is_err()
+            );
+        }
+        for sha in [
+            "a".repeat(63),
+            "A".repeat(64),
+            format!("{}\0hidden", "a".repeat(64)),
+        ] {
+            assert!(
+                insert_bound_attempt(&conn, "invalid", "employer", "valid.example", &sha).is_err()
+            );
+        }
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs_attempt_reservations (
+               id,account_id,application_id,company_key,status,canonical_employer_id
+             ) VALUES ('partial','account','partial','partial','released','employer')",
+                [],
+            )
+            .is_err());
+        let valid_domain = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        insert_bound_attempt(
+            &conn,
+            "valid",
+            &"a".repeat(240),
+            &valid_domain,
+            &"a".repeat(64),
+        )
+        .unwrap();
+        assert!(insert_bound_attempt(
+            &conn,
+            "too-long",
+            &"a".repeat(241),
+            "long.example",
+            &"a".repeat(64)
+        )
+        .is_err());
+        assert!(insert_bound_attempt(
+            &conn,
+            "too-long",
+            "another",
+            &format!("{}.example", "a".repeat(64)),
+            &"a".repeat(64)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn source_verifier_boot_bindings_migration_failure_restores_connection_state() {
+        for foreign_keys_before in [false, true] {
+            for failure in ["SELECT * FROM phase628_missing_relation;", ""] {
+                let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+                conn.pragma_update(None, "foreign_keys", foreign_keys_before)
+                    .unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE phase628_parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE phase628_child(
+                       parent_id INTEGER NOT NULL REFERENCES phase628_parent(id)
+                     );",
+                )
+                .unwrap();
+                // Empty suffix deliberately omits COMMIT: successful statement
+                // execution is not successful migration completion.
+                let migration = format!(
+                    "PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;
+                     CREATE TABLE phase628_interrupted(id INTEGER PRIMARY KEY);
+                     {failure}"
+                );
+                let error = execute_sqlite_transactional_migration(&mut conn, &migration, "065")
+                    .expect_err("partial boot migration must fail");
+                assert!(error.to_string().contains("SQLite migration 065 failed"));
+                assert!(conn.is_autocommit());
+                let foreign_keys_after: bool = conn
+                    .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                    .unwrap();
+                assert_eq!(foreign_keys_before, foreign_keys_after);
+                let partial_table: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                          WHERE name='phase628_interrupted')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(!partial_table);
+                if foreign_keys_before {
+                    assert!(conn
+                        .execute("INSERT INTO phase628_child(parent_id) VALUES(999)", [])
+                        .is_err());
+                }
+                conn.execute("INSERT INTO phase628_parent(id) VALUES(1)", [])
+                    .expect("connection remains usable after failure");
+            }
+        }
+    }
+
+    #[test]
+    fn source_verifier_boot_bindings_migration_success_restores_prior_foreign_key_mode() {
+        for foreign_keys_before in [false, true] {
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "foreign_keys", foreign_keys_before)
+                .unwrap();
+            execute_sqlite_transactional_migration(
+                &mut conn,
+                "PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;
+                 CREATE TABLE phase628_committed(id INTEGER PRIMARY KEY);
+                 COMMIT; PRAGMA foreign_keys=ON;",
+                "065",
+            )
+            .expect("complete boot migration");
+            assert!(conn.is_autocommit());
+            let foreign_keys_after: bool = conn
+                .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                .unwrap();
+            assert_eq!(foreign_keys_before, foreign_keys_after);
+            conn.execute("INSERT INTO phase628_committed(id) VALUES(1)", [])
+                .expect("completed migration schema must persist");
+        }
+    }
+
+    #[test]
+    fn source_verifier_boot_bindings_migration_refuses_an_existing_transaction() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("BEGIN; CREATE TABLE phase628_caller(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        execute_sqlite_transactional_migration(&mut conn, "SELECT 1;", "065")
+            .expect_err("the executor must not own another caller's transaction");
+        assert!(!conn.is_autocommit());
+        conn.execute("INSERT INTO phase628_caller(id) VALUES(1)", [])
+            .expect("caller's transaction must not be rolled back");
+        conn.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn signed_job_integrity_migration_failure_restores_transaction_and_foreign_keys() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch("CREATE TABLE bluey_data_migrations(name TEXT PRIMARY KEY);")
+            .unwrap();
+        let error = execute_sqlite_signed_job_integrity_migration(
+            &mut conn,
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE phase614b_interrupted (id INTEGER PRIMARY KEY);
+             SELECT * FROM phase614b_forced_missing_relation;
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect_err("injected migration failure must propagate");
+        assert!(error.to_string().contains("SQLite migration 058 failed"));
+        assert!(conn.is_autocommit(), "failed migration must roll back");
+        let foreign_keys_enabled: bool = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert!(foreign_keys_enabled, "foreign keys must be restored");
+        let interrupted_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='phase614b_interrupted'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!interrupted_table_exists, "partial schema must roll back");
+        conn.execute_batch(
+            "CREATE TABLE phase614b_parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE phase614b_child (
+               id INTEGER PRIMARY KEY,
+               parent_id INTEGER NOT NULL REFERENCES phase614b_parent(id)
+             );",
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO phase614b_child(id,parent_id) VALUES(1,999)",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn original_source_verifier_startup_migration_failure_restores_state() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch("CREATE TABLE bluey_data_migrations(name TEXT PRIMARY KEY);")
+            .unwrap();
+        let error = execute_sqlite_original_source_verifier_startup_migration(
+            &mut conn,
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE phase628_interrupted (id INTEGER PRIMARY KEY);
+             SELECT * FROM phase628_forced_missing_relation;
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect_err("injected startup migration failure must propagate");
+        assert!(error.to_string().contains("SQLite migration 062 failed"));
+        assert!(conn.is_autocommit(), "failed migration must roll back");
+        let foreign_keys_enabled: bool = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert!(foreign_keys_enabled, "foreign keys must be restored");
+        let interrupted_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='phase628_interrupted'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!interrupted_table_exists, "partial schema must roll back");
+    }
+
+    #[test]
+    fn original_source_verifier_startup_migration_replay_skips_table_swap() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-osv-startup-migration-replay-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).expect("open startup migration fixture");
+        run_migrations(&pool).expect("apply startup migration");
+        let audience_schema = {
+            let mut conn = pool.get().expect("startup migration fixture connection");
+            let before = signature_audience_schema(&conn).expect("read applied audience schema");
+            apply_sqlite_signature_audience_migration_with_hook(&mut conn, || {
+                Err(anyhow::anyhow!(
+                    "replay must not enter signature audience swap path"
+                ))
+            })
+            .expect("already-applied audience replay must not enter swap path");
+            assert_eq!(signature_audience_schema(&conn).unwrap(), before);
+            before
+        };
+        run_migrations(&pool).expect("replay startup migration");
+        let conn = pool.get().expect("assert replayed startup migration");
+        assert_eq!(signature_audience_schema(&conn).unwrap(), audience_schema);
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bluey_data_migrations
+                  WHERE name='jobs-original-source-verifier-startup-authority-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count startup marker");
+        let foreign_keys_enabled: bool = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .expect("read foreign-key setting after replay");
+        assert_eq!(marker_count, 1);
+        assert!(foreign_keys_enabled);
+        assert_eq!(
+            SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY
+                .matches("BEGIN IMMEDIATE")
+                .count(),
+            1
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_operational_hold_event(
+        conn: &rusqlite::Connection,
+        event_id: &str,
+        event_sha256: &str,
+        revision_no: i64,
+        previous_revision_no: Option<i64>,
+        predecessor_event_id: Option<&str>,
+        transition: &str,
+        reason_code: &str,
+        recorded_by: &str,
+        recorded_at_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        let event_ref = format!("event-{event_sha256}");
+        conn.execute(
+            "INSERT INTO jobs_operational_hold_events (
+                event_id, event_ref, event_sha256, canonical_event_base64url, capability,
+                scope_kind, scope_id, revision_no, previous_revision_no,
+                predecessor_event_id, transition, reason_code, reason_ref,
+                recorded_by, recorded_at_ms
+             ) VALUES (?1, ?2, ?3, 'ZXZlbnQ', 'all', 'global', '*', ?4, ?5, ?6,
+                       ?7, ?8, 'incident-123', ?9, ?10)",
+            rusqlite::params![
+                event_id,
+                event_ref,
+                event_sha256,
+                revision_no,
+                previous_revision_no,
+                predecessor_event_id,
+                transition,
+                reason_code,
+                recorded_by,
+                recorded_at_ms,
+            ],
+        )
+    }
+
+    #[test]
+    fn canonical_track_policy_schema_is_immutable_exact_and_cas_monotonic() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY);
+             CREATE TABLE jobs_tracks (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE
+             );
+             CREATE TABLE jobs_application_identities (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+               verification_status TEXT NOT NULL
+             );
+             CREATE TABLE jobs_resume_source_assets (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE CASCADE,
+               sha256 TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY)
+            .unwrap();
+        conn.execute_batch(SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY)
+            .expect("canonical policy migration replay must be safe");
+
+        for table in [
+            "jobs_track_policy_revisions",
+            "jobs_track_policy_review_receipts",
+            "jobs_track_policy_heads",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must not seed policy authority");
+        }
+
+        conn.execute_batch(
+            "INSERT INTO accounts(id) VALUES ('account-policy-001');
+             INSERT INTO jobs_tracks(id, account_id)
+               VALUES ('track-policy-001', 'account-policy-001');
+             INSERT INTO jobs_application_identities(
+               id, account_id, verification_status
+             ) VALUES ('identity-verified-001', 'account-policy-001', 'verified');
+             INSERT INTO jobs_resume_source_assets(id, account_id, sha256)
+               VALUES (
+                 'source-resume-asset-001', 'account-policy-001',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+               );
+             INSERT INTO jobs_track_policy_taxonomy_activation_events (
+               activation_epoch, previous_activation_epoch, taxonomy_version,
+               taxonomy_digest_sha256, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, activation_transition_sha256,
+               predecessor_activation_transition_sha256, activated_at_ms
+             ) VALUES (
+               1, 0, '2026.08.1',
+               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+               1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               '9999999999999999999999999999999999999999999999999999999999999999',
+               NULL, 90
+             );
+             INSERT INTO jobs_track_policy_taxonomy_activation_head
+             SELECT 1, activation_epoch, previous_activation_epoch, taxonomy_version,
+                    taxonomy_digest_sha256, canonicalizer_schema_version,
+                    canonicalizer_digest_sha256, activation_transition_sha256,
+                    predecessor_activation_transition_sha256, activated_at_ms
+               FROM jobs_track_policy_taxonomy_activation_events
+              WHERE activation_epoch = 1;
+             INSERT INTO jobs_track_policy_account_input_transitions (
+               input_transition_id, account_id, input_generation,
+               previous_input_generation, input_kind, input_subject_sha256,
+               account_semantic_sha256, input_transition_sha256,
+               predecessor_input_transition_sha256, changed_at_ms
+             ) VALUES (
+               'account-input-transition-001', 'account-policy-001', 1, 0,
+               'baseline',
+               '6666666666666666666666666666666666666666666666666666666666666666',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               NULL, 91
+             );
+             INSERT INTO jobs_track_policy_account_input_heads
+             SELECT account_id, input_generation, previous_input_generation,
+                    input_transition_id, input_kind, input_subject_sha256,
+                    account_semantic_sha256, input_transition_sha256,
+                    predecessor_input_transition_sha256, changed_at_ms
+               FROM jobs_track_policy_account_input_transitions
+              WHERE input_transition_id = 'account-input-transition-001';
+             INSERT INTO jobs_track_policy_track_input_transitions (
+               input_transition_id, account_id, career_track_id, input_generation,
+               previous_input_generation, track_semantic_sha256,
+               input_transition_sha256, predecessor_input_transition_sha256,
+               changed_at_ms
+             ) VALUES (
+               'track-input-transition-001', 'account-policy-001',
+               'track-policy-001', 1, 0,
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               NULL, 92
+             );
+             INSERT INTO jobs_track_policy_track_input_heads
+             SELECT account_id, career_track_id, input_generation,
+                    previous_input_generation, input_transition_id,
+                    track_semantic_sha256, input_transition_sha256,
+                    predecessor_input_transition_sha256, changed_at_ms
+               FROM jobs_track_policy_track_input_transitions
+              WHERE input_transition_id = 'track-input-transition-001';",
+        )
+        .unwrap();
+
+        let revision_insert = "INSERT INTO jobs_track_policy_revisions (
+               revision_id, account_id, career_track_id, revision_no,
+               taxonomy_version, taxonomy_digest_sha256, canonical_policy_sha256,
+               taxonomy_activation_epoch, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, account_input_generation,
+               account_input_transition_sha256, account_semantic_sha256,
+               track_input_generation, track_input_transition_sha256,
+               track_semantic_sha256,
+               canonical_policy_ciphertext, canonical_role_id, canonical_role_family,
+               verified_application_identity_id,
+               verified_application_identity_sha256, source_resume_asset_id,
+               source_resume_sha256, job_preferences_sha256, predecessor_revision_id,
+               predecessor_revision_no, predecessor_policy_sha256,
+               compatibility_classification, review_state, created_by, created_at_ms
+             ) VALUES (
+               ?1, 'account-policy-001', 'track-policy-001', ?2,
+               '2026.08.1', ?3, ?4, 1, 1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               1,
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               1,
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               ?5, 'software-engineer', 'software-engineering',
+               'identity-verified-001', ?6, 'source-resume-asset-001', ?7,
+               ?8, ?9, ?10, ?11, ?12, 'approved', 'candidate-owner', ?13
+             )";
+        let taxonomy_sha = "b".repeat(64);
+        let identity_sha = "c".repeat(64);
+        let resume_sha = "a".repeat(64);
+        let first_policy_sha = "d".repeat(64);
+        let second_policy_sha = "e".repeat(64);
+        let stale_policy_sha = "6".repeat(64);
+        let preferences_sha = "5".repeat(64);
+        let policy_ciphertext = format!("bluey-jobs:v1:{}", "A".repeat(40));
+        let receipt_ciphertext = format!("bluey-jobs:v1:{}", "B".repeat(40));
+
+        let wrong_resume = conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000001",
+                1_i64,
+                taxonomy_sha,
+                first_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                "f".repeat(64),
+                preferences_sha,
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                "initial",
+                100_i64,
+            ],
+        );
+        assert!(
+            wrong_resume.is_err(),
+            "source-resume SHA drift must fail closed"
+        );
+
+        conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000001",
+                1_i64,
+                taxonomy_sha,
+                first_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                "initial",
+                100_i64,
+            ],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_track_policy_revisions
+                    SET canonical_role_id = 'changed'
+                  WHERE revision_id = 'policy-revision-000001'",
+                [],
+            )
+            .is_err());
+
+        let head_insert = "INSERT INTO jobs_track_policy_heads (
+               account_id, career_track_id, head_generation,
+               previous_head_generation, policy_revision_id, policy_revision_no,
+               canonical_policy_sha256, taxonomy_digest_sha256,
+               taxonomy_activation_epoch, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, account_input_generation,
+               account_input_transition_sha256, account_semantic_sha256,
+               track_input_generation, track_input_transition_sha256,
+               track_semantic_sha256,
+               verified_application_identity_sha256, source_resume_sha256,
+               job_preferences_sha256, review_receipt_id, review_receipt_sha256,
+               head_transition_sha256, predecessor_head_transition_sha256,
+               updated_by, updated_at_ms
+             ) VALUES (
+               'account-policy-001', 'track-policy-001', 1, 0,
+               'policy-revision-000001', 1, ?1, ?2, 1, 1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               1,
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               1,
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               ?3, ?4, ?5, ?6, ?7, ?8, NULL,
+               'candidate-owner', 120
+             )";
+        let head_transition_insert = "INSERT INTO jobs_track_policy_head_transitions (
+               account_id, career_track_id, head_generation,
+               previous_head_generation, policy_revision_id, policy_revision_no,
+               canonical_policy_sha256, taxonomy_digest_sha256,
+               taxonomy_activation_epoch, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, account_input_generation,
+               account_input_transition_sha256, account_semantic_sha256,
+               track_input_generation, track_input_transition_sha256,
+               track_semantic_sha256, verified_application_identity_sha256,
+               source_resume_sha256, job_preferences_sha256,
+               review_receipt_id, review_receipt_sha256, head_transition_sha256,
+               predecessor_head_transition_sha256, updated_by, updated_at_ms
+             ) VALUES (
+               'account-policy-001', 'track-policy-001', ?1, ?2, ?3, ?4,
+               ?5,
+               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+               1, 1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               1,
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               1,
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               '5555555555555555555555555555555555555555555555555555555555555555',
+               ?6, ?7, ?8, ?9, 'candidate-owner', ?10
+             )";
+        assert!(
+            conn.execute(
+                head_transition_insert,
+                rusqlite::params![
+                    1_i64,
+                    0_i64,
+                    "policy-revision-000001",
+                    1_i64,
+                    first_policy_sha,
+                    "policy-review-receipt-001",
+                    "2".repeat(64),
+                    "1".repeat(64),
+                    Option::<String>::None,
+                    120_i64,
+                ],
+            )
+            .is_err(),
+            "an approved revision still needs an exact review receipt"
+        );
+
+        let receipt_insert = "INSERT INTO jobs_track_policy_review_receipts (
+               review_receipt_id, review_receipt_sha256,
+               canonical_review_receipt_ciphertext, account_id, career_track_id,
+               policy_revision_id, policy_revision_no, canonical_policy_sha256,
+               taxonomy_digest_sha256, verified_application_identity_sha256,
+               taxonomy_activation_epoch, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, account_input_generation,
+               account_input_transition_sha256, account_semantic_sha256,
+               track_input_generation, track_input_transition_sha256,
+               track_semantic_sha256,
+               source_resume_sha256, job_preferences_sha256,
+               reviewer_id, decision, decided_at_ms
+             ) VALUES (
+               ?1, ?2, ?3, 'account-policy-001', 'track-policy-001', ?4, ?5,
+               ?6, ?7, ?8, 1, 1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               1,
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               1,
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               ?9, ?10, 'candidate-owner', 'approved', ?11
+             )";
+        conn.execute(
+            receipt_insert,
+            rusqlite::params![
+                "policy-review-receipt-001",
+                "2".repeat(64),
+                receipt_ciphertext,
+                "policy-revision-000001",
+                1_i64,
+                first_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                110_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_transition_insert,
+            rusqlite::params![
+                1_i64,
+                0_i64,
+                "policy-revision-000001",
+                1_i64,
+                first_policy_sha,
+                "policy-review-receipt-001",
+                "2".repeat(64),
+                "1".repeat(64),
+                Option::<String>::None,
+                120_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_insert,
+            rusqlite::params![
+                first_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                "policy-review-receipt-001",
+                "2".repeat(64),
+                "1".repeat(64),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            conn.execute(
+                "UPDATE jobs_track_policy_heads
+                    SET updated_at_ms = 121
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'",
+                [],
+            )
+            .is_err(),
+            "a stale/non-advancing head update must fail closed"
+        );
+
+        conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000002",
+                2_i64,
+                taxonomy_sha,
+                second_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                "policy-revision-000001",
+                1_i64,
+                first_policy_sha,
+                "review_required",
+                100_i64,
+            ],
+        )
+        .expect("successive policy revisions may share the same millisecond");
+        conn.execute(
+            receipt_insert,
+            rusqlite::params![
+                "policy-review-receipt-002",
+                "3".repeat(64),
+                receipt_ciphertext,
+                "policy-revision-000002",
+                2_i64,
+                second_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                140_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_transition_insert,
+            rusqlite::params![
+                2_i64,
+                1_i64,
+                "policy-revision-000002",
+                2_i64,
+                second_policy_sha,
+                "policy-review-receipt-002",
+                "3".repeat(64),
+                "4".repeat(64),
+                "1".repeat(64),
+                150_i64,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_track_policy_heads
+                    SET head_generation = 2, previous_head_generation = 1,
+                        policy_revision_id = 'policy-revision-000002',
+                        policy_revision_no = 2, canonical_policy_sha256 = ?1,
+                        job_preferences_sha256 = ?2,
+                        review_receipt_id = 'policy-review-receipt-002',
+                        review_receipt_sha256 = ?3,
+                        head_transition_sha256 = ?4,
+                        predecessor_head_transition_sha256 = ?5,
+                        updated_at_ms = 150
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'
+                    AND head_generation = 1 AND head_transition_sha256 = ?5",
+                rusqlite::params![
+                    second_policy_sha,
+                    preferences_sha,
+                    "3".repeat(64),
+                    "4".repeat(64),
+                    "1".repeat(64)
+                ],
+            )
+            .unwrap(),
+            1
+        );
+
+        conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000003",
+                3_i64,
+                taxonomy_sha,
+                first_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                "policy-revision-000002",
+                2_i64,
+                second_policy_sha,
+                "review_required",
+                160_i64,
+            ],
+        )
+        .expect("a later revision may intentionally revert to prior policy bytes");
+        conn.execute(
+            receipt_insert,
+            rusqlite::params![
+                "policy-review-receipt-003",
+                "7".repeat(64),
+                receipt_ciphertext,
+                "policy-revision-000003",
+                3_i64,
+                first_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                170_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_transition_insert,
+            rusqlite::params![
+                3_i64,
+                2_i64,
+                "policy-revision-000003",
+                3_i64,
+                first_policy_sha,
+                "policy-review-receipt-003",
+                "7".repeat(64),
+                "8".repeat(64),
+                "4".repeat(64),
+                180_i64,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_track_policy_heads
+                    SET head_generation = 3, previous_head_generation = 2,
+                        policy_revision_id = 'policy-revision-000003',
+                        policy_revision_no = 3, canonical_policy_sha256 = ?1,
+                        job_preferences_sha256 = ?2,
+                        review_receipt_id = 'policy-review-receipt-003',
+                        review_receipt_sha256 = ?3,
+                        head_transition_sha256 = ?4,
+                        predecessor_head_transition_sha256 = ?5,
+                        updated_at_ms = 180
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'
+                    AND head_generation = 2 AND head_transition_sha256 = ?5",
+                rusqlite::params![
+                    first_policy_sha,
+                    preferences_sha,
+                    "7".repeat(64),
+                    "8".repeat(64),
+                    "4".repeat(64)
+                ],
+            )
+            .unwrap(),
+            1,
+            "a reviewed reversion must advance rather than overwrite history"
+        );
+        let reverted_head: (i64, i64, String) = conn
+            .query_row(
+                "SELECT head_generation, policy_revision_no, canonical_policy_sha256
+                   FROM jobs_track_policy_heads
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(reverted_head, (3, 3, first_policy_sha.clone()));
+
+        conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000004",
+                4_i64,
+                taxonomy_sha,
+                stale_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                "policy-revision-000003",
+                3_i64,
+                first_policy_sha,
+                "review_required",
+                190_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            receipt_insert,
+            rusqlite::params![
+                "policy-review-receipt-004",
+                "9".repeat(64),
+                receipt_ciphertext,
+                "policy-revision-000004",
+                4_i64,
+                stale_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                200_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_transition_insert,
+            rusqlite::params![
+                4_i64,
+                3_i64,
+                "policy-revision-000004",
+                4_i64,
+                stale_policy_sha,
+                "policy-review-receipt-004",
+                "9".repeat(64),
+                "a".repeat(64),
+                "8".repeat(64),
+                210_i64,
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_resume_source_assets
+                    SET id = 'source-resume-asset-002', sha256 = ?1
+                  WHERE account_id = 'account-policy-001'",
+                rusqlite::params!["f".repeat(64)],
+            )
+            .expect("resume replacement must not rewrite or block immutable policy history"),
+            1
+        );
+
+        assert!(
+            conn.execute(
+                "UPDATE jobs_track_policy_heads
+                    SET head_generation = 4, previous_head_generation = 3,
+                        policy_revision_id = 'policy-revision-000004',
+                        policy_revision_no = 4, canonical_policy_sha256 = ?1,
+                        job_preferences_sha256 = ?2,
+                        review_receipt_id = 'policy-review-receipt-004',
+                        review_receipt_sha256 = ?3,
+                        head_transition_sha256 = ?4,
+                        predecessor_head_transition_sha256 = ?5,
+                        updated_at_ms = 210
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'
+                    AND head_generation = 3 AND head_transition_sha256 = ?5",
+                rusqlite::params![
+                    stale_policy_sha,
+                    preferences_sha,
+                    "9".repeat(64),
+                    "a".repeat(64),
+                    "8".repeat(64)
+                ],
+            )
+            .is_err(),
+            "a head must not advance after its bound resume asset is replaced"
+        );
+        for (table, expected) in [
+            ("jobs_track_policy_revisions", 4_i64),
+            ("jobs_track_policy_review_receipts", 4_i64),
+            ("jobs_track_policy_heads", 1_i64),
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, expected,
+                "resume replacement must preserve {table} history"
+            );
+        }
+        let head_generation: i64 = conn
+            .query_row(
+                "SELECT head_generation FROM jobs_track_policy_heads
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            head_generation, 3,
+            "resume drift must leave the head intact"
+        );
+
+        assert!(conn
+            .execute(
+                "UPDATE jobs_track_policy_review_receipts
+                    SET reviewer_id = 'other-reviewer'
+                  WHERE review_receipt_id = 'policy-review-receipt-001'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_track_policy_heads
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'",
+                [],
+            )
+            .is_err());
+
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_track_policy_revisions
+                  WHERE revision_id = 'policy-revision-000001'",
+                [],
+            )
+            .is_err());
+
+        assert_eq!(
+            conn.execute("DELETE FROM jobs_tracks WHERE id = 'track-policy-001'", [],)
+                .expect("Career Track deletion must cascade its immutable tenant evidence"),
+            1
+        );
+        for table in [
+            "jobs_track_policy_revisions",
+            "jobs_track_policy_review_receipts",
+            "jobs_track_policy_heads",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must follow Career Track deletion");
+        }
+        let remaining_account: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE id = 'account-policy-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_account, 1,
+            "Track deletion must not delete its account"
+        );
+        assert_eq!(
+            conn.execute("DELETE FROM accounts WHERE id = 'account-policy-001'", [],)
+                .unwrap(),
+            1
+        );
+
+        conn.execute_batch(
+            "INSERT INTO accounts(id) VALUES ('account-policy-002');
+             INSERT INTO jobs_tracks(id, account_id)
+               VALUES ('track-policy-002', 'account-policy-002');
+             INSERT INTO jobs_application_identities(
+               id, account_id, verification_status
+             ) VALUES ('identity-verified-002', 'account-policy-002', 'verified');
+             INSERT INTO jobs_resume_source_assets(id, account_id, sha256)
+               VALUES (
+                 'source-resume-asset-002', 'account-policy-002',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+               );
+             INSERT INTO jobs_track_policy_account_input_transitions (
+               input_transition_id, account_id, input_generation,
+               previous_input_generation, input_kind, input_subject_sha256,
+               account_semantic_sha256, input_transition_sha256,
+               predecessor_input_transition_sha256, changed_at_ms
+             ) VALUES (
+               'account-input-transition-002', 'account-policy-002', 1, 0,
+               'baseline',
+               '6666666666666666666666666666666666666666666666666666666666666666',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               NULL, 91
+             );
+             INSERT INTO jobs_track_policy_account_input_heads
+             SELECT account_id, input_generation, previous_input_generation,
+                    input_transition_id, input_kind, input_subject_sha256,
+                    account_semantic_sha256, input_transition_sha256,
+                    predecessor_input_transition_sha256, changed_at_ms
+               FROM jobs_track_policy_account_input_transitions
+              WHERE input_transition_id = 'account-input-transition-002';
+             INSERT INTO jobs_track_policy_track_input_transitions (
+               input_transition_id, account_id, career_track_id, input_generation,
+               previous_input_generation, track_semantic_sha256,
+               input_transition_sha256, predecessor_input_transition_sha256,
+               changed_at_ms
+             ) VALUES (
+               'track-input-transition-002', 'account-policy-002',
+               'track-policy-002', 1, 0,
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               NULL, 92
+             );
+             INSERT INTO jobs_track_policy_track_input_heads
+             SELECT account_id, career_track_id, input_generation,
+                    previous_input_generation, input_transition_id,
+                    track_semantic_sha256, input_transition_sha256,
+                    predecessor_input_transition_sha256, changed_at_ms
+               FROM jobs_track_policy_track_input_transitions
+              WHERE input_transition_id = 'track-input-transition-002';",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute("DELETE FROM accounts WHERE id = 'account-policy-002'", [])
+                .expect("account deletion must cascade through a live Track and its evidence"),
+            1
+        );
+        for table in [
+            "accounts",
+            "jobs_tracks",
+            "jobs_application_identities",
+            "jobs_resume_source_assets",
+            "jobs_track_policy_account_input_transitions",
+            "jobs_track_policy_account_input_heads",
+            "jobs_track_policy_track_input_transitions",
+            "jobs_track_policy_track_input_heads",
+            "jobs_track_policy_revisions",
+            "jobs_track_policy_review_receipts",
+            "jobs_track_policy_heads",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must follow direct account deletion");
+        }
+    }
+
+    #[test]
+    fn operational_holds_require_exact_history_and_monotonic_heads() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(SQLITE_JOBS_OPERATIONAL_HOLDS).unwrap();
+
+        for table in [
+            "jobs_operational_hold_events",
+            "jobs_operational_hold_heads",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must not seed launch authority");
+        }
+
+        let wrong_global_scope = conn.execute(
+            "INSERT INTO jobs_operational_hold_events (
+                event_id, event_ref, event_sha256, canonical_event_base64url, capability,
+                scope_kind, scope_id, revision_no, previous_revision_no,
+                predecessor_event_id, transition, reason_code, reason_ref,
+                recorded_by, recorded_at_ms
+             ) VALUES ('wrong-global', ?1, ?2, 'ZXZlbnQ', 'all', 'global', 'global',
+                       1, NULL, NULL, 'held', 'incident', NULL, 'operator', 1)",
+            rusqlite::params![format!("event-{}", "d".repeat(64)), "d".repeat(64)],
+        );
+        assert!(wrong_global_scope.is_err());
+
+        insert_operational_hold_event(
+            &conn,
+            "hold-1",
+            &"a".repeat(64),
+            1,
+            None,
+            None,
+            "held",
+            "incident",
+            "operator-1",
+            100,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_operational_hold_heads (
+                capability, scope_kind, scope_id, scope_ref, head_revision, current_event_id,
+                current_event_ref, state, updated_by, updated_at_ms
+             ) VALUES ('all', 'global', '*', ?1, 1, 'hold-1', ?2,
+                       'held', 'operator-1', 100)",
+            rusqlite::params![
+                format!("scope-{}", "f".repeat(64)),
+                format!("event-{}", "a".repeat(64)),
+            ],
+        )
+        .unwrap();
+
+        let skipped_revision = insert_operational_hold_event(
+            &conn,
+            "hold-3-skipped",
+            &"c".repeat(64),
+            3,
+            Some(2),
+            Some("hold-2"),
+            "released",
+            "manual_release",
+            "operator-3",
+            300,
+        );
+        assert!(skipped_revision.is_err());
+
+        insert_operational_hold_event(
+            &conn,
+            "hold-2",
+            &"b".repeat(64),
+            2,
+            Some(1),
+            Some("hold-1"),
+            "held",
+            "security_review",
+            "operator-2",
+            200,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_operational_hold_heads
+                SET head_revision = 2, current_event_id = 'hold-2', current_event_ref = ?1,
+                    state = 'held',
+                    updated_by = 'operator-2', updated_at_ms = 200
+              WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+            rusqlite::params![format!("event-{}", "b".repeat(64))],
+        )
+        .expect("held-to-held escalation must advance the exact head");
+
+        insert_operational_hold_event(
+            &conn,
+            "hold-3",
+            &"c".repeat(64),
+            3,
+            Some(2),
+            Some("hold-2"),
+            "released",
+            "manual_release",
+            "operator-3",
+            300,
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_operational_hold_heads
+                    SET head_revision = 3, current_event_id = 'hold-3', current_event_ref = ?1,
+                        state = 'held',
+                        updated_by = 'operator-3', updated_at_ms = 300
+                  WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+                rusqlite::params![format!("event-{}", "c".repeat(64))],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE jobs_operational_hold_heads
+                SET head_revision = 3, current_event_id = 'hold-3', current_event_ref = ?1,
+                    state = 'released',
+                    updated_by = 'operator-3', updated_at_ms = 300
+              WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+            rusqlite::params![format!("event-{}", "c".repeat(64))],
+        )
+        .unwrap();
+
+        let redundant_release = insert_operational_hold_event(
+            &conn,
+            "hold-4-redundant-release",
+            &"d".repeat(64),
+            4,
+            Some(3),
+            Some("hold-3"),
+            "released",
+            "manual_release",
+            "operator-4",
+            400,
+        );
+        assert!(redundant_release.is_err());
+
+        assert!(conn
+            .execute(
+                "UPDATE jobs_operational_hold_events SET reason_code = 'maintenance'
+                  WHERE event_id = 'hold-1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_operational_hold_events WHERE event_id = 'hold-1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_operational_hold_heads
+                  WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn original_source_hold_capability_upgrade_preserves_ledger_and_replays_as_noop() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(SQLITE_JOBS_OPERATIONAL_HOLDS).unwrap();
+        insert_operational_hold_event(
+            &conn,
+            "hold-before-phase-614",
+            &"a".repeat(64),
+            1,
+            None,
+            None,
+            "held",
+            "incident",
+            "operator-1",
+            100,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_operational_hold_heads (
+               capability, scope_kind, scope_id, scope_ref, head_revision, current_event_id,
+               current_event_ref, state, updated_by, updated_at_ms
+             ) VALUES ('all', 'global', '*', ?1, 1, 'hold-before-phase-614', ?2,
+                       'held', 'operator-1', 100)",
+            rusqlite::params![
+                format!("scope-{}", "b".repeat(64)),
+                format!("event-{}", "a".repeat(64)),
+            ],
+        )
+        .unwrap();
+
+        ensure_sqlite_original_source_verification_hold_capability(&mut conn).unwrap();
+        ensure_sqlite_original_source_verification_hold_capability(&mut conn).unwrap();
+
+        for table in [
+            "jobs_operational_hold_events",
+            "jobs_operational_hold_heads",
+        ] {
+            let schema: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(schema.contains("'original_source_verification'"));
+        }
+        let old_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_operational_hold_events
+                  WHERE event_id = 'hold-before-phase-614'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_heads: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_operational_hold_heads
+                  WHERE current_event_id = 'hold-before-phase-614'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((old_events, old_heads), (1, 1));
+        let foreign_key_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_operational_hold_events
+                  WHERE event_id = 'hold-before-phase-614'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn ats_certification_authority_starts_empty_with_immutable_history() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch(SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY)
+            .unwrap();
+        for table in [
+            "jobs_ats_certification_trust_policies",
+            "jobs_ats_certification_trust_keys",
+            "jobs_ats_certification_trust_head",
+            "jobs_ats_certification_evidence",
+            "jobs_ats_certification_layout_observations",
+            "jobs_ats_certification_manifests",
+            "jobs_ats_certification_manifest_layouts",
+            "jobs_ats_certification_manifest_check_results",
+            "jobs_ats_certification_manifest_evidence",
+            "jobs_ats_certification_runtime_targets",
+            "jobs_ats_certification_activations",
+            "jobs_ats_certification_revocations",
+            "jobs_ats_certification_head_transitions",
+            "jobs_ats_certification_heads",
+            "jobs_ats_certification_quarantine_commands",
+            "jobs_ats_certification_quarantine_heads",
+            "jobs_ats_certification_circuit_events",
+            "jobs_ats_certification_circuit_heads",
+            "jobs_ats_certification_runtime_layout_quarantine_evidence",
+            "jobs_ats_certification_canary_allowlists",
+            "jobs_ats_certification_canary_allowlist_members",
+            "jobs_ats_certification_canary_allowlist_revocations",
+            "jobs_application_ats_certification_bindings",
+            "jobs_ats_certification_canary_reservations",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing ATS certification table {table}");
+        }
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_ats_certification_heads",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        let trust_heads: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_ats_certification_trust_head",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trust_heads, 0);
+        for table in [
+            "jobs_ats_certification_circuit_heads",
+            "jobs_ats_certification_runtime_layout_quarantine_evidence",
+            "jobs_ats_certification_canary_allowlists",
+            "jobs_ats_certification_canary_allowlist_members",
+            "jobs_ats_certification_canary_allowlist_revocations",
+            "jobs_application_ats_certification_bindings",
+            "jobs_ats_certification_canary_reservations",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must not grant default authority");
+        }
+    }
+
+    #[test]
+    fn browser_release_authority_uses_immutable_history_and_a_mutable_explicit_head() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch(SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY)
+            .unwrap();
+
+        for table in [
+            "jobs_browser_release_signature_sets",
+            "jobs_browser_release_signatures",
+            "jobs_browser_release_trust_policies",
+            "jobs_browser_release_trust_keys",
+            "jobs_browser_release_manifests",
+            "jobs_browser_release_artifacts",
+            "jobs_browser_release_activations",
+            "jobs_browser_release_rollbacks",
+            "jobs_browser_release_revocations",
+            "jobs_browser_release_channel_transitions",
+            "jobs_browser_release_channel_heads",
+            "jobs_browser_account_channel_assignments",
+            "jobs_local_run_release_bindings",
+            "jobs_local_run_claim_replays",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                      WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing Browser release table {table}");
+        }
+
+        let signature_set_sha256 = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO jobs_browser_release_signature_sets (\
+               signature_set_sha256, signature_set_id, trust_generation, role,\
+               target_audience, target_sha256, signed_at_ms, signature_count,\
+               canonical_signature_set_base64url, recorded_by, recorded_at_ms\
+             ) VALUES (?1, 'signature-set-test', 1, 'release',\
+               'bluey-jobs-browser-release-manifest-v1', ?2, 1, 1, 'YQ',\
+               'migration-test', 1)",
+            rusqlite::params![signature_set_sha256, "b".repeat(64)],
+        )
+        .unwrap();
+        let immutable = conn
+            .execute(
+                "UPDATE jobs_browser_release_signature_sets SET recorded_at_ms = 2 \
+                  WHERE signature_set_sha256 = ?1",
+                rusqlite::params![signature_set_sha256],
+            )
+            .unwrap_err();
+        assert!(
+            format!("{immutable:?}").contains("signature set is immutable"),
+            "unexpected immutable-row error: {immutable:?}"
+        );
+
+        let subject_sha256 = "f".repeat(64);
+        let insert_revocation = |revocation_sha256: &str,
+                                 revocation_id: &str,
+                                 revocation_generation: i64,
+                                 subject_id: &str| {
+            conn.execute(
+                "INSERT INTO jobs_browser_release_revocations (\
+                       revocation_sha256, revocation_id, revocation_generation,\
+                       trust_generation, subject_kind, subject_id, subject_sha256,\
+                       reason_ref, canonical_revocation_base64url,\
+                       authorization_signature_set_sha256, issued_at_ms, recorded_by,\
+                       recorded_at_ms\
+                     ) VALUES (?1, ?2, ?3, 1, 'artifact', ?4, ?5,\
+                       'migration-test', 'YQ', ?6, 1, 'migration-test', 1)",
+                rusqlite::params![
+                    revocation_sha256,
+                    revocation_id,
+                    revocation_generation,
+                    subject_id,
+                    subject_sha256,
+                    signature_set_sha256,
+                ],
+            )
+        };
+        insert_revocation(&"1".repeat(64), "revocation-a", 1, "artifact-a").unwrap();
+        insert_revocation(&"2".repeat(64), "revocation-b", 2, "artifact-b").unwrap();
+        let duplicate_exact_subject =
+            insert_revocation(&"3".repeat(64), "revocation-c", 3, "artifact-a").unwrap_err();
+        assert!(
+            format!("{duplicate_exact_subject:?}").contains("UNIQUE constraint failed"),
+            "unexpected exact-subject uniqueness error: {duplicate_exact_subject:?}"
+        );
+
+        conn.execute(
+            "INSERT INTO jobs_browser_release_channel_heads (\
+               channel, head_revision, current_transition_sha256,\
+               current_activation_sha256, current_manifest_sha256,\
+               current_trust_generation, current_channel_sequence, updated_at_ms\
+             ) VALUES ('internal', 1, ?1, ?2, ?3, 1, 1, 1)",
+            rusqlite::params!["c".repeat(64), "d".repeat(64), "e".repeat(64)],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_browser_release_channel_heads SET updated_at_ms = 2 \
+                  WHERE channel = 'internal' AND head_revision = 1",
+                [],
+            )
+            .unwrap(),
+            1,
+            "the explicit channel head must be CAS-mutable"
+        );
+        let undeletable = conn
+            .execute(
+                "DELETE FROM jobs_browser_release_channel_heads WHERE channel = 'internal'",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            format!("{undeletable:?}").contains("channel head cannot be deleted"),
+            "unexpected channel-head deletion error: {undeletable:?}"
+        );
+    }
 
     #[test]
     fn global_ingestion_quarantine_columns_upgrade_in_place() {
@@ -2262,6 +6608,649 @@ mod sqlite_migration_replay_tests {
             )
             .unwrap();
         assert_eq!(upgraded, (0, "{}".to_string()));
+    }
+
+    #[test]
+    fn workflow_cleanup_zero_observation_requires_the_exact_empty_exhausted_page() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-workflow-zero-proof-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let ciphertext = format!("bluey-jobs:v1:{}", "x".repeat(24));
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_generations (
+                generation, inventory_generation_id, namespace_ciphertext,
+                namespace_hmac_sha256, workflow_type, visibility_cutoff_ms,
+                confirmation_age_ms, visibility_query_ciphertext,
+                query_digest_sha256, query_hmac_sha256, state, scan_pass,
+                page_index, predecessor_page_digest_sha256, next_attempt_at_ms,
+                request_epoch, fence, request_id, first_request_started_at_ms,
+                lease_owner, lease_token_sha256, lease_expires_at_ms,
+                completion_epoch, created_at_ms, updated_at_ms
+             ) VALUES (900610, 'wfinventory-v3-tampered-zero', ?1, ?2,
+                'applicationWorkflow', 1783900800000, 30000, ?1, ?3, ?4,
+                'scanning', 1, 0, ?5, 1000, 1, 1,
+                'wfcleanup-page-tampered-zero', 999, 'test-owner', ?6, 2000,
+                1, 1000, 1000)",
+            rusqlite::params![
+                ciphertext,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+                "1".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_head (
+                singleton_id, generation, inventory_generation_id,
+                query_digest_sha256, updated_at_ms
+             ) VALUES (1, 900610, 'wfinventory-v3-tampered-zero', ?1, 1000)",
+            rusqlite::params!["b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_pages (
+                generation, completion_epoch, scan_pass, page_index,
+                request_epoch, fence, request_id, predecessor_page_digest_sha256,
+                input_page_token_ciphertext, input_page_token_hmac_sha256,
+                next_page_token_ciphertext, next_page_token_hmac_sha256,
+                page_target_count, page_targets_digest_sha256,
+                page_digest_sha256, evidence_digest_sha256, recorded_at_ms
+             ) VALUES (900610, 1, 1, 0, 1, 1,
+                'wfcleanup-page-tampered-zero', NULL, NULL, NULL, NULL, NULL,
+                1, ?1, ?2, ?3, 1000)",
+            rusqlite::params!["e".repeat(64), "f".repeat(64), "0".repeat(64)],
+        )
+        .unwrap();
+
+        let forged = conn.execute(
+            "INSERT INTO jobs_workflow_legacy_zero_observations (
+                generation, completion_epoch, scan_pass, final_page_index,
+                final_page_digest_sha256, zero_digest_sha256, recorded_at_ms
+             ) VALUES (900610, 1, 1, 0, ?1, ?2, 1000)",
+            rusqlite::params!["f".repeat(64), "1".repeat(64)],
+        );
+        assert!(forged.is_err());
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workflow_cleanup_completion_epoch_requires_an_exact_clean_successor() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-workflow-completion-epoch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let ciphertext = format!("bluey-jobs:v1:{}", "x".repeat(24));
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_generations (
+                generation, inventory_generation_id, namespace_ciphertext,
+                namespace_hmac_sha256, workflow_type, visibility_cutoff_ms,
+                confirmation_age_ms, visibility_query_ciphertext,
+                query_digest_sha256, query_hmac_sha256, state, scan_pass,
+                page_index, predecessor_page_digest_sha256, next_attempt_at_ms,
+                completion_epoch, completed_at_ms, completion_digest_sha256,
+                revalidate_after_ms, created_at_ms, updated_at_ms
+             ) VALUES (900611, 'wfinventory-v3-completion-epoch', ?1, ?2,
+                'applicationWorkflow', 1783900800000, 1000, ?1, ?3, ?4,
+                'complete', 2, 0, ?5, 1000, 7, 1000, ?6, 2000, 1000, 1000)",
+            rusqlite::params![
+                ciphertext,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+                "e".repeat(64),
+            ],
+        )
+        .unwrap();
+
+        let mutate_complete = conn.execute(
+            "UPDATE jobs_workflow_legacy_inventory_generations
+                SET page_index = 1
+              WHERE generation = 900611",
+            [],
+        );
+        assert!(mutate_complete.is_err());
+
+        for epoch in [7_i64, 9_i64] {
+            let stale = conn.execute(
+                "UPDATE jobs_workflow_legacy_inventory_generations
+                    SET state = 'scanning', scan_pass = 1, page_index = 0,
+                        predecessor_page_digest_sha256 = ?1,
+                        completion_epoch = ?2, completed_at_ms = NULL,
+                        completion_digest_sha256 = NULL, revalidate_after_ms = NULL,
+                        next_attempt_at_ms = 1001, updated_at_ms = 1001
+                  WHERE generation = 900611",
+                rusqlite::params!["f".repeat(64), epoch],
+            );
+            assert!(stale.is_err(), "completion epoch {epoch} was accepted");
+        }
+
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_workflow_legacy_inventory_generations
+                    SET state = 'scanning', scan_pass = 1, page_index = 0,
+                        predecessor_page_digest_sha256 = ?1,
+                        request_epoch = 0, fence = 0, request_id = NULL,
+                        first_request_started_at_ms = NULL, last_outcome_code = NULL,
+                        lease_owner = NULL, lease_token_sha256 = NULL,
+                        lease_expires_at_ms = NULL, completion_epoch = 8,
+                        first_zero_observed_at_ms = NULL, completed_at_ms = NULL,
+                        completion_digest_sha256 = NULL, revalidate_after_ms = NULL,
+                        next_attempt_at_ms = 1001, updated_at_ms = 1001
+                  WHERE generation = 900611",
+                rusqlite::params!["f".repeat(64)],
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_head (
+                singleton_id, generation, inventory_generation_id,
+                query_digest_sha256, updated_at_ms
+             ) VALUES (1, 900611, 'wfinventory-v3-completion-epoch', ?1, 1001)",
+            rusqlite::params!["b".repeat(64)],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_workflow_legacy_inventory_head WHERE singleton_id = 1",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_workflow_legacy_inventory_generations
+                  WHERE generation = 900611",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE jobs_workflow_legacy_inventory_generations
+                SET state = 'identity_conflict', updated_at_ms = 1002
+              WHERE generation = 900611",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_legacy_inventory_generations
+                    SET state = 'scanning', updated_at_ms = 1003
+                  WHERE generation = 900611",
+                [],
+            )
+            .is_err());
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workflow_cleanup_legacy_proved_tuple_cannot_reuse_an_epoch() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-workflow-legacy-proof-epoch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let ciphertext = format!("bluey-jobs:v1:{}", "x".repeat(24));
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_generations (
+                generation, inventory_generation_id, namespace_ciphertext,
+                namespace_hmac_sha256, workflow_type, visibility_cutoff_ms,
+                confirmation_age_ms, visibility_query_ciphertext,
+                query_digest_sha256, query_hmac_sha256, state, scan_pass,
+                page_index, predecessor_page_digest_sha256, next_attempt_at_ms,
+                request_epoch, fence, request_id, first_request_started_at_ms,
+                lease_owner, lease_token_sha256, lease_expires_at_ms,
+                completion_epoch, created_at_ms, updated_at_ms
+             ) VALUES (900612, 'wfinventory-v3-target-proof', ?1, ?2,
+                'applicationWorkflow', 1783900800000, 1000, ?1, ?3, ?4,
+                'scanning', 1, 0, ?5, 1000, 1, 1,
+                'wfcleanup-page-target-proof', 999, 'test-owner', ?6, 3000,
+                1, 1000, 1000)",
+            rusqlite::params![
+                ciphertext,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+                "1".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_head (
+                singleton_id, generation, inventory_generation_id,
+                query_digest_sha256, updated_at_ms
+             ) VALUES (1, 900612, 'wfinventory-v3-target-proof', ?1, 1000)",
+            rusqlite::params!["b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_pages (
+                generation, completion_epoch, scan_pass, page_index,
+                request_epoch, fence, request_id, predecessor_page_digest_sha256,
+                page_target_count, page_targets_digest_sha256,
+                page_digest_sha256, evidence_digest_sha256, recorded_at_ms
+             ) VALUES (900612, 1, 1, 0, 1, 1,
+                'wfcleanup-page-target-proof', NULL, 1, ?1, ?2, ?3, 1000)",
+            rusqlite::params!["e".repeat(64), "f".repeat(64), "0".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_targets (
+                generation, target_identity_hmac_sha256,
+                workflow_id_ciphertext, workflow_id_hmac_sha256,
+                run_id_ciphertext, run_id_hmac_sha256,
+                first_execution_run_id_ciphertext,
+                first_execution_run_id_hmac_sha256, target_digest_sha256,
+                discovered_completion_epoch, discovered_scan_pass,
+                discovered_page_index, discovered_page_digest_sha256,
+                observed_status, target_state, proof_epoch, observation_pass,
+                first_absence_observed_at_ms, next_attempt_at_ms,
+                absence_proved_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (900612, ?1, ?2, ?3, ?2, ?4, ?2, ?5, ?6,
+                1, 1, 0, ?7, 'closed', 'absence_proved', 4, 2,
+                1000, 2000, 2000, 1000, 2000)",
+            rusqlite::params![
+                "1".repeat(64),
+                ciphertext,
+                "2".repeat(64),
+                "3".repeat(64),
+                "4".repeat(64),
+                "5".repeat(64),
+                "f".repeat(64),
+            ],
+        )
+        .unwrap();
+
+        let mutate_timestamp = conn.execute(
+            "UPDATE jobs_workflow_legacy_targets
+                SET first_absence_observed_at_ms = 999, updated_at_ms = 2001
+              WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+            rusqlite::params!["1".repeat(64)],
+        );
+        assert!(mutate_timestamp.is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_legacy_targets
+                    SET positive_reset_required = 1, updated_at_ms = 2001
+                  WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+                rusqlite::params!["1".repeat(64)],
+            )
+            .is_err());
+        let reuse_epoch = conn.execute(
+            "UPDATE jobs_workflow_legacy_targets
+                SET target_state = 'delete_pending', updated_at_ms = 2001
+              WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+            rusqlite::params!["1".repeat(64)],
+        );
+        assert!(reuse_epoch.is_err());
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_workflow_legacy_targets
+                    SET workflow_id_ciphertext = NULL, run_id_ciphertext = NULL,
+                        first_execution_run_id_ciphertext = NULL,
+                        raw_ids_scrubbed = 1, updated_at_ms = 2001
+                  WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+                rusqlite::params!["1".repeat(64)],
+            )
+            .unwrap(),
+            1
+        );
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_legacy_targets
+                    SET target_state = 'delete_pending', proof_epoch = 5,
+                        observation_pass = 1, first_absence_observed_at_ms = NULL,
+                        absence_proved_at_ms = NULL, request_id = NULL,
+                        first_request_started_at_ms = NULL, lease_owner = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        updated_at_ms = 2002
+                  WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+                rusqlite::params!["1".repeat(64)],
+            )
+            .is_err());
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_workflow_legacy_targets
+                    SET target_state = 'delete_pending', proof_epoch = 5,
+                        observation_pass = 1, first_absence_observed_at_ms = NULL,
+                        absence_proved_at_ms = NULL, request_id = NULL,
+                        first_request_started_at_ms = NULL, lease_owner = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        workflow_id_ciphertext = ?2, run_id_ciphertext = ?2,
+                        first_execution_run_id_ciphertext = ?2,
+                        raw_ids_scrubbed = 0, updated_at_ms = 2002
+                  WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+                rusqlite::params!["1".repeat(64), ciphertext],
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workflow_cleanup_v2_proved_tuple_and_run_set_are_epoch_bound() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-workflow-v2-proof-epoch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account =
+            crate::db::accounts::Account::create(&pool, "v2-proof@bluey.test", "hash").unwrap();
+        let conn = pool.get().unwrap();
+        let ciphertext = format!("bluey-jobs:v1:{}", "x".repeat(24));
+        let workflow_id = "workflow-v2-proof-0001";
+        let request_id = "workflow-request-v2-proof-01";
+        let cleanup_request_id = "wfcleanup-v2-proof-request";
+        let target_set = "6".repeat(64);
+        let target_digest = "8".repeat(64);
+        conn.execute(
+            "INSERT INTO jobs_postings (
+                id, account_id, canonical_key, posting_json, source,
+                company, title, match_score, status, created_at_ms, updated_at_ms
+             ) VALUES ('posting-v2-proof', ?1, 'v2-proof', '{}', 'test',
+                'Bluey', 'Proof', 0, 'matched', 1000, 1000)",
+            rusqlite::params![account.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_applications (
+                id, account_id, job_id, state, application_json,
+                created_at_ms, updated_at_ms
+             ) VALUES ('application-v2-proof', ?1, 'posting-v2-proof',
+                'matched', '{}', 1000, 1000)",
+            rusqlite::params![account.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_commands (
+                id, account_id, application_id, run_id, workflow_id,
+                command_kind, idempotency_key_hmac_sha256, request_id,
+                request_hmac_sha256, payload_hmac_sha256, state, command_json,
+                next_attempt_at_ms, created_at_ms, updated_at_ms
+             ) VALUES ('command-v2-proof', ?1, 'application-v2-proof',
+                'command-run-v2-proof-01', ?2, 'start', ?3, ?4, ?5, ?6,
+                'pending', ?7, 1000, 1000, 1000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                "1".repeat(64),
+                request_id,
+                "2".repeat(64),
+                "3".repeat(64),
+                ciphertext,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_generations (
+                generation, inventory_generation_id, namespace_ciphertext,
+                namespace_hmac_sha256, workflow_type, visibility_cutoff_ms,
+                confirmation_age_ms, visibility_query_ciphertext,
+                query_digest_sha256, query_hmac_sha256, state, scan_pass,
+                page_index, predecessor_page_digest_sha256, next_attempt_at_ms,
+                completion_epoch, created_at_ms, updated_at_ms
+             ) VALUES (900613, 'wfinventory-v3-v2-proof', ?1, ?2,
+                'applicationWorkflow', 1783900800000, 1000, ?1, ?3, ?4,
+                'scanning', 1, 0, ?5, 1000, 1, 1000, 1000)",
+            rusqlite::params![
+                ciphertext,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_head (
+                singleton_id, generation, inventory_generation_id,
+                query_digest_sha256, updated_at_ms
+             ) VALUES (1, 900613, 'wfinventory-v3-v2-proof', ?1, 1000)",
+            rusqlite::params!["b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_generations (
+                account_id, generation, state, target_set_hmac_sha256,
+                target_count, frozen_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, 1, 'frozen', ?2, 1, 1000, 1000, 1000)",
+            rusqlite::params![account.id, target_set],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_targets (
+                account_id, generation, target_set_hmac_sha256, workflow_id,
+                start_command_id, start_request_id, start_payload_hmac_sha256,
+                target_state, fence, cleanup_request_id, lease_owner,
+                lease_token_sha256, lease_expires_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, 1, ?2, ?3, 'command-v2-proof', ?4, ?5,
+                'cleanup_required', 1, ?6, 'test-owner', ?7, 5000, 1000, 1000)",
+            rusqlite::params![
+                account.id,
+                target_set,
+                workflow_id,
+                request_id,
+                "3".repeat(64),
+                cleanup_request_id,
+                "9".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_v2_target_authorities (
+                account_id, workflow_cleanup_generation, workflow_id,
+                known_run_epoch, known_run_set_digest_sha256,
+                target_digest_sha256, observation_pass, request_epoch,
+                cleanup_fence, cleanup_request_id, first_request_started_at_ms,
+                lease_owner, lease_token_sha256, lease_expires_at_ms,
+                next_attempt_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, 1, ?2, 1, ?3, ?4, 1, 1, 1, ?5, 1000,
+                'test-owner', ?6, 5000, 1000, 1000, 1000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                "7".repeat(64),
+                target_digest,
+                cleanup_request_id,
+                "9".repeat(64),
+            ],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs_workflow_cleanup_v2_run_observations (
+                    account_id, workflow_cleanup_generation, workflow_id,
+                    known_run_epoch, observation_pass, subject_kind,
+                    run_id_hmac_sha256, target_digest_sha256, request_epoch,
+                    cleanup_fence, cleanup_request_id, evidence_digest_sha256,
+                    describe_state, history_state, visibility_state, recorded_at_ms
+                 ) VALUES (?1, 1, ?2, 1, 1, 'workflow', ?3, ?4, 1, 1, ?5, ?6,
+                    'not_found', 'not_found', 'not_found', 1000)",
+                rusqlite::params![
+                    account.id,
+                    workflow_id,
+                    "0".repeat(64),
+                    target_digest,
+                    cleanup_request_id,
+                    "a".repeat(64),
+                ],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_account_bindings (
+                account_id, account_generation, workflow_cleanup_generation,
+                cleanup_generation_id, target_set_hmac_sha256, legacy_generation,
+                legacy_inventory_generation_id, legacy_query_digest_sha256,
+                state, created_at_ms, updated_at_ms
+             ) VALUES (?1, 1000, 1, 'wfcleanup-v3-account-proof', ?2, 900613,
+                'wfinventory-v3-v2-proof', ?3, 'draining', 1000, 1000)",
+            rusqlite::params![account.id, target_set, "b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_v2_run_observations (
+                account_id, workflow_cleanup_generation, workflow_id,
+                known_run_epoch, observation_pass, subject_kind,
+                run_id_hmac_sha256, target_digest_sha256, request_epoch,
+                cleanup_fence, cleanup_request_id, evidence_digest_sha256,
+                describe_state, history_state, visibility_state, recorded_at_ms
+             ) VALUES (?1, 1, ?2, 1, 1, 'workflow', ?3, ?4, 1, 1, ?5, ?6,
+                'not_found', 'not_found', 'not_found', 1000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                "0".repeat(64),
+                target_digest,
+                cleanup_request_id,
+                "a".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                SET observation_pass = 2, first_absence_observed_at_ms = 1000,
+                    updated_at_ms = 1001
+              WHERE account_id = ?1 AND workflow_id = ?2",
+            rusqlite::params![account.id, workflow_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_v2_run_observations (
+                account_id, workflow_cleanup_generation, workflow_id,
+                known_run_epoch, observation_pass, subject_kind,
+                run_id_hmac_sha256, target_digest_sha256, request_epoch,
+                cleanup_fence, cleanup_request_id, evidence_digest_sha256,
+                describe_state, history_state, visibility_state, recorded_at_ms
+             ) VALUES (?1, 1, ?2, 1, 2, 'workflow', ?3, ?4, 1, 1, ?5, ?6,
+                'not_found', 'not_found', 'not_found', 2000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                "0".repeat(64),
+                target_digest,
+                cleanup_request_id,
+                "b".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_execution_cleanup_observations (
+                id, account_id, workflow_id, generation,
+                target_set_hmac_sha256, observation_kind,
+                observed_execution_run_id, cleanup_fence,
+                cleanup_request_id, evidence_hmac_sha256, recorded_at_ms
+             ) VALUES ('wfcleanup-v2-absence-proof', ?1, ?2, 1, ?3,
+                'absence_proved', NULL, 1, ?4, ?5, 2000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                target_set,
+                cleanup_request_id,
+                "c".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_workflow_cleanup_targets
+                SET target_state = 'absence_proved', absence_proved_at_ms = 2000,
+                    lease_owner = NULL, lease_token_sha256 = NULL,
+                    lease_expires_at_ms = NULL, updated_at_ms = 2000
+              WHERE account_id = ?1 AND generation = 1 AND workflow_id = ?2",
+            rusqlite::params![account.id, workflow_id],
+        )
+        .unwrap();
+
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                    SET observation_pass = 1, first_absence_observed_at_ms = NULL
+                  WHERE account_id = ?1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                    SET target_digest_sha256 = ?1
+                  WHERE account_id = ?2 AND workflow_id = ?3",
+                rusqlite::params!["d".repeat(64), account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_targets
+                    SET absence_proved_at_ms = 2001
+                  WHERE account_id = ?1 AND generation = 1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                    SET positive_reset_required = 1
+                  WHERE account_id = ?1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_targets
+                    SET first_execution_run_id = '00000000-0000-4000-8000-000000000001'
+                  WHERE account_id = ?1 AND generation = 1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                    SET known_run_epoch = 2, observation_pass = 1,
+                        first_absence_observed_at_ms = NULL,
+                        cleanup_request_id = NULL, first_request_started_at_ms = NULL,
+                        lease_owner = NULL, lease_token_sha256 = NULL,
+                        lease_expires_at_ms = NULL
+                  WHERE account_id = ?1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs_workflow_cleanup_v2_known_runs (
+                    account_id, workflow_cleanup_generation, workflow_id,
+                    run_id_hmac_sha256, run_id_ciphertext,
+                    discovered_request_epoch, discovered_cleanup_fence,
+                    run_identity_digest_sha256, created_at_ms
+                 ) VALUES (?1, 1, ?2, ?3, ?4, 1, 1, ?5, 2001)",
+                rusqlite::params![
+                    account.id,
+                    workflow_id,
+                    "e".repeat(64),
+                    ciphertext,
+                    "f".repeat(64),
+                ],
+            )
+            .is_err());
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2502,15 +7491,1409 @@ mod sqlite_migration_replay_tests {
             "rows older than the fixed maximum window plus grace are deleted"
         );
     }
+
+    #[test]
+    fn jobs_account_objects_are_backfilled_into_the_durable_ledger() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-object-backfill-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account =
+            crate::db::accounts::Account::create(&pool, "jobs-object-backfill@bluey.test", "hash")
+                .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        pool.get()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO jobs_resume_source_assets (
+                    id, account_id, file_name, media_type, file_type, storage_key,
+                    sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'resume-backfill', '{account_id}', 'Resume.pdf', 'application/pdf', 'pdf',
+                    'accounts/{account_id}/jobs/resume-backfill.pdf', '{resume_sha}', 128, 2,
+                    'converted_layout', {now}, {now}
+                 );
+                 INSERT INTO jobs_browser_profile_snapshots (
+                    account_id, browser_profile_id, generation, object_key, sha256,
+                    size_bytes, envelope_version, writer_run_id, writer_fence, updated_at_ms
+                 ) VALUES (
+                    '{account_id}', 'profile-backfill', 4,
+                    'accounts/{account_id}/jobs/profile-backfill.enc', '{profile_sha}',
+                    256, 2, 'run-backfill', 7, {now}
+                 );",
+                account_id = account.id,
+                resume_sha = "a".repeat(64),
+                profile_sha = "b".repeat(64),
+            ))
+            .unwrap();
+
+        run_migrations(&pool).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let rows: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT logical_id, state, metadata_json
+                   FROM object_uploads
+                  WHERE account_id = ?1 AND logical_id LIKE 'jobs-%'
+                  ORDER BY logical_id",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![account.id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].0,
+            format!(
+                "jobs-browser-profile:profile-backfill:4:2:{}",
+                "b".repeat(64)
+            )
+        );
+        assert_eq!(rows[0].1, "ready");
+        assert!(rows[0].2.contains("jobs_browser_profile_snapshot"));
+        assert_eq!(rows[1].0, "jobs-resume-source:resume-backfill");
+        assert_eq!(rows[1].1, "ready");
+        assert!(rows[1].2.contains("jobs_resume_source"));
+        let outbox_counts: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(CASE
+                              WHEN operation = 'put' AND state = 'completed'
+                               AND attempt_count >= 1 AND last_error IS NULL
+                               AND completed_at_ms IS NOT NULL
+                               AND next_attempt_at_ms = completed_at_ms
+                               AND updated_at_ms = completed_at_ms
+                              THEN 1 ELSE 0
+                            END)
+                   FROM object_storage_outbox WHERE account_id = ?1",
+                rusqlite::params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            outbox_counts,
+            (2, 2),
+            "adopted objects need terminal PUT history without runnable PUT work"
+        );
+    }
+
+    #[test]
+    fn jobs_account_object_backfill_replays_over_current_writer_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-current-object-replay-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account = crate::db::accounts::Account::create(
+            &pool,
+            "jobs-current-object-replay@bluey.test",
+            "hash",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let resume_id = "88f64a61-45e5-4d3e-9ad4-a615dfc854f5";
+        let resume_sha = "c".repeat(64);
+        let requested_profile_sha = "d".repeat(64);
+        let resume_key = format!("accounts/{}/jobs/{resume_id}/{resume_sha}.pdf", account.id);
+        let resume_metadata = serde_json::json!({
+            "artifact_class": "jobs_resume_source",
+            "jobs_resume_source_asset_id": resume_id,
+            "request_id": resume_id,
+            "profile_mode": "replace",
+            "base_profile_sha256": null,
+            "requested_profile_sha256": requested_profile_sha,
+            "replaces_source_asset_id": null,
+            "file_name": "Current Resume.pdf",
+            "file_type": "pdf",
+            "media_type": "application/pdf",
+            "page_count": 3,
+            "retention_policy": "account_lifetime_until_deletion",
+        });
+        assert_eq!(resume_metadata.as_object().unwrap().len(), 12);
+        let limits = crate::object_storage::UploadLimits {
+            max_object_bytes: 1_024,
+            max_account_bytes: 4_096,
+            max_daily_bytes: 4_096,
+            max_account_objects: 10,
+        };
+        let resume_input = crate::db::object_uploads::NewObjectUpload {
+            account_id: account.id.clone(),
+            object_kind: crate::db::object_uploads::ObjectKind::Artifact,
+            logical_id: format!("jobs-resume-source:{resume_id}"),
+            session_id: None,
+            storage_scope: crate::db::object_uploads::StorageScope::Artifact,
+            object_key: resume_key.clone(),
+            size_bytes: 128,
+            sha256: resume_sha.clone(),
+            content_type: "application/pdf".to_string(),
+            expires_at_ms: i64::MAX,
+            metadata_json: resume_metadata.clone(),
+            now_ms: now,
+            limits,
+        };
+        let resume_reservation =
+            crate::db::object_uploads::reserve_account_object_upload(&pool, &resume_input).unwrap();
+        let ready_resume = crate::db::object_uploads::mark_upload_ready(
+            &pool,
+            &resume_reservation.upload.id,
+            now + 1,
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_resume_source_assets (
+                    id, account_id, file_name, media_type, file_type, storage_key,
+                    sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'Current Resume.pdf', 'application/pdf', 'pdf', ?3,
+                           ?4, 128, 3, 'converted_layout', ?5, ?6)",
+                rusqlite::params![resume_id, account.id, resume_key, resume_sha, now, now + 1],
+            )
+            .unwrap();
+
+        let browser_profile_id = "profile-current";
+        let browser_sha = "e".repeat(64);
+        let browser_key = format!(
+            "accounts/{}/jobs/browser/{browser_profile_id}/4/{browser_sha}.enc",
+            account.id
+        );
+        let browser_metadata = serde_json::json!({
+            "artifact_class": "jobs_browser_profile_snapshot",
+            "jobs_browser_profile_id": browser_profile_id,
+            "jobs_application_id": "application-current",
+            "jobs_run_id": "run-current",
+            "generation": 4,
+            "expected_generation": 3,
+            "writer_fence": 7,
+            "envelope_version": 2,
+            "retention_policy": "account_lifetime_until_deletion",
+        });
+        assert_eq!(browser_metadata.as_object().unwrap().len(), 9);
+        let browser_input = crate::db::object_uploads::NewObjectUpload {
+            account_id: account.id.clone(),
+            object_kind: crate::db::object_uploads::ObjectKind::Artifact,
+            logical_id: format!("jobs-browser-profile:{browser_profile_id}:4:2:{browser_sha}"),
+            session_id: None,
+            storage_scope: crate::db::object_uploads::StorageScope::Artifact,
+            object_key: browser_key.clone(),
+            size_bytes: 256,
+            sha256: browser_sha.clone(),
+            content_type: crate::db::jobs::BROWSER_PROFILE_SNAPSHOT_CONTENT_TYPE.to_string(),
+            expires_at_ms: i64::MAX,
+            metadata_json: browser_metadata.clone(),
+            now_ms: now + 2,
+            limits,
+        };
+        let browser_reservation =
+            crate::db::object_uploads::reserve_account_object_upload(&pool, &browser_input)
+                .unwrap();
+        let ready_browser = crate::db::object_uploads::mark_upload_ready(
+            &pool,
+            &browser_reservation.upload.id,
+            now + 3,
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_browser_profile_snapshots (
+                    account_id, browser_profile_id, generation, object_key, sha256,
+                    size_bytes, envelope_version, writer_run_id, writer_fence, updated_at_ms
+                 ) VALUES (?1, ?2, 4, ?3, ?4, 256, 2, 'run-current', 7, ?5)",
+                rusqlite::params![
+                    account.id,
+                    browser_profile_id,
+                    browser_key,
+                    browser_sha,
+                    now + 3
+                ],
+            )
+            .unwrap();
+
+        run_migrations(&pool).expect("current writer metadata must survive migration replay");
+
+        let stored_resume = crate::db::object_uploads::artifact_upload(
+            &pool,
+            &account.id,
+            &resume_input.logical_id,
+        )
+        .unwrap()
+        .expect("current resume ledger row");
+        let stored_browser = crate::db::object_uploads::artifact_upload(
+            &pool,
+            &account.id,
+            &browser_input.logical_id,
+        )
+        .unwrap()
+        .expect("current browser ledger row");
+        assert_eq!(stored_resume, ready_resume);
+        assert_eq!(stored_browser, ready_browser);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_resume.metadata_json).unwrap(),
+            resume_metadata
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_browser.metadata_json).unwrap(),
+            browser_metadata
+        );
+
+        let conn = pool.get().unwrap();
+        let resume_pointer: (String, String, String, i64, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT id, storage_key, sha256, size_bytes, page_count, updated_at_ms
+                   FROM jobs_resume_source_assets WHERE account_id = ?1",
+                rusqlite::params![account.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            resume_pointer,
+            (
+                resume_id.to_string(),
+                resume_key,
+                resume_sha,
+                128,
+                Some(3),
+                now + 1,
+            )
+        );
+        let browser_pointer: (String, i64, String, String, i64, i64, String, i64, i64) = conn
+            .query_row(
+                "SELECT browser_profile_id, generation, object_key, sha256, size_bytes,
+                        envelope_version, writer_run_id, writer_fence, updated_at_ms
+                   FROM jobs_browser_profile_snapshots WHERE account_id = ?1",
+                rusqlite::params![account.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            browser_pointer,
+            (
+                browser_profile_id.to_string(),
+                4,
+                browser_key,
+                browser_sha,
+                256,
+                2,
+                "run-current".to_string(),
+                7,
+                now + 3,
+            )
+        );
+        let outboxes = conn
+            .prepare(
+                "SELECT id, upload_id, account_id, operation, state, attempt_count,
+                        next_attempt_at_ms, last_error, created_at_ms, updated_at_ms,
+                        completed_at_ms
+                   FROM object_storage_outbox
+                  WHERE account_id = ?1
+                  ORDER BY upload_id, operation",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![account.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut expected_outboxes = vec![
+            (
+                format!("{}:put", ready_resume.id),
+                ready_resume.id,
+                account.id.clone(),
+                "put".to_string(),
+                "completed".to_string(),
+                1,
+                now + 1,
+                None,
+                now,
+                now + 1,
+                Some(now + 1),
+            ),
+            (
+                format!("{}:put", ready_browser.id),
+                ready_browser.id,
+                account.id.clone(),
+                "put".to_string(),
+                "completed".to_string(),
+                1,
+                now + 3,
+                None,
+                now + 2,
+                now + 3,
+                Some(now + 3),
+            ),
+        ];
+        expected_outboxes.sort_by(|left, right| left.1.cmp(&right.1));
+        assert_eq!(outboxes, expected_outboxes);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM object_uploads WHERE account_id = ?1",
+                rusqlite::params![account.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "migration replay must not add legacy-shaped duplicates"
+        );
+    }
+
+    #[test]
+    fn jobs_account_object_backfill_rejects_a_mismatched_logical_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-object-backfill-conflict-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account = crate::db::accounts::Account::create(
+            &pool,
+            "jobs-object-backfill-conflict@bluey.test",
+            "hash",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        pool.get()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO jobs_resume_source_assets (
+                    id, account_id, file_name, media_type, file_type, storage_key,
+                    sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'resume-conflict', '{account_id}', 'Resume.pdf', 'application/pdf', 'pdf',
+                    'accounts/{account_id}/jobs/resume-conflict.pdf', '{sha}', 128, 2,
+                    'converted_layout', {now}, {now}
+                 );
+                 INSERT INTO object_uploads (
+                    id, account_id, object_kind, logical_id, session_id, storage_scope,
+                    object_key, size_bytes, sha256, content_type, expires_at_ms, state,
+                    metadata_json, created_at_ms, updated_at_ms, uploaded_at_ms
+                 ) VALUES (
+                    'preexisting-resume-conflict', '{account_id}', 'artifact',
+                    'jobs-resume-source:resume-conflict', NULL, 'artifact',
+                    'accounts/{account_id}/jobs/wrong-object.pdf', 128, '{sha}',
+                    'application/pdf', 9223372036854775807, 'ready',
+                    json_object(
+                      'artifact_class', 'jobs_resume_source',
+                      'jobs_resume_source_asset_id', 'resume-conflict',
+                      'file_name', 'Resume.pdf',
+                      'file_type', 'pdf',
+                      'media_type', 'application/pdf',
+                      'page_count', 2,
+                      'retention_policy', 'account_lifetime_until_deletion'
+                    ),
+                    {now}, {now}, {now}
+                 );",
+                account_id = account.id,
+                sha = "c".repeat(64),
+            ))
+            .unwrap();
+
+        let error = run_migrations(&pool)
+            .expect_err("a logical replay with a different object key must fail closed");
+        assert!(
+            format!("{error:#}").contains("CHECK constraint failed"),
+            "unexpected migration error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn jobs_account_object_backfill_rejects_a_mismatched_put_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-object-backfill-put-conflict-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account = crate::db::accounts::Account::create(
+            &pool,
+            "jobs-object-backfill-put-conflict@bluey.test",
+            "hash",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        pool.get()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO jobs_resume_source_assets (
+                    id, account_id, file_name, media_type, file_type, storage_key,
+                    sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'resume-put-conflict', '{account_id}', 'Resume.pdf', 'application/pdf', 'pdf',
+                    'accounts/{account_id}/jobs/resume-put-conflict.pdf', '{sha}', 128, 2,
+                    'converted_layout', {now}, {now}
+                 );",
+                account_id = account.id,
+                sha = "d".repeat(64),
+            ))
+            .unwrap();
+        run_migrations(&pool).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE object_storage_outbox
+                    SET state = 'retry', last_error = 'preexisting drift',
+                        completed_at_ms = NULL
+                  WHERE account_id = ?1 AND operation = 'put'",
+                rusqlite::params![account.id],
+            )
+            .unwrap();
+
+        let error = run_migrations(&pool)
+            .expect_err("a terminal PUT replay with different state must fail closed");
+        assert!(
+            format!("{error:#}").contains("CHECK constraint failed"),
+            "unexpected migration error: {error:#}"
+        );
+    }
+    #[test]
+    fn managed_cloud_execution_lease_schema_survives_fresh_and_replayed_startup() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-managed-cloud-migration-replay-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).expect("open managed-cloud migration database");
+        run_migrations(&pool).expect("fresh managed-cloud migrations");
+        run_migrations(&pool).expect("replayed managed-cloud migrations");
+        let conn = pool.get().expect("managed-cloud migration connection");
+        let mut statement = conn
+            .prepare("PRAGMA table_info(jobs_execution_leases)")
+            .expect("execution lease columns");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query execution lease columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect execution lease columns");
+        for column in [
+            "managed_cloud_workflow_request_id",
+            "managed_cloud_runtime_instance_id",
+            "managed_cloud_runtime_instance_epoch",
+            "managed_cloud_worker_id",
+            "managed_cloud_lease_authority_sha256",
+        ] {
+            assert!(
+                columns.iter().any(|stored| stored == column),
+                "missing {column}"
+            );
+        }
+        let update_trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger'
+                   AND name='trg_jobs_managed_cloud_execution_lease_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud execution lease update trigger");
+        assert!(update_trigger.contains("managed_cloud_worker_id"));
+        assert!(update_trigger.contains("NOT IN (0, 12)"));
+        let receipt_table: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table'
+                   AND name='jobs_managed_cloud_irreversible_effect_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud irreversible receipt table");
+        assert!(receipt_table.contains("PRIMARY KEY(run_id, fence)"));
+        assert!(receipt_table.contains("runtime_instance_epoch"));
+        let runtime_instance_worker_index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index'
+                   AND name='idx_jobs_managed_cloud_runtime_instance_epoch_worker'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud runtime instance/epoch/worker unique index");
+        assert!(runtime_instance_worker_index
+            .contains("runtime_instance_id, instance_epoch, worker_id"));
+        let receipt_insert_trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger'
+                   AND name='trg_jobs_managed_cloud_irreversible_receipt_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud irreversible receipt insert trigger");
+        assert!(receipt_insert_trigger.contains("lease.phase='click_started'"));
+        assert!(receipt_insert_trigger.contains("managed_cloud_worker_id=NEW.worker_id"));
+        let receipt_delete_trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger'
+                   AND name='trg_jobs_managed_cloud_irreversible_receipt_no_delete'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud irreversible receipt delete trigger");
+        assert!(receipt_delete_trigger.contains("jobs_workflow_cleanup_hard_delete_cascade_tokens"));
+        drop(statement);
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod provisioning_migration_boundary_tests {
+    use super::*;
+
+    fn metadata_table_statement(table: &str) -> String {
+        let prefix = format!("CREATE TABLE {table} (");
+        let rest = SQLITE_JOBS_PROVISIONED_RUNTIME_STARTUP
+            .split_once(prefix.as_str())
+            .unwrap()
+            .1;
+        format!("{prefix}{}\n);", rest.split_once("\n);\n").unwrap().0)
+    }
+
+    fn check_metadata_insert(
+        conn: &rusqlite::Connection,
+        table: &str,
+        fields: &std::collections::BTreeMap<&str, rusqlite::types::Value>,
+    ) -> bool {
+        // Check the exact migration table constraints independently of positive
+        // context/resource proof (which has no accepting reader in C1).
+        conn.execute_batch("SAVEPOINT c1_metadata_case;").unwrap();
+        let columns = fields.keys().copied().collect::<Vec<_>>().join(",");
+        let placeholders = vec!["?"; fields.len()].join(",");
+        let result = conn.execute(
+            &format!("INSERT INTO {table}({columns}) VALUES({placeholders})"),
+            rusqlite::params_from_iter(fields.values()),
+        );
+        conn.execute_batch("ROLLBACK TO c1_metadata_case; RELEASE c1_metadata_case;")
+            .unwrap();
+        result.is_ok()
+    }
+
+    #[test]
+    fn c1_sqlite_new_metadata_rejects_null_nul_and_raw_byte_cap_bypasses() {
+        use rusqlite::types::Value;
+        use std::collections::BTreeMap;
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        for table in [
+            "jobs_managed_cloud_queue_generations",
+            "jobs_managed_cloud_preproduction_contexts",
+        ] {
+            conn.execute_batch(&metadata_table_statement(table))
+                .unwrap();
+        }
+        let queue = "jobs_managed_cloud_queue_generations";
+        let context = "jobs_managed_cloud_preproduction_contexts";
+        let mut q = BTreeMap::new();
+        for (key, value) in [
+            ("queue_generation_id", "q".repeat(20)),
+            ("issuance_ref", "i".repeat(20)),
+            ("environment", "staging".into()),
+            ("region", "us-east-1".into()),
+            ("channel", "canary".into()),
+            ("purpose", "nonproduction_synthetic".into()),
+            ("namespace", "n".repeat(240)),
+            ("task_queue", "t".repeat(240)),
+            ("task_queue_sha256", "a".repeat(64)),
+        ] {
+            q.insert(key, Value::Text(value));
+        }
+        q.insert("created_at_ms", Value::Integer(1));
+        assert!(check_metadata_insert(&conn, queue, &q));
+        for key in ["queue_generation_id", "issuance_ref"] {
+            for length in [20, 128] {
+                let mut good = q.clone();
+                good.insert(key, Value::Text("q".repeat(length)));
+                assert!(check_metadata_insert(&conn, queue, &good));
+            }
+        }
+        for key in q.keys().copied().collect::<Vec<_>>() {
+            let Value::Text(original) = &q[key] else {
+                continue;
+            };
+            let mut bad = q.clone();
+            bad.insert(key, Value::Text(format!("{original}\0suffix")));
+            assert!(
+                !check_metadata_insert(&conn, queue, &bad),
+                "NUL accepted in queue {key}"
+            );
+        }
+        let mut bad = q.clone();
+        bad.insert("queue_generation_id", Value::Null);
+        assert!(!check_metadata_insert(&conn, queue, &bad));
+        let mut bad = q.clone();
+        bad.insert(
+            "task_queue_sha256",
+            Value::Text(format!("a\0{}", "b".repeat(62))),
+        );
+        assert!(!check_metadata_insert(&conn, queue, &bad));
+        let mut c = BTreeMap::new();
+        for (key, value) in [
+            ("context_sha256", "a".repeat(64)),
+            ("context_id", "c".repeat(20)),
+            ("environment", "staging".into()),
+            ("region", "us-east-1".into()),
+            ("channel", "canary".into()),
+            ("purpose", "nonproduction_synthetic".into()),
+            ("source_commit", "a".repeat(40)),
+            ("component_set_sha256", "a".repeat(64)),
+            ("db_instance_sha256", "a".repeat(64)),
+            ("private_resource_set_sha256", "a".repeat(64)),
+            ("namespace", "n".repeat(240)),
+            ("task_queue", "t".repeat(240)),
+            ("queue_generation_id", "q".repeat(20)),
+            ("task_queue_sha256", "a".repeat(64)),
+            ("egress_policy_sha256", "a".repeat(64)),
+            ("cohort_sha256", "a".repeat(64)),
+            ("canonical_context_base64url", "A".repeat(174763)),
+            ("authorization_signature_set_sha256", "a".repeat(64)),
+            ("recorded_by", "r".repeat(240)),
+        ] {
+            c.insert(key, Value::Text(value));
+        }
+        for (key, value) in [
+            ("trust_generation", 1),
+            ("issued_at_ms", 1),
+            ("not_before_ms", 1),
+            ("expires_at_ms", 86_400_001),
+            ("recorded_at_ms", 1),
+        ] {
+            c.insert(key, Value::Integer(value));
+        }
+        assert!(check_metadata_insert(&conn, context, &c));
+        for key in c.keys().copied().collect::<Vec<_>>() {
+            let Value::Text(original) = &c[key] else {
+                continue;
+            };
+            let mut bad = c.clone();
+            bad.insert(key, Value::Text(format!("{original}\0suffix")));
+            assert!(
+                !check_metadata_insert(&conn, context, &bad),
+                "NUL accepted in context {key}"
+            );
+            if key.ends_with("sha256") || key == "source_commit" {
+                let mut bad = c.clone();
+                bad.insert(
+                    key,
+                    Value::Text(format!("a\0{}", "b".repeat(original.len() - 2))),
+                );
+                assert!(
+                    !check_metadata_insert(&conn, context, &bad),
+                    "same-byte NUL accepted in {key}"
+                );
+            }
+        }
+        for (key, value) in [
+            ("context_sha256", Value::Null),
+            (
+                "canonical_context_base64url",
+                Value::Text(format!("A\0{}", "A".repeat(174763))),
+            ),
+            (
+                "canonical_context_base64url",
+                Value::Text("A".repeat(174764)),
+            ),
+            ("expires_at_ms", Value::Integer(86_400_002)),
+            ("environment", Value::Text("production".into())),
+            ("channel", Value::Text("general".into())),
+        ] {
+            let mut bad = c.clone();
+            bad.insert(key, value);
+            assert!(!check_metadata_insert(&conn, context, &bad));
+        }
+    }
+
+    #[test]
+    fn c1_postgres_transaction_boundaries_are_exact_and_driver_owned() {
+        let body = postgres_provisioned_runtime_body(POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP)
+            .expect("reviewed standalone operator file has one outer transaction");
+        assert!(body.contains("current_setting('bluey.migration_table', true)"));
+        assert!(body.contains("ledger := 'bluey_schema_migrations'"));
+        assert!(body.contains("octet_length(ledger) > 63"));
+        assert!(body.contains(
+            "format('INSERT INTO %I(version) VALUES ($1) ON CONFLICT(version) DO NOTHING', ledger)"
+        ));
+        assert!(body.contains("USING '045_jobs_provisioned_runtime_startup.sql';"));
+        assert!(!body
+            .lines()
+            .any(|line| line == "BEGIN;" || line == "COMMIT;"));
+        for changed in [
+            POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP.replacen("\nBEGIN;\n", "\n", 1),
+            POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP.replacen(
+                "\nBEGIN;\n",
+                "\nBEGIN;\nBEGIN;\n",
+                1,
+            ),
+            POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP.replacen("\nCOMMIT;", "", 1),
+            POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP.replacen(
+                "\nCOMMIT;",
+                "\nCOMMIT;\nCOMMIT;",
+                1,
+            ),
+            POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP.replacen(
+                "\nBEGIN;\n",
+                "\nBEGIN;\nCOMMIT;\n",
+                1,
+            ),
+            format!("SELECT 1;\n{POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP}"),
+            format!("{POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP}\nSELECT 1;"),
+            POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP.replacen("\nBEGIN;\n", "\nBEGIN WORK;\n", 1),
+            POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP.replacen("\nCOMMIT;", "\nCOMMIT WORK;", 1),
+        ] {
+            assert!(postgres_provisioned_runtime_body(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn c1_postgres_040_replay_preserves_locked_physical_audience_shape() {
+        let version = JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID;
+        let original = POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY;
+        let prior =
+            adapt_postgres_audience_replay(version, original, SignatureAudienceShape::Eight)
+                .unwrap();
+        assert!(matches!(&prior, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(prior, original);
+        let replay =
+            adapt_postgres_audience_replay(version, original, SignatureAudienceShape::Thirteen)
+                .unwrap();
+        for audience in [
+            "provisioning-v4",
+            "preproduction-context-v1",
+            "serving-latch-v1",
+        ] {
+            assert_eq!(
+                replay
+                    .matches(&format!("'bluey-jobs-managed-cloud-{audience}'"))
+                    .count(),
+                1
+            );
+            assert!(!original.contains(audience));
+        }
+        let successor =
+            adapt_postgres_audience_replay(version, original, SignatureAudienceShape::Fourteen)
+                .unwrap();
+        assert_eq!(
+            successor
+                .matches("'bluey-jobs-managed-cloud-process-attachment-v1'")
+                .count(),
+            1
+        );
+        assert!(adapt_postgres_audience_replay(
+            "another.sql",
+            original,
+            SignatureAudienceShape::Fourteen
+        )
+        .is_err());
+        assert!(adapt_postgres_audience_replay(
+            version,
+            "SELECT 1;",
+            SignatureAudienceShape::Fourteen
+        )
+        .is_err());
+        assert!(POSTGRES_JOBS_PROVISIONED_RUNTIME_STARTUP
+            .contains("USING '045_jobs_provisioned_runtime_startup.sql';"));
+        let sqlite_tail_start = MIGRATIONS
+            .iter()
+            .position(|migration| *migration == SQLITE_JOBS_PROVISIONED_RUNTIME_STARTUP)
+            .expect("SQLite startup migration remains registered");
+        assert_eq!(
+            &MIGRATIONS[sqlite_tail_start..],
+            &[
+                SQLITE_JOBS_PROVISIONED_RUNTIME_STARTUP,
+                SQLITE_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS,
+                SQLITE_JOBS_ATS_STORAGE_FENCES,
+                SQLITE_JOBS_APPLICATION_ANSWER_REVISIONS,
+                SQLITE_JOBS_WORKDAY_RECONCILIATION_HOLDS,
+                SQLITE_JOBS_MCP_READ_GRANTS,
+            ]
+        );
+        let postgres_tail_start = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .position(|(migration, _)| *migration == JOBS_PROVISIONED_RUNTIME_STARTUP_MIGRATION_ID)
+            .expect("PostgreSQL startup migration remains registered");
+        let postgres_tail = POSTGRES_POST_JOBS_MIGRATIONS[postgres_tail_start..]
+            .iter()
+            .map(|(migration, _)| *migration)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            postgres_tail,
+            vec![
+                JOBS_PROVISIONED_RUNTIME_STARTUP_MIGRATION_ID,
+                JOBS_PROVISIONED_RUNTIME_OBSERVATIONS_MIGRATION_ID,
+                JOBS_ATS_STORAGE_FENCES_MIGRATION_ID,
+                JOBS_APPLICATION_ANSWER_REVISIONS_MIGRATION_ID,
+                JOBS_PROCESS_ATTACHMENT_SIGNATURE_AUDIENCE_MIGRATION_ID,
+                JOBS_WORKDAY_RECONCILIATION_HOLDS_MIGRATION_ID,
+                JOBS_MCP_READ_GRANTS_MIGRATION_ID,
+                JOBS_MANAGED_CLOUD_RELEASE_V4_AUDIENCES_MIGRATION_ID,
+            ]
+        );
+    }
+
+    #[test]
+    fn c3_sqlite_replay_selects_only_the_reviewed_guard_block() {
+        let guards = sqlite_provisioned_observation_replay_guards(
+            SQLITE_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS,
+        )
+        .unwrap();
+        assert!(guards.contains("CREATE TRIGGER"));
+        assert!(guards.contains("NEW.protocol_version=1"));
+        assert!(guards.contains("NEW.protocol_version=2"));
+        const BEGIN: &str = "-- C3_REPLAY_SAFE_BOOT_GUARDS_BEGIN\n";
+        const END: &str = "-- C3_REPLAY_SAFE_BOOT_GUARDS_END\n";
+        for changed in [
+            guards.to_owned(),
+            format!("{BEGIN}{BEGIN}{guards}{END}"),
+            format!("{BEGIN}{guards}{END}{END}"),
+            format!("{END}{guards}{BEGIN}"),
+            format!("{BEGIN} \n{END}"),
+        ] {
+            assert!(sqlite_provisioned_observation_replay_guards(&changed).is_err());
+        }
+        for statement in [
+            "ALTER TABLE x ADD COLUMN y TEXT;",
+            "CREATE TABLE x(y TEXT);",
+            "DROP TABLE x;",
+            "PRAGMA foreign_keys=OFF;",
+            "COMMIT;",
+            "ROLLBACK;",
+            "BEGIN IMMEDIATE;",
+            "BEGIN TRANSACTION;",
+            "INSERT INTO bluey_data_migrations VALUES('invalid');",
+        ] {
+            let changed = format!("{BEGIN}{guards}\n{statement}\n{END}");
+            assert!(sqlite_provisioned_observation_replay_guards(&changed).is_err());
+        }
+    }
+
+    #[test]
+    fn c3_postgres_observation_transaction_boundaries_are_driver_owned() {
+        let original = POSTGRES_JOBS_PROVISIONED_RUNTIME_OBSERVATIONS;
+        let body = postgres_provisioned_runtime_body_for_version(original, "046").unwrap();
+        assert!(body.contains("current_setting('bluey.migration_table', true)"));
+        assert!(body.contains("ledger := 'bluey_schema_migrations'"));
+        assert!(body.contains("octet_length(ledger) > 63"));
+        assert!(body.contains(
+            "format('INSERT INTO %I(version) VALUES ($1) ON CONFLICT(version) DO NOTHING', ledger)"
+        ));
+        assert!(body.contains("USING '046_jobs_provisioned_runtime_observations.sql';"));
+        assert!(!body
+            .lines()
+            .any(|line| line == "BEGIN;" || line == "COMMIT;"));
+        assert!(postgres_provisioned_runtime_body_for_version(original, "047").is_err());
+        for changed in [
+            original.replacen("\nBEGIN;\n", "\n", 1),
+            original.replacen("\nBEGIN;\n", "\nBEGIN;\nBEGIN;\n", 1),
+            original.replacen("\nCOMMIT;", "", 1),
+            original.replacen("\nCOMMIT;", "\nCOMMIT;\nCOMMIT;", 1),
+            original.replacen("\nBEGIN;\n", "\nBEGIN;\nCOMMIT;\n", 1),
+            format!("SELECT 1;\n{original}"),
+            format!("{original}\nSELECT 1;"),
+            original.replacen("\nBEGIN;\n", "\nBEGIN WORK;\n", 1),
+            original.replacen("\nCOMMIT;", "\nCOMMIT WORK;", 1),
+        ] {
+            assert!(postgres_provisioned_runtime_body_for_version(&changed, "046").is_err());
+        }
+    }
+
+    #[test]
+    fn c3_sqlite_applied_marker_refreshes_guards_without_repeating_one_shot_ddl() {
+        const BEGIN: &str = "-- C3_REPLAY_SAFE_BOOT_GUARDS_BEGIN\n";
+        const END: &str = "-- C3_REPLAY_SAFE_BOOT_GUARDS_END\n";
+        for foreign_keys in [false, true] {
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE bluey_data_migrations(name TEXT PRIMARY KEY);
+                 CREATE TABLE c3_owned_unit_rows(id INTEGER PRIMARY KEY);
+                 INSERT INTO c3_owned_unit_rows VALUES(7);",
+            )
+            .unwrap();
+            // A tiny labelled unit migration exercises the real executor's
+            // marker/transaction behavior, not the production schema's validity.
+            let guard = "DROP TRIGGER IF EXISTS c3_unit_guard;
+                CREATE TRIGGER c3_unit_guard BEFORE DELETE ON c3_owned_unit_rows
+                BEGIN SELECT RAISE(ABORT, 'unit row is immutable'); END;";
+            let migration = format!(
+                "PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;
+                 CREATE TABLE c3_one_shot(id INTEGER PRIMARY KEY);
+                 {BEGIN}{guard}\n{END}
+                 INSERT INTO bluey_data_migrations(name)
+                 VALUES('jobs-provisioned-runtime-observations-storage-v1');
+                 COMMIT;"
+            );
+            execute_sqlite_provisioned_runtime_observations_migration(&mut conn, &migration)
+                .unwrap();
+            conn.execute_batch("DROP TRIGGER c3_unit_guard;").unwrap();
+            execute_sqlite_provisioned_runtime_observations_migration(&mut conn, &migration)
+                .expect("second run must refresh only the guard, not recreate the table/marker");
+            assert!(conn.execute("DELETE FROM c3_owned_unit_rows", []).is_err());
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.pragma_query_value::<bool, _>(None, "foreign_keys", |row| row.get(0))
+                    .unwrap(),
+                foreign_keys
+            );
+            let interrupted = migration.replacen(
+                "CREATE TRIGGER c3_unit_guard",
+                "SELECT * FROM c3_missing_relation; CREATE TRIGGER c3_unit_guard",
+                1,
+            );
+            assert!(execute_sqlite_provisioned_runtime_observations_migration(
+                &mut conn,
+                &interrupted
+            )
+            .is_err());
+            // The failed refresh rolled the DROP back, preserving the old guard.
+            assert!(conn.execute("DELETE FROM c3_owned_unit_rows", []).is_err());
+            assert!(conn.is_autocommit());
+            assert_eq!(
+                conn.pragma_query_value::<bool, _>(None, "foreign_keys", |row| row.get(0))
+                    .unwrap(),
+                foreign_keys
+            );
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM c3_owned_unit_rows", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn c1_sqlite_failure_before_marker_restores_schema_and_connection() {
+        for foreign_keys in [false, true] {
+            for suffix in ["SELECT * FROM c1_missing_relation;", ""] {
+                let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+                conn.pragma_update(None, "foreign_keys", foreign_keys)
+                    .unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE bluey_data_migrations(name TEXT PRIMARY KEY);
+                    CREATE TABLE c1_prior(id INTEGER PRIMARY KEY);
+                    INSERT INTO c1_prior VALUES(7);",
+                )
+                .unwrap();
+                let interrupted = format!(
+                    "PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;
+                    CREATE TABLE c1_partial(id INTEGER PRIMARY KEY); {suffix}"
+                );
+                assert!(
+                    execute_sqlite_provisioned_runtime_migration(&mut conn, &interrupted).is_err()
+                );
+                assert!(conn.is_autocommit());
+                let restored: bool = conn
+                    .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+                    .unwrap();
+                assert_eq!(restored, foreign_keys);
+                let partial: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name='c1_partial'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(partial, 0);
+                let marker: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM bluey_data_migrations", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(marker, 0);
+                conn.execute("INSERT INTO c1_prior VALUES(8)", [])
+                    .expect("connection usable after rollback");
+                conn.execute_batch("BEGIN;").unwrap();
+                assert!(
+                    execute_sqlite_provisioned_runtime_migration(&mut conn, "SELECT 1;").is_err()
+                );
+                assert!(!conn.is_autocommit());
+                conn.execute_batch("ROLLBACK;").unwrap();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod postgres_migration_tests {
     use super::{
-        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
-        POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
-        SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+        ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
+        JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID, JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
+        JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
+        JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID, JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
+        JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
+        JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID,
+        JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
+        JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
+        JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID,
+        JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID,
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
+        JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
+        JOBS_WORKSPACE_PAGINATION_MIGRATION_ID, MIGRATIONS, POSTGRES_ACCOUNT_DELETION_INTENTS,
+        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+        POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY, POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY,
+        POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+        POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY, POSTGRES_JOBS_OPERATIONAL_HOLDS,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY, POSTGRES_JOBS_PUBLIC_BETA_ACCESS,
+        POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
+        POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+        POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+        POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+        POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+        POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_JOBS_WORKSPACE_PAGINATION, POSTGRES_MIGRATIONS,
+        POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
+        SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
+        SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+        SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+        SQLITE_JOBS_OPERATIONAL_HOLDS, SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+        SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY, SQLITE_JOBS_PUBLIC_BETA_ACCESS,
+        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+        SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+        SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+        SQLITE_JOBS_WORKFLOW_COMMANDS, SQLITE_JOBS_WORKSPACE_PAGINATION,
     };
+
+    #[test]
+    fn attempt_employer_identity_migrations_are_registered_and_additive() {
+        assert!(MIGRATIONS.contains(&super::SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY));
+        let registered = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| *id == super::JOBS_ATTEMPT_EMPLOYER_IDENTITY_MIGRATION_ID)
+            .expect("employer binding migration must be registered");
+        assert_eq!(registered.0, "044_jobs_attempt_employer_identity.sql");
+        assert_eq!(registered.1, super::POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY);
+        assert!(!super::SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY.contains("ADD COLUMN"));
+        for sql in [
+            super::SQLITE_JOBS_ATTEMPT_EMPLOYER_IDENTITY,
+            super::POSTGRES_JOBS_ATTEMPT_EMPLOYER_IDENTITY,
+        ] {
+            assert!(sql.contains("idx_jobs_attempt_reservations_active_employer_id"));
+            assert!(sql.contains("idx_jobs_attempt_reservations_active_employer_domain"));
+            assert!(sql.contains("'reserved', 'running', 'side_effect_unknown', 'submitted'"));
+            assert!(sql.contains("attempt employer identity is immutable"));
+            assert!(sql.contains("submitted attempt status is irreversible"));
+            assert!(sql.contains("unknown attempt requires reconciliation before reentry"));
+            assert!(
+                sql.contains("NEW.status NOT IN ('side_effect_unknown', 'submitted', 'released')")
+            );
+            assert!(sql.contains("OLD.status = 'released' AND NEW.status = 'reserved'"));
+            assert!(
+                sql.contains("NEW.status NOT IN ('released', 'side_effect_unknown', 'submitted')")
+            );
+            assert!(!sql.contains("UPDATE jobs_attempt_reservations"));
+            assert!(!sql.contains("DELETE FROM jobs_attempt_reservations"));
+            assert!(!sql.contains("DROP TABLE"));
+            assert!(!sql.contains("DROP INDEX"));
+        }
+    }
+
+    #[test]
+    fn heartbeat_boot_generation_fence_migrations_are_registered() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| {
+                *id == JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE_MIGRATION_ID
+            })
+            .expect("heartbeat fence migration must be registered");
+        assert_eq!(
+            *version,
+            "042_jobs_source_verifier_heartbeat_boot_generation_fence.sql"
+        );
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE
+        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE));
+        for sql in [
+            SQLITE_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+            POSTGRES_JOBS_SOURCE_VERIFIER_HEARTBEAT_BOOT_GENERATION_FENCE,
+        ] {
+            assert!(sql.contains("committed readiness cannot be lowered"));
+            assert!(sql.contains("ready_boot_generation IS NOT NULL"));
+            assert!(sql.contains("current_boot_generation <= head.ready_boot_generation"));
+            // Must stay replay-safe: no ADD COLUMN on the heartbeat table.
+            assert!(!sql.contains("ADD COLUMN"));
+        }
+    }
+
+    #[test]
+    fn source_verifier_boot_generation_migrations_are_registered() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| *id == JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY_MIGRATION_ID)
+            .expect("source-verifier boot generation migration must be registered");
+        assert_eq!(
+            *version,
+            "041_jobs_source_verifier_boot_generation_authority.sql"
+        );
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY
+        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY));
+        for sql in [
+            SQLITE_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+            POSTGRES_JOBS_SOURCE_VERIFIER_BOOT_GENERATION_AUTHORITY,
+        ] {
+            assert!(sql.contains("jobs_managed_cloud_source_verifier_boot_generation_heads"));
+            assert!(sql.contains("jobs_managed_cloud_source_verifier_boot_registrations"));
+            assert!(sql.contains("jobs_managed_cloud_source_verifier_boot_startup_authorities"));
+            assert!(sql.contains("source_verifier_boot"));
+            assert!(sql.contains("current_boot_generation"));
+            assert!(sql.contains("ready_boot_generation"));
+            assert!(sql.contains("registration_request_id"));
+            assert!(sql.contains("canonical_response_base64url"));
+        }
+        assert!(!SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY
+            .contains("source_verifier_boot"));
+    }
+
+    #[test]
+    fn original_source_verifier_startup_migrations_are_registered_and_version_scoped() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| *id == JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY_MIGRATION_ID)
+            .expect("source-verifier startup migration must be registered");
+        assert_eq!(
+            *version,
+            "040_jobs_original_source_verifier_startup_authority.sql"
+        );
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY
+        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY));
+        for sql in [
+            SQLITE_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+            POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFIER_STARTUP_AUTHORITY,
+        ] {
+            assert!(sql.contains("jobs_managed_cloud_original_source_verifier_startup_authorities"));
+            assert!(sql.contains("source_verifier_startup"));
+            assert!(sql.contains("degraded_heartbeat_sequence"));
+            assert!(sql.contains("ready_heartbeat_sequence"));
+            assert!(sql.contains("canonical_response_base64url"));
+        }
+    }
+
+    #[test]
+    fn workflow_cleanup_migrations_are_dialect_parity_and_fail_closed() {
+        let postgres = POSTGRES_JOBS_WORKFLOW_COMMANDS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sqlite = SQLITE_JOBS_WORKFLOW_COMMANDS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let postgres_authority = POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sqlite_authority = SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .any(|(id, sql)| *id == JOBS_WORKFLOW_COMMANDS_MIGRATION_ID
+                && *sql == POSTGRES_JOBS_WORKFLOW_COMMANDS));
+        assert!(POSTGRES_POST_JOBS_MIGRATIONS.iter().any(|(id, sql)| {
+            *id == JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID
+                && *sql == POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY
+        }));
+        assert!(postgres.contains(
+            "legacy_reconciled BOOLEAN NOT NULL DEFAULT FALSE CHECK(NOT legacy_reconciled)"
+        ));
+        assert!(sqlite
+            .contains("legacy_reconciled INTEGER NOT NULL DEFAULT 0 CHECK(legacy_reconciled = 0)"));
+        assert!(postgres.contains("legacy_unresolved_count BETWEEN 1 AND 9007199254740991"));
+        assert!(sqlite.contains("legacy_unresolved_count BETWEEN 1 AND 9007199254740991"));
+        for schema in [&postgres, &sqlite] {
+            assert!(schema.contains("cleanup_request_id"));
+            assert!(schema.contains("cleanup_fence"));
+            assert!(schema.contains("observation_kind = 'absence_proved'"));
+            assert!(schema.matches("target_state = 'absence_proved'").count() >= 3);
+            assert!(
+                schema.contains("firstExecutionRunId") || schema.contains("first_execution_run_id")
+            );
+        }
+        let legacy_positive_reset_error =
+            "workflow legacy positive evidence requires a new proof epoch";
+        let v2_proof_tuple_error = "workflow v2 proof tuple must advance from immutable evidence";
+        for schema in [&postgres_authority, &sqlite_authority] {
+            assert!(schema.contains("jobs_workflow_legacy_inventory_pages"));
+            assert!(schema.contains("jobs_workflow_legacy_zero_observations"));
+            assert!(schema.contains("final_page_index"));
+            assert!(schema.contains("page_target_count = 0"));
+            assert!(schema.contains("page_index BETWEEN 0 AND 4095"));
+            assert!(schema.contains("raw_ciphertexts_scrubbed"));
+            assert!(schema.contains("raw_ids_scrubbed"));
+            assert!(schema.contains("positive_reset_required"));
+            assert!(schema.contains("workflow legacy page is not current request authority"));
+            assert!(schema.contains(legacy_positive_reset_error));
+            assert!(schema.contains("generation.state IN ('scanning', 'draining')"));
+            assert!(
+                schema.contains("workflow legacy completion epoch must advance and reopen cleanly")
+            );
+            assert!(
+                schema.contains("workflow legacy target terminal state requires a new proof epoch")
+            );
+            assert!(schema.contains("jobs_workflow_cleanup_v2_run_observations"));
+            assert!(schema.contains("known_run_epoch"));
+            assert!(schema.contains("workflow v2 known run set exceeds 32"));
+            assert!(schema.contains(v2_proof_tuple_error));
+            assert!(schema.contains("workflow v2 proved target is immutable"));
+            assert!(schema.contains("workflow v2 terminal positive-reset authority is immutable"));
+            assert!(schema.contains("first.recorded_at_ms = NEW.first_absence_observed_at_ms"));
+            assert!(schema.contains("NEW.absence_proved_at_ms >= second.recorded_at_ms"));
+            assert!(schema.contains("legacy.revalidate_after_ms"));
+            assert!(schema.contains("jobs_workflow_cleanup_object_sweep_scopes"));
+            assert!(schema.contains("jobs_workflow_cleanup_object_sweep_authorization_scopes"));
+            assert!(schema.contains("jobs_workflow_cleanup_hard_delete_cascade_tokens"));
+            assert!(schema.contains("ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED"));
+            assert!(schema.contains(
+                "NOT EXISTS (SELECT 1 FROM accounts account WHERE account.id = OLD.account_id)"
+            ));
+            assert!(schema.contains("OR EXISTS (SELECT 1 FROM jobs_workflow_commands"));
+        }
+        assert!(postgres_authority.contains("prefix_sweep BOOLEAN NOT NULL CHECK(prefix_sweep)"));
+        assert!(sqlite_authority.contains("prefix_sweep INTEGER NOT NULL CHECK(prefix_sweep = 1)"));
+        assert!(
+            postgres_authority
+                .matches("request_id ~ '^[A-Za-z0-9_-]{20,128}$'")
+                .count()
+                >= 6
+        );
+        assert!(
+            sqlite_authority
+                .matches("request_id NOT GLOB '*[^A-Za-z0-9_-]*'")
+                .count()
+                >= 6
+        );
+        assert!(!postgres_authority
+            .contains("FROM jobs_workflow_cleanup_object_sweep_authorizations authorization"));
+        let postgres_drop_hard_delete = postgres_authority
+            .find("DROP VIEW IF EXISTS jobs_workflow_cleanup_hard_delete_ready")
+            .unwrap();
+        let postgres_drop_ready_sweeps = postgres_authority
+            .find("DROP VIEW IF EXISTS jobs_workflow_cleanup_ready_object_sweeps")
+            .unwrap();
+        let postgres_drop_v2_proved = postgres_authority
+            .find("DROP VIEW IF EXISTS jobs_workflow_cleanup_v2_proved_targets")
+            .unwrap();
+        assert!(postgres_drop_hard_delete < postgres_drop_ready_sweeps);
+        assert!(postgres_drop_ready_sweeps < postgres_drop_v2_proved);
+        assert!(postgres_authority.contains(
+            "second.recorded_at_ms >= first.recorded_at_ms + generation.confirmation_age_ms"
+        ));
+        assert!(sqlite_authority.contains(
+            "second.recorded_at_ms >= first.recorded_at_ms + generation.confirmation_age_ms"
+        ));
+        assert!(postgres_authority
+            .contains("NEW.first_execution_run_id IS DISTINCT FROM OLD.first_execution_run_id"));
+        assert!(sqlite_authority
+            .contains("NEW.first_execution_run_id IS NOT OLD.first_execution_run_id"));
+        let postgres_v2_observation_start = concat!(
+            "CREATE OR REPLACE FUNCTION ",
+            "validate_jobs_workflow_cleanup_v2_observation_insert"
+        );
+        let postgres_v2_observation_guard = postgres_authority
+            .split(postgres_v2_observation_start)
+            .nth(1)
+            .unwrap()
+            .split(concat!(
+                "DROP TRIGGER IF EXISTS ",
+                "trg_jobs_workflow_cleanup_v2_observation_current_lease"
+            ))
+            .next()
+            .unwrap();
+        let sqlite_v2_observation_guard = sqlite_authority
+            .split(concat!(
+                "CREATE TRIGGER IF NOT EXISTS ",
+                "trg_jobs_workflow_cleanup_v2_observation_current_lease"
+            ))
+            .nth(1)
+            .unwrap()
+            .split(concat!(
+                "CREATE TRIGGER IF NOT EXISTS ",
+                "trg_jobs_workflow_cleanup_v2_target_proved_immutable"
+            ))
+            .next()
+            .unwrap();
+        for guard in [postgres_v2_observation_guard, sqlite_v2_observation_guard] {
+            assert!(guard.contains("JOIN jobs_workflow_cleanup_account_bindings binding"));
+            assert!(guard.contains("JOIN jobs_workflow_legacy_inventory_generations legacy"));
+        }
+        let postgres_legacy_proof_guard = postgres_authority
+            .split(concat!(
+                "CREATE OR REPLACE FUNCTION ",
+                "validate_jobs_workflow_legacy_target_proof_epoch_update"
+            ))
+            .nth(1)
+            .unwrap()
+            .split("DROP TRIGGER IF EXISTS trg_jobs_workflow_legacy_target_proof_epoch_guard")
+            .next()
+            .unwrap();
+        let sqlite_legacy_proof_guard = sqlite_authority
+            .split(concat!(
+                "CREATE TRIGGER IF NOT EXISTS ",
+                "trg_jobs_workflow_legacy_target_proof_epoch_guard"
+            ))
+            .nth(1)
+            .unwrap()
+            .split(concat!(
+                "CREATE TRIGGER IF NOT EXISTS ",
+                "trg_jobs_workflow_legacy_target_terminal_guard"
+            ))
+            .next()
+            .unwrap();
+        for guard in [postgres_legacy_proof_guard, sqlite_legacy_proof_guard] {
+            assert!(guard.contains("FROM jobs_workflow_legacy_inventory_head head"));
+            assert!(guard.contains("generation.generation = head.generation"));
+            assert!(
+                guard.contains("generation.inventory_generation_id = head.inventory_generation_id")
+            );
+            assert!(guard.contains("generation.query_digest_sha256 = head.query_digest_sha256"));
+            assert!(guard.contains("generation.state IN ('scanning', 'draining')"));
+        }
+    }
 
     #[test]
     fn embedded_postgres_migrations_are_operator_discoverable() {
@@ -2531,6 +8914,377 @@ mod postgres_migration_tests {
                     .any(|line| line.to_ascii_lowercase().contains("target: postgres")),
                 "{version} would be skipped by scripts/bluey-postgres-migrate.sh"
             );
+        }
+    }
+
+    #[test]
+    fn managed_cloud_release_authority_postgres_migration_is_replay_safe() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID)
+            .expect("managed-cloud release authority must be a runtime PostgreSQL migration");
+        assert_eq!(*version, "033_jobs_managed_cloud_release_authority.sql");
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY);
+
+        let added_columns = postgres_sql
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("ADD COLUMN"))
+            .collect::<Vec<_>>();
+        assert_eq!(added_columns.len(), 16);
+        assert!(added_columns
+            .iter()
+            .all(|line| line.starts_with("ADD COLUMN IF NOT EXISTS ")));
+
+        let normalized = postgres_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (table, constraint) in [
+            (
+                "jobs_workflow_cleanup_targets",
+                "fk_jobs_cleanup_target_managed_cloud_binding",
+            ),
+            (
+                "jobs_workflow_cleanup_targets",
+                "ck_jobs_cleanup_target_managed_cloud_binding_complete",
+            ),
+            (
+                "jobs_execution_leases",
+                "ck_jobs_execution_lease_managed_cloud_complete",
+            ),
+            (
+                "jobs_execution_leases",
+                "fk_jobs_execution_lease_managed_cloud_request",
+            ),
+            (
+                "jobs_execution_leases",
+                "fk_jobs_execution_lease_managed_cloud_binding",
+            ),
+            (
+                "jobs_execution_leases",
+                "fk_jobs_execution_lease_managed_cloud_runtime",
+            ),
+        ] {
+            let guard = format!("conrelid='{table}'::regclass AND conname='{constraint}'");
+            assert!(
+                normalized.contains(&guard),
+                "PostgreSQL migration must catalog-guard {constraint} on {table}"
+            );
+            assert_eq!(
+                normalized
+                    .matches(&format!("ADD CONSTRAINT {constraint}"))
+                    .count(),
+                1,
+                "PostgreSQL migration must define {constraint} exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_taxonomy_authority_is_paired_immutable_and_current_head() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(id, _)| *id == JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID)
+            .expect("canonical taxonomy authority must be registered");
+        assert_eq!(*version, JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID);
+        assert_eq!(*version, "034_jobs_canonical_taxonomy_authority.sql");
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY);
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY));
+
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_track_policy_revisions",
+            "CREATE TABLE IF NOT EXISTS jobs_track_policy_review_receipts",
+            "CREATE TABLE IF NOT EXISTS jobs_track_policy_heads",
+            "taxonomy_version",
+            "taxonomy_digest_sha256",
+            "canonical_policy_sha256",
+            "canonical_policy_ciphertext",
+            "canonical_review_receipt_ciphertext",
+            "bluey-jobs:v1:",
+            "canonical_role_id",
+            "canonical_role_family",
+            "verified_application_identity_id",
+            "verified_application_identity_sha256",
+            "source_resume_asset_id",
+            "source_resume_sha256",
+            "job_preferences_sha256",
+            "predecessor_revision_id",
+            "predecessor_revision_no",
+            "predecessor_policy_sha256",
+            "compatibility_classification",
+            "review_state",
+            "reviewer_id",
+            "decision",
+            "decided_at_ms",
+            "review_receipt_id",
+            "review_receipt_sha256",
+            "head_generation",
+            "previous_head_generation",
+            "head_transition_sha256",
+            "predecessor_head_transition_sha256",
+            "trg_jobs_track_policy_revisions_no_update",
+            "trg_jobs_track_policy_revisions_no_delete",
+            "trg_jobs_track_policy_review_receipts_no_update",
+            "trg_jobs_track_policy_review_receipts_no_delete",
+            "trg_jobs_track_policy_heads_validate_insert",
+            "trg_jobs_track_policy_heads_monotonic",
+            "trg_jobs_track_policy_heads_no_delete",
+            "Career Track policy head must advance by exact CAS",
+            "identity.verification_status = 'verified'",
+            "asset.sha256 = NEW.source_resume_sha256",
+            "revision.review_state = 'approved'",
+            "receipt.decision = 'approved'",
+            "ON DELETE CASCADE",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL canonical taxonomy migration missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY.contains(required),
+                "SQLite canonical taxonomy migration missing {required}"
+            );
+        }
+
+        for schema in [postgres_sql, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY] {
+            assert_eq!(
+                schema
+                    .lines()
+                    .filter(|line| line.starts_with("CREATE TABLE IF NOT EXISTS jobs_track_policy_"))
+                    .count(),
+                10
+            );
+            assert!(!schema.contains("INSERT INTO jobs_track_policy_"));
+            assert!(schema.contains("UNIQUE(account_id, career_track_id, revision_no)"));
+            assert!(
+                !schema.contains("UNIQUE(account_id, career_track_id, canonical_policy_sha256)")
+            );
+            assert!(schema.contains("predecessor_revision_no = revision_no - 1"));
+            assert!(schema.contains("predecessor.created_at_ms <= NEW.created_at_ms"));
+            assert!(schema.contains("CHECK(head_generation = policy_revision_no)"));
+            assert!(schema.contains("NEW.head_generation <> OLD.head_generation + 1"));
+            assert!(schema
+                .contains("NEW.predecessor_head_transition_sha256 <> OLD.head_transition_sha256"));
+        }
+    }
+
+    #[test]
+    fn original_source_verification_authority_is_paired_replay_safe_and_current_head() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| {
+                *version == JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID
+            })
+            .expect("original-source verification authority must be the PostgreSQL head");
+        assert_eq!(
+            *version,
+            JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID
+        );
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY
+        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY));
+        for schema in [
+            *postgres_sql,
+            SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+        ] {
+            assert_eq!(
+                schema
+                    .lines()
+                    .filter(|line| line.starts_with(
+                        "CREATE TABLE IF NOT EXISTS jobs_original_source_verification_"
+                    ))
+                    .count(),
+                7
+            );
+            for required in [
+                "jobs_original_source_verification_assignments",
+                "jobs_original_source_verification_attempts",
+                "jobs_original_source_verification_events",
+                "jobs_original_source_verification_observations",
+                "jobs_original_source_verification_receipts",
+                "jobs_original_source_verification_transitions",
+                "jobs_original_source_verification_heads",
+                "jobs_managed_cloud_manifest_source_verification_protocols",
+                "jobs_managed_cloud_manifest_original_source_verifier_identities",
+                "jobs_managed_cloud_original_source_verifier_runtime_grants",
+                "jobs_managed_cloud_original_source_verifier_grant_revocations",
+                "jobs_managed_cloud_original_source_verifier_runtime_instances",
+                "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+                "jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit",
+                "runtime_session_token_sha256",
+                "completion_request_sha256",
+                "original-source head must advance by exact CAS",
+            ] {
+                assert!(schema.contains(required), "migration missing {required}");
+            }
+            assert!(schema.contains("protocol_version"));
+            assert!(schema.contains("source_verification"));
+            assert!(schema.contains("original_source_verifier"));
+            assert!(schema.contains("jobs-workflows"));
+            assert!(!schema.contains("INSERT INTO jobs_original_source_verification_"));
+        }
+    }
+
+    #[test]
+    fn signed_job_integrity_authority_is_paired_and_unseeded() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID)
+            .expect("signed job-integrity authority must be embedded");
+        assert_eq!(*version, JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID);
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY);
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY));
+        for schema in [*postgres_sql, SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY] {
+            assert_eq!(
+                schema
+                    .lines()
+                    .filter(
+                        |line| line.starts_with("CREATE TABLE IF NOT EXISTS jobs_job_integrity_")
+                    )
+                    .count(),
+                7
+            );
+            for required in [
+                "jobs_job_integrity_trust_policies",
+                "jobs_job_integrity_trust_keys",
+                "jobs_job_integrity_attestations",
+                "jobs_job_integrity_revocations",
+                "jobs_job_integrity_head_transitions",
+                "jobs_job_integrity_heads",
+                "jobs_job_integrity_control",
+                "employer_identity",
+                "job_risk",
+                "revocation",
+                "maximum_positive_lifetime_ms",
+                "maximum_nonpositive_lifetime_ms",
+                "allowed_risk_policy_sha256s_json",
+                "root_authorization_id",
+                "employer_identity_authorization_id",
+                "job_risk_authorization_id",
+                "authorization_id",
+                "root_anchor_sha256=NEW.root_anchor_sha256",
+                "existing.public_key_base64url=NEW.public_key_base64url",
+                "job-integrity attestation predecessor binding is invalid",
+                "job-integrity revocation predecessor binding is invalid",
+            ] {
+                assert!(schema.contains(required), "migration missing {required}");
+            }
+            for required in [
+                "jobs_job_integrity_trust_policies_validate_insert",
+                "jobs_job_integrity_trust_keys_validate_insert",
+                "jobs_job_integrity_attestations_validate_insert",
+                "jobs_job_integrity_revocations_validate_insert",
+                "jobs_job_integrity_head_transitions_validate_insert",
+                "jobs_job_integrity_heads_monotonic",
+                "jobs_job_integrity_control_monotonic",
+            ] {
+                assert!(schema.contains(required), "migration missing {required}");
+            }
+            assert!(!schema.contains("INSERT INTO jobs_job_integrity_attestations"));
+            assert!(!schema.contains("INSERT INTO jobs_job_integrity_revocations"));
+        }
+    }
+
+    #[test]
+    fn public_beta_authority_is_paired_dark_and_runtime_ledgered() {
+        let (_, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID)
+            .expect("public beta authority must exist before Jobs routes are served");
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_PUBLIC_BETA_ACCESS);
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_PUBLIC_BETA_ACCESS));
+
+        for table in [
+            "jobs_public_beta_cohorts",
+            "jobs_public_beta_enrollments",
+            "jobs_public_beta_overrides",
+        ] {
+            assert!(postgres_sql.contains(table), "PostgreSQL missing {table}");
+            assert!(
+                SQLITE_JOBS_PUBLIC_BETA_ACCESS.contains(table),
+                "SQLite missing {table}"
+            );
+        }
+        for required in [
+            "'public-v1', 'draft', NULL, NULL, 0, 0, 1",
+            "CHECK(hard_cap >= 0 AND hard_cap <= 10000)",
+            "CHECK(assigned_count >= 0 AND assigned_count <= hard_cap)",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_PUBLIC_BETA_ACCESS.contains(required),
+                "SQLite missing {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn jobs_workspace_pagination_index_is_paired_and_runtime_ledgered() {
+        let (_, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_WORKSPACE_PAGINATION_MIGRATION_ID)
+            .expect("workspace pagination index must exist before Jobs routes are served");
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_WORKSPACE_PAGINATION);
+        assert_eq!(
+            MIGRATIONS
+                .iter()
+                .filter(|sql| **sql == SQLITE_JOBS_WORKSPACE_PAGINATION)
+                .count(),
+            1
+        );
+
+        let postgres_normalized = postgres_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(postgres_normalized
+            .contains("ON jobs_postings(account_id, (-match_score), (-updated_at_ms), id ASC)"));
+        assert!(postgres_normalized.contains(concat!(
+            "idx_jobs_postings_verified_import_backfill ON jobs_postings(",
+            "account_id, (id COLLATE \"C\")) WHERE RIGHT(source, 7) = '_import'"
+        )));
+        assert!(postgres_normalized
+            .contains("CREATE TABLE IF NOT EXISTS jobs_verified_import_backfill_checkpoints"));
+        for required in [
+            "lease_owner",
+            "lease_token_sha256",
+            "lease_expires_at_ms",
+            concat!(
+                "CHECK(completed = 0 OR ( lease_owner IS NULL AND ",
+                "lease_token_sha256 IS NULL AND lease_expires_at_ms IS NULL ))"
+            ),
+        ] {
+            assert!(postgres_normalized.contains(required));
+        }
+        let sqlite_normalized = SQLITE_JOBS_WORKSPACE_PAGINATION
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(sqlite_normalized.contains(
+            "ON jobs_postings(account_id, match_score DESC, updated_at_ms DESC, id ASC)"
+        ));
+        assert!(sqlite_normalized.contains(concat!(
+            "idx_jobs_postings_verified_import_backfill ON jobs_postings(account_id, id) ",
+            "WHERE substr(source, -7) = '_import'"
+        )));
+        assert!(sqlite_normalized
+            .contains("CREATE TABLE IF NOT EXISTS jobs_verified_import_backfill_checkpoints"));
+        for required in [
+            "lease_owner",
+            "lease_token_sha256",
+            "lease_expires_at_ms",
+            concat!(
+                "CHECK(completed = 0 OR ( lease_owner IS NULL AND ",
+                "lease_token_sha256 IS NULL AND lease_expires_at_ms IS NULL ))"
+            ),
+        ] {
+            assert!(sqlite_normalized.contains(required));
         }
     }
 
@@ -2683,4 +9437,601 @@ mod postgres_migration_tests {
             );
         }
     }
+
+    #[test]
+    fn account_deletion_intents_are_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == ACCOUNT_DELETION_INTENTS_MIGRATION_ID)
+            .expect("account-deletion intent must exist before account deletion is served");
+
+        assert_eq!(*version, "021_account_deletion_intents.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS account_deletion_intents",
+            "account_id",
+            "PRIMARY KEY",
+            "REFERENCES accounts(id) ON DELETE CASCADE",
+            "requested_at_ms",
+            "last_checked_at_ms",
+            "fresh_upload_cutoff_ms",
+            "fresh_in_flight_puts",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL missing {required}"
+            );
+            assert!(
+                SQLITE_ACCOUNT_DELETION_INTENTS.contains(required),
+                "SQLite missing {required}"
+            );
+        }
+        assert_eq!(*postgres_sql, POSTGRES_ACCOUNT_DELETION_INTENTS);
+    }
+
+    #[test]
+    fn submission_evidence_capacity_is_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID)
+            .expect("submission evidence capacity must exist before Jobs execution is served");
+
+        assert_eq!(*version, "022_jobs_submission_evidence_reservations.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_submission_evidence_capacity",
+            "PRIMARY KEY(account_id, application_id, run_id)",
+            "REFERENCES accounts(id) ON DELETE CASCADE",
+            "REFERENCES jobs_applications(id) ON DELETE CASCADE",
+            "reserved_bytes",
+            "reserved_objects",
+            "consumed_bytes",
+            "consumed_objects",
+            "expires_at_ms",
+            "state",
+            "WHERE state = 'active'",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS.contains(required),
+                "SQLite missing {required}"
+            );
+        }
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS
+        );
+    }
+
+    #[test]
+    fn jobs_account_objects_are_backfilled_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID)
+            .expect("Jobs account objects must join the ledger before object writers start");
+
+        assert_eq!(*version, "023_jobs_account_object_upload_backfill.sql");
+        for required in [
+            "INTO object_uploads",
+            "jobs_resume_source_assets",
+            "jobs_browser_profile_snapshots",
+            "jobs-resume-source:",
+            "jobs-browser-profile:",
+            "generation || ':' ||",
+            "envelope_version || ':' || lower(sha256)",
+            "jobs_resume_source",
+            "jobs_browser_profile_snapshot",
+            "account_lifetime_until_deletion",
+            "9223372036854775807",
+            "'ready'",
+            "ON CONFLICT (account_id, object_kind, logical_id) DO NOTHING",
+            "INTO object_storage_outbox",
+            "'put', 'completed', 1",
+            "ON CONFLICT (upload_id, operation) DO NOTHING",
+            "attempt_count >= 1",
+            "completed_at_ms",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL.contains(required),
+                "SQLite missing {required}"
+            );
+        }
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL);
+        assert!(!postgres_sql.contains("ON CONFLICT DO NOTHING"));
+        assert!(!SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL.contains("INSERT OR IGNORE"));
+        assert!(postgres_sql
+            .contains("RAISE EXCEPTION 'Jobs account-object backfill validation failed'"));
+        assert!(SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL
+            .contains("CREATE TEMP TABLE jobs_account_object_backfill_validation"));
+
+        let postgres_compact = postgres_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for current_shape_clause in [
+            "'request_id', source.id",
+            "upload.metadata_json::jsonb ->> 'profile_mode' IN ( 'replace', 'merge_source' )",
+            "upload.metadata_json::jsonb ->> 'base_profile_sha256' ~ '^[0-9a-f]{64}$'",
+            "upload.metadata_json::jsonb ->> 'requested_profile_sha256' ~ '^[0-9a-f]{64}$'",
+            "'replaces_source_asset_id', upload.metadata_json::jsonb -> 'replaces_source_asset_id'",
+            "'jobs_application_id', upload.metadata_json::jsonb -> 'jobs_application_id'",
+            "'jobs_run_id', snapshot.writer_run_id",
+            "'expected_generation', snapshot.generation - 1",
+            "'writer_fence', snapshot.writer_fence",
+            "outbox.id = upload.id || ':put'",
+            "outbox.account_id = upload.account_id",
+            "outbox.next_attempt_at_ms = outbox.completed_at_ms",
+            "outbox.updated_at_ms = outbox.completed_at_ms",
+            "outbox.created_at_ms <= outbox.completed_at_ms",
+        ] {
+            assert!(
+                postgres_compact.contains(current_shape_clause),
+                "PostgreSQL current-shape validation missing {current_shape_clause}"
+            );
+        }
+
+        let sqlite_compact = SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for current_shape_clause in [
+            "(SELECT COUNT(*) FROM json_each(upload.metadata_json)) = 12",
+            "json_extract(upload.metadata_json, '$.request_id') = source.id",
+            "json_extract(upload.metadata_json, '$.profile_mode') IN ( 'replace', 'merge_source' )",
+            "(SELECT COUNT(*) FROM json_each(upload.metadata_json)) = 9",
+            "json_extract(upload.metadata_json, '$.jobs_run_id') = snapshot.writer_run_id",
+            "json_extract(upload.metadata_json, '$.writer_fence') = snapshot.writer_fence",
+            "json_extract(upload.metadata_json, '$.expected_generation') = snapshot.generation - 1",
+        ] {
+            assert!(
+                sqlite_compact.contains(current_shape_clause),
+                "SQLite current-shape validation missing {current_shape_clause}"
+            );
+        }
+
+        let maximum_browser_profile_logical_id_bytes = "jobs-browser-profile:".len()
+            + 240
+            + 1
+            + i64::MAX.to_string().len()
+            + 1
+            + i64::MAX.to_string().len()
+            + 1
+            + 64;
+        assert!(
+            maximum_browser_profile_logical_id_bytes <= 384,
+            "the maximum accepted browser-profile candidate identity must fit the ledger"
+        );
+    }
+
+    #[test]
+    fn browser_release_authority_is_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID)
+            .expect("Browser release authority must exist before local tickets can be claimed");
+
+        assert_eq!(*version, "025_jobs_browser_release_authority.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_signature_sets",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_signatures",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_trust_policies",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_trust_keys",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_manifests",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_artifacts",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_activations",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_rollbacks",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_revocations",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_channel_transitions",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_channel_heads",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_account_channel_assignments",
+            "CREATE TABLE IF NOT EXISTS jobs_local_run_release_bindings",
+            "CREATE TABLE IF NOT EXISTS jobs_local_run_claim_replays",
+            "canonical_signature_set_base64url",
+            "canonical_policy_base64url",
+            "authorization_signature_set_sha256",
+            "target_audience",
+            "root_threshold",
+            "release_threshold",
+            "promotion_threshold",
+            "incident_threshold",
+            "app_version",
+            "artifact_filename",
+            "manifest_signature_set_sha256",
+            "activation_authorization_signature_set_sha256",
+            "trust_policy_sha256",
+            "channel_head_revision",
+            "channel_transition_sha256",
+            "transition_kind",
+            "rollback_authority_sha256",
+            "current_transition_sha256",
+            "recorded_by",
+            "UNIQUE(subject_kind, subject_id, subject_sha256)",
+            "subject_kind, subject_id, subject_sha256,",
+            "account_channel_assignment_sha256",
+            "build_descriptor_sha256",
+            "claim_nonce_sha256",
+            "claim_request_sha256",
+            "claim_response_sha256",
+            "claim_response_secret",
+            "trg_jobs_browser_release_rollbacks_no_update",
+            "trg_jobs_browser_release_rollbacks_no_delete",
+            "trg_jobs_browser_release_revocations_no_update",
+            "trg_jobs_browser_release_revocations_no_delete",
+            "trg_jobs_browser_release_signature_sets_no_update",
+            "trg_jobs_browser_release_signature_sets_no_delete",
+            "trg_jobs_browser_release_trust_policies_no_update",
+            "trg_jobs_browser_release_trust_policies_no_delete",
+            "trg_jobs_browser_release_channel_transitions_no_update",
+            "trg_jobs_browser_release_channel_transitions_no_delete",
+            "trg_jobs_browser_release_channel_heads_no_delete",
+            "trg_jobs_local_run_release_bindings_no_update",
+            "trg_jobs_local_run_claim_replays_no_update",
+            "Imported activations and rollback targets remain inert",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL Browser release migration missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY.contains(required),
+                "SQLite Browser release migration missing {required}"
+            );
+        }
+        assert!(postgres_sql
+            .contains("artifact_count               BIGINT NOT NULL CHECK(artifact_count = 5)"));
+        assert!(SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY
+            .contains("artifact_count               INTEGER NOT NULL CHECK(artifact_count = 5)"));
+        for exact_subject in [
+            "'signing-key'",
+            "'build-descriptor'",
+            "'manifest'",
+            "'release'",
+            "'artifact'",
+        ] {
+            assert!(postgres_sql.contains(exact_subject));
+            assert!(SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY.contains(exact_subject));
+        }
+        assert!(!postgres_sql.contains("'artifact', 'activation'"));
+        assert!(!postgres_sql.contains("accepted_server_release_ids_sha256"));
+        assert!(!postgres_sql.contains("artifact_set_sha256"));
+        assert!(!postgres_sql.contains("idx_jobs_browser_release_activations_current"));
+        assert!(!postgres_sql.contains("trg_jobs_browser_release_channel_heads_no_update"));
+        assert_eq!(
+            postgres_sql
+                .lines()
+                .filter(|line| line.trim_start().starts_with("recorded_by "))
+                .count(),
+            7
+        );
+        assert_eq!(
+            SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY
+                .lines()
+                .filter(|line| line.trim_start().starts_with("recorded_by "))
+                .count(),
+            7
+        );
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY);
+    }
+
+    #[test]
+    fn ats_certification_authority_is_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID)
+            .expect("ATS certification authority must migrate before execution admission");
+        assert_eq!(*version, "026_jobs_ats_certification_authority.sql");
+        let required = [
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_trust_policies",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_trust_keys",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_trust_head",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_evidence",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_layout_observations",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_manifests",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_manifest_layouts",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_manifest_check_results",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_manifest_evidence",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_runtime_targets",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_activations",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_revocations",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_head_transitions",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_heads",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_quarantine_commands",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_quarantine_heads",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_circuit_events",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_circuit_heads",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_runtime_layout_quarantine_evidence",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_canary_allowlists",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_canary_allowlist_members",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_canary_allowlist_revocations",
+            "CREATE TABLE IF NOT EXISTS jobs_application_ats_certification_bindings",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_canary_reservations",
+            "canonical_evidence_base64url",
+            "canonical_manifest_base64url",
+            "canonical_activation_base64url",
+            "canonical_revocation_base64url",
+            "canonical_command_base64url",
+            "trust_policy_sha256",
+            "root_trust_anchor_sha256",
+            "predecessor_policy_sha256",
+            "maximum_clock_skew_ms",
+            "maximum_manifest_size_bytes",
+            "maximum_target_count",
+            "maximum_observation_count",
+            "maximum_evidence_object_count",
+            "adapter_bundle_sha256",
+            "allowed_provider_hosts_json",
+            "final_submit_control_id",
+            "tested_at_ms",
+            "automation_bundle_sha256",
+            "browser_release_manifest_sha256",
+            "runner_build_id",
+            "runner_image_sha256",
+            "target_key",
+            "surface_sha256",
+            "scope_sha256",
+            "account_allowlist_sha256",
+            "canonical_allowlist_base64url",
+            "trg_jobs_ats_certification_canary_allowlists_no_update",
+            "trg_jobs_ats_certification_canary_allowlist_members_no_update",
+            "trg_jobs_ats_certification_canary_allowlist_revocations_no_update",
+            "current_transition_sha256",
+            "predecessor_command_sha256",
+            "event_sha256",
+            "binding_sha256",
+            "layout_observation_sha256",
+            "observed_surface_sha256",
+            "phase_b_request_id",
+            "canary_reservation_sha256",
+            "metering_reservation_sha256",
+            "layout_drift_overflow",
+            "idx_jobs_ats_runtime_layout_quarantine_scope",
+            "trg_jobs_ats_certification_evidence_no_update",
+            "trg_jobs_ats_certification_trust_policies_no_update",
+            "trg_jobs_ats_certification_trust_keys_no_update",
+            "trg_jobs_ats_certification_trust_head_monotonic",
+            "trg_jobs_ats_certification_manifests_no_update",
+            "trg_jobs_ats_certification_activations_no_update",
+            "trg_jobs_ats_certification_revocations_no_delete",
+            "trg_jobs_ats_certification_heads_monotonic",
+            "trg_jobs_ats_certification_quarantine_heads_monotonic",
+            "trg_jobs_ats_certification_circuit_heads_monotonic",
+            "trg_jobs_ats_runtime_layout_quarantine_no_update",
+            "trg_jobs_ats_runtime_layout_quarantine_no_delete",
+            "trg_jobs_application_ats_certification_bindings_transition",
+            "2026.07.1-beta.1",
+            "2026.07.0-beta.1",
+        ];
+        for expected in required {
+            assert!(
+                postgres_sql.contains(expected),
+                "PostgreSQL migration missing {expected}"
+            );
+            assert!(
+                SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY.contains(expected),
+                "SQLite migration missing {expected}"
+            );
+        }
+        assert_eq!(
+            postgres_sql
+                .lines()
+                .filter(|line| line.starts_with("CREATE TABLE IF NOT EXISTS jobs_ats_"))
+                .count(),
+            23
+        );
+        assert_eq!(
+            SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY
+                .lines()
+                .filter(|line| line.starts_with("CREATE TABLE IF NOT EXISTS jobs_ats_"))
+                .count(),
+            23
+        );
+        assert!(!postgres_sql.contains("INSERT INTO jobs_ats_certification_heads"));
+        assert!(!SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY
+            .contains("INSERT INTO jobs_ats_certification_heads"));
+        assert!(!postgres_sql.contains("INSERT INTO jobs_ats_certification_trust_head"));
+        assert!(!SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY
+            .contains("INSERT INTO jobs_ats_certification_trust_head"));
+        for table in [
+            "jobs_ats_certification_circuit_heads",
+            "jobs_ats_certification_runtime_layout_quarantine_evidence",
+            "jobs_ats_certification_canary_allowlists",
+            "jobs_ats_certification_canary_allowlist_members",
+            "jobs_ats_certification_canary_allowlist_revocations",
+            "jobs_application_ats_certification_bindings",
+            "jobs_ats_certification_canary_reservations",
+        ] {
+            let insert = format!("INSERT INTO {table}");
+            assert!(!postgres_sql.contains(&insert));
+            assert!(!SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY.contains(&insert));
+        }
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY);
+    }
+
+    #[test]
+    fn operational_holds_are_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_OPERATIONAL_HOLDS_MIGRATION_ID)
+            .expect("operational holds must migrate before Jobs work is admitted");
+        assert_eq!(*version, "030_jobs_operational_holds.sql");
+
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_operational_hold_events",
+            "CREATE TABLE IF NOT EXISTS jobs_operational_hold_heads",
+            "idx_jobs_operational_hold_events_history",
+            "idx_jobs_operational_hold_heads_lookup",
+            "idx_jobs_operational_hold_heads_refs",
+            "trg_jobs_operational_hold_events_validate_insert",
+            "trg_jobs_operational_hold_events_no_update",
+            "trg_jobs_operational_hold_events_no_delete",
+            "trg_jobs_operational_hold_heads_validate_insert",
+            "trg_jobs_operational_hold_heads_monotonic",
+            "trg_jobs_operational_hold_heads_no_delete",
+            "previous_revision_no",
+            "predecessor_event_id",
+            "head_revision",
+            "current_event_id",
+            "manual_release",
+            "communication_dispatch",
+            "discovery_source",
+            "model_provider",
+            "scope_id = '*'",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL operational-hold migration missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_OPERATIONAL_HOLDS.contains(required),
+                "SQLite operational-hold migration missing {required}"
+            );
+        }
+        for forbidden in ["expires_at", "ttl", "INSERT INTO jobs_operational_hold"] {
+            assert!(
+                !postgres_sql.contains(forbidden),
+                "PostgreSQL operational holds must not contain {forbidden}"
+            );
+            assert!(
+                !SQLITE_JOBS_OPERATIONAL_HOLDS.contains(forbidden),
+                "SQLite operational holds must not contain {forbidden}"
+            );
+        }
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_OPERATIONAL_HOLDS);
+    }
+
+    #[test]
+    fn runner_volume_purge_is_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID)
+            .expect("runner-volume purge schema must exist before a runner can enroll");
+
+        assert_eq!(*version, "024_jobs_runner_volume_purge.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_fleet_state",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_legacy_inventory_authorities",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_admission_grants",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volumes",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_keys",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_authority_uses",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_storage_attestations",
+            "CREATE TABLE IF NOT EXISTS jobs_execution_lease_volume_bindings",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_account_subjects",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_residencies",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_purge_requests",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_purge_targets",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_purge_tombstones",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_purge_enforcements",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_destructions",
+            "idx_jobs_runner_volume_grants_expiry",
+            "idx_jobs_runner_volumes_worker_status",
+            "idx_jobs_runner_volume_authority_uses_consumed",
+            "idx_jobs_runner_volume_storage_attestations_latest",
+            "idx_jobs_execution_lease_volume_bindings_volume",
+            "idx_jobs_runner_residencies_subject_state",
+            "idx_jobs_runner_residencies_volume_state",
+            "idx_jobs_runner_purge_requests_account_state",
+            "idx_jobs_runner_purge_requests_deletion_attempt",
+            "idx_jobs_runner_purge_targets_volume_state",
+            "idx_jobs_runner_purge_targets_request_state",
+            "idx_jobs_runner_purge_tombstones_request",
+            "idx_jobs_runner_purge_enforcements_volume_state",
+            "idx_jobs_runner_volume_destructions_volume",
+            "REFERENCES accounts(id) ON DELETE SET NULL",
+            "public_key_base64url",
+            "enrollment_epoch",
+            "issued_fleet_generation",
+            "required_tombstone_generation",
+            "reconciled_tombstone_generation",
+            "destruction_generation",
+            "legacy_reconciliation_generation",
+            "storage_attestation_generation",
+            "storage_attestation_count",
+            "storage_attestation_set_sha256",
+            "legacy_inventory_state",
+            "legacy_inventory_generation",
+            "legacy_inventory_reconciliation_id",
+            "legacy_inventory_authority_id",
+            "legacy_inventory_authority_sha256",
+            "legacy_inventory_root_count",
+            "legacy_inventory_root_set_sha256",
+            "cutover_enrollment_generation",
+            "cutover_purge_generation",
+            "cutover_tombstone_generation",
+            "cutover_destruction_generation",
+            "cutover_legacy_reconciliation_generation",
+            "cutover_storage_attestation_generation",
+            "cutover_storage_attestation_count",
+            "cutover_storage_attestation_set_sha256",
+            "cutover_legacy_inventory_generation",
+            "cutover_legacy_inventory_reconciliation_id",
+            "cutover_legacy_inventory_authority_id",
+            "cutover_legacy_inventory_authority_sha256",
+            "cutover_non_destroyed_volume_count",
+            "cutover_destruction_count",
+            "cutover_unresolved_legacy_volume_count",
+            "purge_subject_sha256",
+            "volume_key_fingerprint",
+            "command_sha256",
+            "ack_signature",
+            "legacy_unresolved_count",
+            "resolved_target_count",
+            "target_set_sha256",
+            "snapshot_inventory_sha256",
+            "runner legacy inventory authority is append-only",
+            "runner volume storage attestation is append-only",
+            "indefinite_managed_restore_safety",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL runner purge migration missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_RUNNER_VOLUME_PURGE.contains(required),
+                "SQLite runner purge migration missing {required}"
+            );
+        }
+        let postgres_compact = postgres_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sqlite_compact = SQLITE_JOBS_RUNNER_VOLUME_PURGE
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(postgres_compact
+            .contains("purge_generation BIGINT NOT NULL DEFAULT 0 CHECK(purge_generation >= 0)"));
+        assert!(sqlite_compact
+            .contains("purge_generation INTEGER NOT NULL DEFAULT 0 CHECK(purge_generation >= 0)"));
+        assert!(postgres_compact.contains(
+            "destruction_generation BIGINT NOT NULL DEFAULT 0 CHECK(destruction_generation >= 0)"
+        ));
+        assert!(sqlite_compact.contains(
+            "destruction_generation INTEGER NOT NULL DEFAULT 0 CHECK(destruction_generation >= 0)"
+        ));
+        assert!(postgres_compact.contains(
+            "legacy_reconciliation_generation BIGINT NOT NULL DEFAULT 0 CHECK(legacy_reconciliation_generation >= 0)"
+        ));
+        assert!(sqlite_compact.contains(
+            "legacy_reconciliation_generation INTEGER NOT NULL DEFAULT 0 CHECK(legacy_reconciliation_generation >= 0)"
+        ));
+        assert!(postgres_compact.contains(
+            "legacy_unresolved SMALLINT NOT NULL DEFAULT 0 CHECK(legacy_unresolved IN (0, 1))"
+        ));
+        assert!(postgres_compact.contains(
+            "tombstone_generation BIGINT NOT NULL UNIQUE CHECK(tombstone_generation >= 1)"
+        ));
+        assert!(sqlite_compact.contains(
+            "tombstone_generation INTEGER NOT NULL UNIQUE CHECK(tombstone_generation >= 1)"
+        ));
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_RUNNER_VOLUME_PURGE);
+    }
 }
+
+#[cfg(test)]
+include!("postgres-audience-cli-owned-tests.rs");

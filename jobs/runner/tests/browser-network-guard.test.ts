@@ -28,7 +28,7 @@ describe("browser network guard", () => {
     expect(validate).toHaveBeenCalledTimes(7);
   });
 
-  it("validates WebSocket handshakes and never connects a denied target", async () => {
+  it("denies every WebSocket handshake, including public endpoints", async () => {
     const context = new FakeBrowserContext();
     const validate = vi.fn(async (url: string) => {
       if (url.includes("127.0.0.1")) throw new Error("private target");
@@ -42,9 +42,9 @@ describe("browser network guard", () => {
 
     const allowed = new FakeWebSocketRoute("wss://public.example/socket");
     await context.webSocketHandler!(allowed as never);
-    expect(allowed.connected).toBe(true);
-    expect(allowed.closed).toBe(false);
-    expect(validate).toHaveBeenCalledWith("https://public.example/socket");
+    expect(allowed.connected).toBe(false);
+    expect(allowed.closed).toBe(true);
+    expect(validate).not.toHaveBeenCalled();
   });
 
   it("rejects credential-bearing and private targets through the production validator", async () => {
@@ -53,6 +53,8 @@ describe("browser network guard", () => {
     await expect(assertPublicBrowserTarget("wss://127.0.0.1/socket"))
       .rejects.toThrow("Private network");
     expect(NETWORK_EGRESS_REQUIREMENT).toContain("deny private");
+    expect(NETWORK_EGRESS_REQUIREMENT).toContain("WebSockets");
+    expect(NETWORK_EGRESS_REQUIREMENT).toContain("WebRTC");
   });
 });
 

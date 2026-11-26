@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { parseFragment, type DefaultTreeAdapterMap } from "parse5";
 
 import type { PublicAtsSource } from "./contracts.js";
@@ -10,6 +11,10 @@ import { submissionPolicy, type SubmissionCapability } from "./policy.js";
 const MAX_FEED_BYTES = 2 * 1024 * 1024;
 const MAX_FEED_ROWS = 20_000;
 const DEFAULT_TIMEOUT_MS = 10_000;
+const CURATED_INTERMEDIARIES = [
+  "github.com", "raw.githubusercontent.com", "gist.githubusercontent.com",
+  "simplify.jobs", "prepai.dev", "zapply.jobs",
+];
 
 export type CuratedFeedId =
   | "simplify-new-grad"
@@ -176,41 +181,53 @@ export function parseCuratedFeed(feedId: CuratedFeedId, content: string): Curate
   let skippedClosed = 0;
   let skippedInvalid = 0;
   let duplicatesCollapsed = 0;
-  let inheritedCompany = "";
   const leads = new Map<string, CuratedFeedLead>();
   let observedRows = 0;
+  let recognizedTable = false;
 
   for (const table of tables) {
-    if (table.length < 2) continue;
+    if (table.length === 0) continue;
     const headers = table[0]!.cells.map((cell) => normalizedHeader(cell.text));
     const companyIndex = headerIndex(headers, ["company"]);
     const titleIndex = headerIndex(headers, ["role", "title", "position"]);
     const locationIndex = headerIndex(headers, ["location", "locations"]);
     const applyIndex = headerIndex(headers, ["application", "apply", "link"]);
     const postedIndex = headerIndex(headers, ["age", "posted", "date"]);
-    if ([companyIndex, titleIndex, locationIndex, applyIndex].some((value) => value < 0)) continue;
+    const requiredColumns = [companyIndex, titleIndex, locationIndex, applyIndex];
+    if (requiredColumns.includes(-1) || new Set(requiredColumns).size !== requiredColumns.length) continue;
+    recognizedTable = true;
+    const lastRequiredColumn = Math.max(...requiredColumns);
+    let inheritedCompany = "";
 
     for (const row of table.slice(1)) {
       observedRows += 1;
       if (observedRows > MAX_FEED_ROWS) {
         throw new CuratedFeedError("too_large", "Curated feed exceeds the row limit");
       }
+      if (row.cells.length <= lastRequiredColumn) {
+        inheritedCompany = "";
+        skippedInvalid += 1;
+        continue;
+      }
+      const companyLabel = cleanText(row.cells[companyIndex]!.text);
+      const company = companyLabel && companyLabel !== "↳" ? companyLabel : inheritedCompany;
       const rowText = row.cells.map((cell) => cell.text).join(" ");
       if (isClosedRow(rowText)) {
+        // A structurally valid closed posting can name the next row's company.
+        inheritedCompany = company;
         skippedClosed += 1;
         continue;
       }
-      let company = cleanText(row.cells[companyIndex]?.text ?? "");
-      if (company === "↳" || company === "") company = inheritedCompany;
-      else inheritedCompany = company;
       const title = cleanText(row.cells[titleIndex]?.text ?? "");
       const location = cleanText(row.cells[locationIndex]?.text ?? "");
       const postedLabel = postedIndex >= 0 ? cleanText(row.cells[postedIndex]?.text ?? "") : "";
       const originalUrl = selectOriginalApplicationUrl(row.cells[applyIndex]?.links ?? []);
       if (!company || !title || !location || !originalUrl) {
+        inheritedCompany = "";
         skippedInvalid += 1;
         continue;
       }
+      inheritedCompany = company;
       if (leads.has(originalUrl)) {
         duplicatesCollapsed += 1;
         continue;
@@ -236,8 +253,11 @@ export function parseCuratedFeed(feedId: CuratedFeedId, content: string): Curate
     }
   }
 
-  if (tables.length === 0) {
+  if (!recognizedTable) {
     throw new CuratedFeedError("invalid_feed", "Curated feed contains no supported job tables");
+  }
+  if (leads.size === 0 && skippedInvalid > 0) {
+    throw new CuratedFeedError("invalid_feed", "Curated feed rows did not produce a valid job snapshot");
   }
   return {
     descriptor,
@@ -322,11 +342,14 @@ function descriptorFor(feedId: CuratedFeedId): CuratedFeedDescriptor {
 
 function extractHtmlTables(content: string): TableRow[][] {
   const document = parseFragment(content);
-  return descendants(document, "table").map((table) => descendants(table, "tr").map((row) => ({
-    cells: childElements(row)
-      .filter((element) => element.tagName === "td" || element.tagName === "th")
-      .map(cellFromElement),
-  })).filter((row) => row.cells.length > 0));
+  return descendants(document, "table").map((table) => childElements(table)
+    .flatMap((element) => ["thead", "tbody", "tfoot"].includes(element.tagName) ? childElements(element) : [element])
+    .filter((element) => element.tagName === "tr")
+    .map((row) => ({
+      cells: childElements(row)
+        .filter((element) => element.tagName === "td" || element.tagName === "th")
+        .map(cellFromElement),
+    })).filter((row) => row.cells.length > 0));
 }
 
 function extractMarkdownTables(content: string): TableRow[][] {
@@ -346,10 +369,13 @@ function extractMarkdownTables(content: string): TableRow[][] {
   return tables;
 }
 
-function descendants(root: Node, tagName: string): Element[] {
+function descendants(root: Node, tagName: string, skipTables = false): Element[] {
   const output: Element[] = [];
   const visit = (node: Node): void => {
-    if (isElement(node) && node.tagName === tagName) output.push(node);
+    if (isElement(node)) {
+      if (skipTables && node.tagName === "table") return;
+      if (node.tagName === tagName) output.push(node);
+    }
     for (const child of childNodes(node)) visit(child);
   };
   visit(root);
@@ -359,7 +385,7 @@ function descendants(root: Node, tagName: string): Element[] {
 function cellFromElement(element: Element): TableCell {
   return {
     text: cleanText(textContent(element)),
-    links: descendants(element, "a").flatMap((anchor) => {
+    links: descendants(element, "a", true).flatMap((anchor) => {
       const href = anchor.attrs.find((attribute) => attribute.name === "href")?.value;
       return href ? [href] : [];
     }),
@@ -400,6 +426,7 @@ function isElement(node: Node): node is Element {
 }
 
 function textContent(node: Node): string {
+  if (isElement(node) && node.tagName === "table") return "";
   if ("value" in node && typeof node.value === "string") return node.value;
   return childNodes(node).map(textContent).join(" ");
 }
@@ -461,9 +488,13 @@ function selectOriginalApplicationUrl(links: string[]): string | null {
     } catch {
       continue;
     }
-    if (url.protocol !== "https:") continue;
-    const host = url.hostname.toLowerCase().replace(/^www\./, "");
-    if (["github.com", "raw.githubusercontent.com", "simplify.jobs", "prepai.dev", "zapply.jobs"].some((blocked) => host === blocked || host.endsWith(`.${blocked}`))) {
+    if (url.protocol !== "https:" || url.username || url.password || url.port) continue;
+    // Reject unsupported URL forms early. Feed-specific intermediary checks are
+    // intentionally stricter than server intake. Neither proves source ownership.
+    const host = url.hostname.toLowerCase().replace(/\.$/, "");
+    if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") ||
+      isIP(host.replace(/^\[|\]$/g, "")) !== 0 ||
+      CURATED_INTERMEDIARIES.some((blocked) => host === blocked || host.endsWith(`.${blocked}`))) {
       continue;
     }
     for (const key of [...url.searchParams.keys()]) {
